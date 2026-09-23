@@ -372,6 +372,17 @@ async function removeHistoryItem() {
               @keydown.enter.exact.prevent="doGenerate"
             />
             <button
+              v-if="prompt.trim() && !loading"
+              class="clear-icon"
+              aria-label="清除输入"
+              title="清除输入"
+              @click="prompt = ''"
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                <path d="M7 7l10 10M17 7L7 17" />
+              </svg>
+            </button>
+            <button
               class="gen-icon"
               :disabled="loading || !prompt.trim()"
               :aria-label="loading ? '生成中…' : '生成画面'"
@@ -1018,6 +1029,31 @@ async function removeHistoryItem() {
   opacity: 0.45;
   cursor: not-allowed;
   box-shadow: none;
+}
+.clear-icon {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--text-3);
+  background: transparent;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+.clear-icon svg {
+  width: 14px;
+  height: 14px;
+}
+.clear-icon:hover {
+  color: var(--danger);
+  border-color: color-mix(in oklch, var(--danger) 45%, var(--line));
+  background: color-mix(in oklch, var(--danger) 8%, transparent);
 }
 
 .drawer-scrim {
