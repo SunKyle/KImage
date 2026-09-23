@@ -587,8 +587,8 @@ async function removeHistoryItem() {
 }
 .wordmark {
   display: flex;
-  align-items: baseline;
-  gap: 8px;
+  align-items: center;
+  gap: 9px;
 }
 .mark {
   display: inline-flex;
@@ -597,7 +597,7 @@ async function removeHistoryItem() {
 .mark svg {
   width: 30px;
   height: 30px;
-  margin-right: 2px;
+  display: block;
   transition: transform var(--dur) var(--ease);
 }
 .wordmark:hover .mark svg {
