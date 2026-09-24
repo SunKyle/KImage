@@ -585,18 +585,6 @@ async function removeHistoryItem() {
               <button class="d-close" @click="showSettings = false" aria-label="关闭">✕</button>
             </header>
 
-            <div class="presets" role="group" aria-label="快速选择">
-              <span class="preset-label">预设</span>
-              <button
-                v-for="(p, i) in presetProviders"
-                :key="p.label"
-                class="preset"
-                @click="applyProvider(i)"
-              >
-                {{ p.label }}
-              </button>
-            </div>
-
             <!-- ===== 视图一:已保存的接口列表 ===== -->
             <section v-if="cfgView === 'list'" class="cfg-bloc">
               <header class="cfg-head">
@@ -639,6 +627,18 @@ async function removeHistoryItem() {
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6l-6 6 6 6" /></svg>
                 </button>
               </header>
+
+              <div class="presets" role="group" aria-label="快速选择">
+                <span class="preset-label">预设</span>
+                <button
+                  v-for="(p, i) in presetProviders"
+                  :key="p.label"
+                  class="preset"
+                  @click="applyProvider(i)"
+                >
+                  {{ p.label }}
+                </button>
+              </div>
 
               <label class="field">
                 <span class="flabel">配置名称</span>
