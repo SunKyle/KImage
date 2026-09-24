@@ -5,8 +5,11 @@ import ImagePreview from './components/ImagePreview.vue'
 import HistoryDrawer from './components/HistoryDrawer.vue'
 import {
   generate,
-  loadConfig,
-  saveConfig,
+  uid,
+  loadConfigs,
+  saveConfigs,
+  loadActiveId,
+  saveActiveId,
   loadHistory,
   addHistoryRecord,
   removeHistoryRecord,
@@ -51,7 +54,11 @@ function toggleTheme() {
 
 // —— 设置面板 ——
 const showSettings = ref(false)
-const config = ref<ApiConfig>({ baseUrl: '', apiKey: '', model: '' })
+// 全部已保存的接口配置
+const configs = ref<ApiConfig[]>([])
+// 当前正在编辑/激活的配置(表单直接绑定)
+const config = ref<ApiConfig>({ id: '', name: '', baseUrl: '', apiKey: '', model: '' })
+const activeId = ref('')
 
 const presetProviders = [
   {
@@ -72,7 +79,13 @@ const presetProviders = [
 ]
 
 onMounted(() => {
-  config.value = loadConfig()
+  configs.value = loadConfigs()
+  activeId.value = loadActiveId()
+  // 选中激活配置;无激活则取第一条
+  const active =
+    configs.value.find((c) => c.id === activeId.value) ||
+    configs.value[0]
+  if (active) config.value = { ...active }
   libItems.value = loadPrompts()
   presets.value = loadPresets()
   loadHistory().then((h) => (history.value = h))
@@ -84,9 +97,60 @@ function applyProvider(i: number) {
   config.value.model = p.model
 }
 
+// 新建一份空白配置(不立即保存)
+function newConfig() {
+  config.value = { id: '', name: '', baseUrl: '', apiKey: '', model: '' }
+}
+// 复制已有配置:基于它生成一份新编辑(不立即保存)
+function duplicateConfig(c: ApiConfig) {
+  config.value = { ...c, id: '', name: c.name ? `${c.name} 副本` : '配置副本' }
+}
+// 保存当前正在编辑的配置(新增或更新),并设为激活
 function saveSettings() {
-  saveConfig(config.value)
+  const cfg = {
+    ...config.value,
+    id: config.value.id || uid(),
+    name: config.value.name.trim() || cfgNameFromUrl(config.value.baseUrl)
+  }
+  const idx = configs.value.findIndex((c) => c.id === cfg.id)
+  if (idx >= 0) configs.value[idx] = cfg
+  else configs.value.push(cfg)
+  saveConfigs(configs.value)
+  config.value = { ...cfg }
+  activeId.value = cfg.id
+  saveActiveId(cfg.id)
   showSettings.value = false
+}
+// 从地址推导一个默认名称
+function cfgNameFromUrl(url: string): string {
+  try {
+    return new URL(url).hostname || '未命名配置'
+  } catch {
+    return '未命名配置'
+  }
+}
+// 设某条配置为激活
+function activateConfig(c: ApiConfig) {
+  config.value = { ...c }
+  activeId.value = c.id
+  saveActiveId(c.id)
+}
+// 删除一条配置;若删的是激活项,自动激活剩余第一条
+function removeConfig(c: ApiConfig) {
+  configs.value = configs.value.filter((x) => x.id !== c.id)
+  saveConfigs(configs.value)
+  if (activeId.value === c.id) {
+    const next = configs.value[0]
+    if (next) {
+      config.value = { ...next }
+      activeId.value = next.id
+      saveActiveId(next.id)
+    } else {
+      config.value = { id: '', name: '', baseUrl: '', apiKey: '', model: '' }
+      activeId.value = ''
+      saveActiveId('')
+    }
+  }
 }
 
 function configured() {
@@ -524,6 +588,38 @@ async function removeHistoryItem() {
               </button>
             </div>
 
+            <!-- 已保存的配置列表 -->
+            <div v-if="configs.length" class="cfg-list">
+              <div class="cfg-row" :class="{ on: config.id === c.id }" v-for="c in configs" :key="c.id">
+                <button class="cfg-main" @click="activateConfig(c)">
+                  <span class="cfg-name">{{ c.name || '未命名配置' }}</span>
+                  <span class="cfg-meta">{{ c.baseUrl }}<template v-if="c.model"> · {{ c.model }}</template></span>
+                </button>
+                <span v-if="config.id === c.id" class="cfg-active">当前</span>
+                <div class="cfg-ops">
+                  <button class="cfg-op" @click="duplicateConfig(c)" title="复制" aria-label="复制">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                      <rect x="9" y="9" width="11" height="11" rx="2" />
+                      <path d="M5 15V6a1 1 0 0 1 1-1h9" />
+                    </svg>
+                  </button>
+                  <button class="cfg-op danger" @click="removeConfig(c)" title="删除" aria-label="删除">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2M6 7l1 12a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-12" />
+                    </svg>
+                  </button>
+                </div>
+              </div>
+            </div>
+            <button class="preset new-cfg" @click="newConfig">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14" /></svg>
+              新建配置
+            </button>
+
+            <label class="field">
+              <span class="flabel">配置名称</span>
+              <input v-model="config.name" placeholder="如：豆包主力 / 通义备用" spellcheck="false" />
+            </label>
             <label class="field">
               <span class="flabel">接口地址 Base URL</span>
               <input v-model="config.baseUrl" placeholder="https://example.com/api/v3" spellcheck="false" />
@@ -731,6 +827,116 @@ async function removeHistoryItem() {
   background: var(--accent-soft);
   border-color: var(--accent);
   color: var(--accent-strong);
+}
+/* 已保存的接口配置列表 */
+.cfg-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: var(--sp-5) 0;
+}
+.cfg-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--bg);
+  transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+.cfg-row.on {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.cfg-main {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  cursor: pointer;
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--text);
+}
+.cfg-main:hover .cfg-name {
+  color: var(--accent);
+}
+.cfg-name {
+  font-size: 14px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: color var(--dur) var(--ease);
+}
+.cfg-meta {
+  font-size: 12px;
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cfg-active {
+  flex-shrink: 0;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  color: var(--accent-strong);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+}
+.cfg-ops {
+  flex-shrink: 0;
+  display: flex;
+  gap: 4px;
+}
+.cfg-op {
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  color: var(--text-3);
+  background: none;
+  cursor: pointer;
+  transition: all var(--dur) var(--ease);
+}
+.cfg-op svg {
+  width: 15px;
+  height: 15px;
+}
+.cfg-op:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--bg-elev);
+}
+.cfg-op.danger:hover {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+.new-cfg {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  justify-content: center;
+  border-style: dashed;
+  color: var(--text-3);
+}
+.new-cfg svg {
+  width: 15px;
+  height: 15px;
+}
+.new-cfg:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+  border-style: dashed;
 }
 .field {
   display: block;

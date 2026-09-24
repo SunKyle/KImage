@@ -1,5 +1,7 @@
-// 用户自定义的接口配置,持久化到 localStorage
+// 用户自定义的接口配置,持久化到 localStorage(列表,可多份)
 export interface ApiConfig {
+  id: string
+  name: string
   baseUrl: string // 例如 https://ark.cn-beijing.volces.com/api/v3
   apiKey: string
   model: string

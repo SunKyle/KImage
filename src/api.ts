@@ -1,20 +1,49 @@
 import type { ApiConfig, GenParams, ImagesResponse, PromptItem, Preset } from './types'
 import { getAll, putAll, putOne, deleteOne, urlToDataURL, detectMimeFromDataUrl } from './lib/idb'
 
-const CONFIG_KEY = 'kimage.apiConfig'
+const CONFIG_KEY = 'kimage.apiConfigs'
+const CONFIG_ACTIVE_KEY = 'kimage.apiActive'
 
-export function loadConfig(): ApiConfig {
+export function uid(): string {
+  return Math.random().toString(36).slice(2) + Date.now().toString(36)
+}
+
+// 读取全部接口配置列表
+export function loadConfigs(): ApiConfig[] {
   try {
     const raw = localStorage.getItem(CONFIG_KEY)
-    if (raw) return JSON.parse(raw)
+    if (raw) {
+      const arr = JSON.parse(raw)
+      if (Array.isArray(arr)) return arr as ApiConfig[]
+    }
   } catch {
     /* ignore */
   }
-  return { baseUrl: '', apiKey: '', model: '' }
+  // 兼容旧的单份配置格式
+  try {
+    const raw = localStorage.getItem('kimage.apiConfig')
+    if (raw) {
+      const c = JSON.parse(raw)
+      const list: ApiConfig[] = [{ id: uid(), name: '默认配置', ...c }]
+      saveConfigs(list)
+      return list
+    }
+  } catch {
+    /* ignore */
+  }
+  return []
 }
 
-export function saveConfig(cfg: ApiConfig) {
-  localStorage.setItem(CONFIG_KEY, JSON.stringify(cfg))
+export function saveConfigs(list: ApiConfig[]) {
+  localStorage.setItem(CONFIG_KEY, JSON.stringify(list))
+}
+
+export function loadActiveId(): string {
+  return localStorage.getItem(CONFIG_ACTIVE_KEY) || ''
+}
+
+export function saveActiveId(id: string) {
+  localStorage.setItem(CONFIG_ACTIVE_KEY, id)
 }
 
 /**
