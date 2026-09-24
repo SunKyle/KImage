@@ -298,7 +298,6 @@ function download(url: string, index: number) {
 
 function openPreview(entry: HistoryEntry) {
   previewEntry.value = entry
-  showHistory.value = false
 }
 function closePreview() {
   previewEntry.value = null
