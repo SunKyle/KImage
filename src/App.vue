@@ -405,15 +405,6 @@ async function removeHistoryEntry(entry: HistoryEntry) {
         <span class="title">KImage</span>
       </div>
       <nav class="mast-actions">
-        <button
-          v-if="!configured()"
-          class="icob icon-btn-warn"
-          @click="showSettings = true"
-          title="未配置接口"
-          aria-label="未配置接口"
-        >
-          <span class="dot dot-warn"></span>
-        </button>
         <button class="icob" @click="showLib = true" title="提示词库" aria-label="提示词库">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
             <path d="M12 6v12M6 12h12M9 3.5h6M9 20.5h6" />
@@ -434,10 +425,10 @@ async function removeHistoryEntry(entry: HistoryEntry) {
         </button>
         <button
           class="icob"
-          :class="{ active: showSettings }"
+          :class="{ active: showSettings, 'icon-btn-warn': !configured() }"
           @click="showSettings = !showSettings"
-          :title="showSettings ? '关闭设置' : '接口设置'"
-          :aria-label="showSettings ? '关闭设置' : '接口设置'"
+          :title="configured() ? (showSettings ? '关闭设置' : '接口设置') : '未配置接口,点击设置'"
+          :aria-label="configured() ? (showSettings ? '关闭设置' : '接口设置') : '未配置接口,点击设置'"
         >
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
             <path d="M12 8.5a3.5 3.5 0 0 1 3.5 3.5A3.5 3.5 0 0 1 12 15.5 3.5 3.5 0 0 1 8.5 12 3.5 3.5 0 0 1 12 8.5Z" />
@@ -830,15 +821,6 @@ async function removeHistoryEntry(entry: HistoryEntry) {
 .icon-btn-warn {
   border-color: color-mix(in oklch, var(--danger) 45%, var(--line));
   color: var(--danger);
-}
-.dot {
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-}
-.dot-warn {
-  background: var(--danger);
-  box-shadow: 0 0 0 3px color-mix(in oklch, var(--danger) 22%, transparent);
 }
 
 .frame {
