@@ -312,7 +312,7 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
   align-items: center;
   justify-content: center;
   min-height: 420px;
-  background: #fafaf9;
+  background: var(--image-bg);
   border-radius: var(--r);
   overflow: hidden;
 }
@@ -330,11 +330,14 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
   height: 44px;
   font-size: 22px;
   color: var(--text-2);
-  background: rgba(255, 255, 255, 0.6);
+  background: color-mix(in oklch, var(--surface) 78%, transparent);
+  border: 1px solid var(--line);
   border-radius: var(--r-sm);
+  backdrop-filter: blur(4px);
+  transition: color var(--dur) var(--ease), background var(--dur) var(--ease);
 }
 .nav:hover {
-  background: #fff;
+  background: var(--surface);
   color: var(--accent);
 }
 .nav.prev {
@@ -444,7 +447,7 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
 }
 .act.primary {
   background: var(--accent);
-  color: oklch(0.985 0.01 45);
+  color: var(--accent-contrast);
   border-color: var(--accent);
 }
 .act.primary:hover {

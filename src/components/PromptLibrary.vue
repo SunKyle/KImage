@@ -91,7 +91,9 @@ function fmt(t: number) {
               <h2>提示词库</h2>
               <span class="d-count">{{ props.items.length }} 条</span>
             </div>
-            <button class="d-close" @click="emit('close')" aria-label="关闭">✕</button>
+            <button class="d-close" @click="emit('close')" aria-label="关闭" title="关闭">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18" /></svg>
+            </button>
           </header>
 
           <!-- 工具栏 -->
@@ -124,19 +126,29 @@ function fmt(t: number) {
           </div>
 
           <!-- 列表 -->
-          <ul class="d-list">
+          <ul class="d-list no-bar">
             <li v-for="item in filtered" :key="item.id" class="d-item">
               <button class="d-card" @click="emit('use', item)">
                 <span class="d-cat">{{ item.category }}</span>
                 <span class="d-text">{{ item.prompt }}</span>
                 <span class="d-time">{{ fmt(item.createdAt) }}</span>
               </button>
-              <button class="d-del" :aria-label="`删除 ${item.title}`" @click="emit('remove', item.id)">
-                删除
+              <button class="d-del" :aria-label="`删除 ${item.title}`" title="删除" @click="emit('remove', item.id)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2M6 7l1 12a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-12" />
+                </svg>
               </button>
             </li>
             <li v-if="!filtered.length" class="d-none">
-              <p>还没有提示词，先在生成框输入后点“收藏”。</p>
+              <div class="d-none-ico" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M5 8a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2" />
+                  <path d="M6 8v10a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V8" />
+                  <path d="M9 12h6" />
+                </svg>
+              </div>
+              <p class="d-none-title">还没有提示词</p>
+              <p class="d-none-sub">在生成框输入一段描述，预览时可“收藏到提示词库”，或点上方“+ 新建”直接存入。</p>
             </li>
           </ul>
         </aside>
@@ -151,6 +163,9 @@ function fmt(t: number) {
   inset: 0;
   z-index: 50;
   background: color-mix(in oklch, #000 30%, transparent);
+  /* 蒙层做轻微毛玻璃,抽屉浮在内容之上而不是糊一层黑 */
+  backdrop-filter: blur(6px) saturate(130%);
+  -webkit-backdrop-filter: blur(6px) saturate(130%);
   display: flex;
   justify-content: flex-end;
 }
@@ -159,15 +174,18 @@ function fmt(t: number) {
   height: 100%;
   background: var(--bg);
   border-left: 1px solid var(--line);
-  box-shadow: var(--sh-md);
+  box-shadow: -30px 0 70px -28px rgba(0, 0, 0, 0.28);
   display: flex;
   flex-direction: column;
   padding: var(--sp-5);
 }
 .d-head {
+  flex-shrink: 0;
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
+  padding-bottom: var(--sp-4);
+  border-bottom: 1px solid var(--line);
 }
 .d-head h2 {
   font-family: var(--font-display);
@@ -179,13 +197,26 @@ function fmt(t: number) {
   color: var(--text-3);
 }
 .d-close {
-  font-size: 16px;
-  color: var(--text-2);
-  padding: 4px;
-  border-radius: var(--r-sm);
+  flex-shrink: 0;
+  width: 30px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--text-3);
+  transition: all var(--dur) var(--ease);
+  cursor: pointer;
+}
+.d-close svg {
+  width: 15px;
+  height: 15px;
 }
 .d-close:hover {
+  border-color: var(--line-strong);
   color: var(--text);
+  background: var(--bg-elev);
 }
 .d-tools {
   margin-top: var(--sp-4);
@@ -215,7 +246,7 @@ function fmt(t: number) {
 .cat.on {
   background: var(--accent);
   border-color: var(--accent);
-  color: oklch(0.985 0.01 45);
+  color: var(--accent-contrast);
 }
 .io {
   display: flex;
@@ -255,12 +286,13 @@ function fmt(t: number) {
   padding: 8px;
   border-radius: var(--r-sm);
   background: var(--accent);
-  color: oklch(0.985 0.01 45);
+  color: var(--accent-contrast);
   font-size: 13px;
 }
 .d-list {
   list-style: none;
-  margin-top: var(--sp-5);
+  margin-top: var(--sp-4);
+  padding-right: 2px;
   overflow-y: auto;
   flex: 1;
   display: flex;
@@ -303,28 +335,80 @@ function fmt(t: number) {
   color: var(--text-3);
 }
 .d-del {
-  font-size: 12px;
-  color: var(--text-3);
-  padding: 4px 6px;
-  border-radius: var(--r-sm);
   flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  color: var(--text-3);
+  background: none;
+  cursor: pointer;
+  transition: all var(--dur) var(--ease);
+}
+.d-del svg {
+  width: 15px;
+  height: 15px;
 }
 .d-del:hover {
+  border-color: var(--danger);
   color: var(--danger);
+  background: color-mix(in oklch, var(--danger) 8%, transparent);
 }
 .d-none {
   color: var(--text-3);
   font-size: 13px;
   text-align: center;
   padding: var(--sp-6) var(--sp-3);
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--r);
+}
+.d-none-ico {
+  width: 40px;
+  height: 40px;
+  margin: 0 auto var(--sp-2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-3);
+  opacity: 0.7;
+}
+.d-none-ico svg {
+  width: 24px;
+  height: 24px;
+}
+.d-none-title {
+  font-family: var(--font-display);
+  font-size: 15px;
+  color: var(--text-2);
+}
+.d-none-sub {
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-3);
+  max-width: 260px;
+  margin-left: auto;
+  margin-right: auto;
 }
 
+/* 蒙层淡入淡出,面板单独横向滑入(此前是整体平移,蒙层会跟着甩) */
 .drawer-enter-active,
 .drawer-leave-active {
+  transition: opacity var(--dur) var(--ease);
+}
+.drawer-enter-active .drawer,
+.drawer-leave-active .drawer {
   transition: transform var(--dur) var(--ease);
 }
 .drawer-enter-from,
 .drawer-leave-to {
+  opacity: 0;
+}
+.drawer-enter-from .drawer,
+.drawer-leave-to .drawer {
   transform: translateX(100%);
 }
 </style>

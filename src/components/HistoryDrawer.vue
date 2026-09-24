@@ -35,10 +35,12 @@ function renderData(item: { type: 'b64' | 'url'; data: string }) {
               <h2>历史记录</h2>
               <span class="d-count">{{ items.length }} 条</span>
             </div>
-            <button class="d-close" @click="emit('close')" aria-label="关闭">✕</button>
+            <button class="d-close" @click="emit('close')" aria-label="关闭" title="关闭">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18" /></svg>
+            </button>
           </header>
 
-          <ul class="d-list">
+          <ul class="d-list no-bar">
             <li v-for="entry in items" :key="entry.id" class="d-item">
               <div class="d-line">
                 <button
@@ -80,7 +82,14 @@ function renderData(item: { type: 'b64' | 'url'; data: string }) {
               </div>
             </li>
             <li v-if="!items.length" class="d-none">
-              <p>还没有生成记录</p>
+              <div class="d-none-ico" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="12" cy="12" r="9" />
+                  <path d="M12 7.4V12l2.8 1.9" />
+                </svg>
+              </div>
+              <p class="d-none-title">还没有生成记录</p>
+              <p class="d-none-sub">输入提示词并生成后，结果会自动保存在这里，随时回看与复用。</p>
             </li>
           </ul>
         </aside>
@@ -95,6 +104,9 @@ function renderData(item: { type: 'b64' | 'url'; data: string }) {
   inset: 0;
   z-index: 50;
   background: color-mix(in oklch, #000 30%, transparent);
+  /* 蒙层做轻微毛玻璃,抽屉浮在内容之上而不是糊一层黑 */
+  backdrop-filter: blur(6px) saturate(130%);
+  -webkit-backdrop-filter: blur(6px) saturate(130%);
   display: flex;
   justify-content: flex-end;
 }
@@ -103,15 +115,18 @@ function renderData(item: { type: 'b64' | 'url'; data: string }) {
   height: 100%;
   background: var(--bg);
   border-left: 1px solid var(--line);
-  box-shadow: var(--sh-md);
+  box-shadow: -30px 0 70px -28px rgba(0, 0, 0, 0.28);
   display: flex;
   flex-direction: column;
   padding: var(--sp-5);
 }
 .d-head {
+  flex-shrink: 0;
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
+  padding-bottom: var(--sp-4);
+  border-bottom: 1px solid var(--line);
 }
 .d-head h2 {
   font-family: var(--font-display);
@@ -123,17 +138,31 @@ function renderData(item: { type: 'b64' | 'url'; data: string }) {
   color: var(--text-3);
 }
 .d-close {
-  font-size: 16px;
-  color: var(--text-2);
-  padding: 4px;
-  border-radius: var(--r-sm);
+  flex-shrink: 0;
+  width: 30px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--text-3);
+  transition: all var(--dur) var(--ease);
+  cursor: pointer;
+}
+.d-close svg {
+  width: 15px;
+  height: 15px;
 }
 .d-close:hover {
+  border-color: var(--line-strong);
   color: var(--text);
+  background: var(--bg-elev);
 }
 .d-list {
   list-style: none;
-  margin-top: var(--sp-5);
+  margin-top: var(--sp-4);
+  padding-right: 2px;
   overflow-y: auto;
   flex: 1;
   display: flex;
@@ -250,14 +279,53 @@ function renderData(item: { type: 'b64' | 'url'; data: string }) {
   font-size: 13px;
   text-align: center;
   padding: var(--sp-6) var(--sp-3);
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--r);
+}
+.d-none-ico {
+  width: 40px;
+  height: 40px;
+  margin: 0 auto var(--sp-2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-3);
+  opacity: 0.7;
+}
+.d-none-ico svg {
+  width: 24px;
+  height: 24px;
+}
+.d-none-title {
+  font-family: var(--font-display);
+  font-size: 15px;
+  color: var(--text-2);
+}
+.d-none-sub {
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-3);
+  max-width: 260px;
+  margin-left: auto;
+  margin-right: auto;
 }
 
+/* 蒙层淡入淡出,面板单独横向滑入(此前是整体平移,蒙层会跟着甩) */
 .drawer-enter-active,
 .drawer-leave-active {
+  transition: opacity var(--dur) var(--ease);
+}
+.drawer-enter-active .drawer,
+.drawer-leave-active .drawer {
   transition: transform var(--dur) var(--ease);
 }
 .drawer-enter-from,
 .drawer-leave-to {
+  opacity: 0;
+}
+.drawer-enter-from .drawer,
+.drawer-leave-to .drawer {
   transform: translateX(100%);
 }
 </style>

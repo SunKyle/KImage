@@ -100,6 +100,21 @@
 
 html {
   scroll-behavior: smooth;
+  /* 隐藏页面滚动条,保留滚动能力 */
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+html::-webkit-scrollbar {
+  display: none;
+}
+
+/* 隐藏滚动条但保留滚动能力,用于抽屉等内容区 */
+.no-bar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.no-bar::-webkit-scrollbar {
+  display: none;
 }
 
 body {
