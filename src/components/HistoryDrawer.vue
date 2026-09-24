@@ -60,8 +60,12 @@ function renderData(item: { type: 'b64' | 'url'; data: string }) {
                   class="d-use"
                   @click="emit('use', entry.prompt)"
                   title="使用该提示词"
+                  aria-label="使用该提示词"
                 >
-                  使用
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M12 20V8M8 12l4-4 4 4" />
+                    <path d="M4 20h16" />
+                  </svg>
                 </button>
                 <button
                   class="d-del"
@@ -197,15 +201,26 @@ function renderData(item: { type: 'b64' | 'url'; data: string }) {
 }
 .d-use {
   flex-shrink: 0;
-  padding: 6px 10px;
-  font-size: 12px;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   border: 1px solid var(--line);
   border-radius: var(--r-sm);
-  color: var(--text-2);
+  color: var(--text-3);
+  background: none;
+  cursor: pointer;
+  transition: all var(--dur) var(--ease);
+}
+.d-use svg {
+  width: 15px;
+  height: 15px;
 }
 .d-use:hover {
   border-color: var(--accent);
   color: var(--accent);
+  background: var(--accent-soft);
 }
 .d-del {
   flex-shrink: 0;
