@@ -228,16 +228,41 @@ function importLibItems(items: PromptItem[]) {
   savePrompts(libItems.value)
 }
 
-// —— 图生图:读取本地图片为 data URL ——
+// —— 图生图:读取本地图片为 data URL(压缩到最长边 1024,避免请求体过大 413) ——
 function onPickRef(e: Event) {
   const file = (e.target as HTMLInputElement).files?.[0]
   if (!file) return
   const reader = new FileReader()
   reader.onload = () => {
-    refImage.value = String(reader.result)
+    const url = String(reader.result)
+    compressImage(url, 1024).then((out) => (refImage.value = out))
   }
   reader.readAsDataURL(file)
   ;(e.target as HTMLInputElement).value = ''
+}
+// 用 canvas 压缩图片:超过 maxEdge 的最长边等比缩放,透明图铺白底,输出 JPEG
+function compressImage(dataUrl: string, maxEdge = 1024): Promise<string> {
+  return new Promise((resolve) => {
+    const img = new Image()
+    img.onload = () => {
+      let { width, height } = img
+      const scale = Math.min(1, maxEdge / Math.max(width, height))
+      if (scale >= 1) return resolve(dataUrl) // 本来就小,原样保留
+      width = Math.round(width * scale)
+      height = Math.round(height * scale)
+      const c = document.createElement('canvas')
+      c.width = width
+      c.height = height
+      const ctx = c.getContext('2d')
+      if (!ctx) return resolve(dataUrl)
+      ctx.fillStyle = '#fff' // 透明 PNG 转 JPEG 时铺白底,避免变黑
+      ctx.fillRect(0, 0, width, height)
+      ctx.drawImage(img, 0, 0, width, height)
+      resolve(c.toDataURL('image/jpeg', 0.85))
+    }
+    img.onerror = () => resolve(dataUrl)
+    img.src = dataUrl
+  })
 }
 function clearRef() {
   refImage.value = ''
