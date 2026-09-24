@@ -43,39 +43,54 @@ app.post('/api/generate', async (req, res) => {
 
   const target = baseUrl.replace(/\/+$/, '') + '/images/generations'
 
-  const body = {
-    model: model || undefined,
-    prompt,
-    n,
-    size,
-    ...(responseFormat ? { response_format: responseFormat } : {})
-  }
+  const isImageGen = image && typeof image === 'string' && image.startsWith('data:image')
 
-  // 图生图:OpenAI 兼容接口通过 image_url 传入参考图(Data URL)
-  if (image && typeof image === 'string' && image.startsWith('data:image')) {
-    body.image = [image]
-  }
-
-  const headers = { 'Content-Type': 'application/json' }
+  const headers = {}
   if (apiKey) {
     headers['Authorization'] = `Bearer ${apiKey}`
+  }
+
+  // 图生图:gpt-image 等模型不接受 JSON 里的 data-url base64,
+  // 必须走 multipart 文件上传(或在个别服务下传公网 URL)。
+  let payload
+  if (isImageGen) {
+    const [meta, b64] = image.split(',')
+    const mime = (meta.match(/data:([^;]+)/) || [])[1] || 'image/jpeg'
+    const type = mime.includes('png') ? 'png' : 'jpeg'
+    const fd = new FormData()
+    if (model) fd.append('model', model)
+    fd.append('prompt', prompt)
+    fd.append('n', String(n))
+    fd.append('size', size)
+    if (responseFormat) fd.append('response_format', responseFormat)
+    fd.append('image', new Blob([Buffer.from(b64, 'base64')], { type: mime }), `image.${type}`)
+    payload = fd // fetch 自动设置 multipart boundary
+  } else {
+    headers['Content-Type'] = 'application/json'
+    payload = JSON.stringify({
+      model: model || undefined,
+      prompt,
+      n,
+      size,
+      ...(responseFormat ? { response_format: responseFormat } : {})
+    })
   }
 
   try {
     const upstream = await fetch(target, {
       method: 'POST',
       headers,
-      body: JSON.stringify(body)
+      body: payload
     })
 
     const text = await upstream.text()
 
     if (!upstream.ok) {
       let detail = text
-      // 豆包 Seedream 3.0-t2i 等纯文生图模型不接受参考图,给出明确指引
+      // 收到 base64_input_not_supported 等错误,给出明确指引
       if (/base64_input_not_supported|b64传参|multipart/i.test(text)) {
         detail =
-          '当前模型不支持参考图(图生图)。若用的是豆包,请将模型换成支持图生图的版本(如 doubao-seedream-4.0 / 4.5 / 5.0),3.0-t2i 为纯文生图。原始错误: ' +
+          '图生图已改用 multipart 文件上传发送参考图。若仍报该错,说明该接口需要图片公网 URL 或对文件字段命名有要求,请检查你的 baseUrl 对应接口的图生图规范。原始错误: ' +
           text
       }
       return res.status(upstream.status).json({
