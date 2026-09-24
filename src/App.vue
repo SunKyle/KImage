@@ -56,9 +56,11 @@ function toggleTheme() {
 const showSettings = ref(false)
 // 全部已保存的接口配置
 const configs = ref<ApiConfig[]>([])
-// 当前正在编辑/激活的配置(表单直接绑定)
+// 当前正在编辑的配置(表单直接绑定)
 const config = ref<ApiConfig>({ id: '', name: '', baseUrl: '', apiKey: '', model: '' })
 const activeId = ref('')
+// 设置面板视图:'list' = 已保存接口列表,'form' = 新增/编辑接口表单(独立一屏)
+const cfgView = ref<'list' | 'form'>('list')
 
 const presetProviders = [
   {
@@ -97,13 +99,15 @@ function applyProvider(i: number) {
   config.value.model = p.model
 }
 
-// 新建一份空白配置(不立即保存)
+// 新建一份空白配置(进入独立的新增接口表单页)
 function newConfig() {
   config.value = { id: '', name: '', baseUrl: '', apiKey: '', model: '' }
+  cfgView.value = 'form'
 }
-// 复制已有配置:基于它生成一份新编辑(不立即保存)
+// 复制已有配置:基于它生成一份新编辑(切到表单页)
 function duplicateConfig(c: ApiConfig) {
   config.value = { ...c, id: '', name: c.name ? `${c.name} 副本` : '配置副本' }
+  cfgView.value = 'form'
 }
 // 保存当前正在编辑的配置(新增或更新),并设为激活
 function saveSettings() {
@@ -119,6 +123,7 @@ function saveSettings() {
   config.value = { ...cfg }
   activeId.value = cfg.id
   saveActiveId(cfg.id)
+  cfgView.value = 'list'
   showSettings.value = false
 }
 // 从地址推导一个默认名称
@@ -128,6 +133,10 @@ function cfgNameFromUrl(url: string): string {
   } catch {
     return '未命名配置'
   }
+}
+// 从表单返回列表视图
+function cancelConfig() {
+  cfgView.value = 'list'
 }
 // 设某条配置为激活
 function activateConfig(c: ApiConfig) {
@@ -588,15 +597,16 @@ async function removeHistoryItem() {
               </button>
             </div>
 
-            <!-- 已保存的接口配置列表 -->
-            <section v-if="configs.length" class="cfg-bloc">
+            <!-- ===== 视图一:已保存的接口列表 ===== -->
+            <section v-if="cfgView === 'list'" class="cfg-bloc">
               <header class="cfg-head">
-                <span class="preset-label">已保存的接口</span>
+                <span class="preset-label">{{ configs.length ? '已保存的接口' : '接口列表' }}</span>
                 <button class="cfg-add" @click="newConfig" title="新增接口" aria-label="新增接口">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14" /></svg>
                 </button>
               </header>
-              <div class="cfg-list">
+
+              <div v-if="configs.length" class="cfg-list">
                 <div class="cfg-row" :class="{ on: config.id === c.id }" v-for="c in configs" :key="c.id">
                   <button class="cfg-main" @click="activateConfig(c)">
                     <span class="cfg-name">{{ c.name || '未命名配置' }}</span>
@@ -618,37 +628,39 @@ async function removeHistoryItem() {
                   </div>
                 </div>
               </div>
+              <p v-else class="cfg-empty">还没有接口，点右上角 ＋ 新增第一个。</p>
             </section>
 
-            <!-- 新增/编辑表单区 -->
-            <header v-else class="cfg-head">
-              <span class="preset-label">还没有已保存的接口</span>
-              <button class="cfg-add" @click="newConfig" title="新增接口" aria-label="新增接口">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14" /></svg>
-              </button>
-            </header>
-            <p class="cfg-form-title">{{ config.id ? '编辑接口' : '新增接口' }}</p>
+            <!-- ===== 视图二:新增/编辑接口表单(独立一屏) ===== -->
+            <section v-else class="cfg-form">
+              <header class="cfg-head">
+                <span class="preset-label">{{ config.id ? '编辑接口' : '新增接口' }}</span>
+                <button class="cfg-back" @click="cancelConfig" title="返回列表" aria-label="返回列表">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6l-6 6 6 6" /></svg>
+                </button>
+              </header>
 
-            <label class="field">
-              <span class="flabel">配置名称</span>
-              <input v-model="config.name" placeholder="如：豆包主力 / 通义备用" spellcheck="false" />
-            </label>
-            <label class="field">
-              <span class="flabel">接口地址 Base URL</span>
-              <input v-model="config.baseUrl" placeholder="https://example.com/api/v3" spellcheck="false" />
-            </label>
-            <label class="field">
-              <span class="flabel">API Key</span>
-              <input v-model="config.apiKey" type="password" placeholder="sk-…  (本地服务可留空)" />
-            </label>
-            <label class="field">
-              <span class="flabel">模型名称</span>
-              <input v-model="config.model" placeholder="doubao-seedream-3-0-t2i" spellcheck="false" />
-            </label>
+              <label class="field">
+                <span class="flabel">配置名称</span>
+                <input v-model="config.name" placeholder="如：豆包主力 / 通义备用" spellcheck="false" />
+              </label>
+              <label class="field">
+                <span class="flabel">接口地址 Base URL</span>
+                <input v-model="config.baseUrl" placeholder="https://example.com/api/v3" spellcheck="false" />
+              </label>
+              <label class="field">
+                <span class="flabel">API Key</span>
+                <input v-model="config.apiKey" type="password" placeholder="sk-…  (本地服务可留空)" />
+              </label>
+              <label class="field">
+                <span class="flabel">模型名称</span>
+                <input v-model="config.model" placeholder="doubao-seedream-3-0-t2i" spellcheck="false" />
+              </label>
 
-            <div class="drawer-foot">
-              <button class="slot-btn" @click="saveSettings">保存配置</button>
-            </div>
+              <div class="drawer-foot">
+                <button class="slot-btn" @click="saveSettings">保存配置</button>
+              </div>
+            </section>
           </aside>
         </div>
       </Transition>
@@ -881,11 +893,32 @@ async function removeHistoryItem() {
   color: var(--accent);
   background: var(--accent-soft);
 }
-.cfg-form-title {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--text);
-  margin: var(--sp-5) 0 var(--sp-4);
+.cfg-back {
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--text-3);
+  background: none;
+  cursor: pointer;
+  transition: all var(--dur) var(--ease);
+}
+.cfg-back svg {
+  width: 16px;
+  height: 16px;
+}
+.cfg-back:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+.cfg-empty {
+  font-size: 13px;
+  color: var(--text-3);
+  padding: 18px 4px;
 }
 .cfg-row {
   display: flex;
