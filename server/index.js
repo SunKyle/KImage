@@ -71,9 +71,16 @@ app.post('/api/generate', async (req, res) => {
     const text = await upstream.text()
 
     if (!upstream.ok) {
+      let detail = text
+      // 豆包 Seedream 3.0-t2i 等纯文生图模型不接受参考图,给出明确指引
+      if (/base64_input_not_supported|b64传参|multipart/i.test(text)) {
+        detail =
+          '当前模型不支持参考图(图生图)。若用的是豆包,请将模型换成支持图生图的版本(如 doubao-seedream-4.0 / 4.5 / 5.0),3.0-t2i 为纯文生图。原始错误: ' +
+          text
+      }
       return res.status(upstream.status).json({
         error: `上游接口错误 ${upstream.status}`,
-        detail: text
+        detail
       })
     }
 
