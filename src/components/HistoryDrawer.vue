@@ -10,6 +10,7 @@ const emit = defineEmits<{
   (e: 'close'): void
   (e: 'open', entry: HistoryEntry): void
   (e: 'use', prompt: string): void
+  (e: 'remove', entry: HistoryEntry): void
 }>()
 
 function fmt(ts: number) {
@@ -61,6 +62,16 @@ function renderData(item: { type: 'b64' | 'url'; data: string }) {
                   title="使用该提示词"
                 >
                   使用
+                </button>
+                <button
+                  class="d-del"
+                  @click="emit('remove', entry)"
+                  title="删除该条历史"
+                  aria-label="删除该条历史"
+                >
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2M6 7l1 12a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-12" />
+                  </svg>
                 </button>
               </div>
             </li>
@@ -195,6 +206,29 @@ function renderData(item: { type: 'b64' | 'url'; data: string }) {
 .d-use:hover {
   border-color: var(--accent);
   color: var(--accent);
+}
+.d-del {
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  color: var(--text-3);
+  background: none;
+  cursor: pointer;
+  transition: all var(--dur) var(--ease);
+}
+.d-del svg {
+  width: 15px;
+  height: 15px;
+}
+.d-del:hover {
+  border-color: var(--danger);
+  color: var(--danger);
+  background: color-mix(in oklch, var(--danger) 8%, transparent);
 }
 .d-none {
   color: var(--text-3);

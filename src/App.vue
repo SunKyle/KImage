@@ -344,6 +344,11 @@ async function removeHistoryItem() {
   await removeHistoryRecord(cur.id)
   closePreview()
 }
+// 历史抽屉:直接删除某条记录
+async function removeHistoryEntry(entry: HistoryEntry) {
+  history.value = history.value.filter((h) => h.id !== entry.id)
+  await removeHistoryRecord(entry.id)
+}
 
 </script>
 
@@ -684,6 +689,7 @@ async function removeHistoryItem() {
       @close="showHistory = false"
       @open="openPreview"
       @use="usePreviewPrompt"
+      @remove="removeHistoryEntry"
     />
 
     <!-- 历史图片预览 -->
