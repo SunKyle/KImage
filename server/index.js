@@ -43,7 +43,10 @@ app.post('/api/generate', async (req, res) => {
     baseUrl,
     apiKey,
     responseFormat,
-    image
+    image,
+    quality,
+    background,
+    vendor
   } = req.body || {}
 
   if (!prompt) {
@@ -54,13 +57,22 @@ app.post('/api/generate', async (req, res) => {
     return res.status(400).json({ error: '请先配置接口地址 Base URL' })
   }
 
-  const target = baseUrl.replace(/\/+$/, '') + '/images/generations'
-
   const isImageGen = image && typeof image === 'string' && image.startsWith('data:image')
+
+  // OpenAI 的图生图走 /images/edits,其余厂商仍在 /images/generations 上用 multipart 传参考图
+  const endpoint = isImageGen && vendor === 'openai' ? '/images/edits' : '/images/generations'
+  const target = baseUrl.replace(/\/+$/, '') + endpoint
 
   const headers = {}
   if (apiKey) {
     headers['Authorization'] = `Bearer ${apiKey}`
+  }
+
+  // quality / background 是 OpenAI 系的扩展参数,不少接口不认,所以只在显式选择时带上
+  const extras = {
+    ...(responseFormat ? { response_format: responseFormat } : {}),
+    ...(quality ? { quality } : {}),
+    ...(background ? { background } : {})
   }
 
   // 图生图:gpt-image 等模型不接受 JSON 里的 data-url base64,
@@ -75,7 +87,7 @@ app.post('/api/generate', async (req, res) => {
     fd.append('prompt', prompt)
     fd.append('n', String(n))
     fd.append('size', size)
-    if (responseFormat) fd.append('response_format', responseFormat)
+    for (const [k, v] of Object.entries(extras)) fd.append(k, String(v))
     fd.append('image', new Blob([Buffer.from(b64, 'base64')], { type: mime }), `image.${type}`)
     payload = fd // fetch 自动设置 multipart boundary
   } else {
@@ -85,15 +97,23 @@ app.post('/api/generate', async (req, res) => {
       prompt,
       n,
       size,
-      ...(responseFormat ? { response_format: responseFormat } : {})
+      ...extras
     })
   }
+
+  // 前端点"终止"会断开连接;这里同步中断对上游的请求,
+  // 并借此判断连接是否还在,避免往已断开的响应里写数据
+  const ac = new AbortController()
+  res.on('close', () => {
+    if (!res.writableEnded) ac.abort()
+  })
 
   try {
     const upstream = await fetch(target, {
       method: 'POST',
       headers,
-      body: payload
+      body: payload,
+      signal: ac.signal
     })
 
     const text = await upstream.text()
@@ -104,6 +124,11 @@ app.post('/api/generate', async (req, res) => {
       if (/base64_input_not_supported|b64传参|multipart/i.test(text)) {
         detail =
           '图生图已改用 multipart 文件上传发送参考图。若仍报该错,说明该接口需要图片公网 URL 或对文件字段命名有要求,请检查你的 baseUrl 对应接口的图生图规范。原始错误: ' +
+          text
+      } else if (/unknown (parameter|argument)|unrecognized|unexpected.*parameter|invalid.*(parameter|param)/i.test(text)) {
+        // 大多是不支持 quality / background 这类扩展参数
+        detail =
+          '上游不认识请求里的某个参数,最常见的是 quality / background —— 这两个是 OpenAI 系的扩展参数。请到「接口设置」把厂商选对(选对后界面会隐藏不支持的参数),或把参数面板里的画质/背景改回「自动」。原始错误: ' +
           text
       }
       return res.status(upstream.status).json({
@@ -116,6 +141,8 @@ app.post('/api/generate', async (req, res) => {
     res.setHeader('Content-Type', 'application/json')
     res.send(text)
   } catch (e) {
+    // 客户端点了"终止"(fetch 被中断),或响应已经发出:都无需也无法再回响应
+    if (e?.name === 'AbortError' || res.headersSent) return
     // undici(Node fetch)遇到连接层失败时只抛 "fetch failed",
     // 真正的原因(DNS/TCP/TLS)藏在 e.cause 里,这里一并透出,否则无法排查
     const cause = e?.cause

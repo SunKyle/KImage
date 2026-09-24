@@ -101,12 +101,18 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
           <!-- 顶部工具栏 -->
           <div class="toolbar">
             <div class="tb-left">
-              <span class="badge">生成记录</span>
+              <span class="tb-title">生成记录</span>
             </div>
             <div v-if="imgs.length > 1" class="tb-count">{{ active + 1 }} / {{ imgs.length }}</div>
             <div class="tool-actions">
               <span class="menu-wrap">
-                <button class="tbtn" @click="menuOpen = !menuOpen" title="更多操作" aria-label="更多">⋮</button>
+                <button class="tbtn" @click="menuOpen = !menuOpen" title="更多操作" aria-label="更多操作">
+                  <svg viewBox="0 0 24 24" fill="currentColor">
+                    <circle cx="12" cy="5.5" r="1.6" />
+                    <circle cx="12" cy="12" r="1.6" />
+                    <circle cx="12" cy="18.5" r="1.6" />
+                  </svg>
+                </button>
                 <Transition name="po">
                   <div v-if="menuOpen" class="menu">
                     <button class="mitem" @click="menuAction('favorite')">收藏到提示词库</button>
@@ -115,18 +121,30 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
                   </div>
                 </Transition>
               </span>
-              <button class="tbtn close" @click="close" title="关闭 (Esc)" aria-label="关闭">×</button>
+              <button class="tbtn" @click="close" title="关闭 (Esc)" aria-label="关闭">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
             </div>
           </div>
 
           <!-- 主体:左图右信息 -->
-          <div class="body">
+          <div class="body no-bar">
             <!-- 图片区 -->
             <div class="stage">
               <div class="img-wrap">
                 <img :src="imgs[active]" :alt="`生成结果 ${active + 1}`" />
-                <button v-if="imgs.length > 1" class="nav prev" @click="prev">‹</button>
-                <button v-if="imgs.length > 1" class="nav next" @click="next">›</button>
+                <button v-if="imgs.length > 1" class="nav prev" @click="prev" title="上一张" aria-label="上一张">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M15 6l-6 6 6 6" />
+                  </svg>
+                </button>
+                <button v-if="imgs.length > 1" class="nav next" @click="next" title="下一张" aria-label="下一张">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M9 6l6 6-6 6" />
+                  </svg>
+                </button>
               </div>
               <!-- 缩略图导航 -->
               <div v-if="imgs.length > 1" class="thumbs">
@@ -143,7 +161,7 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
             </div>
 
             <!-- 信息侧栏 -->
-            <aside class="side">
+            <aside class="side no-bar">
               <div class="side-head">
                 <div class="side-tags">
                   <span class="tag">{{ entry.size }}</span>
@@ -178,8 +196,10 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
   position: fixed;
   inset: 0;
   z-index: 60;
-  background: rgba(20, 15, 10, 0.55);
-  backdrop-filter: blur(4px);
+  /* 与抽屉同一套蒙层:主题化半透明黑 + 轻毛玻璃 */
+  background: color-mix(in oklch, #000 30%, transparent);
+  backdrop-filter: blur(6px) saturate(130%);
+  -webkit-backdrop-filter: blur(6px) saturate(130%);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -187,8 +207,10 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
 }
 .preview {
   width: min(960px, 100%);
-  max-height: 92vh;
+  /* 高度取确定值,不随内容伸缩:展开提示词只在侧栏内部滚动,卡片尺寸保持不变 */
+  height: min(92vh, 880px);
   background: var(--bg);
+  border: 1px solid var(--line);
   border-radius: var(--r-lg);
   overflow: hidden;
   display: flex;
@@ -201,26 +223,28 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 12px 16px;
+  gap: var(--sp-3);
+  flex-shrink: 0;
+  padding: var(--sp-4) var(--sp-5);
   border-bottom: 1px solid var(--line);
 }
 .tb-left {
   flex: 1;
 }
-.badge {
-  font-size: 12px;
-  color: var(--text-2);
-  background: var(--bg-elev);
-  border: 1px solid var(--line);
-  padding: 3px 10px;
-  border-radius: 999px;
+/* 标题走 font-display,与抽屉头部、图墙小节标题同一套字号体系 */
+.tb-title {
+  font-family: var(--font-display);
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--text);
 }
 .tb-count {
   position: absolute;
   left: 50%;
   transform: translateX(-50%);
   font-size: 13px;
-  color: var(--text-2);
+  color: var(--text-3);
   font-variant-numeric: tabular-nums;
 }
 .tool-actions {
@@ -228,25 +252,32 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 2px;
+  gap: var(--sp-1);
 }
+/* 与抽屉/设置列表里的图标按钮同一套尺寸与状态 */
 .tbtn {
-  font-size: 16px;
-  color: var(--text-2);
-  width: 34px;
-  height: 34px;
+  flex-shrink: 0;
+  width: 30px;
+  height: 30px;
   display: flex;
   align-items: center;
   justify-content: center;
+  border: 1px solid var(--line);
   border-radius: var(--r-sm);
-  transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+  color: var(--text-3);
+  background: none;
+  cursor: pointer;
+  transition: color var(--dur) var(--ease), background var(--dur) var(--ease),
+    border-color var(--dur) var(--ease);
+}
+.tbtn svg {
+  width: 15px;
+  height: 15px;
 }
 .tbtn:hover {
   color: var(--text);
+  border-color: var(--line-strong);
   background: var(--bg-elev);
-}
-.tbtn.close {
-  font-size: 20px;
 }
 .menu-wrap {
   position: relative;
@@ -271,7 +302,8 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
   padding: 8px 10px;
   font-size: 13px;
   color: var(--text-2);
-  border-radius: 6px;
+  border-radius: var(--r-sm);
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
 }
 .mitem:hover {
   background: var(--bg-elev);
@@ -293,6 +325,8 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
 .body {
   display: grid;
   grid-template-columns: 1fr 300px;
+  /* 行高填满 body:两栏等高,侧栏内容再多也只在自己内部滚动 */
+  grid-template-rows: minmax(0, 1fr);
   min-height: 0;
   flex: 1;
 }
@@ -301,55 +335,73 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
 .stage {
   position: relative;
   display: flex;
-  gap: 4px;
-  padding: 16px;
-  align-items: center;
+  /* 与 padding 取同一档:缩略图条左右两侧的间距才相等(8px 的 gap 会显得左边挤) */
+  gap: var(--sp-4);
+  padding: var(--sp-4);
+  min-height: 0;
 }
 .img-wrap {
   position: relative;
   flex: 1;
+  min-width: 0;
   display: flex;
   align-items: center;
   justify-content: center;
-  min-height: 420px;
   background: var(--image-bg);
   border-radius: var(--r);
   overflow: hidden;
 }
 .img-wrap img {
+  /* 百分比高度依赖父级的确定高度(stage 撑满网格行),这样图不会顶破卡片 */
   max-width: 100%;
-  max-height: 70vh;
+  max-height: 100%;
   object-fit: contain;
   display: block;
 }
+/* 压在图上的翻页键:圆形毛玻璃,同主页面输入框按钮的造型 */
 .nav {
   position: absolute;
   top: 50%;
   transform: translateY(-50%);
-  width: 34px;
-  height: 44px;
-  font-size: 22px;
+  width: 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   color: var(--text-2);
-  background: color-mix(in oklch, var(--surface) 78%, transparent);
+  background: color-mix(in oklch, var(--surface) 80%, transparent);
   border: 1px solid var(--line);
-  border-radius: var(--r-sm);
-  backdrop-filter: blur(4px);
-  transition: color var(--dur) var(--ease), background var(--dur) var(--ease);
+  border-radius: 999px;
+  backdrop-filter: blur(6px) saturate(130%);
+  -webkit-backdrop-filter: blur(6px) saturate(130%);
+  cursor: pointer;
+  transition: color var(--dur) var(--ease), background var(--dur) var(--ease),
+    border-color var(--dur) var(--ease), transform 120ms var(--ease);
+}
+.nav svg {
+  width: 16px;
+  height: 16px;
 }
 .nav:hover {
   background: var(--surface);
+  border-color: color-mix(in oklch, var(--accent) 45%, var(--line));
   color: var(--accent);
 }
+.nav:active {
+  transform: translateY(-50%) scale(0.94);
+}
 .nav.prev {
-  left: 10px;
+  left: 12px;
 }
 .nav.next {
-  right: 10px;
+  right: 12px;
 }
 .thumbs {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--sp-2);
+  /* 画布改为撑满高度后,缩略图条要自己保持垂直居中 */
+  align-self: center;
 }
 .thumb {
   width: 52px;
@@ -357,22 +409,27 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
   border-radius: var(--r-sm);
   overflow: hidden;
   border: 2px solid transparent;
-  opacity: 0.6;
+  opacity: 0.55;
+  cursor: pointer;
+  transition: opacity var(--dur) var(--ease), border-color var(--dur) var(--ease);
 }
 .thumb img {
   width: 100%;
   height: 100%;
   object-fit: cover;
 }
+.thumb:hover {
+  opacity: 0.85;
+}
 .thumb.active {
-  border-color: var(--accent);
+  border-color: color-mix(in oklch, var(--accent) 70%, transparent);
   opacity: 1;
 }
 /* 信息侧栏 */
 .side {
   display: flex;
   flex-direction: column;
-  padding: 18px;
+  padding: var(--sp-5);
   border-left: 1px solid var(--line);
   gap: var(--sp-5);
   overflow-y: auto;
@@ -380,7 +437,7 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
 .side-head {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--sp-2);
 }
 .side-tags {
   display: flex;
@@ -424,14 +481,22 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
   overflow: hidden;
 }
 .expand-btn {
-  margin-top: 8px;
+  align-self: flex-start;
+  margin-top: var(--sp-2);
+  padding: 5px 10px;
+  margin-left: -10px;
   font-size: 12px;
   color: var(--accent);
+  border-radius: 999px;
+  transition: background var(--dur) var(--ease);
+}
+.expand-btn:hover {
+  background: var(--accent-soft);
 }
 .side-actions {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: var(--sp-2);
   margin-top: auto;
 }
 .act {
@@ -440,10 +505,13 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
   font-size: 14px;
   border: 1px solid var(--line);
   color: var(--text);
-  transition: all var(--dur) var(--ease);
+  cursor: pointer;
+  transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease),
+    box-shadow var(--dur) var(--ease);
 }
 .act:hover {
   border-color: var(--line-strong);
+  background: var(--bg-elev);
 }
 .act.primary {
   background: var(--accent);
@@ -452,6 +520,8 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
 }
 .act.primary:hover {
   background: var(--accent-strong);
+  border-color: var(--accent-strong);
+  box-shadow: 0 8px 22px -12px color-mix(in oklch, var(--accent) 70%, transparent);
 }
 
 .modal-enter-active,
@@ -474,11 +544,17 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
 @media (max-width: 720px) {
   .body {
     grid-template-columns: 1fr;
+    /* 窄屏改为上下堆叠:行高交还给内容,由 body 整体滚动 */
+    grid-template-rows: auto auto;
     overflow-y: auto;
+  }
+  .stage {
+    min-height: 320px;
   }
   .side {
     border-left: none;
     border-top: 1px solid var(--line);
+    overflow-y: visible;
   }
 }
 </style>

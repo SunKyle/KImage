@@ -1,4 +1,7 @@
 import { createApp } from 'vue'
+// 字标字体:只引 latin 子集,避免把西里尔/希腊等用不到的字形打进包
+import '@fontsource/poppins/latin-700.css'
+import '@fontsource/pacifico/latin-400.css'
 import './style.css'
 import App from './App.vue'
 

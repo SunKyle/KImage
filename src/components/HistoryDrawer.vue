@@ -35,7 +35,7 @@ function renderData(item: { type: 'b64' | 'url'; data: string }) {
               <h2>历史记录</h2>
               <span class="d-count">{{ items.length }} 条</span>
             </div>
-            <button class="d-close" @click="emit('close')" aria-label="关闭" title="关闭">
+            <button class="d-close tip-left" @click="emit('close')" aria-label="关闭" data-tip="关闭">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18" /></svg>
             </button>
           </header>
@@ -59,9 +59,9 @@ function renderData(item: { type: 'b64' | 'url'; data: string }) {
                   </span>
                 </button>
                 <button
-                  class="d-use"
+                  class="d-use tip-left"
                   @click="emit('use', entry.prompt)"
-                  title="使用该提示词"
+                  data-tip="使用该提示词"
                   aria-label="使用该提示词"
                 >
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
@@ -70,9 +70,9 @@ function renderData(item: { type: 'b64' | 'url'; data: string }) {
                   </svg>
                 </button>
                 <button
-                  class="d-del"
+                  class="d-del tip-left"
                   @click="emit('remove', entry)"
-                  title="删除该条历史"
+                  data-tip="删除该条历史"
                   aria-label="删除该条历史"
                 >
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
@@ -130,8 +130,9 @@ function renderData(item: { type: 'b64' | 'url'; data: string }) {
 }
 .d-head h2 {
   font-family: var(--font-display);
-  font-weight: 500;
+  font-weight: 600;
   font-size: 22px;
+  letter-spacing: -0.01em;
 }
 .d-count {
   font-size: 12px;

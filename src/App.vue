@@ -15,27 +15,33 @@ import {
   removeHistoryRecord,
   loadPrompts,
   savePrompts,
-  loadPresets,
-  STYLE_WORDS
+  PROVIDERS,
+  getProvider,
+  inferVendor,
+  allowedSizes
 } from './api'
-import type { ApiConfig, HistoryEntry, PromptItem, Preset } from './types'
+import type { Cap, Provider } from './api'
+import type { ApiConfig, HistoryEntry, PromptItem } from './types'
 
 // —— 状态 ——
 const prompt = ref('')
 const size = ref('1024x1024')
 const n = ref(1)
+// 'auto' 表示交给上游自己决定,请求时不带这个参数
+const quality = ref('auto')
+const background = ref('auto')
 const loading = ref(false)
 const error = ref('')
+// 发起生成时锁定的参数快照:生成中途改尺寸/张数/提示词,不会影响已发出的这一批
+const running = ref({ prompt: '', size: '1024x1024', n: 1 })
 const history = ref<HistoryEntry[]>([])
 const libItems = ref<PromptItem[]>([])
-const presets = ref<Preset[]>([])
 const refImage = ref('') // 图生图参考图 (data URL)
-const usedStyles = ref<string[]>([]) // 当前已用的风格标签
 const showLib = ref(false)
 const showHistory = ref(false)
 const previewEntry = ref<HistoryEntry | null>(null)
 // 参数 icon 展开的面板:同一时间只开一个,再次点击收起
-type PanelKey = '' | 'ref' | 'size' | 'n' | 'style' | 'config'
+type PanelKey = '' | 'ref' | 'size' | 'n' | 'quality' | 'bg' | 'config'
 const openPanel = ref<PanelKey>('')
 // 收起动画播放期间保留上一次的面板内容,避免"内容先消失、容器再合拢"的两段跳变
 const shownPanel = ref<PanelKey>('')
@@ -80,10 +86,86 @@ function tileRatio(size: string) {
 }
 // 图墙列数随图数自适应,免得太少时被压成窄条
 const feedCols = computed(() =>
-  Math.min(4, Math.max(1, feedItems.value.length + (loading.value ? Math.max(1, n.value) : 0)))
+  Math.min(4, Math.max(1, feedItems.value.length + (loading.value ? Math.max(1, running.value.n) : 0)))
 )
 
-const sizeOptions = ['512x512', '1024x1024', '1024x1792', '1792x1024', '2560x1440']
+// 当前生效的厂商:配置里没写就按域名猜(兼容加字段之前存的老配置)
+const provider = computed<Provider>(() => {
+  const cfg = config.value
+  return getProvider(cfg.vendor || inferVendor(cfg.baseUrl))
+})
+// 尺寸候选随厂商(以及 OpenAI 的模型代次)变化
+const sizeOptions = computed(() => {
+  const list = allowedSizes(provider.value.id, config.value.model)
+  return Array.isArray(list) ? list : FREE_SIZES
+})
+
+// 画质档位与背景:auto 一律不发,避免不支持这些扩展参数的上游报错
+// hint 是给界面的注解,说明这一档在耗时/费用上的代价
+const qualityOptions = [
+  { value: 'auto', label: '自动', hint: '由上游决定' },
+  { value: 'low', label: '低', hint: '更快更省' },
+  { value: 'medium', label: '中', hint: '均衡' },
+  { value: 'high', label: '高', hint: '更细更慢' }
+]
+const backgroundOptions = [
+  { value: 'auto', label: '自动' },
+  { value: 'transparent', label: '透明' },
+  { value: 'opaque', label: '不透明' }
+]
+// 张数上限:多数生图接口一次最多 10 张
+const N_MAX = 10
+
+// 'auto' 是给上游的值,界面上叫"自动"
+function sizeLabel(s: string) {
+  return s === 'auto' ? '自动' : s
+}
+
+// 参数值 → 界面文案(下拉式参数共用)
+function optionLabel(list: Array<{ value: string; label: string }>, v: string) {
+  return list.find((o) => o.value === v)?.label || v
+}
+
+// 配置行上展示的厂商名(老配置按域名回填后再查表)
+function vendorLabel(c: ApiConfig) {
+  return getProvider(c.vendor || inferVendor(c.baseUrl)).label
+}
+
+// 参数面板底部说明:支持就明说,不确定就提醒可以改回「自动」兜底
+function capHint(c: Cap) {
+  if (c === 'yes') return `当前厂商(${provider.value.label})支持。`
+  if (c === 'no') return `当前厂商(${provider.value.label})不支持,已隐藏。`
+  return '自定义/中转接口是否支持不确定,若上游报错请改回「自动」。'
+}
+
+// 厂商不限尺寸时给的一组常用值
+const FREE_SIZES = ['512x512', '1024x1024', '1024x1792', '1792x1024', '2560x1440', 'auto']
+
+// 按厂商能力决定携带哪些扩展参数:已知不支持的一律不发
+function extraParams(): Record<string, string> {
+  const caps = provider.value
+  const out: Record<string, string> = {}
+  if (caps.quality !== 'no' && quality.value !== 'auto') out.quality = quality.value
+  if (caps.background !== 'no' && background.value !== 'auto') out.background = background.value
+  return out
+}
+
+// 选厂商时先讲清它能吃什么:界面上的参数门控就是照着这份声明来的
+const capabilityNote = computed(() => {
+  const p = provider.value
+  const t = (c: Cap) => (c === 'yes' ? '支持' : c === 'no' ? '不支持' : '依接口而定')
+  return `画质 ${t(p.quality)} · 背景 ${t(p.background)} · 图生图走 ${
+    p.edit === 'edits' ? '/images/edits' : '/images/generations'
+  }`
+})
+
+// 自定义张数:允许手输,失焦/回车时收敛到 1..N_MAX 的整数并回写输入框
+function clampN(e: Event) {
+  const el = e.target as HTMLInputElement
+  const v = Math.round(Number(el.value))
+  n.value = Number.isFinite(v) && v >= 1 ? Math.min(N_MAX, v) : n.value
+  el.value = String(n.value)
+}
 
 // —— 主题 ——
 const theme = ref<'light' | 'dark'>('light')
@@ -119,23 +201,11 @@ const activeId = ref('')
 // 设置面板视图:'list' = 已保存接口列表,'form' = 新增/编辑接口表单(独立一屏)
 const cfgView = ref<'list' | 'form'>('list')
 
-const presetProviders = [
-  {
-    label: '豆包 Seedream(火山方舟)',
-    baseUrl: 'https://ark.cn-beijing.volces.com/api/v3',
-    model: 'doubao-seedream-3-0-t2i'
-  },
-  {
-    label: '通义万相(百炼)',
-    baseUrl: 'https://dashscope.aliyuncs.com/api/v1',
-    model: 'wanx2.1-t2i-turbo'
-  },
-  {
-    label: 'OpenAI(海外)',
-    baseUrl: 'https://api.openai.com/v1',
-    model: 'gpt-image-1'
-  }
-]
+// 换厂商/换模型后,原来的尺寸可能已不在候选里,自动回退到第一个,免得发出上游不认的值
+// (必须放在 config 声明之后,watch 会立刻求值一次,提前会撞上 TDZ)
+watch(sizeOptions, (list) => {
+  if (list.length && !list.includes(size.value)) size.value = list[0]
+})
 
 onMounted(() => {
   configs.value = loadConfigs()
@@ -146,19 +216,19 @@ onMounted(() => {
     configs.value[0]
   if (active) config.value = { ...active }
   libItems.value = loadPrompts()
-  presets.value = loadPresets()
   loadHistory().then((h) => (history.value = h))
 })
 
-function applyProvider(i: number) {
-  const p = presetProviders[i]
-  config.value.baseUrl = p.baseUrl
-  config.value.model = p.model
+// 选厂商:已知厂商顺带填入它的默认地址与模型;自定义只记身份,不动用户已填的内容
+function applyProvider(p: Provider) {
+  config.value.vendor = p.id
+  if (p.baseUrl) config.value.baseUrl = p.baseUrl
+  if (p.model) config.value.model = p.model
 }
 
 // 新建一份空白配置(进入独立的新增接口表单页)
 function newConfig() {
-  config.value = { id: '', name: '', baseUrl: '', apiKey: '', model: '' }
+  config.value = { id: '', name: '', baseUrl: '', apiKey: '', model: '', vendor: 'custom' }
   cfgView.value = 'form'
 }
 // 复制已有配置:基于它生成一份新编辑(切到表单页)
@@ -204,7 +274,7 @@ function cancelConfig() {
 function openConfigManager() {
   cfgView.value = configs.value.length ? 'list' : 'form'
   if (!configs.value.length) {
-    config.value = { id: '', name: '', baseUrl: '', apiKey: '', model: '' }
+    config.value = { id: '', name: '', baseUrl: '', apiKey: '', model: '', vendor: 'custom' }
   }
   showSettings.value = true
   openPanel.value = ''
@@ -226,7 +296,7 @@ function removeConfig(c: ApiConfig) {
       activeId.value = next.id
       saveActiveId(next.id)
     } else {
-      config.value = { id: '', name: '', baseUrl: '', apiKey: '', model: '' }
+      config.value = { id: '', name: '', baseUrl: '', apiKey: '', model: '', vendor: 'custom' }
       activeId.value = ''
       saveActiveId('')
     }
@@ -237,47 +307,9 @@ function configured() {
   return !!config.value.baseUrl
 }
 
-// —— 参数预设 ——
-function applyPreset(pr: Preset) {
-  size.value = pr.size
-  n.value = pr.n
-}
-
-// —— 风格快捷词:追加/撤销 ——
-function appendStyle(word: string) {
-  const chip = STYLE_WORDS.find((s) => s.word === word)
-  const label = chip?.label ?? word
-  if (usedStyles.value.includes(label)) {
-    // 撤销:从 prompt 移除该风格片段
-    prompt.value = prompt.value
-      .split(',').map((p) => p.trim()).filter((p) => p !== word.trim()).join(', ')
-    usedStyles.value = usedStyles.value.filter((l) => l !== label)
-  } else {
-    if (!prompt.value.trim()) {
-      prompt.value = word
-    } else {
-      prompt.value = prompt.value.replace(/[,\s]*$/, '') + ', ' + word
-    }
-    usedStyles.value = [...usedStyles.value, label]
-  }
-}
-
-// 提示词被清空时,清除已用风格标记
-watch(prompt, (v) => {
-  if (!v.trim()) usedStyles.value = []
-})
-
-// 按 prompt 内容重算已用风格(用于回填历史/提示词后)
-function syncUsedStyles() {
-  usedStyles.value = STYLE_WORDS
-    .filter((s) => prompt.value.includes(s.word))
-    .map((s) => s.label)
-}
-
 function useLibItem(item: PromptItem) {
   prompt.value = item.prompt
   if (item.size) size.value = item.size
-  syncUsedStyles()
   showLib.value = false
   window.scrollTo({ top: 0, behavior: 'smooth' })
 }
@@ -335,6 +367,9 @@ function clearRef() {
 }
 
 // —— 生图 ——
+// 当前这一批的请求句柄,用于中途终止
+const controller = ref<AbortController | null>(null)
+
 async function doGenerate() {
   if (loading.value) return
   if (!prompt.value.trim()) {
@@ -347,22 +382,29 @@ async function doGenerate() {
     return
   }
 
+  // 发起前锁定这一批的参数,后面一律读快照,避免中途改参数串味
+  running.value = { prompt: prompt.value, size: size.value, n: n.value }
+  controller.value = new AbortController()
+
   loading.value = true
   error.value = ''
   try {
     const res = await generate(
       {
-        prompt: prompt.value,
-        size: size.value,
-        n: n.value,
-        ...(refImage.value ? { image: refImage.value } : {})
+        prompt: running.value.prompt,
+        size: running.value.size,
+        n: running.value.n,
+        ...(refImage.value ? { image: refImage.value } : {}),
+        // 由厂商能力表决定带哪些扩展参数:auto 与已知不支持的都不发
+        ...extraParams()
       },
-      config.value
+      config.value,
+      controller.value.signal
     )
     const record: HistoryEntry = {
       id: Date.now() + Math.random().toString(16).slice(2),
-      prompt: prompt.value,
-      size: size.value,
+      prompt: running.value.prompt,
+      size: running.value.size,
       model: config.value.model || undefined,
       createdAt: Date.now(),
       results: res
@@ -370,10 +412,18 @@ async function doGenerate() {
     history.value = [record, ...history.value]
     await addHistoryRecord(record)
   } catch (e: any) {
+    // 主动终止不是失败,不报错也不入历史
+    if (e?.name === 'AbortError') return
     error.value = e?.message || '生成失败'
   } finally {
     loading.value = false
+    controller.value = null
   }
+}
+
+// 终止当前批次
+function stopGenerate() {
+  controller.value?.abort()
 }
 
 // —— 工具 ——
@@ -398,7 +448,6 @@ function closePreview() {
 }
 function usePreviewPrompt(t: string) {
   prompt.value = t
-  syncUsedStyles()
   window.scrollTo({ top: 0, behavior: 'smooth' })
 }
 
@@ -450,26 +499,13 @@ async function removeHistoryEntry(entry: HistoryEntry) {
     <!-- 品牌 + 全局操作 -->
     <header class="masthead" :class="{ scrolled }">
       <div class="wordmark">
-        <span class="mark" aria-hidden="true">
-          <svg viewBox="0 0 32 32" fill="none">
-            <defs>
-              <linearGradient id="lg-k" x1="8" y1="6" x2="24" y2="26">
-                <stop offset="0" stop-color="#c98a5e" />
-                <stop offset="1" stop-color="#a85f3f" />
-              </linearGradient>
-            </defs>
-            <!-- 取景框圆角方形 -->
-            <rect x="3.2" y="3.2" width="25.6" height="25.6" rx="7" stroke="currentColor" stroke-width="1.8" />
-            <!-- 画面边缘渐变线(留白呼吸感) -->
-            <path d="M3.2 22.5h6.2l3.6-6 4.2 6h5.4" stroke="url(#lg-k)" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" />
-            <!-- 内置太阳：图像主题 -->
-            <circle cx="21.5" cy="11.2" r="2.6" stroke="url(#lg-k)" stroke-width="2.2" />
-          </svg>
+        <span class="title">
+          KImage
+          <span class="title-script">Gallery</span>
         </span>
-        <span class="title">KImage</span>
       </div>
       <nav class="mast-actions">
-        <button class="icob" @click="showLib = true" title="提示词库" aria-label="提示词库">
+        <button class="icob tip-below" @click="showLib = true" data-tip="提示词库" aria-label="提示词库">
           <!-- 摊开的书:表达"收藏成册的提示词库" -->
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
             <path d="M12 7v14" />
@@ -477,10 +513,10 @@ async function removeHistoryEntry(entry: HistoryEntry) {
           </svg>
         </button>
         <button
-          class="icob"
+          class="icob tip-below"
           :class="{ active: showHistory }"
           @click="showHistory = true"
-          title="历史"
+          data-tip="历史"
           aria-label="历史"
         >
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
@@ -490,10 +526,10 @@ async function removeHistoryEntry(entry: HistoryEntry) {
           <span v-if="history.length" class="icob-badge">{{ history.length }}</span>
         </button>
         <button
-          class="icob"
+          class="icob tip-below"
           :class="{ active: showSettings, 'icon-btn-warn': !configured() }"
           @click="showSettings = !showSettings"
-          :title="configured() ? (showSettings ? '关闭设置' : '接口设置') : '未配置接口,点击设置'"
+          :data-tip="configured() ? (showSettings ? '关闭设置' : '接口设置') : '未配置接口,点击设置'"
           :aria-label="configured() ? (showSettings ? '关闭设置' : '接口设置') : '未配置接口,点击设置'"
         >
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
@@ -502,9 +538,9 @@ async function removeHistoryEntry(entry: HistoryEntry) {
           </svg>
         </button>
         <button
-          class="icob"
+          class="icob tip-below"
           @click="toggleTheme"
-          :title="theme === 'dark' ? '切换浅色' : '切换深色'"
+          :data-tip="theme === 'dark' ? '切换浅色' : '切换深色'"
           :aria-label="theme === 'dark' ? '切换浅色' : '切换深色'"
         >
           <svg v-if="theme === 'dark'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
@@ -543,9 +579,10 @@ async function removeHistoryEntry(entry: HistoryEntry) {
             <!-- 二、参数 icon 行(横线下方),点击 icon 展开对应选项 -->
             <div class="param-bar" role="group" aria-label="生成参数">
               <button
-                class="param-btn"
+                class="param-btn has-val"
                 :class="{ on: openPanel === 'config', filled: !!configured() }"
-                title="配置"
+                :data-tip="`配置 · ${activeConfigName}`"
+                aria-label="配置"
                 @click="togglePanel('config')"
               >
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
@@ -553,26 +590,13 @@ async function removeHistoryEntry(entry: HistoryEntry) {
                   <circle cx="14.5" cy="7" r="2.3" />
                   <circle cx="9.5" cy="17" r="2.3" />
                 </svg>
-                <span>配置</span>
                 <b class="param-val param-val-name">{{ activeConfigName }}</b>
               </button>
               <button
-                class="param-btn"
-                :class="{ on: openPanel === 'ref', filled: !!refImage }"
-                title="参考图"
-                @click="togglePanel('ref')"
-              >
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
-                  <rect x="3" y="4" width="18" height="16" rx="2.5" />
-                  <circle cx="8.5" cy="9.5" r="1.8" />
-                  <path d="M4 17.5l4.5-4.5L12 16.5l3-3 5 5" />
-                </svg>
-                <span>参考图</span>
-              </button>
-              <button
-                class="param-btn"
+                class="param-btn has-val"
                 :class="{ on: openPanel === 'size' }"
-                title="尺寸"
+                :data-tip="`尺寸 · ${sizeLabel(size)}`"
+                aria-label="尺寸"
                 @click="togglePanel('size')"
               >
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
@@ -580,13 +604,13 @@ async function removeHistoryEntry(entry: HistoryEntry) {
                   <rect x="3.5" y="3.5" width="17" height="17" rx="3" />
                   <path d="M9.5 14.5 14.5 9.5M9.5 11.6v2.9h2.9M14.5 12.4V9.5h-2.9" />
                 </svg>
-                <span>尺寸</span>
-                <b class="param-val">{{ size }}</b>
+                <b class="param-val">{{ sizeLabel(size) }}</b>
               </button>
               <button
-                class="param-btn"
+                class="param-btn has-val"
                 :class="{ on: openPanel === 'n' }"
-                title="张数"
+                :data-tip="`张数 · ${n} 张`"
+                aria-label="张数"
                 @click="togglePanel('n')"
               >
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
@@ -595,21 +619,51 @@ async function removeHistoryEntry(entry: HistoryEntry) {
                   <rect x="3.5" y="13.5" width="7" height="7" rx="1.6" />
                   <rect x="13.5" y="13.5" width="7" height="7" rx="1.6" />
                 </svg>
-                <span>张数</span>
                 <b class="param-val">{{ n }}</b>
               </button>
+              <!-- 已知不认画质的厂商直接收起来,免得选了却被上游 400 -->
+              <button
+                v-if="provider.quality !== 'no'"
+                class="param-btn"
+                :class="{ on: openPanel === 'quality', filled: quality !== 'auto' }"
+                :data-tip="`画质 · ${optionLabel(qualityOptions, quality)}`"
+                aria-label="画质"
+                @click="togglePanel('quality')"
+              >
+                <!-- 三根递升的柱子:表达档位高低 -->
+                <svg viewBox="0 0 24 24" fill="currentColor">
+                  <rect x="4" y="13.5" width="3.2" height="6.5" rx="1.6" />
+                  <rect x="10.4" y="9" width="3.2" height="11" rx="1.6" />
+                  <rect x="16.8" y="4.5" width="3.2" height="15.5" rx="1.6" />
+                </svg>
+              </button>
+              <button
+                v-if="provider.background !== 'no'"
+                class="param-btn"
+                :class="{ on: openPanel === 'bg', filled: background !== 'auto' }"
+                :data-tip="`背景 · ${optionLabel(backgroundOptions, background)}`"
+                aria-label="背景"
+                @click="togglePanel('bg')"
+              >
+                <!-- 方框 + 棋盘点:透明底的通用符号 -->
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="3.5" y="3.5" width="17" height="17" rx="2.5" />
+                  <path d="M8 8h.01M16 8h.01M12 12h.01M8 16h.01M16 16h.01" stroke-width="2.6" />
+                </svg>
+              </button>
+              <!-- 参考图放最后:它是一次性的输入,不是常规参数 -->
               <button
                 class="param-btn"
-                :class="{ on: openPanel === 'style', filled: usedStyles.length > 0 }"
-                title="风格"
-                @click="togglePanel('style')"
+                :class="{ on: openPanel === 'ref', filled: !!refImage }"
+                :data-tip="refImage ? '参考图 · 已选' : '参考图 · 未选'"
+                aria-label="参考图"
+                @click="togglePanel('ref')"
               >
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M12 3l1.9 4.6L18.5 9.5l-4.6 1.9L12 16l-1.9-4.6L5.5 9.5l4.6-1.9L12 3Z" />
-                  <path d="M18 16.5l.8 2 2 .8-2 .8-.8 2-.8-2-2-.8 2-.8.8-2Z" />
+                  <rect x="3" y="4" width="18" height="16" rx="2.5" />
+                  <circle cx="8.5" cy="9.5" r="1.8" />
+                  <path d="M4 17.5l4.5-4.5L12 16.5l3-3 5 5" />
                 </svg>
-                <span>风格</span>
-                <b v-if="usedStyles.length" class="param-val">{{ usedStyles.length }}</b>
               </button>
 
               <!-- 清除(次级) + 生成(主按钮),右对齐收在参数行末尾 -->
@@ -618,7 +672,7 @@ async function removeHistoryEntry(entry: HistoryEntry) {
                   v-if="prompt.trim() && !loading"
                   class="clear-icon"
                   aria-label="清除输入"
-                  title="清除输入"
+                  data-tip="清除输入"
                   @click="prompt = ''"
                 >
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
@@ -627,12 +681,15 @@ async function removeHistoryEntry(entry: HistoryEntry) {
                 </button>
                 <button
                   class="gen-icon"
-                  :disabled="loading || !prompt.trim()"
-                  :aria-label="loading ? '生成中…' : '生成画面'"
-                  :title="loading ? '生成中…' : '生成画面（Enter）'"
-                  @click="doGenerate"
+                  :disabled="!loading && !prompt.trim()"
+                  :aria-label="loading ? '终止生成' : '生成画面'"
+                  :data-tip="loading ? '终止生成' : '生成画面（Enter）'"
+                  @click="loading ? stopGenerate() : doGenerate()"
                 >
-                  <span v-if="loading" class="spinner" aria-hidden="true"></span>
+                  <!-- 生成中变为方块停止键,点击可终止这一批 -->
+                  <svg v-if="loading" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round">
+                    <rect x="7" y="7" width="10" height="10" rx="1.6" />
+                  </svg>
                   <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M5 12h13" />
                     <path d="M13 6l6 6-6 6" />
@@ -660,11 +717,10 @@ async function removeHistoryEntry(entry: HistoryEntry) {
                         {{ c.name || '未命名配置' }}
                       </button>
                     </div>
-                    <div class="pp-group">
-                      <span v-if="!configs.length" class="pp-note">还没有保存的配置</span>
-                      <button class="pp-action" @click="openConfigManager">
-                        {{ configs.length ? '管理接口配置' : '去新增配置' }}
-                      </button>
+                    <!-- 没有已保存配置时给一个入口;有配置时只管切换,管理走顶部齿轮 -->
+                    <div v-if="!configs.length" class="pp-group">
+                      <span class="pp-note">还没有保存的配置</span>
+                      <button class="pp-action" @click="openConfigManager">去新增配置</button>
                     </div>
                   </div>
 
@@ -685,27 +741,16 @@ async function removeHistoryEntry(entry: HistoryEntry) {
                   <!-- 尺寸 -->
                   <div v-else-if="shownPanel === 'size'" class="pp-body">
                     <div class="pp-group">
-                      <span class="pp-label">常用</span>
-                      <button
-                        v-for="pr in presets"
-                        :key="pr.id"
-                        class="preset"
-                        :class="{ on: size === pr.size && n === pr.n }"
-                        @click="applyPreset(pr)"
-                      >
-                        {{ pr.name }}
-                      </button>
-                    </div>
-                    <div class="pp-group">
                       <span class="pp-label">尺寸</span>
                       <button
                         v-for="s in sizeOptions"
                         :key="s"
                         class="preset"
                         :class="{ on: size === s }"
+                        :title="s === 'auto' ? '由上游按提示词自动决定尺寸' : ''"
                         @click="size = s"
                       >
-                        {{ s }}
+                        {{ sizeLabel(s) }}
                       </button>
                     </div>
                   </div>
@@ -724,23 +769,56 @@ async function removeHistoryEntry(entry: HistoryEntry) {
                         {{ c }} 张
                       </button>
                     </div>
+                    <div class="pp-group">
+                      <span class="pp-label">自定义</span>
+                      <input
+                        class="num-input"
+                        type="number"
+                        min="1"
+                        :max="N_MAX"
+                        :value="n"
+                        :placeholder="`1-${N_MAX}`"
+                        aria-label="自定义张数"
+                        @change="clampN"
+                      />
+                      <span class="pp-note">张,最多 {{ N_MAX }} 张</span>
+                    </div>
                   </div>
 
-                  <!-- 风格 -->
-                  <div v-else-if="shownPanel === 'style'" class="pp-body">
+                  <!-- 画质 -->
+                  <div v-else-if="shownPanel === 'quality'" class="pp-body">
                     <div class="pp-group">
-                      <span class="pp-label">风格</span>
+                      <span class="pp-label">画质</span>
                       <button
-                        v-for="s in STYLE_WORDS"
-                        :key="s.label"
-                        class="preset"
-                        :class="{ on: usedStyles.includes(s.label) }"
-                        :title="usedStyles.includes(s.label) ? '再次点击撤销' : '追加到提示词'"
-                        @click="appendStyle(s.word)"
+                        v-for="o in qualityOptions"
+                        :key="o.value"
+                        class="preset preset-rich"
+                        :class="{ on: quality === o.value }"
+                        @click="quality = o.value"
                       >
-                        {{ s.label }}
+                        <span>{{ o.label }}</span>
+                        <em class="preset-hint">{{ o.hint }}</em>
                       </button>
                     </div>
+                    <p class="pp-tip">档位越高越清晰,耗时与费用也越高。{{ capHint(provider.quality) }}</p>
+                  </div>
+
+                  <!-- 背景 -->
+                  <div v-else-if="shownPanel === 'bg'" class="pp-body">
+                    <div class="pp-group">
+                      <span class="pp-label">背景</span>
+                      <button
+                        v-for="o in backgroundOptions"
+                        :key="o.value"
+                        class="preset"
+                        :class="{ on: background === o.value }"
+                        :title="o.value === 'auto' ? '由上游决定,不发送该参数' : ''"
+                        @click="background = o.value"
+                      >
+                        {{ o.label }}
+                      </button>
+                    </div>
+                    <p class="pp-tip">选「透明」可得到无底图,适合做素材。{{ capHint(provider.background) }}</p>
                   </div>
                 </div>
               </div>
@@ -748,8 +826,6 @@ async function removeHistoryEntry(entry: HistoryEntry) {
 
             <input id="ref-file" type="file" accept="image/*" hidden @change="onPickRef" />
           </div>
-
-          <p class="hint">Enter 发送 · Shift + Enter 换行 · 配置、预设与提示词库均存于本地</p>
 
           <p v-if="error" class="err" role="alert">{{ error }}</p>
         </div>
@@ -786,10 +862,10 @@ async function removeHistoryEntry(entry: HistoryEntry) {
             <div class="fold-inner">
               <div class="feed-grid" :class="`cols-${feedCols}`">
                 <div
-                  v-for="k in loading ? (n > 0 ? n : 1) : 0"
+                  v-for="k in loading ? (running.n > 0 ? running.n : 1) : 0"
                   :key="`sk-${k}`"
                   class="tile tile-skel"
-                  :style="{ aspectRatio: String(tileRatio(size)) }"
+                  :style="{ aspectRatio: String(tileRatio(running.size)) }"
                 >
                   <div class="skel-shimmer"></div>
                 </div>
@@ -824,7 +900,7 @@ async function removeHistoryEntry(entry: HistoryEntry) {
                 <h2>接口设置</h2>
                 <p class="d-lede">支持任意 OpenAI 兼容的生图接口，配置保存在本地。</p>
               </div>
-              <button class="d-close" @click="showSettings = false" aria-label="关闭" title="关闭">
+              <button class="d-close tip-left" @click="showSettings = false" aria-label="关闭" data-tip="关闭">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18" /></svg>
               </button>
             </header>
@@ -834,7 +910,7 @@ async function removeHistoryEntry(entry: HistoryEntry) {
               <section v-if="cfgView === 'list'" class="cfg-bloc">
                 <header class="cfg-head">
                   <span class="preset-label">{{ configs.length ? '已保存的接口' : '接口列表' }}</span>
-                  <button class="cfg-add" @click="newConfig" title="新增接口" aria-label="新增接口">
+                  <button class="cfg-add tip-left" @click="newConfig" data-tip="新增接口" aria-label="新增接口">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14" /></svg>
                   </button>
                 </header>
@@ -843,23 +919,26 @@ async function removeHistoryEntry(entry: HistoryEntry) {
                   <div class="cfg-row" :class="{ on: config.id === c.id }" v-for="c in configs" :key="c.id">
                     <button class="cfg-main" @click="activateConfig(c)">
                       <span class="cfg-name">{{ c.name || '未命名配置' }}</span>
-                      <span class="cfg-meta">{{ c.baseUrl }}<template v-if="c.model"> · {{ c.model }}</template></span>
+                      <span class="cfg-meta">
+                        <span class="cfg-vendor">{{ vendorLabel(c) }}</span>
+                        <span class="cfg-url">{{ c.baseUrl }}<template v-if="c.model"> · {{ c.model }}</template></span>
+                      </span>
                     </button>
                     <span v-if="config.id === c.id" class="cfg-active">当前</span>
                     <div class="cfg-ops">
-                      <button class="cfg-op" @click="editConfig(c)" title="修改" aria-label="修改">
+                      <button class="cfg-op tip-left" @click="editConfig(c)" data-tip="修改" aria-label="修改">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
                           <path d="M12 20h9" />
                           <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
                         </svg>
                       </button>
-                      <button class="cfg-op" @click="duplicateConfig(c)" title="复制" aria-label="复制">
+                      <button class="cfg-op tip-left" @click="duplicateConfig(c)" data-tip="复制" aria-label="复制">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
                           <rect x="9" y="9" width="11" height="11" rx="2" />
                           <path d="M5 15V6a1 1 0 0 1 1-1h9" />
                         </svg>
                       </button>
-                      <button class="cfg-op danger" @click="removeConfig(c)" title="删除" aria-label="删除">
+                      <button class="cfg-op danger tip-left" @click="removeConfig(c)" data-tip="删除" aria-label="删除">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
                           <path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2M6 7l1 12a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-12" />
                         </svg>
@@ -867,29 +946,40 @@ async function removeHistoryEntry(entry: HistoryEntry) {
                     </div>
                   </div>
                 </div>
-                <p v-else class="cfg-empty">还没有接口，点右上角 ＋ 新增第一个。</p>
+                <div v-else class="cfg-empty">
+                  <div class="cfg-empty-ico" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M12 22v-5M9 8V2M15 8V2" />
+                      <path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z" />
+                    </svg>
+                  </div>
+                  <p class="cfg-empty-title">还没有接口</p>
+                  <p class="cfg-empty-sub">点右上角 ＋ 新增第一个，支持任意 OpenAI 兼容的生图接口，配置只存在本地。</p>
+                </div>
               </section>
 
               <!-- ===== 视图二:新增/编辑接口表单(独立一屏) ===== -->
               <section v-else class="cfg-form">
                 <header class="cfg-head">
                   <span class="preset-label">{{ config.id ? '编辑接口' : '新增接口' }}</span>
-                  <button class="cfg-back" @click="cancelConfig" title="返回列表" aria-label="返回列表">
+                  <button class="cfg-back tip-left" @click="cancelConfig" data-tip="返回列表" aria-label="返回列表">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6l-6 6 6 6" /></svg>
                   </button>
                 </header>
 
-                <div class="presets" role="group" aria-label="快速选择">
-                  <span class="preset-label">预设</span>
+                <div class="presets" role="group" aria-label="选择厂商">
+                  <span class="preset-label">厂商</span>
                   <button
-                    v-for="(p, i) in presetProviders"
-                    :key="p.label"
+                    v-for="p in PROVIDERS"
+                    :key="p.id"
                     class="preset"
-                    @click="applyProvider(i)"
+                    :class="{ on: (config.vendor || 'custom') === p.id }"
+                    @click="applyProvider(p)"
                   >
                     {{ p.label }}
                   </button>
                 </div>
+                <p class="vendor-note">{{ capabilityNote }}</p>
 
                 <label class="field">
                   <span class="flabel">配置名称</span>
@@ -995,28 +1085,25 @@ async function removeHistoryEntry(entry: HistoryEntry) {
 .wordmark {
   display: flex;
   align-items: center;
-  gap: 9px;
-}
-.mark {
-  display: inline-flex;
-  color: var(--text);
-}
-.mark svg {
-  width: 30px;
-  height: 30px;
-  display: block;
-  transition: transform var(--dur) var(--ease);
-}
-.wordmark:hover .mark svg {
-  transform: rotate(-4deg) scale(1.04);
 }
 .title {
-  font-family: var(--font-display);
+  /* 品牌锁形:几何粗体主打 + 手写体后缀,两者按基线对齐 */
+  font-family: var(--font-wordmark);
   font-size: 21px;
-  /* 字标:加重笔画 + 收紧字距,避免读成正文(正字距是正文/大写小字的用法) */
-  font-weight: 600;
-  letter-spacing: -0.022em;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
   color: var(--text);
+  display: inline-flex;
+  align-items: baseline;
+  gap: 7px;
+}
+.title-script {
+  font-family: var(--font-script);
+  /* 手写体字面小、上下留白多,要放大一档才和左边的字重们等高 */
+  font-size: 24px;
+  font-weight: 400;
+  letter-spacing: 0;
 }
 .mast-actions {
   display: flex;
@@ -1104,29 +1191,14 @@ async function removeHistoryEntry(entry: HistoryEntry) {
   flex-wrap: wrap;
   align-items: center;
   gap: var(--sp-2);
-  margin: var(--sp-5) 0 var(--sp-5);
+  margin: 0 0 var(--sp-2);
 }
-.preset-label {
-  font-size: 13px;
+/* 厂商能力说明:紧贴在厂商按钮下方,说明界面为何只露出这些参数 */
+.vendor-note {
+  margin: 0 0 var(--sp-5);
+  font-size: 12px;
+  line-height: 1.6;
   color: var(--text-3);
-  margin-right: 6px;
-}
-.preset {
-  padding: 6px 12px;
-  font-size: 13px;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  color: var(--text-2);
-  transition: all var(--dur) var(--ease);
-}
-.preset:hover {
-  border-color: var(--accent);
-  color: var(--accent);
-}
-.preset.on {
-  background: var(--accent-soft);
-  border-color: var(--accent);
-  color: var(--accent-strong);
 }
 /* 已保存的接口配置列表 */
 .cfg-bloc {
@@ -1136,7 +1208,7 @@ async function removeHistoryEntry(entry: HistoryEntry) {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 10px;
+  margin-bottom: var(--sp-4);
 }
 .cfg-head .preset-label {
   margin-right: 0;
@@ -1146,29 +1218,10 @@ async function removeHistoryEntry(entry: HistoryEntry) {
   flex-direction: column;
   gap: 8px;
 }
-.cfg-add {
-  width: 30px;
-  height: 30px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  color: var(--text-3);
-  background: none;
-  cursor: pointer;
-  transition: all var(--dur) var(--ease);
-}
-.cfg-add svg {
-  width: 16px;
-  height: 16px;
-}
-.cfg-add:hover {
-  border-color: var(--accent);
-  color: var(--accent);
-  background: var(--accent-soft);
-}
+/* 列表头部的新增、表单头部的返回:同一套圆形图标按钮 */
+.cfg-add,
 .cfg-back {
+  flex-shrink: 0;
   width: 30px;
   height: 30px;
   display: flex;
@@ -1179,21 +1232,52 @@ async function removeHistoryEntry(entry: HistoryEntry) {
   color: var(--text-3);
   background: none;
   cursor: pointer;
-  transition: all var(--dur) var(--ease);
+  transition: color var(--dur) var(--ease), background var(--dur) var(--ease),
+    border-color var(--dur) var(--ease);
 }
+.cfg-add svg,
 .cfg-back svg {
   width: 16px;
   height: 16px;
 }
+.cfg-add:hover,
 .cfg-back:hover {
-  border-color: var(--accent);
+  border-color: color-mix(in oklch, var(--accent) 45%, var(--line));
   color: var(--accent);
   background: var(--accent-soft);
 }
+/* 空态:和历史抽屉的空态用同一套虚线框造型 */
 .cfg-empty {
-  font-size: 13px;
+  text-align: center;
+  padding: var(--sp-6) var(--sp-3);
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--r);
   color: var(--text-3);
-  padding: 18px 4px;
+}
+.cfg-empty-ico {
+  width: 40px;
+  height: 40px;
+  margin: 0 auto var(--sp-2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.7;
+}
+.cfg-empty-ico svg {
+  width: 24px;
+  height: 24px;
+}
+.cfg-empty-title {
+  font-family: var(--font-display);
+  font-size: 15px;
+  color: var(--text-2);
+}
+.cfg-empty-sub {
+  margin: 6px auto 0;
+  max-width: 260px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-3);
 }
 .cfg-row {
   display: flex;
@@ -1239,8 +1323,25 @@ async function removeHistoryEntry(entry: HistoryEntry) {
   transition: color var(--dur) var(--ease);
 }
 .cfg-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
   font-size: 12px;
   color: var(--text-3);
+}
+/* 厂商小标签 + 地址,地址过长时自己截断,不挤压标签 */
+.cfg-vendor {
+  flex-shrink: 0;
+  padding: 1px 7px;
+  font-size: 11px;
+  border-radius: 999px;
+  color: var(--text-2);
+  background: color-mix(in oklch, var(--text) 6%, transparent);
+  border: 1px solid var(--line);
+}
+.cfg-url {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1363,7 +1464,7 @@ async function removeHistoryEntry(entry: HistoryEntry) {
   z-index: 1;
 }
 .composer {
-  max-width: 840px; /* 放宽:保证参数行一行容纳各参数 + 清除/发送按钮 */
+  max-width: 840px;
   width: 100%;
   margin: 0 auto;
 }
@@ -1425,14 +1526,13 @@ async function removeHistoryEntry(entry: HistoryEntry) {
   padding: 12px 2px 0;
   border-top: 1px solid var(--line);
 }
+/* 纯图标按钮:名称与当前值都放进 title,鼠标悬停才显示 */
 .param-btn {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  justify-content: center;
+  width: 34px;
   height: 34px;
-  padding: 0 13px 0 11px;
-  font-size: 13px;
-  line-height: 1;
   color: var(--text-2);
   border: 1px solid var(--line);
   border-radius: 999px;
@@ -1458,24 +1558,24 @@ async function removeHistoryEntry(entry: HistoryEntry) {
   border-color: color-mix(in oklch, var(--accent) 40%, transparent);
   color: var(--accent-strong);
 }
-.param-val {
-  font-weight: 500;
-  color: var(--text);
-  font-variant-numeric: tabular-nums;
+/* 带数值的参数(尺寸/张数):图标右侧直接露出当前值,宽度随内容撑开 */
+.param-btn.has-val {
+  width: auto;
+  gap: 6px;
+  padding: 0 12px 0 10px;
 }
-/* 配置名过长时省略 */
+.param-val {
+  font-size: 13px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+/* 配置名可能很长,限宽后省略;行高继承自 body(1.6),不会切掉字的下缘 */
 .param-val-name {
-  max-width: 130px;
+  max-width: 120px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-weight: 400;
-  font-size: 12px;
-  color: var(--text-3);
-}
-.param-btn.on .param-val-name,
-.param-btn.filled .param-val-name {
-  color: inherit;
 }
 .param-btn.on .param-val,
 .param-btn.filled .param-val {
@@ -1539,6 +1639,37 @@ async function removeHistoryEntry(entry: HistoryEntry) {
   font-size: 13px;
   color: var(--text-2);
 }
+/* 面板底部的说明文字 */
+.pp-tip {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-3);
+}
+/* 面板里的紧凑数字输入(自定义张数) */
+.num-input {
+  width: 76px;
+  padding: 6px 10px;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+  /* 去掉数字框自带的上下箭头,和面板里的胶囊按钮保持同一套造型 */
+  appearance: textfield;
+  -moz-appearance: textfield;
+}
+.num-input::-webkit-outer-spin-button,
+.num-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+.num-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 6px 18px -10px color-mix(in oklch, var(--accent) 60%, transparent);
+}
 .pp-action {
   font-size: 13px;
   color: var(--accent);
@@ -1551,8 +1682,9 @@ async function removeHistoryEntry(entry: HistoryEntry) {
   background: var(--accent-soft);
 }
 
+/* 面板里的分区小标题,和参数面板的 .pp-label 同一档 */
 .preset-label {
-  font-size: 13px;
+  font-size: 12px;
   color: var(--text-3);
   margin-right: 2px;
 }
@@ -1563,7 +1695,8 @@ async function removeHistoryEntry(entry: HistoryEntry) {
   border-radius: 999px;
   color: var(--text-2);
   background: var(--surface);
-  transition: all var(--dur) var(--ease);
+  transition: border-color var(--dur) var(--ease), color var(--dur) var(--ease),
+    background var(--dur) var(--ease);
 }
 .preset:hover {
   border-color: var(--accent);
@@ -1573,6 +1706,25 @@ async function removeHistoryEntry(entry: HistoryEntry) {
   background: var(--accent-soft);
   border-color: var(--accent);
   color: var(--accent-strong);
+}
+/* 带注解的胶囊(画质档位):主标签 + 一句代价说明,同一行排布 */
+.preset-rich {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.preset-hint {
+  font-style: normal;
+  font-size: 11px;
+  color: var(--text-3);
+  transition: color var(--dur) var(--ease);
+}
+.preset-rich:hover .preset-hint {
+  color: var(--accent);
+}
+.preset-rich.on .preset-hint {
+  color: inherit;
+  opacity: 0.75;
 }
 
 /* 参考图选择 */
@@ -1681,8 +1833,10 @@ async function removeHistoryEntry(entry: HistoryEntry) {
 }
 .drawer-panel h2 {
   font-family: var(--font-display);
-  font-weight: 500;
+  /* 和主页面小节标题、预览弹层标题同一套:600 + 微收字距 */
+  font-weight: 600;
   font-size: 22px;
+  letter-spacing: -0.01em;
 }
 /* 头部固定,内容独立滚动 */
 .d-head {
@@ -1747,20 +1901,6 @@ async function removeHistoryEntry(entry: HistoryEntry) {
 .drawer-enter-from .drawer-panel,
 .drawer-leave-to .drawer-panel {
   transform: translateX(100%);
-}
-
-.spinner {
-  width: 14px;
-  height: 14px;
-  border: 2px solid rgba(255, 255, 255, 0.35);
-  border-top-color: #fff;
-  border-radius: 50%;
-  animation: spin 0.8s linear infinite;
-}
-@keyframes spin {
-  to {
-    transform: rotate(360deg);
-  }
 }
 
 /* ===== 历史图墙(输入框下方的最近生成) ===== */
@@ -1929,13 +2069,6 @@ async function removeHistoryEntry(entry: HistoryEntry) {
     opacity: 1;
     transform: translateY(0);
   }
-}
-
-.hint {
-  margin-top: 10px;
-  text-align: center;
-  font-size: 12px;
-  color: var(--text-3);
 }
 
 @media (max-width: 860px) {

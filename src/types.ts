@@ -5,6 +5,9 @@ export interface ApiConfig {
   baseUrl: string // 例如 https://ark.cn-beijing.volces.com/api/v3
   apiKey: string
   model: string
+  // 厂商 id(见 api.ts 的 PROVIDERS);决定支持哪些扩展参数、尺寸与图生图端点
+  // 可选是为了兼容加这个字段之前存下来的配置,读的时候会按域名回填
+  vendor?: string
 }
 
 // 生成参数
@@ -14,6 +17,10 @@ export interface GenParams {
   n: number
   // 图生图:参考图(data URL / base64),可选
   image?: string
+  // 画质档位:auto / low / medium / high(部分接口不支持)
+  quality?: string
+  // 背景:auto / transparent / opaque(部分接口不支持)
+  background?: string
 }
 
 // 提示词库收藏项
@@ -24,14 +31,6 @@ export interface PromptItem {
   category: string // 分类/标签
   size?: string
   createdAt: number
-}
-
-// 参数预设:打包可复用配方
-export interface Preset {
-  id: string
-  name: string
-  size: string
-  n: number
 }
 
 // 一条生成记录

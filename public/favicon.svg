@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+  <!--
+    站点图标:圆角方块 + K 字标 + 右上四角星
+    方块底色和渐变都随浏览器主题切换(prefers-color-scheme),
+    避免深色标签页里墨色起笔糊掉看不见。
+    属性值即浅色方案,浏览器不支持内嵌样式时也不会渲染成空白。
+  -->
+  <style>
+    @media (prefers-color-scheme: dark) {
+      .tile { fill: #17171a; }
+      .c1 { stop-color: #edeff6; }
+      .c2 { stop-color: #6d96ff; }
+      .c3 { stop-color: #a89cff; }
+      .c4 { stop-color: #efa3f5; }
+    }
+  </style>
+
+  <defs>
+    <!-- userSpaceOnUse:两笔共用一个坐标系,渐变才能横跨整个 K 连续过渡 -->
+    <linearGradient id="k" gradientUnits="userSpaceOnUse" x1="2.9" y1="4.6" x2="16.1" y2="20">
+      <stop class="c1" offset="0" stop-color="#232a38" />
+      <stop class="c2" offset="0.42" stop-color="#4c7df0" />
+      <stop class="c3" offset="0.75" stop-color="#8b7cff" />
+      <stop class="c4" offset="1" stop-color="#de8cef" />
+    </linearGradient>
+    <linearGradient id="spark" gradientUnits="userSpaceOnUse" x1="16.3" y1="2.2" x2="21.1" y2="7">
+      <stop class="c2" offset="0" stop-color="#4c7df0" />
+      <stop class="c3" offset="0.55" stop-color="#8b7cff" />
+      <stop class="c4" offset="1" stop-color="#de8cef" />
+    </linearGradient>
+  </defs>
+
+  <rect class="tile" x="0" y="0" width="32" height="32" rx="7.5" fill="#ffffff" />
+
+  <!-- 24 视口的字形平移进 32 的方块,四周留 4 单位边距 -->
+  <g transform="translate(4 4)">
+    <path d="M4.7 6.6V17.8" stroke="url(#k)" stroke-width="3.6" stroke-linecap="round" fill="none" />
+    <path
+      d="M13.5 6.4 4.7 12.2 14.3 18.2"
+      stroke="url(#k)"
+      stroke-width="3.6"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      fill="none"
+    />
+    <path
+      d="M18.7 2.2Q19.3 4.6 21.1 4.6 19.3 5.4 18.7 7 18.1 5.4 16.3 4.6 18.1 4.6 18.7 2.2Z"
+      fill="url(#spark)"
+    />
+  </g>
+</svg>

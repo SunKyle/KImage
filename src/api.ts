@@ -1,4 +1,4 @@
-import type { ApiConfig, GenParams, ImagesResponse, PromptItem, Preset } from './types'
+import type { ApiConfig, GenParams, ImagesResponse, PromptItem } from './types'
 import { getAll, putAll, putOne, deleteOne, urlToDataURL, detectMimeFromDataUrl } from './lib/idb'
 
 const CONFIG_KEY = 'kimage.apiConfigs'
@@ -8,13 +8,103 @@ export function uid(): string {
   return Math.random().toString(36).slice(2) + Date.now().toString(36)
 }
 
+/* ===== 厂商能力表 =====================================================
+   各家的扩展参数、尺寸取值、图生图端点都不一样,集中在这里声明,
+   界面按它决定显示什么、代理按它决定打哪个端点。
+   要支持新厂商,或某家改了规则,只改这一处。
+   -------------------------------------------------------------------- */
+export type Cap = 'yes' | 'no' | 'unknown'
+
+export interface Provider {
+  id: string
+  label: string
+  baseUrl: string
+  model: string
+  quality: Cap
+  background: Cap
+  /** 允许的尺寸;'free' 表示由接口自行决定 */
+  sizes: string[] | 'free'
+  /** 图生图打哪个端点 */
+  edit: 'generations' | 'edits'
+}
+
+// 兜底项:baseUrl 认不出来时的归宿
+const CUSTOM: Provider = {
+  id: 'custom',
+  label: '自定义 / 兼容接口',
+  baseUrl: '',
+  model: '',
+  // 未知厂商一律按"不确定"处理:照常展示参数,但不静默丢弃
+  quality: 'unknown',
+  background: 'unknown',
+  sizes: 'free',
+  edit: 'generations'
+}
+
+export const PROVIDERS: Provider[] = [
+  {
+    id: 'openai',
+    label: 'OpenAI(海外)',
+    baseUrl: 'https://api.openai.com/v1',
+    model: 'gpt-image-1',
+    quality: 'yes',
+    background: 'yes',
+    sizes: ['auto', '1024x1024', '1536x1024', '1024x1536'],
+    edit: 'edits'
+  },
+  {
+    id: 'ark',
+    label: '豆包 Seedream(火山方舟)',
+    baseUrl: 'https://ark.cn-beijing.volces.com/api/v3',
+    model: 'doubao-seedream-3-0-t2i',
+    quality: 'no',
+    background: 'no',
+    sizes: 'free',
+    edit: 'generations'
+  },
+  {
+    id: 'dashscope',
+    label: '通义万相(百炼)',
+    baseUrl: 'https://dashscope.aliyuncs.com/api/v1',
+    model: 'wanx2.1-t2i-turbo',
+    quality: 'no',
+    background: 'no',
+    sizes: 'free',
+    edit: 'generations'
+  },
+  CUSTOM
+]
+
+export function getProvider(id: string | undefined): Provider {
+  return PROVIDERS.find((p) => p.id === id) || CUSTOM
+}
+
+/** 老配置没有 vendor 字段时按域名猜,省得用户重配一遍 */
+export function inferVendor(baseUrl: string): string {
+  const h = (baseUrl || '').toLowerCase()
+  if (h.includes('openai')) return 'openai'
+  if (h.includes('volces') || h.includes('ark.cn')) return 'ark'
+  if (h.includes('dashscope') || h.includes('aliyun')) return 'dashscope'
+  return 'custom'
+}
+
+/** OpenAI 两代模型认的尺寸不同,这里再细分一层;其余厂商不限 */
+export function allowedSizes(vendorId: string | undefined, model: string): string[] | 'free' {
+  if (vendorId === 'openai') {
+    return /dall-e-3/i.test(model || '')
+      ? ['1024x1024', '1792x1024', '1024x1792']
+      : ['auto', '1024x1024', '1536x1024', '1024x1536']
+  }
+  return getProvider(vendorId).sizes
+}
+
 // 读取全部接口配置列表
 export function loadConfigs(): ApiConfig[] {
   try {
     const raw = localStorage.getItem(CONFIG_KEY)
     if (raw) {
       const arr = JSON.parse(raw)
-      if (Array.isArray(arr)) return arr as ApiConfig[]
+      if (Array.isArray(arr)) return (arr as ApiConfig[]).map(withVendor)
     }
   } catch {
     /* ignore */
@@ -24,7 +114,7 @@ export function loadConfigs(): ApiConfig[] {
     const raw = localStorage.getItem('kimage.apiConfig')
     if (raw) {
       const c = JSON.parse(raw)
-      const list: ApiConfig[] = [{ id: uid(), name: '默认配置', ...c }]
+      const list: ApiConfig[] = [withVendor({ id: uid(), name: '默认配置', ...c })]
       saveConfigs(list)
       return list
     }
@@ -32,6 +122,11 @@ export function loadConfigs(): ApiConfig[] {
     /* ignore */
   }
   return []
+}
+
+// 补齐 vendor(加这个字段之前存下来的配置没有它)
+function withVendor(c: ApiConfig): ApiConfig {
+  return c.vendor ? c : { ...c, vendor: inferVendor(c.baseUrl) }
 }
 
 export function saveConfigs(list: ApiConfig[]) {
@@ -52,7 +147,8 @@ export function saveActiveId(id: string) {
  */
 export async function generate(
   params: GenParams,
-  config: ApiConfig
+  config: ApiConfig,
+  signal?: AbortSignal
 ): Promise<Array<{ type: 'b64' | 'url'; data: string }>> {
   const resp = await fetch('/api/generate', {
     method: 'POST',
@@ -61,8 +157,11 @@ export async function generate(
       ...params,
       baseUrl: config.baseUrl,
       apiKey: config.apiKey,
-      model: config.model || undefined
-    })
+      model: config.model || undefined,
+      // 厂商决定代理打哪个端点(OpenAI 图生图走 /images/edits,其余走 /generations)
+      vendor: config.vendor || inferVendor(config.baseUrl)
+    }),
+    signal
   })
 
   if (!resp.ok) {
@@ -138,34 +237,3 @@ export function loadPrompts(): PromptItem[] {
 export function savePrompts(list: PromptItem[]) {
   localStorage.setItem(LIB_KEY, JSON.stringify(list))
 }
-
-/* ===== 参数预设 ===== */
-const PRESET_KEY = 'kimage.presets'
-export const DEFAULT_PRESETS: Preset[] = [
-  { id: 'p-square', name: '方图', size: '1024x1024', n: 1 },
-  { id: 'p-portrait', name: '竖幅', size: '1024x1792', n: 1 },
-  { id: 'p-landscape', name: '横版', size: '1792x1024', n: 1 },
-  { id: 'p-wide', name: '超宽屏', size: '2560x1440', n: 1 }
-]
-export function loadPresets(): Preset[] {
-  try {
-    const raw = localStorage.getItem(PRESET_KEY)
-    if (raw) return JSON.parse(raw) as Preset[]
-    return DEFAULT_PRESETS
-  } catch {
-    return DEFAULT_PRESETS
-  }
-}
-export function savePresets(list: Preset[]) {
-  localStorage.setItem(PRESET_KEY, JSON.stringify(list))
-}
-
-/* ===== 风格快捷词 ===== */
-export const STYLE_WORDS = [
-  { label: '电影感', word: 'cinematic, film grain, anamorphic' },
-  { label: '写实', word: 'photorealistic, natural lighting, high detail' },
-  { label: '插画', word: 'illustration, hand-drawn, storybook style' },
-  { label: '赛博朋克', word: 'cyberpunk, neon, futuristic cityscape' },
-  { label: '极简', word: 'minimalist, clean composition, negative space' },
-  { label: '梦幻', word: 'ethereal, dreamy, soft glowing light' }
-]

@@ -91,7 +91,7 @@ function fmt(t: number) {
               <h2>提示词库</h2>
               <span class="d-count">{{ props.items.length }} 条</span>
             </div>
-            <button class="d-close" @click="emit('close')" aria-label="关闭" title="关闭">
+            <button class="d-close tip-left" @click="emit('close')" aria-label="关闭" data-tip="关闭">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18" /></svg>
             </button>
           </header>
@@ -133,7 +133,12 @@ function fmt(t: number) {
                 <span class="d-text">{{ item.prompt }}</span>
                 <span class="d-time">{{ fmt(item.createdAt) }}</span>
               </button>
-              <button class="d-del" :aria-label="`删除 ${item.title}`" title="删除" @click="emit('remove', item.id)">
+              <button
+                class="d-del tip-left"
+                :aria-label="`删除 ${item.title}`"
+                data-tip="删除"
+                @click="emit('remove', item.id)"
+              >
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2M6 7l1 12a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-12" />
                 </svg>
@@ -189,8 +194,9 @@ function fmt(t: number) {
 }
 .d-head h2 {
   font-family: var(--font-display);
-  font-weight: 500;
+  font-weight: 600;
   font-size: 22px;
+  letter-spacing: -0.01em;
 }
 .d-count {
   font-size: 12px;
