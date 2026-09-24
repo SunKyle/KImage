@@ -109,6 +109,11 @@ function duplicateConfig(c: ApiConfig) {
   config.value = { ...c, id: '', name: c.name ? `${c.name} 副本` : '配置副本' }
   cfgView.value = 'form'
 }
+// 编辑已有配置:带入该配置,切到表单页
+function editConfig(c: ApiConfig) {
+  config.value = { ...c }
+  cfgView.value = 'form'
+}
 // 保存当前正在编辑的配置(新增或更新),并设为激活
 function saveSettings() {
   const cfg = {
@@ -606,6 +611,12 @@ async function removeHistoryEntry(entry: HistoryEntry) {
                   </button>
                   <span v-if="config.id === c.id" class="cfg-active">当前</span>
                   <div class="cfg-ops">
+                    <button class="cfg-op" @click="editConfig(c)" title="修改" aria-label="修改">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M12 20h9" />
+                        <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+                      </svg>
+                    </button>
                     <button class="cfg-op" @click="duplicateConfig(c)" title="复制" aria-label="复制">
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
                         <rect x="9" y="9" width="11" height="11" rx="2" />
