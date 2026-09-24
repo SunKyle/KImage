@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { reuseParamsOf } from '../api'
+import { imageSrc, reuseParamsOf } from '../api'
 import type { HistoryEntry, ReuseParams } from '../types'
 
 defineProps<{
@@ -18,11 +18,6 @@ function fmt(ts: number) {
   const d = new Date(ts)
   const p = (x: number) => String(x).padStart(2, '0')
   return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
-}
-
-function renderData(item: { type: 'b64' | 'url'; data: string }) {
-  if (item.data.startsWith('data:')) return item.data
-  return item.type === 'b64' ? `data:image/png;base64,${item.data}` : item.data
 }
 </script>
 
@@ -49,7 +44,7 @@ function renderData(item: { type: 'b64' | 'url'; data: string }) {
                   @click="emit('open', entry)"
                   :title="entry.prompt"
                 >
-                  <img loading="lazy" :src="renderData(entry.results[0])" :alt="entry.prompt" />
+                  <img loading="lazy" :src="imageSrc(entry.results[0])" :alt="entry.prompt" />
                   <span class="d-body">
                     <span class="d-text">{{ entry.prompt }}</span>
                     <span class="d-tags">
@@ -91,6 +86,10 @@ function renderData(item: { type: 'b64' | 'url'; data: string }) {
               </div>
               <p class="d-none-title">还没有生成记录</p>
               <p class="d-none-sub">输入提示词并生成后，结果会自动保存在这里，随时回看与复用。</p>
+            </li>
+            <!-- 说明保留规则:空间吃紧时会自动清最旧的,不写出来用户会以为记录丢了 -->
+            <li v-if="items.length" class="d-note">
+              历史保存在本地，存储空间接近上限时会自动清理最旧的记录
             </li>
           </ul>
         </aside>
@@ -311,6 +310,14 @@ function renderData(item: { type: 'b64' | 'url'; data: string }) {
   max-width: 260px;
   margin-left: auto;
   margin-right: auto;
+}
+/* 列表末尾的保留规则说明:比列表内容再低一级,不抢视线 */
+.d-note {
+  padding: var(--sp-4) var(--sp-2) var(--sp-2);
+  font-size: 12px;
+  line-height: 1.6;
+  text-align: center;
+  color: var(--text-3);
 }
 
 /* 蒙层淡入淡出,面板单独横向滑入(此前是整体平移,蒙层会跟着甩) */

@@ -1,15 +1,41 @@
 // 极简 IndexedDB 封装:用来持久化历史记录(比 localStorage 容量大得多)
 const DB_NAME = 'kimage.db'
 const STORE = 'history'
+/* ===== 历史容量 =====================================================
+   不按固定条数淘汰,而是看浏览器给的配额:只有占用接近上限时才清理最旧的一批。
+   固定条数会在空间还很宽裕时就静默删记录,而每条记录的体积差很多,
+   「50 条」到底占多少空间其实无从预估。
+   拿不到配额信息(旧浏览器/隐私模式)时退回条数兜底,避免历史无限增长。
+   ------------------------------------------------------------------ */
+/** 占用超过这条水位线才开始清理 */
+const HIGH_WATER = 0.8
+/** 一次清掉最旧的这个比例:0.8 × (1 − 0.3) ≈ 0.56,能压回水位线以下 */
+const PRUNE_RATIO = 0.3
+/** 无论如何都至少留这么多条,避免把历史清空 */
+const MIN_KEEP = 20
+/** 拿不到配额信息时的兜底上限 */
+const HARD_LIMIT = 500
+
+export interface PruneResult {
+  /** 清掉了几条 */
+  removed: number
+  /** 清理前的占用比例,用于向用户解释为什么会清 */
+  usageRatio: number
+}
 
 function openDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, 1)
+    const req = indexedDB.open(DB_NAME, 2)
     req.onupgradeneeded = () => {
       const db = req.result
-      if (!db.objectStoreNames.contains(STORE)) {
-        db.createObjectStore(STORE, { keyPath: 'id' })
-      }
+      const tx = req.transaction
+      if (!tx) return
+      const store = db.objectStoreNames.contains(STORE)
+        ? // 从 v1 升上来时 store 已存在,从升级事务里取出来补索引
+          tx.objectStore(STORE)
+        : db.createObjectStore(STORE, { keyPath: 'id' })
+      // createdAt 索引让"淘汰最旧"只需读主键,不必把整表记录读出来
+      if (!store.indexNames.contains('createdAt')) store.createIndex('createdAt', 'createdAt')
     }
     req.onsuccess = () => resolve(req.result)
     req.onerror = () => reject(req.error)
@@ -30,16 +56,55 @@ export async function getAll<T>(): Promise<T[]> {
   })
 }
 
-export async function putAll<T extends { id: string }>(items: T[], slice = 50): Promise<void> {
-  const db = await openDB()
+/** 读取浏览器给的存储配额;隐私模式等场景会抛,一律当作"拿不到" */
+async function storageUsage(): Promise<{ usage: number; quota: number } | null> {
+  try {
+    const est = await navigator.storage?.estimate?.()
+    if (est && est.usage != null && est.quota) return { usage: est.usage, quota: est.quota }
+  } catch {
+    /* ignore */
+  }
+  return null
+}
+
+/** 按 createdAt 升序取主键,最旧的排在最前 */
+function oldestKeys(db: IDBDatabase): Promise<IDBValidKey[]> {
   return new Promise((resolve, reject) => {
+    const req = db.transaction(STORE, 'readonly').objectStore(STORE).index('createdAt').getAllKeys()
+    req.onsuccess = () => resolve(req.result)
+    req.onerror = () => reject(req.error)
+  })
+}
+
+/**
+ * 空间吃紧时清掉最旧的一批历史;还宽裕就原样返回 null。
+ * 替代了原来的「按固定条数淘汰」——那个会在空间充裕时就静默删记录。
+ * 返回清了多少条,交由界面告知用户。
+ */
+export async function pruneHistory(): Promise<PruneResult | null> {
+  const db = await openDB()
+
+  const est = await storageUsage()
+  const usageRatio = est ? est.usage / est.quota : 0
+  // 有余量就不动历史
+  if (est && usageRatio < HIGH_WATER) return null
+
+  const keys = await oldestKeys(db)
+  // 配额驱动时按比例清;拿不到配额则退回条数兜底
+  const want = est ? Math.ceil(keys.length * PRUNE_RATIO) : Math.max(0, keys.length - HARD_LIMIT)
+  const count = Math.min(Math.max(0, keys.length - MIN_KEEP), want)
+  if (count <= 0) return null
+
+  await new Promise<void>((resolve, reject) => {
     const tx = db.transaction(STORE, 'readwrite')
     const store = tx.objectStore(STORE)
-    store.clear()
-    items.slice(0, slice).forEach((it) => store.put(it))
+    // keys 已按 createdAt 升序,前面的是最旧的
+    for (let i = 0; i < count; i++) store.delete(keys[i])
     tx.oncomplete = () => resolve()
     tx.onerror = () => reject(tx.error)
   })
+
+  return { removed: count, usageRatio }
 }
 
 export async function putOne<T extends { id: string }>(item: T): Promise<void> {
@@ -60,12 +125,27 @@ export async function deleteOne(id: string): Promise<void> {
   })
 }
 
-// 工具:把远端图片 URL 抓成 base64(Data URL),用于本地持久化预览
-export async function urlToDataURL(url: string): Promise<string> {
+/* ===== 图片载荷的编解码 =====
+   历史里存 Blob 而不是 data URL:base64 会膨胀 33%,
+   而且字符串要整段进 JS 堆;Blob 由浏览器放在堆外,只在渲染时按需读。 */
+
+export async function urlToBlob(url: string): Promise<Blob> {
   const resp = await fetch(url, { mode: 'cors' })
-  if (!resp.ok) throw new Error('fetch failed')
-  const blob = await resp.blob()
-  return await new Promise<string>((resolve, reject) => {
+  if (!resp.ok) throw new Error(`抓取远端图片失败 ${resp.status}`)
+  return await resp.blob()
+}
+
+/** base64(不含 data: 前缀)→ Blob */
+export function base64ToBlob(b64: string, mime = 'image/png'): Blob {
+  const bin = atob(b64)
+  const bytes = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+  return new Blob([bytes], { type: mime })
+}
+
+/** Blob → data URL。接口只认 data URL,用作参考图时需要这一趟转换 */
+export function blobToDataURL(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
     const reader = new FileReader()
     reader.onload = () => resolve(String(reader.result))
     reader.onerror = () => reject(reader.error)

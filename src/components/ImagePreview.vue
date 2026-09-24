@@ -1,17 +1,20 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
-import { BACKGROUND_OPTIONS, QUALITY_OPTIONS, optionLabel, reuseParamsOf } from '../api'
-import type { HistoryEntry, ReuseParams } from '../types'
+import { BACKGROUND_OPTIONS, QUALITY_OPTIONS, imageSrc, optionLabel, reuseParamsOf } from '../api'
+import type { HistoryEntry, ResultItem, ReuseParams } from '../types'
 
 const props = defineProps<{
   visible: boolean
   entry: HistoryEntry | null
+  // 全部历史,用于上下翻页在记录之间切换
+  items: HistoryEntry[]
 }>()
 const emit = defineEmits<{
   (e: 'close'): void
+  (e: 'navigate', entry: HistoryEntry): void
   (e: 'usePrompt', params: ReuseParams): void
   (e: 'favorite', prompt: string): void
-  (e: 'reference', activeSrc: string): void
+  (e: 'reference', item: ResultItem): void
   (e: 'remove'): void
 }>()
 
@@ -23,48 +26,61 @@ const copied = ref(false)
 let copiedTimer: number | undefined
 
 const imgs = computed(() => {
-  return props.entry ? props.entry.results.map((r) => renderData(r)) : []
+  return props.entry ? props.entry.results.map(imageSrc) : []
 })
 
-// 缩略图按出图比例裁形:竖幅就是竖条,和主图对得上,而不是统一压成方块
-const ratio = computed(() => {
+// 记录里的尺寸能解析出比例就直接用;'auto' 之类解析不出来时返回 0
+const sizeRatio = computed(() => {
   const [w, h] = (props.entry?.size || '').split('x').map(Number)
-  return w && h ? Math.min(2, Math.max(0.5, w / h)) : 1
+  return w > 0 && h > 0 ? w / h : 0
 })
+// 缩略图收窄极端比例,免得竖条太细、横条太扁
+const thumbRatio = computed(() => Math.min(2, Math.max(0.5, sizeRatio.value || 1)))
 
-// 主图盒子的比例以真实像素为准:size 填 auto 时记录里算不出比例,
-// 而且上游偶尔会返回与请求不一致的尺寸,读 naturalWidth 最可靠
+// 主图盒子:优先用记录里的尺寸。取不到才等图片加载,而且只锁第一张 ——
+// 同一条记录里的图尺寸一致,锁定它才不会在左右翻页时反复改卡片宽度
 const loadedRatio = ref(0)
-const boxRatio = computed(() => loadedRatio.value || ratio.value)
+const boxRatio = computed(() => sizeRatio.value || loadedRatio.value || 1)
 function onImgLoad(e: Event) {
+  if (loadedRatio.value) return
   const el = e.target as HTMLImageElement
   if (el.naturalWidth && el.naturalHeight) loadedRatio.value = el.naturalWidth / el.naturalHeight
 }
 
-function renderData(item: { type: 'b64' | 'url'; data: string }) {
-  if (item.data.startsWith('data:')) return item.data
-  return item.type === 'b64' ? `data:image/png;base64,${item.data}` : item.data
+// 每次打开、或上下翻到另一条记录,都回到初始视图
+function resetView() {
+  active.value = 0
+  expanded.value = false
+  menuOpen.value = false
+  copied.value = false
+  loadedRatio.value = 0
 }
-
-// 每次打开时重置到第一张
 watch(
   () => props.visible,
   (v) => {
-    if (v) {
-      active.value = 0
-      expanded.value = false
-      menuOpen.value = false
-      copied.value = false
-      loadedRatio.value = 0
-    }
+    if (v) resetView()
+  }
+)
+// 翻到别的记录时,单独重置(此时 visible 不变,上面那个 watch 不会触发)
+watch(
+  () => props.entry?.id,
+  () => {
+    if (props.visible) resetView()
   }
 )
 
-// 换张时先清掉比例,等新图 load 再定,避免沿用上一张的比例
-watch(
-  () => active.value,
-  () => (loadedRatio.value = 0)
-)
+// —— 记录导航:上下翻的是历史,左右翻的是本条内的多张图 ——
+const entryIndex = computed(() => {
+  const cur = props.entry
+  return cur ? props.items.findIndex((e) => e.id === cur.id) : -1
+})
+const canGoUp = computed(() => entryIndex.value > 0)
+const canGoDown = computed(() => entryIndex.value >= 0 && entryIndex.value < props.items.length - 1)
+/** 沿历史列表上下移动:history 是最新在前,所以 -1 是更新的那条 */
+function goEntry(step: number) {
+  const next = props.items[entryIndex.value + step]
+  if (next) emit('navigate', next)
+}
 
 function close() {
   emit('close')
@@ -105,12 +121,20 @@ function fmtElapsed(ms: number) {
   return s >= 10 ? `${Math.round(s)}s` : `${s.toFixed(1)}s`
 }
 
-// 键盘支持
+// 键盘:左右翻本条的多张图,上下翻历史记录
 function onKey(e: KeyboardEvent) {
   if (!props.visible) return
   if (e.key === 'Escape') close()
-  if (e.key === 'ArrowLeft') prev()
-  if (e.key === 'ArrowRight') next()
+  else if (e.key === 'ArrowLeft') prev()
+  else if (e.key === 'ArrowRight') next()
+  else if (e.key === 'ArrowUp') {
+    // 拦下默认行为,否则上下键会去滚侧栏
+    e.preventDefault()
+    goEntry(-1)
+  } else if (e.key === 'ArrowDown') {
+    e.preventDefault()
+    goEntry(1)
+  }
 }
 onMounted(() => window.addEventListener('keydown', onKey))
 onUnmounted(() => {
@@ -124,7 +148,9 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
   if (kind === 'favorite') {
     emit('favorite', props.entry.prompt)
   } else if (kind === 'reference') {
-    emit('reference', imgs.value[active.value])
+    // 交出原始载荷而不是渲染用的 src:主界面要转成 data URL 才能当参考图
+    const item = props.entry.results[active.value]
+    if (item) emit('reference', item)
   } else if (kind === 'remove') {
     emit('remove')
   }
@@ -164,7 +190,7 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
                   :key="i"
                   class="thumb"
                   :class="{ active: i === active }"
-                  :style="{ aspectRatio: String(ratio) }"
+                  :style="{ aspectRatio: String(thumbRatio) }"
                   :aria-label="`第 ${i + 1} 张`"
                   @click="active = i"
                 >
@@ -175,30 +201,58 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
 
             <!-- 信息侧栏 -->
             <aside class="side no-bar">
-              <!-- 顶行只放操作控件,右对齐 -->
+              <!-- 顶行分两组:左边翻记录,右边是当前这条的操作 -->
               <div class="toolbar">
-                <span v-if="imgs.length > 1" class="tpill tcount">{{ active + 1 }} / {{ imgs.length }}</span>
-                <span class="menu-wrap">
-                  <button class="tpill tip-below" @click="menuOpen = !menuOpen" data-tip="更多操作" aria-label="更多操作">
-                    <svg viewBox="0 0 24 24" fill="currentColor">
-                      <circle cx="12" cy="5.5" r="1.6" />
-                      <circle cx="12" cy="12" r="1.6" />
-                      <circle cx="12" cy="18.5" r="1.6" />
+                <!-- 上下翻历史:history 最新在前,所以 ↑ 是更新的那条 -->
+                <div v-if="items.length > 1" class="tnav">
+                  <button
+                    class="tpill tip-below"
+                    :disabled="!canGoUp"
+                    @click="goEntry(-1)"
+                    data-tip="更新的记录（↑）"
+                    aria-label="更新的记录"
+                  >
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M6 15l6-6 6 6" />
                     </svg>
                   </button>
-                  <Transition name="po">
-                    <div v-if="menuOpen" class="menu">
-                      <button class="mitem" @click="menuAction('favorite')">收藏到提示词库</button>
-                      <button class="mitem" @click="menuAction('reference')">用作参考图</button>
-                      <button class="mitem danger" @click="menuAction('remove')">删除该条历史</button>
-                    </div>
-                  </Transition>
-                </span>
-                <button class="tpill tip-below" @click="close" data-tip="关闭（Esc）" aria-label="关闭">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
-                    <path d="M6 6l12 12M18 6L6 18" />
-                  </svg>
-                </button>
+                  <span class="tpos">{{ entryIndex + 1 }} / {{ items.length }}</span>
+                  <button
+                    class="tpill tip-below"
+                    :disabled="!canGoDown"
+                    @click="goEntry(1)"
+                    data-tip="更早的记录（↓）"
+                    aria-label="更早的记录"
+                  >
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M6 9l6 6 6-6" />
+                    </svg>
+                  </button>
+                </div>
+
+                <div class="toolbar-main">
+                  <span class="menu-wrap">
+                    <button class="tpill tip-below" @click="menuOpen = !menuOpen" data-tip="更多操作" aria-label="更多操作">
+                      <svg viewBox="0 0 24 24" fill="currentColor">
+                        <circle cx="12" cy="5.5" r="1.6" />
+                        <circle cx="12" cy="12" r="1.6" />
+                        <circle cx="12" cy="18.5" r="1.6" />
+                      </svg>
+                    </button>
+                    <Transition name="po">
+                      <div v-if="menuOpen" class="menu">
+                        <button class="mitem" @click="menuAction('favorite')">收藏到提示词库</button>
+                        <button class="mitem" @click="menuAction('reference')">用作参考图</button>
+                        <button class="mitem danger" @click="menuAction('remove')">删除该条历史</button>
+                      </div>
+                    </Transition>
+                  </span>
+                  <button class="tpill tip-below" @click="close" data-tip="关闭（Esc）" aria-label="关闭">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+                      <path d="M6 6l12 12M18 6L6 18" />
+                    </svg>
+                  </button>
+                </div>
               </div>
 
               <!-- 提示词:小节标题带分隔线,复制收在标题右侧,贴着它作用的内容 -->
@@ -297,27 +351,46 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
   box-shadow: var(--sh-md);
 }
 
-/* 顶行只放操作控件,推到右侧 */
+/* 顶行分两组:左=翻记录,右=本条的操作;两组各自成团 */
 .toolbar {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
+  justify-content: space-between;
+  gap: var(--sp-3);
 }
-/* 胶囊按钮:计数、更多、关闭共用一套造型 */
+/* 翻记录的箭头组:两个圆钮夹一个位置指示 */
+.tnav {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.tpos {
+  min-width: 46px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+/* 没有翻记录那组时,右侧这组也要靠右 */
+.toolbar-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+/* 圆形图标按钮:与主页面的 .param-btn / .icob 同一套造型。
+   宽高必须相等 —— 靠左右 padding 撑宽会变成椭圆 */
 .tpill {
+  flex-shrink: 0;
+  width: 34px;
   height: 34px;
-  min-width: 34px;
-  padding: 0 12px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 6px;
   border: 1px solid var(--line);
   border-radius: 999px;
   background: var(--surface);
   color: var(--text-2);
-  font-size: 13px;
   cursor: pointer;
   transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease),
     background var(--dur) var(--ease);
@@ -326,16 +399,15 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
   width: 15px;
   height: 15px;
 }
-/* 计数只是状态,不该有悬停反馈,所以把它排除在按钮态之外 */
-.tpill:not(.tcount):hover {
+/* 只有禁用态(翻到头的那一端)不参与悬停反馈 */
+.tpill:not(:disabled):hover {
   color: var(--text);
   border-color: var(--line-strong);
-  background: var(--surface);
+  background: var(--bg-elev);
 }
-.tcount {
-  cursor: default;
-  color: var(--text-3);
-  font-variant-numeric: tabular-nums;
+.tpill:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 .menu-wrap {
   position: relative;
@@ -639,15 +711,18 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
   border-color: var(--line-strong);
   background: var(--bg-elev);
 }
+/* 主操作用 --cta(黑药丸),与主页面发送键同一套 token:
+   深色模式下它会自动反相成白底黑字,不用另写主题覆盖。
+   accent 在这套设计里的职责是 AI 状态/高亮,不作为按钮底色。 */
 .act.primary {
-  background: var(--accent);
-  color: var(--accent-contrast);
-  border-color: var(--accent);
+  background: var(--cta);
+  color: var(--cta-text);
+  border-color: var(--cta);
 }
 .act.primary:hover {
-  background: var(--accent-strong);
-  border-color: var(--accent-strong);
-  box-shadow: 0 8px 22px -12px color-mix(in oklch, var(--accent) 70%, transparent);
+  background: var(--cta-hover);
+  border-color: var(--cta-hover);
+  box-shadow: 0 8px 22px -12px color-mix(in oklch, var(--cta) 55%, transparent);
 }
 
 .modal-enter-active,

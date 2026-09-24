@@ -214,11 +214,12 @@ html::-webkit-scrollbar {
 
 body {
   /* 背景图:极简山水,平铺全屏,随视口缩放;亮/暗主题各一张。
+     用 WebP:原 PNG 是未优化的编码(1.4MB),转 WebP 后仅 30KB 左右。
      上层叠加当前主题色半透明遮罩(62%),避免削弱卡片与文字对比度 */
   background:
     linear-gradient(color-mix(in srgb, var(--bg) 62%, transparent),
                     color-mix(in srgb, var(--bg) 62%, transparent)),
-    url('/src/assets/bg-light.png') center / cover no-repeat fixed;
+    url('/src/assets/bg-light.webp') center / cover no-repeat fixed;
   color: var(--text);
   font-family: var(--font-body);
   line-height: 1.6;                    /* Body 1.6 */
@@ -288,5 +289,5 @@ select:focus-visible {
   background:
     linear-gradient(color-mix(in srgb, var(--bg) 62%, transparent),
                     color-mix(in srgb, var(--bg) 62%, transparent)),
-    url('/src/assets/bg-dark.png') center / cover no-repeat fixed;
+    url('/src/assets/bg-dark.webp') center / cover no-repeat fixed;
 }

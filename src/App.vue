@@ -20,11 +20,13 @@ import {
   inferVendor,
   allowedSizes,
   optionLabel,
+  imageSrc,
   QUALITY_OPTIONS,
   BACKGROUND_OPTIONS
 } from './api'
+import { blobToDataURL } from './lib/idb'
 import type { Cap, Provider } from './api'
-import type { ApiConfig, HistoryEntry, PromptItem, ReuseParams } from './types'
+import type { ApiConfig, HistoryEntry, PromptItem, ResultItem, ReuseParams } from './types'
 
 // —— 状态 ——
 const prompt = ref('')
@@ -35,6 +37,20 @@ const quality = ref('auto')
 const background = ref('auto')
 const loading = ref(false)
 const error = ref('')
+// 错误区默认收成一行:上游原文动辄上百字,整段铺开会把输入区顶得很高
+const errorOpen = ref(false)
+// 只有真正发起过生图才谈得上"重试",校验类提示不给这个按钮
+const canRetry = ref(false)
+// 统一的错误出口:顺带把折叠状态收回、标记可否重试
+function fail(msg: string, retryable = false) {
+  error.value = msg
+  canRetry.value = retryable
+  errorOpen.value = false
+}
+// 校验类提示都很短,不值得给「详情」;上游原文通常远长于此
+const errorLong = computed(() => error.value.length > 90)
+// 存储清理的事后告知。它不是错误,所以单独一条通道,中性配色
+const notice = ref('')
 // 发起生成时锁定的参数快照:生成中途改尺寸/张数/提示词,不会影响已发出的这一批
 const running = ref({ prompt: '', size: '1024x1024', n: 1 })
 const history = ref<HistoryEntry[]>([])
@@ -77,7 +93,7 @@ const feedItems = computed(() => {
   const out: Array<{
     key: string
     entry: HistoryEntry
-    item: { type: 'b64' | 'url'; data: string }
+    item: ResultItem
     ratio: number
   }> = []
   for (const entry of history.value) {
@@ -398,11 +414,11 @@ const controller = ref<AbortController | null>(null)
 async function doGenerate() {
   if (loading.value) return
   if (!prompt.value.trim()) {
-    error.value = '请先输入提示词'
+    fail('请先输入提示词')
     return
   }
   if (!configured()) {
-    error.value = '请先在“接口设置”中配置接口地址'
+    fail('请先在“接口设置”中配置接口地址')
     showSettings.value = true
     return
   }
@@ -417,6 +433,8 @@ async function doGenerate() {
 
   loading.value = true
   error.value = ''
+  notice.value = ''
+  canRetry.value = false
   try {
     const res = await generate(
       {
@@ -444,11 +462,20 @@ async function doGenerate() {
       results: res
     }
     history.value = [record, ...history.value]
-    await addHistoryRecord(record)
+    const pruned = await addHistoryRecord(record)
+    if (pruned) {
+      // 磁盘上已经删掉了,内存里也要同步,否则界面还留着早已不存在的记录
+      history.value = history.value.slice(0, Math.max(0, history.value.length - pruned.removed))
+      const pct = Math.round(pruned.usageRatio * 100)
+      notice.value = pct
+        ? `本地存储已用约 ${pct}%，为腾出空间清理了最旧的 ${pruned.removed} 条历史`
+        : `为控制本地占用，清理了最旧的 ${pruned.removed} 条历史`
+    }
   } catch (e: any) {
     // 主动终止不是失败,不报错也不入历史
     if (e?.name === 'AbortError') return
-    error.value = e?.message || '生成失败'
+    // 走到这里说明请求真的发出去了,可以重试
+    fail(e?.message || '生成失败', true)
   } finally {
     loading.value = false
     controller.value = null
@@ -460,13 +487,13 @@ function stopGenerate() {
   controller.value?.abort()
 }
 
-// —— 工具 ——
-function renderData(item: { type: 'b64' | 'url'; data: string }) {
-  // 已是完整 Data URL 直接返回;旧数据若是纯 base64 补一个 png 前缀(尽力兼容)
-  if (item.data.startsWith('data:')) return item.data
-  return item.type === 'b64' ? `data:image/png;base64,${item.data}` : item.data
+// 重试:按当前输入再发一次(用户可能已经改过提示词或参数,以界面上的为准)
+function retry() {
+  if (loading.value) return
+  doGenerate()
 }
 
+// —— 工具 ——
 // 图墙角标用的紧凑时间:09-24 15:54
 function fmtDate(ts: number) {
   const d = new Date(ts)
@@ -507,13 +534,14 @@ function favoriteFromPreview(t: string) {
   showLib.value = true
 }
 
-// 预览菜单:把当前图用作参考图
-function setAsReference(src: string) {
-  if (!src || !src.startsWith('data:')) {
-    error.value = '仅本地图片(Data URL)可作为参考图'
+// 预览菜单:把当前图用作参考图。接口只认 data URL,Blob 要现转一趟
+async function setAsReference(item: ResultItem) {
+  const dataUrl = typeof item.data === 'string' ? item.data : await blobToDataURL(item.data)
+  if (!dataUrl.startsWith('data:')) {
+    fail('仅本地图片可作为参考图')
     return
   }
-  refImage.value = src
+  refImage.value = dataUrl
   closePreview()
   window.scrollTo({ top: 0, behavior: 'smooth' })
 }
@@ -882,7 +910,26 @@ async function removeHistoryEntry(entry: HistoryEntry) {
             <input id="ref-file" type="file" accept="image/*" hidden @change="onPickRef" />
           </div>
 
-          <p v-if="error" class="err" role="alert">{{ error }}</p>
+          <!-- 存储清理提示:是提醒不是错误,中性配色 + 可手动关掉 -->
+          <div v-if="notice" class="note" role="status">
+            <span class="note-msg">{{ notice }}</span>
+            <button class="note-close" @click="notice = ''" aria-label="知道了">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                <path d="M6 6l12 12M18 6L6 18" />
+              </svg>
+            </button>
+          </div>
+
+          <!-- 报错:默认收成一行,过长才给「详情」;真失败过才给「重试」 -->
+          <div v-if="error" class="err" role="alert">
+            <p class="err-msg" :class="{ clipped: !errorOpen }">{{ error }}</p>
+            <div v-if="errorLong || canRetry" class="err-ops">
+              <button v-if="errorLong" class="err-btn" @click="errorOpen = !errorOpen">
+                {{ errorOpen ? '收起' : '详情' }}
+              </button>
+              <button v-if="canRetry" class="err-btn" @click="retry">重试</button>
+            </div>
+          </div>
         </div>
 
         <!-- 历史图墙:输入框下方展示最近生成的图,可收起 -->
@@ -932,7 +979,7 @@ async function removeHistoryEntry(entry: HistoryEntry) {
                   :title="t.entry.prompt"
                   @click="openPreview(t.entry)"
                 >
-                  <img loading="lazy" :src="renderData(t.item)" :alt="t.entry.prompt" />
+                  <img loading="lazy" :src="imageSrc(t.item)" :alt="t.entry.prompt" />
                   <span class="tile-veil">
                     <span class="tile-text">{{ t.entry.prompt }}</span>
                     <span class="tile-meta">{{ fmtDate(t.entry.createdAt) }} · {{ t.entry.size }}</span>
@@ -1088,7 +1135,9 @@ async function removeHistoryEntry(entry: HistoryEntry) {
     <ImagePreview
       :visible="!!previewEntry"
       :entry="previewEntry"
+      :items="history"
       @close="closePreview"
+      @navigate="openPreview"
       @use-prompt="usePreviewPrompt"
       @favorite="favoriteFromPreview"
       @reference="setAsReference"
@@ -1810,6 +1859,72 @@ async function removeHistoryEntry(entry: HistoryEntry) {
   padding: 8px 12px;
   background: color-mix(in oklch, var(--danger) 10%, transparent);
   border-radius: var(--r-sm);
+}
+/* 存储清理提示:提醒而非错误,用中性色,不与报错抢注意力 */
+.note {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-3);
+  margin-top: var(--sp-2);
+  padding: 8px 12px;
+  font-size: 13px;
+  color: var(--text-2);
+  background: var(--bg-elev);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+}
+.note-msg {
+  flex: 1;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.note-close {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-3);
+  border-radius: 999px;
+  transition: color var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+.note-close svg {
+  width: 13px;
+  height: 13px;
+}
+.note-close:hover {
+  color: var(--text);
+  background: var(--surface);
+}
+
+/* 长报错默认一行截断:上游原文动辄上百字,整段铺开会把输入区顶得很高 */
+.err-msg {
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.err-msg.clipped {
+  display: -webkit-box;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.err-ops {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 6px;
+}
+.err-btn {
+  padding: 3px 10px;
+  font-size: 12px;
+  color: var(--danger);
+  border: 1px solid color-mix(in oklch, var(--danger) 32%, transparent);
+  border-radius: 999px;
+  transition: background var(--dur) var(--ease);
+}
+.err-btn:hover {
+  background: color-mix(in oklch, var(--danger) 12%, transparent);
 }
 
 /* 输入框图标簇:清除(次级) + 发送(主按钮),同尺寸、同造型、留白节奏一致 */

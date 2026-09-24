@@ -1,5 +1,14 @@
-import type { ApiConfig, GenParams, HistoryEntry, ImagesResponse, PromptItem, ReuseParams } from './types'
-import { getAll, putAll, putOne, deleteOne, urlToDataURL, detectMimeFromDataUrl } from './lib/idb'
+import type { ApiConfig, GenParams, HistoryEntry, ImagesResponse, PromptItem, ResultItem, ReuseParams } from './types'
+import type { PruneResult } from './lib/idb'
+import {
+  getAll,
+  pruneHistory,
+  putOne,
+  deleteOne,
+  urlToBlob,
+  base64ToBlob,
+  detectMimeFromDataUrl
+} from './lib/idb'
 
 const CONFIG_KEY = 'kimage.apiConfigs'
 const CONFIG_ACTIVE_KEY = 'kimage.apiActive'
@@ -166,13 +175,13 @@ export function saveActiveId(id: string) {
 
 /**
  * 调用后端代理生图。
- * 返回标准化后的 [{ type, data }] 列表。
+ * 返回标准化后的 ResultItem 列表(图片载荷统一是 Blob)。
  */
 export async function generate(
   params: GenParams,
   config: ApiConfig,
   signal?: AbortSignal
-): Promise<Array<{ type: 'b64' | 'url'; data: string }>> {
+): Promise<ResultItem[]> {
   const resp = await fetch('/api/generate', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -205,18 +214,18 @@ export async function generate(
     throw new Error('上游未返回任何图片')
   }
 
-  // 把结果标准化;URL 形式尽量转成本地 base64,避免历史预览因外链过期失效
-  // b64 内容按真实格式(JPEG/PNG/…)包装成 Data URL,避免硬编码 png 导致裂图
+  // 结果统一落成 Blob:base64 会膨胀 33% 且整段进 JS 堆,Blob 由浏览器放在堆外。
+  // b64 按真实格式(JPEG/PNG/…)标注 MIME,避免硬编码 png 导致裂图。
   return await Promise.all(
-    data.data.map(async (item) => {
+    data.data.map(async (item): Promise<ResultItem> => {
       if (item.b64_json) {
         const mime = detectMimeFromDataUrl(item.b64_json)
-        return { type: 'b64', data: `data:${mime};base64,${item.b64_json}` }
+        return { type: 'b64', data: base64ToBlob(item.b64_json, mime) }
       }
       if (item.url) {
         try {
-          const local = await urlToDataURL(item.url)
-          return { type: 'b64', data: local }
+          // URL 结果抓成本地 Blob,避免历史预览因外链过期失效
+          return { type: 'b64', data: await urlToBlob(item.url) }
         } catch {
           return { type: 'url', data: item.url }
         }
@@ -224,6 +233,28 @@ export async function generate(
       return { type: 'url', data: '' }
     })
   )
+}
+
+/* ===== 图片载荷 → 可渲染的 src =====================================
+   新记录是 Blob,渲染时现造 object URL;旧记录是 data URL 字符串,原样返回。
+   object URL 用 WeakMap 缓存且不回收:同一个 Blob 会被图墙、抽屉、预览同时取用,
+   谁先卸载就 revoke 会把其它处弄裂;而 Blob 本身已被 history 持有,
+   多留一个 URL 字符串不构成额外泄漏。
+   ------------------------------------------------------------------ */
+const srcCache = new WeakMap<Blob, string>()
+export function imageSrc(item: ResultItem): string {
+  if (typeof item.data === 'string') {
+    // 旧数据若是纯 base64,补一个 png 前缀(尽力兼容)
+    const s = item.data
+    if (!s || s.startsWith('data:') || s.startsWith('blob:')) return s
+    return item.type === 'b64' ? `data:image/png;base64,${s}` : s
+  }
+  let url = srcCache.get(item.data)
+  if (!url) {
+    url = URL.createObjectURL(item.data)
+    srcCache.set(item.data, url)
+  }
+  return url
 }
 
 /* ===== 历史记录(IndexedDB,容量不受限、真正持久) ===== */
@@ -246,15 +277,17 @@ export async function loadHistory() {
     return []
   }
 }
-export async function addHistoryRecord(record: any) {
+/**
+ * 写入一条历史,并在空间吃紧时清理最旧的一批。
+ * 返回 PruneResult 表示"确实清了",交由界面告知用户;空间宽裕时返回 null。
+ */
+export async function addHistoryRecord(record: HistoryEntry): Promise<PruneResult | null> {
   await putOne(record)
-  const all = await loadHistory()
-  await putAll(all, 50)
+  return await pruneHistory()
 }
 export async function removeHistoryRecord(id: string) {
+  // 删除不可能超出保留量,无需再裁剪
   await deleteOne(id)
-  const all = await loadHistory()
-  await putAll(all, 50)
 }
 
 /* ===== 提示词库(收藏) ===== */

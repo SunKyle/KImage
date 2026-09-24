@@ -33,6 +33,11 @@ export interface PromptItem {
   createdAt: number
 }
 
+// 一条图片结果。
+// 新记录存 Blob:浏览器把它放在 JS 堆外,渲染时才按需读,避免整段 base64 常驻内存;
+// 加这个改动之前存下来的记录是 data URL 字符串,读取时要能同时认这两种。
+export type ResultItem = { type: 'b64' | 'url'; data: string | Blob }
+
 // 一条生成记录
 export interface HistoryEntry {
   id: string
@@ -47,8 +52,8 @@ export interface HistoryEntry {
   // 这一批从发起到返回的耗时(毫秒)
   elapsedMs?: number
   createdAt: number
-  // 上游可能返回一张或多张图,存 base64 或 url
-  results: Array<{ type: 'b64' | 'url'; data: string }>
+  // 上游可能返回一张或多张图
+  results: ResultItem[]
 }
 
 // 「使用提示词」时带回的一组参数,用于一键复现当时的出图条件
