@@ -583,13 +583,6 @@ async function removeHistoryEntry(entry: HistoryEntry) {
             </figcaption>
           </figure>
         </div>
-
-        <!-- 空态 -->
-        <div v-else class="empty">
-          <p class="empty-glyph">✳</p>
-          <p class="empty-title">尚未生成画面</p>
-          <p class="empty-sub">输入一段提示词，或点击“提示词库”快速回放收藏。</p>
-        </div>
       </section>
     </main>
 
@@ -607,7 +600,9 @@ async function removeHistoryEntry(entry: HistoryEntry) {
                 <h2>接口设置</h2>
                 <p class="d-lede">支持任意 OpenAI 兼容的生图接口，配置保存在本地。</p>
               </div>
-              <button class="d-close" @click="showSettings = false" aria-label="关闭">✕</button>
+              <button class="d-close" @click="showSettings = false" aria-label="关闭" title="关闭">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18" /></svg>
+              </button>
             </header>
 
             <!-- ===== 视图一:已保存的接口列表 ===== -->
@@ -1383,15 +1378,24 @@ async function removeHistoryEntry(entry: HistoryEntry) {
   gap: var(--sp-3);
 }
 .d-close {
-  font-size: 16px;
-  line-height: 1;
-  color: var(--text-2);
-  padding: 6px;
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line);
   border-radius: var(--r-sm);
-  transition: color var(--dur) var(--ease), background var(--dur) var(--ease);
+  color: var(--text-3);
+  transition: all var(--dur) var(--ease);
   cursor: pointer;
 }
+.d-close svg {
+  width: 15px;
+  height: 15px;
+}
 .d-close:hover {
+  border-color: var(--line-strong);
   color: var(--text);
   background: var(--bg-elev);
 }
@@ -1501,30 +1505,6 @@ async function removeHistoryEntry(entry: HistoryEntry) {
     opacity: 1;
     transform: translateY(0);
   }
-}
-
-/* 空态 */
-.empty {
-  text-align: center;
-  padding: var(--sp-8) var(--sp-5);
-  border: 1px dashed var(--line-strong);
-  border-radius: var(--r-lg);
-}
-.empty-glyph {
-  font-size: 30px;
-  color: var(--accent);
-  opacity: 0.65;
-}
-.empty-title {
-  margin-top: var(--sp-3);
-  font-family: var(--font-display);
-  font-size: 20px;
-  font-weight: 500;
-}
-.empty-sub {
-  margin-top: var(--sp-2);
-  color: var(--text-2);
-  font-size: 14px;
 }
 
 .colophon {
