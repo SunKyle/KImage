@@ -18,10 +18,13 @@ import {
   PROVIDERS,
   getProvider,
   inferVendor,
-  allowedSizes
+  allowedSizes,
+  optionLabel,
+  QUALITY_OPTIONS,
+  BACKGROUND_OPTIONS
 } from './api'
 import type { Cap, Provider } from './api'
-import type { ApiConfig, HistoryEntry, PromptItem } from './types'
+import type { ApiConfig, HistoryEntry, PromptItem, ReuseParams } from './types'
 
 // —— 状态 ——
 const prompt = ref('')
@@ -51,6 +54,18 @@ watch(openPanel, (v) => {
 function togglePanel(p: Exclude<PanelKey, ''>) {
   openPanel.value = openPanel.value === p ? '' : p
 }
+// 面板展开后点别处收起:只有参数行和面板自身算"内部"
+const paramBarEl = ref<HTMLElement | null>(null)
+const panelEl = ref<HTMLElement | null>(null)
+function onDocPointerDown(e: PointerEvent) {
+  if (!openPanel.value) return
+  const t = e.target as Node | null
+  if (!t) return
+  if (paramBarEl.value?.contains(t) || panelEl.value?.contains(t)) return
+  openPanel.value = ''
+}
+onMounted(() => document.addEventListener('pointerdown', onDocPointerDown))
+onBeforeUnmount(() => document.removeEventListener('pointerdown', onDocPointerDown))
 // 当前激活配置的名称(未配置时显示占位)
 const activeConfigName = computed(() => config.value.name || config.value.baseUrl || '未配置')
 
@@ -99,31 +114,15 @@ const sizeOptions = computed(() => {
   const list = allowedSizes(provider.value.id, config.value.model)
   return Array.isArray(list) ? list : FREE_SIZES
 })
+// 尺寸是否由接口自行决定:固定候选的厂商不开放手填,列表已经是全部合法值
+const sizeFree = computed(() => allowedSizes(provider.value.id, config.value.model) === 'free')
 
-// 画质档位与背景:auto 一律不发,避免不支持这些扩展参数的上游报错
-// hint 是给界面的注解,说明这一档在耗时/费用上的代价
-const qualityOptions = [
-  { value: 'auto', label: '自动', hint: '由上游决定' },
-  { value: 'low', label: '低', hint: '更快更省' },
-  { value: 'medium', label: '中', hint: '均衡' },
-  { value: 'high', label: '高', hint: '更细更慢' }
-]
-const backgroundOptions = [
-  { value: 'auto', label: '自动' },
-  { value: 'transparent', label: '透明' },
-  { value: 'opaque', label: '不透明' }
-]
 // 张数上限:多数生图接口一次最多 10 张
 const N_MAX = 10
 
 // 'auto' 是给上游的值,界面上叫"自动"
 function sizeLabel(s: string) {
   return s === 'auto' ? '自动' : s
-}
-
-// 参数值 → 界面文案(下拉式参数共用)
-function optionLabel(list: Array<{ value: string; label: string }>, v: string) {
-  return list.find((o) => o.value === v)?.label || v
 }
 
 // 配置行上展示的厂商名(老配置按域名回填后再查表)
@@ -165,6 +164,25 @@ function clampN(e: Event) {
   const v = Math.round(Number(el.value))
   n.value = Number.isFinite(v) && v >= 1 ? Math.min(N_MAX, v) : n.value
   el.value = String(n.value)
+}
+
+// 把手填的尺寸归一成 1024x1536:容忍 × * 大写与空格;认不出来返回 null
+function normalizeSize(raw: string): string | null {
+  if (/^auto$/i.test(raw)) return 'auto'
+  const m = raw.replace(/[×✕*]/g, 'x').replace(/\s+/g, '').match(/^(\d{1,5})x(\d{1,5})$/i)
+  if (!m) return null
+  const w = Number(m[1])
+  const h = Number(m[2])
+  return w > 0 && h > 0 ? `${w}x${h}` : null
+}
+
+// 自定义尺寸:失焦/回车时归一化;认不出来就还原成当前生效值,不做隐式猜测
+function commitSize(e: Event) {
+  const el = e.target as HTMLInputElement
+  const norm = normalizeSize(el.value.trim())
+  if (norm) size.value = norm
+  // 两种情况都回写:成功显示归一化结果,失败还原当前值(值没变时 Vue 不会重渲染)
+  el.value = size.value
 }
 
 // —— 主题 ——
@@ -307,9 +325,16 @@ function configured() {
   return !!config.value.baseUrl
 }
 
+// 套用尺寸:厂商声明 free 就照单全收,给了固定列表的必须命中,否则宁可不改
+function applySize(s?: string) {
+  if (!s) return
+  const list = allowedSizes(provider.value.id, config.value.model)
+  if (list === 'free' || list.includes(s)) size.value = s
+}
+
 function useLibItem(item: PromptItem) {
   prompt.value = item.prompt
-  if (item.size) size.value = item.size
+  applySize(item.size)
   showLib.value = false
   window.scrollTo({ top: 0, behavior: 'smooth' })
 }
@@ -384,6 +409,10 @@ async function doGenerate() {
 
   // 发起前锁定这一批的参数,后面一律读快照,避免中途改参数串味
   running.value = { prompt: prompt.value, size: size.value, n: n.value }
+  // 扩展参数与参考图同样要快照:它们在 await 期间可能被改动
+  const extras = extraParams()
+  const refSrc = refImage.value
+  const startedAt = Date.now()
   controller.value = new AbortController()
 
   loading.value = true
@@ -394,9 +423,9 @@ async function doGenerate() {
         prompt: running.value.prompt,
         size: running.value.size,
         n: running.value.n,
-        ...(refImage.value ? { image: refImage.value } : {}),
+        ...(refSrc ? { image: refSrc } : {}),
         // 由厂商能力表决定带哪些扩展参数:auto 与已知不支持的都不发
-        ...extraParams()
+        ...extras
       },
       config.value,
       controller.value.signal
@@ -406,6 +435,11 @@ async function doGenerate() {
       prompt: running.value.prompt,
       size: running.value.size,
       model: config.value.model || undefined,
+      // 只记真正发出去的扩展参数,免得预览里展示出当时并没生效的档位
+      quality: extras.quality,
+      background: extras.background,
+      hasRef: !!refSrc,
+      elapsedMs: Date.now() - startedAt,
       createdAt: Date.now(),
       results: res
     }
@@ -446,8 +480,14 @@ function openPreview(entry: HistoryEntry) {
 function closePreview() {
   previewEntry.value = null
 }
-function usePreviewPrompt(t: string) {
-  prompt.value = t
+// 复现一条记录:提示词连同当时的参数一起带回,但只套用当前厂商认得的项
+function usePreviewPrompt(p: ReuseParams) {
+  prompt.value = p.prompt
+  applySize(p.size)
+  if (p.n) n.value = Math.min(N_MAX, Math.max(1, p.n))
+  // 已知不支持的厂商直接跳过,免得把界面上根本不存在的档位偷偷塞进去
+  if (p.quality && provider.value.quality !== 'no') quality.value = p.quality
+  if (p.background && provider.value.background !== 'no') background.value = p.background
   window.scrollTo({ top: 0, behavior: 'smooth' })
 }
 
@@ -577,7 +617,7 @@ async function removeHistoryEntry(entry: HistoryEntry) {
             </div>
 
             <!-- 二、参数 icon 行(横线下方),点击 icon 展开对应选项 -->
-            <div class="param-bar" role="group" aria-label="生成参数">
+            <div class="param-bar" ref="paramBarEl" role="group" aria-label="生成参数">
               <button
                 class="param-btn has-val"
                 :class="{ on: openPanel === 'config', filled: !!configured() }"
@@ -619,14 +659,14 @@ async function removeHistoryEntry(entry: HistoryEntry) {
                   <rect x="3.5" y="13.5" width="7" height="7" rx="1.6" />
                   <rect x="13.5" y="13.5" width="7" height="7" rx="1.6" />
                 </svg>
-                <b class="param-val">{{ n }}</b>
+                <b class="param-val">{{ n }} 张</b>
               </button>
               <!-- 已知不认画质的厂商直接收起来,免得选了却被上游 400 -->
               <button
                 v-if="provider.quality !== 'no'"
-                class="param-btn"
+                class="param-btn has-val"
                 :class="{ on: openPanel === 'quality', filled: quality !== 'auto' }"
-                :data-tip="`画质 · ${optionLabel(qualityOptions, quality)}`"
+                :data-tip="`画质 · ${optionLabel(QUALITY_OPTIONS, quality)}`"
                 aria-label="画质"
                 @click="togglePanel('quality')"
               >
@@ -636,12 +676,13 @@ async function removeHistoryEntry(entry: HistoryEntry) {
                   <rect x="10.4" y="9" width="3.2" height="11" rx="1.6" />
                   <rect x="16.8" y="4.5" width="3.2" height="15.5" rx="1.6" />
                 </svg>
+                <b class="param-val">{{ optionLabel(QUALITY_OPTIONS, quality) }}</b>
               </button>
               <button
                 v-if="provider.background !== 'no'"
-                class="param-btn"
+                class="param-btn has-val"
                 :class="{ on: openPanel === 'bg', filled: background !== 'auto' }"
-                :data-tip="`背景 · ${optionLabel(backgroundOptions, background)}`"
+                :data-tip="`背景 · ${optionLabel(BACKGROUND_OPTIONS, background)}`"
                 aria-label="背景"
                 @click="togglePanel('bg')"
               >
@@ -650,6 +691,7 @@ async function removeHistoryEntry(entry: HistoryEntry) {
                   <rect x="3.5" y="3.5" width="17" height="17" rx="2.5" />
                   <path d="M8 8h.01M16 8h.01M12 12h.01M8 16h.01M16 16h.01" stroke-width="2.6" />
                 </svg>
+                <b class="param-val">{{ optionLabel(BACKGROUND_OPTIONS, background) }}</b>
               </button>
               <!-- 参考图放最后:它是一次性的输入,不是常规参数 -->
               <button
@@ -699,7 +741,7 @@ async function removeHistoryEntry(entry: HistoryEntry) {
             </div>
 
             <!-- 展开面板:用 grid-template-rows 动画高度,收起时连续合拢无跳变 -->
-            <div class="fold" :class="{ open: !!openPanel }">
+            <div class="fold" ref="panelEl" :class="{ open: !!openPanel }">
               <div class="fold-inner">
                 <div class="param-panel">
                   <!-- 配置 -->
@@ -753,6 +795,19 @@ async function removeHistoryEntry(entry: HistoryEntry) {
                         {{ sizeLabel(s) }}
                       </button>
                     </div>
+                    <!-- 固定候选的厂商不开放手填:列表已经是全部合法值,填别的只会被上游拒掉 -->
+                    <div v-if="sizeFree" class="pp-group">
+                      <span class="pp-label">自定义</span>
+                      <input
+                        class="num-input size-input"
+                        :value="size"
+                        placeholder="如 1536x1024"
+                        spellcheck="false"
+                        aria-label="自定义尺寸"
+                        @change="commitSize"
+                      />
+                      <span class="pp-note">宽 × 高,也可填 auto</span>
+                    </div>
                   </div>
 
                   <!-- 张数 -->
@@ -790,7 +845,7 @@ async function removeHistoryEntry(entry: HistoryEntry) {
                     <div class="pp-group">
                       <span class="pp-label">画质</span>
                       <button
-                        v-for="o in qualityOptions"
+                        v-for="o in QUALITY_OPTIONS"
                         :key="o.value"
                         class="preset preset-rich"
                         :class="{ on: quality === o.value }"
@@ -808,7 +863,7 @@ async function removeHistoryEntry(entry: HistoryEntry) {
                     <div class="pp-group">
                       <span class="pp-label">背景</span>
                       <button
-                        v-for="o in backgroundOptions"
+                        v-for="o in BACKGROUND_OPTIONS"
                         :key="o.value"
                         class="preset"
                         :class="{ on: background === o.value }"
@@ -1669,6 +1724,12 @@ async function removeHistoryEntry(entry: HistoryEntry) {
 .num-input:focus {
   border-color: var(--accent);
   box-shadow: 0 6px 18px -10px color-mix(in oklch, var(--accent) 60%, transparent);
+}
+/* 自定义尺寸:比纯数字输入更宽,容纳 1024x1024 这类字符串,左对齐便于对位读数 */
+.size-input {
+  width: 124px;
+  text-align: left;
+  padding-left: 12px;
 }
 .pp-action {
   font-size: 13px;

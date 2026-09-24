@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import type { HistoryEntry } from '../types'
+import { reuseParamsOf } from '../api'
+import type { HistoryEntry, ReuseParams } from '../types'
 
 defineProps<{
   items: HistoryEntry[]
@@ -9,7 +10,7 @@ defineProps<{
 const emit = defineEmits<{
   (e: 'close'): void
   (e: 'open', entry: HistoryEntry): void
-  (e: 'use', prompt: string): void
+  (e: 'use', params: ReuseParams): void
   (e: 'remove', entry: HistoryEntry): void
 }>()
 
@@ -60,7 +61,7 @@ function renderData(item: { type: 'b64' | 'url'; data: string }) {
                 </button>
                 <button
                   class="d-use tip-left"
-                  @click="emit('use', entry.prompt)"
+                  @click="emit('use', reuseParamsOf(entry))"
                   data-tip="使用该提示词"
                   aria-label="使用该提示词"
                 >

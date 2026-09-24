@@ -39,9 +39,26 @@ export interface HistoryEntry {
   prompt: string
   size: string
   model?: string
+  // 真正发出去的扩展参数(默认档不记,老记录也没有这些字段)
+  quality?: string
+  background?: string
+  // 是否用了参考图(图生图)
+  hasRef?: boolean
+  // 这一批从发起到返回的耗时(毫秒)
+  elapsedMs?: number
   createdAt: number
   // 上游可能返回一张或多张图,存 base64 或 url
   results: Array<{ type: 'b64' | 'url'; data: string }>
+}
+
+// 「使用提示词」时带回的一组参数,用于一键复现当时的出图条件
+// 全部可选:套用前要按当前厂商的能力逐项校验
+export interface ReuseParams {
+  prompt: string
+  size?: string
+  n?: number
+  quality?: string
+  background?: string
 }
 
 // 通用 OpenAI /images/generations 响应格式

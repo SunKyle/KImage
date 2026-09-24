@@ -1,4 +1,4 @@
-import type { ApiConfig, GenParams, ImagesResponse, PromptItem } from './types'
+import type { ApiConfig, GenParams, HistoryEntry, ImagesResponse, PromptItem, ReuseParams } from './types'
 import { getAll, putAll, putOne, deleteOne, urlToDataURL, detectMimeFromDataUrl } from './lib/idb'
 
 const CONFIG_KEY = 'kimage.apiConfigs'
@@ -96,6 +96,29 @@ export function allowedSizes(vendorId: string | undefined, model: string): strin
       : ['auto', '1024x1024', '1536x1024', '1024x1536']
   }
   return getProvider(vendorId).sizes
+}
+
+/* ===== 扩展参数的取值与界面文案 =====================================
+   放在这里是为了让主界面和历史预览共用同一份文案,避免两处各写一套
+   后出现「面板显示低、预览显示 low」这类不一致。
+   hint 是界面上给档位的代价注解。
+   ------------------------------------------------------------------ */
+export const QUALITY_OPTIONS = [
+  { value: 'auto', label: '自动', hint: '由上游决定' },
+  { value: 'low', label: '低', hint: '更快更省' },
+  { value: 'medium', label: '中', hint: '均衡' },
+  { value: 'high', label: '高', hint: '更细更慢' }
+]
+export const BACKGROUND_OPTIONS = [
+  { value: 'auto', label: '自动' },
+  { value: 'transparent', label: '透明' },
+  { value: 'opaque', label: '不透明' }
+]
+
+/** 取值 → 界面文案;认不出来的值原样返回,不至于显示空白 */
+export function optionLabel(list: Array<{ value: string; label: string }>, v?: string) {
+  if (!v) return ''
+  return list.find((o) => o.value === v)?.label || v
 }
 
 // 读取全部接口配置列表
@@ -204,6 +227,17 @@ export async function generate(
 }
 
 /* ===== 历史记录(IndexedDB,容量不受限、真正持久) ===== */
+/** 把一条历史摊成可复现的参数,交给主界面按当前厂商的能力逐项套用 */
+export function reuseParamsOf(e: HistoryEntry): ReuseParams {
+  return {
+    prompt: e.prompt,
+    size: e.size,
+    // 实际拿到的张数,而不是当初请求的数值:上游少给了就以实际为准
+    n: e.results.length,
+    quality: e.quality,
+    background: e.background
+  }
+}
 export async function loadHistory() {
   try {
     const list = await getAll<any>()
