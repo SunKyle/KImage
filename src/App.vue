@@ -32,6 +32,21 @@ const libItems = ref<PromptItem[]>([])
 const presets = ref<Preset[]>([])
 const refImage = ref('') // 图生图参考图 (data URL)
 const usedStyles = ref<string[]>([]) // 当前已用的风格标签(收起摘要用)
+// 输入区下方建议词:从 STYLE_WORDS 取一撮,支持“换一批”
+let sugStart = 0
+const sugCount = 5
+const suggestions = ref(sugTake())
+function sugTake() {
+  const out: typeof STYLE_WORDS = []
+  for (let i = 0; i < Math.min(sugCount, STYLE_WORDS.length); i++) {
+    out.push(STYLE_WORDS[(sugStart + i) % STYLE_WORDS.length])
+  }
+  return out
+}
+function refreshSuggestions() {
+  sugStart = (sugStart + 2) % STYLE_WORDS.length
+  suggestions.value = sugTake()
+}
 const showLib = ref(false)
 const showHistory = ref(false)
 const showMeta = ref(false) // 尺寸/张数/参考图折叠
@@ -456,6 +471,7 @@ async function removeHistoryEntry(entry: HistoryEntry) {
       <!-- 生图工作台 -->
       <section class="workbench" aria-label="生图工作台">
         <header class="hero">
+          <div class="hero-aura" aria-hidden="true"></div>
           <h1 class="hero-title">把想象，交给画面</h1>
           <p class="hero-sub">一句话，一段描述，剩下的交给我们。</p>
         </header>
@@ -469,31 +485,56 @@ async function removeHistoryEntry(entry: HistoryEntry) {
               placeholder="描述你想要的画面：一只在樱花树下打盹的橘猫，清晨柔光，电影感，浅景深…（Enter 发送）"
               @keydown.enter.exact.prevent="doGenerate"
             />
-            <button
-              v-if="prompt.trim() && !loading"
-              class="clear-icon"
-              aria-label="清除输入"
-              title="清除输入"
-              @click="prompt = ''"
-            >
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-                <path d="M7 7l10 10M17 7L7 17" />
-              </svg>
-            </button>
-            <button
-              class="gen-icon"
-              :disabled="loading || !prompt.trim()"
-              :aria-label="loading ? '生成中…' : '生成画面'"
-              :title="loading ? '生成中…' : '生成画面（Enter）'"
-              @click="doGenerate"
-            >
-              <span v-if="loading" class="spinner" aria-hidden="true"></span>
-              <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-                <!-- 精简发送箭头 -->
-                <path d="M5 12h13" />
-                <path d="M13 6l6 6-6 6" />
-              </svg>
-            </button>
+            <div class="prompt-actions">
+              <button
+                v-if="prompt.trim() && !loading"
+                class="clear-icon"
+                aria-label="清除输入"
+                title="清除输入"
+                @click="prompt = ''"
+              >
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+              <button
+                class="gen-icon"
+                :disabled="loading || !prompt.trim()"
+                :aria-label="loading ? '生成中…' : '生成画面'"
+                :title="loading ? '生成中…' : '生成画面（Enter）'"
+                @click="doGenerate"
+              >
+                <span v-if="loading" class="spinner" aria-hidden="true"></span>
+                <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <!-- 精简发送箭头 -->
+                  <path d="M5 12h13" />
+                  <path d="M13 6l6 6-6 6" />
+                </svg>
+              </button>
+            </div>
+
+            <div class="sugg-row" role="group" aria-label="提示词建议">
+              <button
+                v-for="s in suggestions"
+                :key="s.label"
+                class="sugg-chip"
+                :title="usedStyles.includes(s.label) ? '再次点击撤销' : '追加到提示词'"
+                @click="appendStyle(s.word)"
+              >
+                {{ s.label }}
+              </button>
+              <button
+                class="sugg-refresh"
+                @click="refreshSuggestions"
+                title="换一批建议"
+                aria-label="换一批建议"
+              >
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M21 12a9 9 0 1 1-2.6-6.4" />
+                  <path d="M21 3v5h-5" />
+                </svg>
+              </button>
+            </div>
           </div>
 
           <p class="hint">Enter 发送 · Shift + Enter 换行 · 配置、预设与提示词库均存于本地</p>
@@ -569,21 +610,37 @@ async function removeHistoryEntry(entry: HistoryEntry) {
           <p v-if="error" class="err" role="alert">{{ error }}</p>
         </div>
 
-        <!-- 结果:横滑画廊 -->
-        <div v-if="loading" class="skeleton" aria-hidden="true">
-          <div v-for="k in (n > 0 ? n : 1)" :key="k" class="skel-slot">
-            <div class="skel-shimmer"></div>
+        <!-- 结果:瀑布流网格 -->
+        <div v-if="loading" class="skel-zone">
+          <div class="section-head" aria-hidden="true">
+            <span class="sec-title">正在生成…</span>
+          </div>
+          <div class="skeleton" aria-hidden="true">
+            <div v-for="k in (n > 0 ? n : 1)" :key="k" class="skel-slot">
+              <div class="skel-shimmer"></div>
+            </div>
           </div>
         </div>
 
-        <div v-else-if="results.length" class="gallery" aria-live="polite">
-          <figure v-for="(r, i) in results" :key="i" class="shot">
-            <img :src="renderData(r)" :alt="`生成结果 ${i + 1}`" />
-            <figcaption class="shot-foot">
-              <span class="shot-meta">{{ size }} · {{ i + 1 }}/{{ results.length }}</span>
-              <button class="text-btn" @click="download(renderData(r), i)">下载</button>
-            </figcaption>
-          </figure>
+        <div v-else-if="results.length" class="res-zone" aria-live="polite">
+          <div class="section-head">
+            <span class="sec-title">最近生成</span>
+            <button v-if="history.length" class="sec-more" @click="showHistory = true">
+              查看全部
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M9 6l6 6-6 6" />
+              </svg>
+            </button>
+          </div>
+          <div class="gallery">
+            <figure v-for="(r, i) in results" :key="i" class="shot">
+              <img :src="renderData(r)" :alt="`生成结果 ${i + 1}`" />
+              <figcaption class="shot-foot">
+                <span class="shot-meta">{{ size }} · {{ i + 1 }}/{{ results.length }}</span>
+                <button class="text-btn" @click="download(renderData(r), i)">下载</button>
+              </figcaption>
+            </figure>
+          </div>
         </div>
       </section>
     </main>
@@ -739,8 +796,7 @@ async function removeHistoryEntry(entry: HistoryEntry) {
   position: sticky;
   top: 0;
   z-index: 10;
-  backdrop-filter: blur(10px);
-  background: color-mix(in oklch, var(--bg) 82%, transparent);
+  /* 透明融入到背景图,不需额外作色 */
 }
 .wordmark {
   display: flex;
@@ -809,7 +865,7 @@ async function removeHistoryEntry(entry: HistoryEntry) {
   text-align: center;
   border-radius: 999px;
   background: var(--accent);
-  color: oklch(0.985 0.01 45);
+  color: var(--accent-contrast);
 }
 .icon-btn-warn {
   border-color: color-mix(in oklch, var(--danger) 45%, var(--line));
@@ -1050,10 +1106,7 @@ async function removeHistoryEntry(entry: HistoryEntry) {
 .field input:focus,
 .composer textarea:focus {
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-soft);
-}
-.composer textarea:focus {
-  box-shadow: 0 0 0 3px var(--accent-soft), 0 2px 10px color-mix(in oklch, var(--accent) 10%, transparent);
+  box-shadow: 0 6px 22px -8px color-mix(in oklch, var(--accent) 40%, transparent);
 }
 .panel-foot {
   margin-top: var(--sp-6);
@@ -1064,7 +1117,7 @@ async function removeHistoryEntry(entry: HistoryEntry) {
   padding: 10px 20px;
   border-radius: var(--r-sm);
   background: var(--accent);
-  color: oklch(0.985 0.01 45);
+  color: var(--accent-contrast);
   font-size: 14px;
   font-weight: 500;
   transition: background var(--dur) var(--ease);
@@ -1079,30 +1132,130 @@ async function removeHistoryEntry(entry: HistoryEntry) {
   gap: var(--sp-6);
 }
 .hero {
+  position: relative;
   text-align: center;
-  padding: var(--sp-6) var(--sp-4) var(--sp-1);
+  padding: clamp(36px, 6vw, 80px) var(--sp-4) var(--sp-4);
+  overflow: hidden;
+}
+.hero-aura {
+  position: absolute;
+  inset: -45% -18%;
+  pointer-events: none;
+  background:
+    radial-gradient(58% 55% at 26% 22%, color-mix(in oklch, var(--aura) 60%, transparent), transparent 72%),
+    radial-gradient(46% 52% at 76% 28%, color-mix(in oklch, var(--aura) 46%, transparent), transparent 74%),
+    radial-gradient(80% 46% at 50% 0%, color-mix(in oklch, var(--aura) 40%, transparent), transparent 78%);
+  filter: blur(14px);
 }
 .hero-title {
   font-family: var(--font-display);
-  font-weight: 500;
-  font-size: clamp(28px, 4.5vw, 40px);
-  letter-spacing: -0.02em;
-  line-height: 1.2;
+  font-weight: 600;
+  font-size: clamp(32px, 5.2vw, 52px);
+  letter-spacing: -0.025em;
+  line-height: 1.1;
+  position: relative;
+  z-index: 1;
 }
 .hero-sub {
-  margin-top: var(--sp-2);
+  margin-top: var(--sp-3);
   color: var(--text-2);
-  font-size: 14px;
+  font-size: 15px;
+  position: relative;
+  z-index: 1;
+}
+.composer {
+  max-width: 720px;
+  width: 100%;
+  margin: 0 auto;
 }
 .prompt-box {
   position: relative;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg); /* Prompt Composer: Large 24px */
+  padding: 14px 14px 12px 18px;
+  box-shadow: var(--sh-float);
+  display: flex;
+  flex-direction: column;
+  transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
 }
-.composer textarea {
+.prompt-box:focus-within {
+  border-color: color-mix(in oklch, var(--accent) 50%, var(--line));
+  box-shadow: var(--sh-float), 0 0 0 4px color-mix(in oklch, var(--accent) 14%, transparent),
+    0 10px 34px -12px color-mix(in oklch, var(--accent) 32%, transparent);
+}
+.prompt-box textarea {
   resize: vertical;
   line-height: 1.6;
-  font-size: 15px;
-  min-height: 112px;
-  padding-right: 44px;
+  font-size: 16px;
+  min-height: 104px;
+  padding: 10px 88px 10px 2px;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+.prompt-box textarea:focus,
+.prompt-box textarea:focus-visible {
+  border: none;
+  box-shadow: none;
+  outline: none;
+}
+/* 建议词横滑行 */
+.sugg-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 10px 4px 2px;
+  border-top: 1px solid var(--line);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.sugg-row::-webkit-scrollbar {
+  display: none;
+}
+.sugg-chip {
+  flex: 0 0 auto;
+  padding: 6px 13px;
+  font-size: 13px;
+  color: var(--text-2);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--bg-elev);
+  white-space: nowrap;
+  transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease),
+    background var(--dur) var(--ease), transform 120ms var(--ease);
+}
+.sugg-chip:hover {
+  color: var(--text);
+  border-color: var(--line-strong);
+  background: var(--surface);
+}
+.sugg-chip:active {
+  transform: translateY(1px);
+}
+.sugg-refresh {
+  flex: 0 0 auto;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  color: var(--text-3);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease),
+    background var(--dur) var(--ease);
+}
+.sugg-refresh:hover {
+  color: var(--text);
+  border-color: var(--line-strong);
+  background: var(--bg-elev);
+}
+.sugg-refresh svg {
+  width: 15px;
+  height: 15px;
 }
 .text-btn {
   font-size: 13px;
@@ -1286,63 +1439,69 @@ async function removeHistoryEntry(entry: HistoryEntry) {
   border-radius: var(--r-sm);
 }
 
-.gen-icon {
+/* 输入框图标簇:清除(次级) + 发送(主按钮),同尺寸、同造型、留白节奏一致 */
+.prompt-actions {
   position: absolute;
-  right: 10px;
-  bottom: 12px;
+  right: 12px;
+  bottom: 58px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.clear-icon,
+.gen-icon {
+  flex-shrink: 0;
   width: 34px;
   height: 34px;
-  border-radius: 999px;
-  background: var(--accent);
-  color: oklch(0.985 0.01 45);
+  border-radius: var(--r-sm);
   display: flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  box-shadow: 0 2px 8px color-mix(in oklch, var(--accent) 32%, transparent);
-  transition: background var(--dur) var(--ease), transform 120ms var(--ease), box-shadow var(--dur) var(--ease);
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease),
+    border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease), transform 120ms var(--ease);
 }
+.clear-icon svg,
 .gen-icon svg {
   width: 16px;
   height: 16px;
 }
-.gen-icon:hover:not(:disabled) {
-  background: var(--accent-strong);
-  box-shadow: 0 4px 12px color-mix(in oklch, var(--accent) 42%, transparent);
-}
-.gen-icon:active:not(:disabled) {
-  transform: scale(0.94);
-  box-shadow: 0 1px 4px color-mix(in oklch, var(--accent) 30%, transparent);
-}
-.gen-icon:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
-  box-shadow: none;
-}
 .clear-icon {
-  position: absolute;
-  top: 10px;
-  right: 10px;
-  width: 28px;
-  height: 28px;
-  border-radius: 999px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--line-strong);
   color: var(--text-3);
-  background: transparent;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease), background var(--dur) var(--ease);
-}
-.clear-icon svg {
-  width: 14px;
-  height: 14px;
+  background: color-mix(in oklch, var(--surface) 72%, transparent);
+  backdrop-filter: blur(4px);
 }
 .clear-icon:hover {
   color: var(--danger);
   border-color: color-mix(in oklch, var(--danger) 45%, var(--line));
   background: color-mix(in oklch, var(--danger) 8%, transparent);
+}
+.clear-icon:active {
+  transform: scale(0.94);
+}
+.gen-icon {
+  width: 40px;
+  height: 40px;
+  border: 1px solid var(--cta);
+  background: var(--cta);
+  color: var(--cta-text);
+  border-radius: var(--r-sm);
+  box-shadow: 0 2px 8px color-mix(in oklch, var(--cta) 30%, transparent);
+}
+.gen-icon:hover:not(:disabled) {
+  background: var(--cta-hover);
+  border-color: var(--cta-hover);
+  box-shadow: 0 4px 12px color-mix(in oklch, var(--cta) 42%, transparent);
+}
+.gen-icon:active:not(:disabled) {
+  transform: scale(0.94);
+  box-shadow: 0 1px 4px color-mix(in oklch, var(--cta) 30%, transparent);
+}
+.gen-icon:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  box-shadow: none;
 }
 
 .drawer-scrim {
@@ -1440,7 +1599,6 @@ async function removeHistoryEntry(entry: HistoryEntry) {
   border-radius: var(--r-lg);
   overflow: hidden;
   background: var(--bg-elev);
-  border: 1px solid var(--line);
 }
 .skel-shimmer {
   width: 100%;
@@ -1460,35 +1618,92 @@ async function removeHistoryEntry(entry: HistoryEntry) {
   }
 }
 
-/* 结果横滑画廊 */
-.gallery {
+/* 结果区小节标题 */
+.skel-zone,
+.res-zone {
   display: flex;
+  flex-direction: column;
   gap: var(--sp-4);
-  overflow-x: auto;
-  padding-bottom: var(--sp-3);
-  scroll-snap-type: x mandatory;
+}
+.section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.sec-title {
+  font-family: var(--font-display);
+  font-size: 18px;
+  font-weight: 500;
+  color: var(--text);
+}
+.sec-more {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font-size: 13px;
+  color: var(--text-3);
+  padding: 4px 8px;
+  border-radius: var(--r-sm);
+  transition: color var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+.sec-more:hover {
+  color: var(--text);
+  background: var(--bg-elev);
+}
+.sec-more svg {
+  width: 14px;
+  height: 14px;
+}
+
+/* 结果:瀑布流网格(3 列蜂巢,首个跨 2 列放大;单图横铺) */
+.gallery {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  grid-auto-flow: dense;
+  align-items: start;
+  gap: var(--sp-4);
 }
 .shot {
-  flex: 0 0 min(340px, 80vw);
-  scroll-snap-align: start;
-  background: var(--bg-elev);
-  border: 1px solid var(--line);
+  margin: 0;
+  background: var(--surface);
+  border: none; /* Image Card: 无明显边框,用圆角+阴影 */
   border-radius: var(--r-lg);
   overflow: hidden;
   box-shadow: var(--sh-sm);
   animation: rise 400ms var(--ease) both;
+  transition: transform var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+}
+.shot:hover {
+  transform: scale(1.02); /* hover: 微放大 + 阴影加深 */
+  box-shadow: var(--sh-md);
 }
 .shot img {
   width: 100%;
   display: block;
   aspect-ratio: 1;
   object-fit: cover;
+  background: var(--image-bg);
+}
+.shot:nth-child(3n + 1) {
+  grid-column: span 2;
+}
+.shot:nth-child(3n + 1) img {
+  aspect-ratio: 16 / 10;
+}
+.shot:only-child {
+  grid-column: 1 / -1;
+  max-width: 720px;
+  margin: 0 auto;
+}
+.shot:only-child img {
+  aspect-ratio: 16 / 9;
 }
 .shot-foot {
   display: flex;
   align-items: center;
   justify-content: space-between;
   padding: 10px 14px;
+  border-top: 1px solid var(--line);
 }
 .shot-meta {
   font-size: 12px;
@@ -1517,10 +1732,18 @@ async function removeHistoryEntry(entry: HistoryEntry) {
   .gallery {
     grid-template-columns: 1fr;
   }
-  .gen {
-    margin-left: 0;
-    width: 100%;
-    margin-top: 4px;
+  .shot:nth-child(3n + 1),
+  .shot:only-child {
+    grid-column: span 1;
+    max-width: none;
+    margin: 0;
+  }
+  .shot:nth-child(3n + 1) img,
+  .shot:only-child img {
+    aspect-ratio: 1;
+  }
+  .prompt-box {
+    border-radius: var(--r);
   }
 }
 </style>

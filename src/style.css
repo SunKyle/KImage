@@ -1,33 +1,37 @@
 /* ============================================================
-   KImage · 设计系统
-   克制艺术感工作室 · 深浅双主题
+   KImage · Design System v1.0
+   克制 · Editorial · Image First
    ------------------------------------------------------------
-   字体:标题用衬线(宋体系)营造编辑/艺术气质,正文用克制无衬线
-   色彩:非纯黑纯白,向暖褐 tint;强调用陶土赭石,克制使用
+   Apple-like 轻盈无衬线排版 + 暖白纸感 + 中性灰度 + 克制薰衣草强调
+   "让 AI 的能力隐藏，让创作过程自然。"
    ============================================================ */
 
 :root {
-  /* —— 色彩(浅色) —— */
-  --bg: oklch(0.965 0.008 80);            /* 暖白纸感 */
-  --bg-elev: oklch(0.985 0.006 80);       /* 浮起表面 */
-  --surface: oklch(0.99 0.004 80);        /* 卡片/面板 */
-  --line: oklch(0.88 0.01 80);            /* 分隔线,克制 */
-  --line-strong: oklch(0.78 0.015 70);
-  --text: oklch(0.26 0.02 60);            /* 主文字暖黑 */
-  --text-2: oklch(0.45 0.02 60);
-  --text-3: oklch(0.62 0.015 60);
-  --accent: oklch(0.48 0.09 45);          /* 陶土赭石 */
-  --accent-strong: oklch(0.42 0.1 42);
-  --accent-soft: oklch(0.93 0.03 55);
-  --danger: oklch(0.55 0.16 27);
+  /* —— 色彩(浅色) Light Theme —— */
+  --bg: #FAFAF8;                  /* 页面背景 */
+  --bg-elev: #F5F5F2;             /* surface-secondary: 输入/悬浮区 */
+  --surface: #FFFFFF;             /* surface: 卡片/面板 */
+  --surface-hover: #EFEFEA;       /* surface-hover */
+  --image-bg: #F0EFEC;            /* 图片画布底,内嵌感 */
+  --line: #E8E6E1;                /* 分隔线 */
+  --line-strong: rgba(0, 0, 0, 0.16);
+  --text: #111111;                /* text-primary */
+  --text-2: #6B6B6B;              /* text-secondary */
+  --text-3: #999999;              /* text-tertiary */
+  --text-4: #C5C5C5;              /* text-disabled */
+  --accent: #8B7CFF;              /* Brand Accent: AI状态/Highlight/Focus/Gradient */
+  --accent-strong: #7666FA;
+  --accent-soft: rgba(139, 124, 255, 0.1);
+  --accent-contrast: #FFFFFF;     /* 强调色实心上的文字 */
+  --danger: #E5484D;
 
-  /* —— 字体 —— */
-  --font-display: "Fraunces", Georgia, "Noto Serif SC", "Songti SC",
-    "SimSun", serif;
-  --font-body: -apple-system, BlinkMacSystemFont, "Segoe UI",
-    "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  /* —— 字体:无衬线,Inter / SF Pro —— */
+  --font-display: "Inter", "SF Pro Display", -apple-system,
+    BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", system-ui, sans-serif;
+  --font-body: "Inter", -apple-system, BlinkMacSystemFont, "SF Pro Text",
+    "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
 
-  /* —— 间距刻度 —— */
+  /* —— 间距:8px Grid —— */
   --sp-1: 4px;
   --sp-2: 8px;
   --sp-3: 12px;
@@ -37,35 +41,55 @@
   --sp-7: 48px;
   --sp-8: 64px;
 
-  /* —— 圆角/阴影/过渡 —— */
-  --r-sm: 8px;
-  --r: 14px;
-  --r-lg: 20px;
-  --sh-sm: 0 1px 2px rgba(60, 40, 20, 0.05);
-  --sh-md: 0 6px 24px -12px rgba(60, 40, 20, 0.18);
+  /* —— 圆角 / 阴影 / 过渡 —— */
+  --r-sm: 8px;                    /* Small: Tag / Icon Button */
+  --r: 16px;                      /* Medium: Card / Input */
+  --r-lg: 24px;                   /* Large: Prompt Composer / Modal */
+
+  /* Shadow System */
+  --sh-sm: 0 8px 30px rgba(0, 0, 0, 0.06);      /* Soft Shadow: 普通组件 */
+  --sh-md: 0 20px 60px rgba(0, 0, 0, 0.12);     /* Floating Shadow: 重要组件 */
+  --sh-float: 0 20px 60px rgba(0, 0, 0, 0.12);  /* Prompt Composer 悬浮弥散 */
+
   --dur: 220ms;
   --ease: cubic-bezier(0.32, 0.72, 0, 1);
+
+  /* —— 首页工作台 —— */
+  --aura: #8B7CFF;                /* 薰衣草氛围光(经 color-mix 降透明) */
+  --cta: #111111;                 /* Primary Button: 黑药丸 */
+  --cta-hover: #2A2A2A;
+  --cta-text: #FFFFFF;
 
   color-scheme: light;
 }
 
-/* 深色主题:暖深棕黑,不纯黑 */
+/* 深色主题 Dark Theme */
 [data-theme="dark"] {
-  --bg: oklch(0.2 0.01 55);
-  --bg-elev: oklch(0.24 0.012 55);
-  --surface: oklch(0.27 0.014 55);
-  --line: oklch(0.36 0.014 55);
-  --line-strong: oklch(0.45 0.018 55);
-  --text: oklch(0.92 0.012 70);
-  --text-2: oklch(0.74 0.014 65);
-  --text-3: oklch(0.58 0.012 60);
-  --accent: oklch(0.72 0.11 50);
-  --accent-strong: oklch(0.78 0.11 52);
-  --accent-soft: oklch(0.32 0.04 48);
-  --danger: oklch(0.7 0.14 27);
+  --bg: #0F0F11;
+  --bg-elev: #1E1E21;
+  --surface: #171719;
+  --surface-hover: #232326;
+  --image-bg: #0B0B0D;
+  --line: rgba(255, 255, 255, 0.08);
+  --line-strong: rgba(255, 255, 255, 0.16);
+  --text: #F5F5F5;
+  --text-2: #A1A1A1;
+  --text-3: #666666;
+  --text-4: #45454A;
+  --accent: #A89CFF;
+  --accent-strong: #B8ACFF;
+  --accent-soft: rgba(168, 156, 255, 0.14);
+  --accent-contrast: #131317;
+  --danger: #FF5C5F;
 
-  --sh-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
-  --sh-md: 0 8px 28px -14px rgba(0, 0, 0, 0.55);
+  --sh-sm: 0 8px 30px rgba(0, 0, 0, 0.4);
+  --sh-md: 0 20px 60px rgba(0, 0, 0, 0.5);
+  --sh-float: 0 20px 60px rgba(0, 0, 0, 0.5);
+
+  --aura: #A89CFF;
+  --cta: #F5F5F5;
+  --cta-hover: #FFFFFF;
+  --cta-text: #111111;
 
   color-scheme: dark;
 }
@@ -81,10 +105,11 @@ html {
 }
 
 body {
-  background: var(--bg);
+  /* 背景图:极简山水,平铺全屏,随视口缩放;亮/暗主题各一张 */
+  background: var(--bg) url('/src/assets/bg-light.png') center / cover no-repeat fixed;
   color: var(--text);
   font-family: var(--font-body);
-  line-height: 1.65;
+  line-height: 1.6;                    /* Body 1.6 */
   min-height: 100vh;
   -webkit-font-smoothing: antialiased;
   transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
@@ -133,9 +158,20 @@ select {
   }
 }
 
-/* 聚焦可见性 */
+/* 聚焦可见性:强调色(薰衣草) */
 :focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
   border-radius: 2px;
+}
+/* 文本输入框聚焦:改用边框+弥漫光晕作为指示,去掉外围偏移描边形成的“发光框” */
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: none;
+}
+
+/* 深色主题:切换为暗色山水背景图(需置于 body 背景声明之后以覆盖) */
+[data-theme="dark"] body {
+  background: var(--bg) url('/src/assets/bg-dark.png') center / cover no-repeat fixed;
 }
