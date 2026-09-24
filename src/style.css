@@ -103,8 +103,12 @@ html {
 }
 
 body {
-  /* 背景图:极简山水,平铺全屏,随视口缩放;亮/暗主题各一张 */
-  background: var(--bg) url('/src/assets/bg-light.png') center / cover no-repeat fixed;
+  /* 背景图:极简山水,平铺全屏,随视口缩放;亮/暗主题各一张。
+     上层叠加当前主题色半透明遮罩(62%),避免削弱卡片与文字对比度 */
+  background:
+    linear-gradient(color-mix(in srgb, var(--bg) 62%, transparent),
+                    color-mix(in srgb, var(--bg) 62%, transparent)),
+    url('/src/assets/bg-light.png') center / cover no-repeat fixed;
   color: var(--text);
   font-family: var(--font-body);
   line-height: 1.6;                    /* Body 1.6 */
@@ -169,7 +173,10 @@ select:focus-visible {
   outline: none;
 }
 
-/* 深色主题:切换为暗色山水背景图(需置于 body 背景声明之后以覆盖) */
+/* 深色主题:切换为暗色山水背景图,并同步叠加主题色遮罩(需置于 body 背景声明之后以覆盖) */
 [data-theme="dark"] body {
-  background: var(--bg) url('/src/assets/bg-dark.png') center / cover no-repeat fixed;
+  background:
+    linear-gradient(color-mix(in srgb, var(--bg) 62%, transparent),
+                    color-mix(in srgb, var(--bg) 62%, transparent)),
+    url('/src/assets/bg-dark.png') center / cover no-repeat fixed;
 }
