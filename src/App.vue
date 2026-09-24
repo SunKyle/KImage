@@ -588,33 +588,46 @@ async function removeHistoryItem() {
               </button>
             </div>
 
-            <!-- 已保存的配置列表 -->
-            <div v-if="configs.length" class="cfg-list">
-              <div class="cfg-row" :class="{ on: config.id === c.id }" v-for="c in configs" :key="c.id">
-                <button class="cfg-main" @click="activateConfig(c)">
-                  <span class="cfg-name">{{ c.name || '未命名配置' }}</span>
-                  <span class="cfg-meta">{{ c.baseUrl }}<template v-if="c.model"> · {{ c.model }}</template></span>
+            <!-- 已保存的接口配置列表 -->
+            <section v-if="configs.length" class="cfg-bloc">
+              <header class="cfg-head">
+                <span class="preset-label">已保存的接口</span>
+                <button class="cfg-add" @click="newConfig" title="新增接口" aria-label="新增接口">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14" /></svg>
                 </button>
-                <span v-if="config.id === c.id" class="cfg-active">当前</span>
-                <div class="cfg-ops">
-                  <button class="cfg-op" @click="duplicateConfig(c)" title="复制" aria-label="复制">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                      <rect x="9" y="9" width="11" height="11" rx="2" />
-                      <path d="M5 15V6a1 1 0 0 1 1-1h9" />
-                    </svg>
+              </header>
+              <div class="cfg-list">
+                <div class="cfg-row" :class="{ on: config.id === c.id }" v-for="c in configs" :key="c.id">
+                  <button class="cfg-main" @click="activateConfig(c)">
+                    <span class="cfg-name">{{ c.name || '未命名配置' }}</span>
+                    <span class="cfg-meta">{{ c.baseUrl }}<template v-if="c.model"> · {{ c.model }}</template></span>
                   </button>
-                  <button class="cfg-op danger" @click="removeConfig(c)" title="删除" aria-label="删除">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                      <path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2M6 7l1 12a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-12" />
-                    </svg>
-                  </button>
+                  <span v-if="config.id === c.id" class="cfg-active">当前</span>
+                  <div class="cfg-ops">
+                    <button class="cfg-op" @click="duplicateConfig(c)" title="复制" aria-label="复制">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                        <rect x="9" y="9" width="11" height="11" rx="2" />
+                        <path d="M5 15V6a1 1 0 0 1 1-1h9" />
+                      </svg>
+                    </button>
+                    <button class="cfg-op danger" @click="removeConfig(c)" title="删除" aria-label="删除">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2M6 7l1 12a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-12" />
+                      </svg>
+                    </button>
+                  </div>
                 </div>
               </div>
-            </div>
-            <button class="preset new-cfg" @click="newConfig">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14" /></svg>
-              新建配置
-            </button>
+            </section>
+
+            <!-- 新增/编辑表单区 -->
+            <header v-else class="cfg-head">
+              <span class="preset-label">还没有已保存的接口</span>
+              <button class="cfg-add" @click="newConfig" title="新增接口" aria-label="新增接口">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14" /></svg>
+              </button>
+            </header>
+            <p class="cfg-form-title">{{ config.id ? '编辑接口' : '新增接口' }}</p>
 
             <label class="field">
               <span class="flabel">配置名称</span>
@@ -829,11 +842,50 @@ async function removeHistoryItem() {
   color: var(--accent-strong);
 }
 /* 已保存的接口配置列表 */
+.cfg-bloc {
+  margin: var(--sp-5) 0;
+}
+.cfg-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+.cfg-head .preset-label {
+  margin-right: 0;
+}
 .cfg-list {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  margin: var(--sp-5) 0;
+}
+.cfg-add {
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--text-3);
+  background: none;
+  cursor: pointer;
+  transition: all var(--dur) var(--ease);
+}
+.cfg-add svg {
+  width: 16px;
+  height: 16px;
+}
+.cfg-add:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+.cfg-form-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  margin: var(--sp-5) 0 var(--sp-4);
 }
 .cfg-row {
   display: flex;
@@ -919,24 +971,6 @@ async function removeHistoryItem() {
 .cfg-op.danger:hover {
   border-color: var(--danger);
   color: var(--danger);
-}
-.new-cfg {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  width: 100%;
-  justify-content: center;
-  border-style: dashed;
-  color: var(--text-3);
-}
-.new-cfg svg {
-  width: 15px;
-  height: 15px;
-}
-.new-cfg:hover {
-  color: var(--accent);
-  border-color: var(--accent);
-  border-style: dashed;
 }
 .field {
   display: block;
