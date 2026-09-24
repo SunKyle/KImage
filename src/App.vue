@@ -496,6 +496,8 @@ async function removeHistoryEntry(entry: HistoryEntry) {
             </button>
           </div>
 
+          <p class="hint">Enter 发送 · Shift + Enter 换行 · 配置、预设与提示词库均存于本地</p>
+
           <button class="adv-toggle" @click="showMeta = !showMeta" :aria-expanded="showMeta">
             <span v-if="showMeta">收起参数</span>
             <span v-else class="adv-summary">
@@ -585,10 +587,6 @@ async function removeHistoryEntry(entry: HistoryEntry) {
         </div>
       </section>
     </main>
-
-    <footer class="colophon">
-      Enter 发送 · Shift + Enter 换行 · 配置、预设与提示词库均存于本地
-    </footer>
 
     <!-- 接口设置抽屉 -->
     <Teleport to="body">
@@ -1507,8 +1505,8 @@ async function removeHistoryEntry(entry: HistoryEntry) {
   }
 }
 
-.colophon {
-  margin-top: var(--sp-8);
+.hint {
+  margin-top: 10px;
   text-align: center;
   font-size: 12px;
   color: var(--text-3);
