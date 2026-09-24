@@ -55,7 +55,6 @@
   --ease: cubic-bezier(0.32, 0.72, 0, 1);
 
   /* —— 首页工作台 —— */
-  --aura: #8B7CFF;                /* 薰衣草氛围光(经 color-mix 降透明) */
   --cta: #111111;                 /* Primary Button: 黑药丸 */
   --cta-hover: #2A2A2A;
   --cta-text: #FFFFFF;
@@ -86,7 +85,6 @@
   --sh-md: 0 20px 60px rgba(0, 0, 0, 0.5);
   --sh-float: 0 20px 60px rgba(0, 0, 0, 0.5);
 
-  --aura: #A89CFF;
   --cta: #F5F5F5;
   --cta-hover: #FFFFFF;
   --cta-text: #111111;

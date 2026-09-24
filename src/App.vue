@@ -471,7 +471,6 @@ async function removeHistoryEntry(entry: HistoryEntry) {
       <!-- 生图工作台 -->
       <section class="workbench" aria-label="生图工作台">
         <header class="hero">
-          <div class="hero-aura" aria-hidden="true"></div>
           <h1 class="hero-title">把想象，交给画面</h1>
           <p class="hero-sub">一句话，一段描述，剩下的交给我们。</p>
         </header>
@@ -1136,16 +1135,6 @@ async function removeHistoryEntry(entry: HistoryEntry) {
   text-align: center;
   padding: clamp(36px, 6vw, 80px) var(--sp-4) var(--sp-4);
   overflow: hidden;
-}
-.hero-aura {
-  position: absolute;
-  inset: -45% -18%;
-  pointer-events: none;
-  background:
-    radial-gradient(58% 55% at 26% 22%, color-mix(in oklch, var(--aura) 60%, transparent), transparent 72%),
-    radial-gradient(46% 52% at 76% 28%, color-mix(in oklch, var(--aura) 46%, transparent), transparent 74%),
-    radial-gradient(80% 46% at 50% 0%, color-mix(in oklch, var(--aura) 40%, transparent), transparent 78%);
-  filter: blur(14px);
 }
 .hero-title {
   font-family: var(--font-display);
