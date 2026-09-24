@@ -4,8 +4,30 @@ import dotenv from 'dotenv'
 import path from 'node:path'
 import fs from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { ProxyAgent } from 'undici'
 
 dotenv.config()
+
+/* Node 的 fetch(undici)不读 macOS 的系统代理设置,只认显式配置。
+   于是会出现「浏览器/curl 走代理能通,服务端却 fetch failed」的情况。
+   这里让被阻断的境外接口可选地走代理,国内接口仍直连(见 NO_PROXY),
+   不配 UPSTREAM_PROXY 时全程直连,行为不变。 */
+const UPSTREAM_PROXY = process.env.UPSTREAM_PROXY || ''
+const NO_PROXY = (process.env.NO_PROXY || 'localhost,127.0.0.1,volces.com,aliyuncs.com')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean)
+
+const proxyAgent = UPSTREAM_PROXY ? new ProxyAgent(UPSTREAM_PROXY) : null
+if (proxyAgent) {
+  console.log(`[KImage] 上游代理: ${UPSTREAM_PROXY}(以下域名直连: ${NO_PROXY.join(', ')})`)
+}
+/** 命中的域名直连,其余走代理;没配代理则一律直连(返回 undefined 用默认调度器) */
+function dispatcherFor(target) {
+  if (!proxyAgent) return undefined
+  const host = new URL(target).hostname
+  return NO_PROXY.some((s) => host === s || host.endsWith(`.${s}`)) ? undefined : proxyAgent
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const DIST = path.resolve(__dirname, '../dist')
@@ -19,8 +41,13 @@ const CONNECT_HINTS = {
   ENOTFOUND: '域名解析失败,请检查 Base URL 拼写与本机 DNS。',
   ECONNREFUSED: '目标拒绝连接,请检查地址与端口是否正确。',
   ETIMEDOUT: '连接超时,通常是网络不通或该接口被阻断,可改用国内可达的接口。',
+  ECONNRESET:
+    '连接被重置(TCP RST),不是接口写错了 —— 通常是该域名在传输途中被网络阻断,常见于挂在 Cloudflare 上的中转服务。' +
+    '给服务端配好代理即可:启动时带上 UPSTREAM_PROXY=http://127.0.0.1:端口,或改用国内可达的接口。',
+  EPIPE: '连接被对端提前关闭,多为代理或防火墙中断,请检查网络链路。',
   UND_ERR_CONNECT_TIMEOUT:
     '连接超时,通常是网络不通或该接口被阻断;海外接口在国内直连会被丢包,需换用国内节点或为服务端配置代理。',
+  UND_ERR_SOCKET: 'socket 中途断开,多为代理/防火墙问题,请检查网络链路或改用国内可达的接口。',
   UNABLE_TO_VERIFY_LEAF_SIGNATURE:
     'TLS 证书不被 Node 信任,多见于本地代理软件的根证书,需把根证书加入 NODE_EXTRA_CA_CERTS。',
   SELF_SIGNED_CERT_IN_CHAIN:
@@ -113,7 +140,8 @@ app.post('/api/generate', async (req, res) => {
       method: 'POST',
       headers,
       body: payload,
-      signal: ac.signal
+      signal: ac.signal,
+      dispatcher: dispatcherFor(target)
     })
 
     const text = await upstream.text()
