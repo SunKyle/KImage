@@ -14,6 +14,19 @@ const app = express()
 app.use(cors())
 app.use(express.json({ limit: '15mb' }))
 
+// 连接层失败的常见原因与排查方向,附在报错里,避免只看到一句 "fetch failed"
+const CONNECT_HINTS = {
+  ENOTFOUND: '域名解析失败,请检查 Base URL 拼写与本机 DNS。',
+  ECONNREFUSED: '目标拒绝连接,请检查地址与端口是否正确。',
+  ETIMEDOUT: '连接超时,通常是网络不通或该接口被阻断,可改用国内可达的接口。',
+  UND_ERR_CONNECT_TIMEOUT:
+    '连接超时,通常是网络不通或该接口被阻断;海外接口在国内直连会被丢包,需换用国内节点或为服务端配置代理。',
+  UNABLE_TO_VERIFY_LEAF_SIGNATURE:
+    'TLS 证书不被 Node 信任,多见于本地代理软件的根证书,需把根证书加入 NODE_EXTRA_CA_CERTS。',
+  SELF_SIGNED_CERT_IN_CHAIN:
+    'TLS 证书链含自签证书,多见于本地代理软件,需把根证书加入 NODE_EXTRA_CA_CERTS。'
+}
+
 /**
  * 通用图像生成代理。
  * 前端把配置(prompt / size / n / model / baseUrl / apiKey)POST 过来,
@@ -103,7 +116,16 @@ app.post('/api/generate', async (req, res) => {
     res.setHeader('Content-Type', 'application/json')
     res.send(text)
   } catch (e) {
-    return res.status(502).json({ error: '无法连接上游服务', detail: String(e) })
+    // undici(Node fetch)遇到连接层失败时只抛 "fetch failed",
+    // 真正的原因(DNS/TCP/TLS)藏在 e.cause 里,这里一并透出,否则无法排查
+    const cause = e?.cause
+    const code = cause?.code || cause?.errno || ''
+    const reason = [code, cause?.message].filter(Boolean).join(' ') || String(e)
+    const hint = CONNECT_HINTS[code] || ''
+    return res.status(502).json({
+      error: '无法连接上游服务',
+      detail: `${target} — ${reason}。${hint}`
+    })
   }
 })
 
