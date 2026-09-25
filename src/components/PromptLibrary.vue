@@ -24,6 +24,8 @@ const menuOpen = ref(false)
 const showAdd = ref(false)
 const draftPrompt = ref('')
 const draftCategory = ref('')
+// 翻到背面的那张卡(存 id):同时只翻一张,网格里翻开好几张会找不到焦点
+const flipped = ref<string | null>(null)
 
 const categories = computed(() => {
   const set = new Set(props.items.map((i) => i.category || '未分类'))
@@ -37,6 +39,20 @@ const filtered = computed(() => {
   if (q) list = list.filter((i) => i.prompt.toLowerCase().includes(q))
   return list
 })
+
+function flip(id: string) {
+  flipped.value = flipped.value === id ? null : id
+}
+
+/* 参数拼成一行用 · 连接。原来三个描边小胶囊在 322px 的卡里是三个小盒子,
+   跟提示词抢视线;拼成一行之后它退成背景信息,提示词才立得住 */
+function paramLine(item: PromptItem): string {
+  const out: string[] = []
+  if (item.size) out.push(item.size === 'auto' ? '自动' : item.size)
+  if (item.quality) out.push(optionLabel(QUALITY_OPTIONS, item.quality))
+  if (item.background) out.push(optionLabel(BACKGROUND_OPTIONS, item.background))
+  return out.join(' · ')
+}
 
 // 搜索和分类是两套筛选,空态里要能一键把两个都清掉
 function resetFilter() {
@@ -163,53 +179,62 @@ function fmt(t: number) {
     </div>
 
     <ul v-if="filtered.length" class="lib-grid">
-      <li v-for="item in filtered" :key="item.id" class="card">
-        <!-- 整块可点 = 使用该提示词;操作按钮单独放,不能嵌在 button 里 -->
-        <button class="card-main" :title="item.prompt" @click="emit('use', item)">
-          <img v-if="item.thumb" class="cover" :src="item.thumb" alt="" />
-          <span v-else class="cover cover-none" aria-hidden="true">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M4 6h16M4 12h10M4 18h13" />
-            </svg>
-          </span>
-          <span class="main-body">
-            <span class="card-meta">
-              <span class="cat-tag">{{ item.category || '未分类' }}</span>
-              <span class="card-time">{{ fmt(item.createdAt) }}</span>
-            </span>
-            <span class="card-text">{{ item.prompt }}</span>
-          </span>
-        </button>
-
-        <!-- hover 才显形:整卡本身就是主操作,常驻按钮会跟它抢注意力 -->
-        <div class="ops">
-          <button
-            class="op"
-            data-tip="使用该提示词"
-            :aria-label="`使用：${item.prompt.slice(0, 20)}`"
-            @click="emit('use', item)"
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M12 20V8M8 12l4-4 4 4" />
-              <path d="M4 20h16" />
-            </svg>
-          </button>
-          <button
-            class="op op-del"
-            data-tip="删除"
-            :aria-label="`删除：${item.prompt.slice(0, 20)}`"
-            @click="emit('remove', item.id)"
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2M6 7l1 12a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-12" />
-            </svg>
-          </button>
-        </div>
-
-        <div v-if="item.size || item.quality || item.background" class="card-foot">
-          <span v-if="item.size" class="pill">{{ item.size === 'auto' ? '自动' : item.size }}</span>
-          <span v-if="item.quality" class="pill">{{ optionLabel(QUALITY_OPTIONS, item.quality) }}</span>
-          <span v-if="item.background" class="pill">{{ optionLabel(BACKGROUND_OPTIONS, item.background) }}</span>
+      <li
+        v-for="item in filtered"
+        :key="item.id"
+        class="card"
+        :class="{ on: flipped === item.id }"
+        role="button"
+        tabindex="0"
+        :aria-pressed="flipped === item.id"
+        :aria-label="flipped === item.id ? '返回提示词' : '查看这条提示词的出图效果'"
+        @click="flip(item.id)"
+        @keydown.enter.self.prevent="flip(item.id)"
+        @keydown.space.self.prevent="flip(item.id)"
+      >
+        <div class="flip-inner">
+          <!-- 正面:分类 + 提示词 + 参数/操作。脚注也在这里面,整张卡才是同一块在转 -->
+          <div class="face face-front">
+            <div class="card-top">
+              <div class="card-meta">
+                <span class="card-cat">{{ item.category || '未分类' }}</span>
+                <span class="card-time">{{ fmt(item.createdAt) }}</span>
+              </div>
+              <div class="card-text">{{ item.prompt }}</div>
+            </div>
+            <div class="card-foot">
+              <span class="card-params">{{ paramLine(item) }}</span>
+              <!-- 卡片的点击是翻面,这两个必须 stop,否则点它们也会跟着翻 -->
+              <div class="ops">
+                <button
+                  class="op"
+                  data-tip="使用该提示词"
+                  :aria-label="`使用：${item.prompt.slice(0, 20)}`"
+                  @click.stop="emit('use', item)"
+                >
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M12 20V8M8 12l4-4 4 4" />
+                    <path d="M4 20h16" />
+                  </svg>
+                </button>
+                <button
+                  class="op op-del"
+                  data-tip="删除"
+                  :aria-label="`删除：${item.prompt.slice(0, 20)}`"
+                  @click.stop="emit('remove', item.id)"
+                >
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2M6 7l1 12a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-12" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+          </div>
+          <!-- 背面:整张卡就是这一张图 -->
+          <div class="face face-back">
+            <img v-if="item.thumb" :src="item.thumb" alt="" />
+            <span v-else class="back-none">这条没有存封面</span>
+          </div>
         </div>
       </li>
     </ul>
@@ -255,7 +280,8 @@ function fmt(t: number) {
 .lib-sub {
   margin-top: 6px;
   font-size: 13px;
-  color: var(--text-3);
+  /* 用 text-2 而不是 text-3:#999 在浅色面上只有 2.85:1,正文级文字要达到 4.5:1 */
+  color: var(--text-2);
 }
 .lib-ops {
   display: flex;
@@ -292,7 +318,7 @@ function fmt(t: number) {
   justify-content: center;
   border: 1px solid var(--line);
   border-radius: 999px;
-  color: var(--text-3);
+  color: var(--text-2);
   background: var(--surface);
   cursor: pointer;
   transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease),
@@ -445,100 +471,156 @@ function fmt(t: number) {
   color: var(--text);
 }
 
-/* 网格:auto-fill 让列数跟着容器走,窄屏自然退成两列/一列 */
+/* 网格:auto-fill 让列数跟着容器走。三列是刻意的 —— 卡片宽度决定了背面图片的
+   放大倍数:320px 的封面铺到 ~293px 是略微缩小,清晰;排成两列(490px)就要放大
+   1.5 倍,2x 屏上明显糊。卡片面积比原来的扁条更大,只是方了 */
 .lib-grid {
   list-style: none;
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-  gap: var(--sp-3);
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: var(--sp-4);
   margin-top: var(--sp-5);
 }
 .card {
   position: relative;
-  display: flex;
-  flex-direction: column;
+  /* grid 让 .flip-inner 铺满整张卡:同一行的卡片被长提示词撑高时,
+     两面的白底和图片底才跟着铺满,不会在卡片下方露出一条空边 */
+  display: grid;
   border: 1px solid var(--line);
   border-radius: var(--r);
   background: var(--surface);
-  transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+  cursor: pointer;
+  outline: none;
+  /* 转的是卡片自己:底色和描边都是它的,所以整张一起转。
+     透视不放在祖先上,而是写进 transform 里 —— 祖先上的 perspective 是一个
+     大平面、所有卡片共用一个消失点,网格边缘的卡会被拉歪。
+     preserve-3d 让里面两个面的 rotateY 和这张卡合在同一个 3D 空间里 */
+  transform-style: preserve-3d;
+  transition: transform 560ms var(--ease), border-color var(--dur) var(--ease),
+    box-shadow var(--dur) var(--ease);
+}
+.card.on {
+  transform: perspective(1600px) rotateY(180deg);
 }
 .card:hover,
-.card:focus-within {
+.card:focus-visible {
   border-color: var(--line-strong);
   box-shadow: var(--sh-sm);
 }
-/* flex:1 让卡片被文字撑高时脚注仍贴住底边,同一行的卡片视觉上齐平 */
-.card-main {
-  flex: 1;
-  display: flex;
-  align-items: flex-start;
-  gap: var(--sp-3);
-  width: 100%;
-  padding: var(--sp-4);
-  text-align: left;
-  cursor: pointer;
+/* 键盘聚焦要有看得见的环,只靠描边变色对键盘用户几乎不可辨 */
+.card:focus-visible {
+  box-shadow: var(--sh-sm), 0 0 0 3px var(--accent-soft);
 }
-.cover {
-  width: 56px;
-  height: 56px;
-  flex: none;
-  object-fit: cover;
-  border-radius: var(--r-sm);
-  background: var(--bg-elev);
+
+/* —— 翻面 ——
+   两个面用 grid 叠在同一个格子里(不是绝对定位),容器高度由较高的那一面自然决定,
+   于是既不需要定高、也不依赖 aspect-ratio,少两个会被静默忽略的属性。
+
+   可见性用透明度兜底,不单靠 backface-visibility:后者在祖先带
+   overflow / transform / filter 时会被压平失效,那时两个面会上下排开同时显示,
+   点一下也没有任何视觉反馈 —— 正是之前踩到的样子。
+   延迟 220ms(翻转大约走到侧面时)再换面,肉眼看不出来。
+
+   pointer-events 必须跟着换:透明元素照样能被点中,否则翻到背面后
+   还会点到正面那层已经看不见的操作按钮 */
+.flip-inner {
+  display: grid;
+  min-height: 300px;
+  transform-style: preserve-3d;
 }
-.cover-none {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--text-4);
-}
-.cover-none svg {
-  width: 20px;
-  height: 20px;
-}
-.main-body {
+.face {
+  grid-area: 1 / 1;
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  min-width: 0;
+  /* 圆角是整圈的:两个面各占满整张卡,不再是只盖上半个 */
+  border-radius: calc(var(--r) - 1px);
+  overflow: hidden;
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
+  transition: opacity 120ms linear 220ms;
 }
+.face-front {
+  background: var(--surface);
+  opacity: 1;
+  pointer-events: auto;
+}
+.face-back {
+  align-items: center;
+  justify-content: center;
+  /* 不留内边距:图直接铺到卡片边缘,留边交给 contain 自己算,
+     这样背面是一张实心的照片卡,而不是灰框里漂着一张小图 */
+  background: var(--stage-bg);
+  opacity: 0;
+  pointer-events: none;
+  transform: rotateY(180deg);
+}
+.card.on .face-front {
+  opacity: 0;
+  pointer-events: none;
+}
+.card.on .face-back {
+  opacity: 1;
+  pointer-events: auto;
+}
+/* flex:1 让它吃掉剩下的高度,配 contain 完整显示且不变形。
+   不用百分比高度,是为了避开"父高由内容决定"时的循环引用 */
+.face-back img {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  object-fit: contain;
+}
+/* 内边距放在上半块而不是 .face 上;脚注与正文之间靠留白分开,不再画横线 */
+.card-top {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: var(--sp-4);
+}
+.back-none {
+  font-size: 13px;
+  color: var(--text-2);
+}
+
 .card-meta {
   display: flex;
-  align-items: center;
+  align-items: baseline;
   gap: 8px;
-  /* 给右上角的操作按钮留位,时间不会被压在按钮底下 */
-  padding-right: 58px;
-}
-.cat-tag {
-  padding: 1px 7px;
-  border-radius: 999px;
-  border: 1px solid var(--line);
-  background: var(--bg-elev);
+  /* 分类与时间同为 12px,靠字重和位置区分。
+     原来分类是个 11px 小胶囊 —— 去掉那个描边盒子之后这一行安静下来,
+     提示词才能真正成为卡片里最重的元素 */
+  font-size: 12px;
+  line-height: 1.4;
   color: var(--text-2);
-  font-size: 11px;
+}
+.card-cat {
+  font-weight: 500;
 }
 .card-time {
   margin-left: auto;
-  font-size: 11px;
-  color: var(--text-3);
 }
 .card-text {
-  /* 两行截断:抽屉里只有一行,整页宽度下两行才够装常见提示词 */
+  /* 提示词是这张卡的主角:字号最大、颜色最深。
+     在剩余空间里垂直居中 —— 卡片高度是统一的,短提示词若贴着顶,
+     下面会空出一大块,看着像没加载完 */
+  margin: auto 0;
   display: -webkit-box;
   -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
+  -webkit-line-clamp: 8;
   overflow: hidden;
-  font-size: 13px;
-  line-height: 1.55;
+  font-size: 15px;
+  line-height: 1.62;
   color: var(--text);
 }
 .ops {
-  position: absolute;
-  top: 11px;
-  right: 11px;
   display: flex;
-  gap: 4px;
+  flex-shrink: 0;
+  gap: 2px;
+  margin-left: auto;
 }
+/* 图标用 --text-2 而不是 --text-3:后者在浅色面上只有 2.85:1,
+   达不到非文本元素 3:1 的下限 */
 .op {
   width: 28px;
   height: 28px;
@@ -547,31 +629,23 @@ function fmt(t: number) {
   justify-content: center;
   border: 1px solid transparent;
   border-radius: var(--r-sm);
-  color: var(--text-3);
-  background: var(--surface);
+  color: var(--text-2);
+  background: none;
   cursor: pointer;
-  opacity: 0.55;
-  transition: opacity var(--dur) var(--ease), color var(--dur) var(--ease),
-    border-color var(--dur) var(--ease), background var(--dur) var(--ease);
+  transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease),
+    background var(--dur) var(--ease), transform 120ms var(--ease);
 }
 .op svg {
   width: 15px;
   height: 15px;
 }
-.card:hover .op,
-.card:focus-within .op {
-  opacity: 1;
-}
-/* 触屏没有 hover,常驻显示,否则操作永远点不到 */
-@media (hover: none) {
-  .op {
-    opacity: 1;
-  }
-}
 .op:hover {
   color: var(--accent-strong);
   border-color: color-mix(in oklch, var(--accent) 45%, transparent);
   background: var(--accent-soft);
+}
+.op:active {
+  transform: scale(0.94);
 }
 .op-del:hover {
   color: var(--danger);
@@ -580,19 +654,19 @@ function fmt(t: number) {
 }
 .card-foot {
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
-  gap: 6px;
-  padding: 10px var(--sp-4);
-  border-top: 1px solid var(--line);
+  gap: 10px;
+  padding: 0 var(--sp-4) var(--sp-4);
 }
-.pill {
-  padding: 2px 8px;
-  border-radius: 999px;
-  border: 1px solid var(--line);
-  background: var(--bg-elev);
+/* 参数是一行文字,不是三个小胶囊:它只是背景信息,
+   拼成一行之后不再跟提示词抢视线,一行也够放下 */
+.card-params {
+  min-width: 0;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
   color: var(--text-2);
-  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -628,7 +702,7 @@ function fmt(t: number) {
   max-width: 380px;
   font-size: 13px;
   line-height: 1.7;
-  color: var(--text-3);
+  color: var(--text-2);
 }
 .none-action {
   margin-top: var(--sp-5);
@@ -644,6 +718,13 @@ function fmt(t: number) {
 .none-action:hover {
   border-color: var(--line-strong);
   background: var(--bg-elev);
+}
+
+/* 关闭动效时仍然能翻,只是不再有过渡 */
+@media (prefers-reduced-motion: reduce) {
+  .card {
+    transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+  }
 }
 
 .po-enter-active,

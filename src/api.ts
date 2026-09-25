@@ -356,6 +356,10 @@ export async function removeHistoryRecord(id: string) {
   // 删除不可能超出保留量,无需再裁剪
   await deleteOne(id)
 }
+/** 覆盖写回一条历史。改的是结果项上的「标记」,条目本身没变,所以不必重跑裁剪 */
+export async function saveHistoryRecord(entry: HistoryEntry) {
+  await putOne(entry)
+}
 
 /* ===== 提示词库(收藏) ===== */
 const LIB_KEY = 'kimage.prompts'
@@ -373,14 +377,22 @@ export function savePrompts(list: PromptItem[]): boolean {
     localStorage.setItem(LIB_KEY, JSON.stringify(list))
     return true
   } catch {
-    // 配额不够时退化成不带缩略图的版本:提示词本身比封面重要得多,
-    // 宁可丢封面,也不能让整次保存失败(那样用户会以为存进去了)
-    try {
-      localStorage.setItem(LIB_KEY, JSON.stringify(list.map((p) => ({ ...p, thumb: undefined }))))
-      return false
-    } catch {
-      return false
+    /* 配额不够时逐级丢封面:提示词本身比封面重要得多,宁可丢图也不能让整次保存失败
+       (那样用户会以为存进去了)。列表是从新到旧排的,所以丢的是最旧那批的封面。
+
+       降级按二分来:一条一条地试,每轮都要把整个列表重新序列化一遍,
+       库稍大一点就会把主线程卡住;二分最多试 log2(n) 轮,几十条和几百条都没差别。 */
+    for (let keep = Math.floor(list.length / 2); keep >= 0; keep = Math.floor(keep / 2)) {
+      const next = list.map((p, i) => (i < keep ? { ...p } : { ...p, thumb: undefined }))
+      try {
+        localStorage.setItem(LIB_KEY, JSON.stringify(next))
+        return false
+      } catch {
+        /* 还装不下,保留封面的大半再砍一半 */
+      }
+      if (keep === 0) break
     }
+    return false
   }
 }
 

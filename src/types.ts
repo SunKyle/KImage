@@ -51,7 +51,10 @@ export interface FavoritePayload {
 // 一条图片结果。
 // 新记录存 Blob:浏览器把它放在 JS 堆外,渲染时才按需读,避免整段 base64 常驻内存;
 // 加这个改动之前存下来的记录是 data URL 字符串,读取时要能同时认这两种。
-export type ResultItem = { type: 'b64' | 'url'; data: string | Blob }
+// marked 是「标记这张图」的标记:历史图墙是按张摊平的,所以标在图上而不是整条记录上。
+// 叫标记而不是收藏,是为了跟「收藏到提示词库」区分开 —— 那个存的是提示词,进的是提示词库。
+// 可选是为了兼容加这个字段之前存下来的记录。
+export type ResultItem = { type: 'b64' | 'url'; data: string | Blob; marked?: boolean }
 
 // 一条生成记录
 export interface HistoryEntry {

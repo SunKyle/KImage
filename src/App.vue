@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, watch, toRaw } from 'vue'
 import PromptLibrary from './components/PromptLibrary.vue'
 import ImagePreview from './components/ImagePreview.vue'
 import HistoryPage from './components/HistoryPage.vue'
@@ -15,6 +15,7 @@ import {
   loadHistory,
   addHistoryRecord,
   removeHistoryRecord,
+  saveHistoryRecord,
   loadPrompts,
   savePrompts,
   PROVIDERS,
@@ -483,7 +484,7 @@ function onPickRef(e: Event) {
   ;(e.target as HTMLInputElement).value = ''
 }
 // 用 canvas 压缩图片:超过 maxEdge 的最长边等比缩放,透明图铺白底,输出 JPEG
-function compressImage(dataUrl: string, maxEdge = 1024): Promise<string> {
+function compressImage(dataUrl: string, maxEdge = 1024, quality = 0.85): Promise<string> {
   return new Promise((resolve) => {
     const img = new Image()
     img.onload = () => {
@@ -500,7 +501,7 @@ function compressImage(dataUrl: string, maxEdge = 1024): Promise<string> {
       ctx.fillStyle = '#fff' // 透明 PNG 转 JPEG 时铺白底,避免变黑
       ctx.fillRect(0, 0, width, height)
       ctx.drawImage(img, 0, 0, width, height)
-      resolve(c.toDataURL('image/jpeg', 0.85))
+      resolve(c.toDataURL('image/jpeg', quality))
     }
     img.onerror = () => resolve(dataUrl)
     img.src = dataUrl
@@ -639,12 +640,15 @@ function usePreviewPrompt(p: ReuseParams) {
 /**
  * 生成封面缩略图。compressImage 在最长边已经小于目标时会把输入原样返回,
  * 那种情况可能是个 blob: URL(刷新即失效),所以只收 data: 开头的;
- * 同时限长,避免把原始大图当成封面塞进 localStorage
+ * 同时限长,避免把原始大图当成封面塞进 localStorage。
+ *
+ * 320px / 0.78:库页卡片的背面会把这张图铺开显示,原来 160px 在那个尺寸下会糊。
+ * 画质压得比参考图低,是因为它按条数存进 localStorage,省下的都是配额。
  */
 async function thumbOf(src: string): Promise<string | undefined> {
   if (!src) return undefined
-  const out = await compressImage(src, 160)
-  return /^data:image\//.test(out) && out.length < 60000 ? out : undefined
+  const out = await compressImage(src, 320, 0.78)
+  return /^data:image\//.test(out) && out.length < 80000 ? out : undefined
 }
 
 // 预览菜单:收藏当前预览的提示词到库(连带参数与一张封面缩略图)
@@ -690,6 +694,14 @@ async function removeHistoryItem() {
 async function removeHistoryEntry(entry: HistoryEntry) {
   history.value = history.value.filter((h) => h.id !== entry.id)
   await removeHistoryRecord(entry.id)
+}
+/* 标记逐张标:图墙里一块图块就是一张图,所以标在结果项上而不是整条记录上。
+   改完必须落盘,否则刷新就丢;界面靠响应式代理更新,而 idb 只吃原始对象,故 toRaw */
+async function toggleMark(entry: HistoryEntry, index: number) {
+  const item = entry.results[index]
+  if (!item) return
+  item.marked = !item.marked
+  await saveHistoryRecord(toRaw(entry))
 }
 
 </script>
@@ -1156,6 +1168,7 @@ async function removeHistoryEntry(entry: HistoryEntry) {
         @open="openPreview"
         @use="usePreviewPrompt"
         @remove="removeHistoryEntry"
+        @mark="toggleMark"
       />
     </main>
 
