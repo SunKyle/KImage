@@ -26,11 +26,26 @@ export interface GenParams {
 // 提示词库收藏项
 export interface PromptItem {
   id: string
-  title: string // 用户命名
   prompt: string
   category: string // 分类/标签
+  // 收藏时一并记下这几个参数,从库里取用时才能完整复现,而不是只填回提示词
   size?: string
+  quality?: string
+  background?: string
+  // 列表里做视觉锚点的小缩略图(data URL)。
+  // 库存在 localStorage(配额约 5MB),所以压得很紧:160px / webp 0.6,通常 5~9KB
+  thumb?: string
   createdAt: number
+}
+
+// 预览里「收藏到提示词库」时一起交出来的内容:
+// 提示词 + 当时真正发出去的参数 + 当前这张图的渲染地址(用来生成封面缩略图)
+export interface FavoritePayload {
+  prompt: string
+  size: string
+  quality?: string
+  background?: string
+  src: string
 }
 
 // 一条图片结果。
@@ -54,6 +69,10 @@ export interface HistoryEntry {
   createdAt: number
   // 上游可能返回一张或多张图
   results: ResultItem[]
+  // 列表用的小缩略图。抽屉里只显示 48px,但浏览器是按原始分辨率解码的,
+  // 几十条一起挂载时会连续做几十次全尺寸解码,主线程被压住。
+  // 可选:老记录没有这个字段,列表退回渲染原图
+  thumb?: Blob
 }
 
 // 「使用提示词」时带回的一组参数,用于一键复现当时的出图条件

@@ -257,6 +257,73 @@ export function imageSrc(item: ResultItem): string {
   return url
 }
 
+/* ===== 列表缩略图 ===================================================
+   抽屉列表把图缩到 48px 显示,但浏览器仍按原始分辨率解码:几十条一起
+   挂载就是几十次全尺寸解码,而打开抽屉的同时还有弹簧动画和抽屉滑入在
+   跑,主线程被压满,表现就是「只有 home → 历史 会卡」。
+   入库时顺手做一张小图,列表只渲染它。老记录没有 thumb,退回原图。
+   ------------------------------------------------------------------ */
+const THUMB_EDGE = 128
+
+export async function makeThumb(item: ResultItem | undefined): Promise<Blob | undefined> {
+  if (!item) return undefined
+  try {
+    const src = imageSrc(item)
+    if (!src) return undefined
+    const bmp = await createImageBitmap(await (await fetch(src)).blob())
+    const scale = Math.min(1, THUMB_EDGE / Math.max(bmp.width, bmp.height))
+    if (scale >= 1) {
+      // 本来就比缩略图还小,不值得多存一份
+      bmp.close()
+      return undefined
+    }
+    const c = document.createElement('canvas')
+    c.width = Math.max(1, Math.round(bmp.width * scale))
+    c.height = Math.max(1, Math.round(bmp.height * scale))
+    const ctx = c.getContext('2d')
+    if (!ctx) {
+      bmp.close()
+      return undefined
+    }
+    ctx.drawImage(bmp, 0, 0, c.width, c.height)
+    bmp.close()
+    // webp 编码在个别环境下不可用,退回 png(透明图不能走 jpeg,会糊成黑底)
+    return (
+      (await new Promise<Blob | null>((r) => c.toBlob(r, 'image/webp', 0.8))) ??
+      (await new Promise<Blob | null>((r) => c.toBlob(r, 'image/png'))) ??
+      undefined
+    )
+  } catch {
+    return undefined
+  }
+}
+
+/** 列表用的地址:优先小缩略图,没有就退回原图 */
+export function thumbSrc(e: HistoryEntry): string {
+  const item: ResultItem | undefined = e.thumb ? { type: 'b64', data: e.thumb } : e.results?.[0]
+  return item ? imageSrc(item) : ''
+}
+
+/**
+ * 给加这个字段之前存下来的老记录补缩略图。
+ * 每张之间留一段间隔,免得一上来就把主线程占满;补完落盘,只跑一次。
+ * 任何一张失败都跳过,不影响使用。
+ */
+export async function backfillThumbs(list: HistoryEntry[]): Promise<void> {
+  for (const entry of list) {
+    if (entry.thumb) continue
+    const t = await makeThumb(entry.results?.[0])
+    if (!t) continue
+    entry.thumb = t
+    try {
+      await putOne(entry)
+    } catch {
+      /* 落盘失败就只留内存里这一份,下次打开还会再试 */
+    }
+    await new Promise((r) => setTimeout(r, 300))
+  }
+}
+
 /* ===== 历史记录(IndexedDB,容量不受限、真正持久) ===== */
 /** 把一条历史摊成可复现的参数,交给主界面按当前厂商的能力逐项套用 */
 export function reuseParamsOf(e: HistoryEntry): ReuseParams {
@@ -301,6 +368,19 @@ export function loadPrompts(): PromptItem[] {
     return []
   }
 }
-export function savePrompts(list: PromptItem[]) {
-  localStorage.setItem(LIB_KEY, JSON.stringify(list))
+export function savePrompts(list: PromptItem[]): boolean {
+  try {
+    localStorage.setItem(LIB_KEY, JSON.stringify(list))
+    return true
+  } catch {
+    // 配额不够时退化成不带缩略图的版本:提示词本身比封面重要得多,
+    // 宁可丢封面,也不能让整次保存失败(那样用户会以为存进去了)
+    try {
+      localStorage.setItem(LIB_KEY, JSON.stringify(list.map((p) => ({ ...p, thumb: undefined }))))
+      return false
+    } catch {
+      return false
+    }
+  }
 }
+

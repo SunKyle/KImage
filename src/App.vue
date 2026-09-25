@@ -2,7 +2,9 @@
 import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import PromptLibrary from './components/PromptLibrary.vue'
 import ImagePreview from './components/ImagePreview.vue'
-import HistoryDrawer from './components/HistoryDrawer.vue'
+import HistoryPage from './components/HistoryPage.vue'
+import RubberSegment from './components/RubberSegment.vue'
+import LatticeLoader from './components/LatticeLoader.vue'
 import {
   generate,
   uid,
@@ -21,12 +23,14 @@ import {
   allowedSizes,
   optionLabel,
   imageSrc,
+  makeThumb,
+  backfillThumbs,
   QUALITY_OPTIONS,
   BACKGROUND_OPTIONS
 } from './api'
 import { blobToDataURL } from './lib/idb'
 import type { Cap, Provider } from './api'
-import type { ApiConfig, HistoryEntry, PromptItem, ResultItem, ReuseParams } from './types'
+import type { ApiConfig, FavoritePayload, HistoryEntry, PromptItem, ResultItem, ReuseParams } from './types'
 
 // —— 状态 ——
 const prompt = ref('')
@@ -56,8 +60,9 @@ const running = ref({ prompt: '', size: '1024x1024', n: 1 })
 const history = ref<HistoryEntry[]>([])
 const libItems = ref<PromptItem[]>([])
 const refImage = ref('') // 图生图参考图 (data URL)
-const showLib = ref(false)
-const showHistory = ref(false)
+// 底下的页面:首页 / 提示词库 / 历史记录三个平级视图,同时只挂载一个。
+// 接口设置仍是浮层,它开在哪个页面之上不影响这里
+const page = ref<'home' | 'lib' | 'history'>('home')
 const previewEntry = ref<HistoryEntry | null>(null)
 // 参数 icon 展开的面板:同一时间只开一个,再次点击收起
 type PanelKey = '' | 'ref' | 'size' | 'n' | 'quality' | 'bg' | 'config'
@@ -68,7 +73,11 @@ watch(openPanel, (v) => {
   if (v) shownPanel.value = v
 })
 function togglePanel(p: Exclude<PanelKey, ''>) {
-  openPanel.value = openPanel.value === p ? '' : p
+  const same = openPanel.value === p
+  openPanel.value = same ? '' : p
+  // 收起后把焦点还给输入框:点这个图标通常就是为了改个参数接着打字,
+  // 不该再要求用户手动点回输入区。切到另一个面板时不抢,用户还在选。
+  if (same) focusPrompt()
 }
 // 面板展开后点别处收起:只有参数行和面板自身算"内部"
 const paramBarEl = ref<HTMLElement | null>(null)
@@ -78,10 +87,55 @@ function onDocPointerDown(e: PointerEvent) {
   const t = e.target as Node | null
   if (!t) return
   if (paramBarEl.value?.contains(t) || panelEl.value?.contains(t)) return
+  // 这里不回焦:用户是主动点到别处去的,把焦点拽回来反而打断了那一下操作
   openPanel.value = ''
 }
-onMounted(() => document.addEventListener('pointerdown', onDocPointerDown))
-onBeforeUnmount(() => document.removeEventListener('pointerdown', onDocPointerDown))
+// Esc 收起面板,同样把焦点还给输入框 —— 不给键盘留一条路的话,这条回焦只有鼠标能用
+function onDocKeyDown(e: KeyboardEvent) {
+  if (e.key !== 'Escape' || !openPanel.value) return
+  openPanel.value = ''
+  focusPrompt()
+}
+onMounted(() => {
+  document.addEventListener('pointerdown', onDocPointerDown)
+  window.addEventListener('keydown', onDocKeyDown)
+  window.addEventListener('resize', fitPrompt)
+})
+onBeforeUnmount(() => {
+  document.removeEventListener('pointerdown', onDocPointerDown)
+  window.removeEventListener('keydown', onDocKeyDown)
+  window.removeEventListener('resize', fitPrompt)
+})
+// —— 输入区:随内容长高 + 焦点归位 ——
+const promptEl = ref<HTMLTextAreaElement | null>(null)
+// 最多长到 6 行,再多转内部滚动。不封顶的话,一段长提示词会把参数行和下面的图墙顶出视口
+const INPUT_MAX_ROWS = 6
+// 与 .prompt-box textarea 的 font-size 16px × line-height 1.6 对应,改那两处要一起改
+const INPUT_LINE = 16 * 1.6
+// 该 textarea 的上下内边距(6 + 8):scrollHeight 含内边距,算上限时要加回来
+const INPUT_PAD = 14
+
+/* 高度先置 auto 再读 scrollHeight,否则 scrollHeight 只会返回不小于当前高度的值,
+   框能长不能缩。全局是 border-box,所以这个值可以直接当 height 用。 */
+function fitPrompt() {
+  const el = promptEl.value
+  if (!el) return
+  el.style.height = 'auto'
+  const max = INPUT_MAX_ROWS * INPUT_LINE + INPUT_PAD
+  el.style.height = `${Math.min(el.scrollHeight, max)}px`
+  el.style.overflowY = el.scrollHeight > max ? 'auto' : 'hidden'
+}
+// flush: 'post' —— 要等 v-model 写进 DOM 之后再量,否则量到的是上一个字的高度
+watch(prompt, fitPrompt, { flush: 'post' })
+// 工作台与提示词库是两个视图,切回来时输入框是重新挂载的,
+// 得按当前草稿再量一次高度,否则多行的提示词会被 CSS 的一行兜底高度切掉
+watch(promptEl, () => fitPrompt(), { flush: 'post' })
+
+// preventScroll:焦点回来时不要把页面拽上去,用户可能正在看下面的图墙
+function focusPrompt() {
+  promptEl.value?.focus({ preventScroll: true })
+}
+
 // 当前激活配置的名称(未配置时显示占位)
 const activeConfigName = computed(() => config.value.name || config.value.baseUrl || '未配置')
 
@@ -227,6 +281,27 @@ onBeforeUnmount(() => window.removeEventListener('scroll', onScroll))
 
 // —— 设置面板 ——
 const showSettings = ref(false)
+
+// —— 顶部导航(分段控件) ——
+// 四个条目代表四种视图状态,而不是四个动作:滑块停在哪儿就是当前打开了哪个面板。
+// 页面状态由 page 持有,接口设置是浮层另算,navView 只是这两者的投影,避免两份状态互相打架。
+// 必须放在 page / showSettings 声明之后:getter 里引用了它们
+const navItems = [
+  { value: 'home', label: '首页' },
+  { value: 'lib', label: '提示词库' },
+  { value: 'history', label: '历史' },
+  { value: 'settings', label: '接口设置' }
+]
+const navView = computed({
+  get: () => (showSettings.value ? 'settings' : page.value),
+  set: (v: string) => {
+    showSettings.value = v === 'settings'
+    // 接口设置是浮层,开在原来那页之上,关掉要回到原页,所以这时不动 page
+    if (v === 'home' || v === 'lib' || v === 'history') page.value = v
+  }
+})
+// 切视图后回到顶部:否则在首页滚到一半再切过去,新页面会停在半空
+watch(navView, () => window.scrollTo({ top: 0 }))
 // 全部已保存的接口配置
 const configs = ref<ApiConfig[]>([])
 // 当前正在编辑的配置(表单直接绑定)
@@ -250,7 +325,11 @@ onMounted(() => {
     configs.value[0]
   if (active) config.value = { ...active }
   libItems.value = loadPrompts()
-  loadHistory().then((h) => (history.value = h))
+  loadHistory().then((h) => {
+    history.value = h
+    // 老记录没有列表缩略图,后台慢慢补;不 await,免得拖慢首屏
+    backfillThumbs(h)
+  })
 })
 
 // 选厂商:已知厂商顺带填入它的默认地址与模型;自定义只记身份,不动用户已填的内容
@@ -348,23 +427,47 @@ function applySize(s?: string) {
   if (list === 'free' || list.includes(s)) size.value = s
 }
 
+// 保存提示词库。配额不足时 savePrompts 会退化成不带缩略图的版本,
+// 这时必须说一声 —— 否则封面会莫名消失,而用户以为存好了
+function persistLib() {
+  if (!savePrompts(libItems.value)) {
+    notice.value = '本地存储空间不足，提示词已存下，但封面缩略图未能保存'
+  }
+}
 function useLibItem(item: PromptItem) {
   prompt.value = item.prompt
   applySize(item.size)
-  showLib.value = false
-  window.scrollTo({ top: 0, behavior: 'smooth' })
+  // 画质/背景同样过一遍能力表:库里存的可能是别家厂商支持的档位
+  if (item.quality && provider.value.quality !== 'no') quality.value = item.quality
+  if (item.background && provider.value.background !== 'no') background.value = item.background
+  // 关掉库页就等于切回首页;回顶部由 navView 的 watch 统一负责,这里不必再来一次
+  page.value = 'home'
 }
 function removeLibItem(id: string) {
   libItems.value = libItems.value.filter((i) => i.id !== id)
-  savePrompts(libItems.value)
+  persistLib()
 }
 function addLibItem(item: PromptItem) {
   libItems.value = [item, ...libItems.value]
-  savePrompts(libItems.value)
+  persistLib()
 }
 function importLibItems(items: PromptItem[]) {
-  libItems.value = [...items, ...libItems.value]
-  savePrompts(libItems.value)
+  // 内容是外部文件,逐条规整:缺 prompt 的记录会让列表渲染崩掉,
+  // 超大的 thumb 会顶爆 localStorage 配额,两者都必须在入口拦掉
+  const clean: PromptItem[] = items
+    .filter((i) => i && typeof i.prompt === 'string' && i.prompt.trim())
+    .map((i) => ({
+      id: i.id || uid(),
+      prompt: i.prompt,
+      category: i.category || '未分类',
+      size: i.size,
+      quality: i.quality,
+      background: i.background,
+      thumb: typeof i.thumb === 'string' && i.thumb.startsWith('data:image/') ? i.thumb : undefined,
+      createdAt: typeof i.createdAt === 'number' ? i.createdAt : Date.now()
+    }))
+  libItems.value = [...clean, ...libItems.value]
+  persistLib()
 }
 
 // —— 图生图:读取本地图片为 data URL(压缩到最长边 1024,避免请求体过大 413) ——
@@ -410,6 +513,15 @@ function clearRef() {
 // —— 生图 ——
 // 当前这一批的请求句柄,用于中途终止
 const controller = ref<AbortController | null>(null)
+
+/* 中文输入法里用回车「上屏」也会触发 keydown.enter(keyCode 229,isComposing 为真)。
+   这里必须提前返回、且不能 preventDefault —— 一 prevent 就把输入法确认候选词的
+   动作吃掉了,而且会把还没上屏的拼音当成提示词发出去。 */
+function onEnter(e: KeyboardEvent) {
+  if (e.isComposing || e.keyCode === 229) return
+  e.preventDefault()
+  doGenerate()
+}
 
 async function doGenerate() {
   if (loading.value) return
@@ -461,6 +573,9 @@ async function doGenerate() {
       createdAt: Date.now(),
       results: res
     }
+    // 缩略图要在入列表和落盘之前补上:入列表后拿到的是响应式代理,
+    // 在代理上改动不会回写到这里的原始对象,而 idb 又只接受原始对象
+    record.thumb = await makeThumb(res[0])
     history.value = [record, ...history.value]
     const pruned = await addHistoryRecord(record)
     if (pruned) {
@@ -515,23 +630,40 @@ function usePreviewPrompt(p: ReuseParams) {
   // 已知不支持的厂商直接跳过,免得把界面上根本不存在的档位偷偷塞进去
   if (p.quality && provider.value.quality !== 'no') quality.value = p.quality
   if (p.background && provider.value.background !== 'no') background.value = p.background
+  // 从历史页取用要先回到首页,否则参数填进去了却看不见输入框
+  page.value = 'home'
+  // 已经在首页时上面这次赋值不会触发滚动(navView 没变),所以这里补一次
   window.scrollTo({ top: 0, behavior: 'smooth' })
 }
 
-// 预览菜单:收藏当前预览的提示词到库
-function favoriteFromPreview(t: string) {
-  if (!t.trim()) return
+/**
+ * 生成封面缩略图。compressImage 在最长边已经小于目标时会把输入原样返回,
+ * 那种情况可能是个 blob: URL(刷新即失效),所以只收 data: 开头的;
+ * 同时限长,避免把原始大图当成封面塞进 localStorage
+ */
+async function thumbOf(src: string): Promise<string | undefined> {
+  if (!src) return undefined
+  const out = await compressImage(src, 160)
+  return /^data:image\//.test(out) && out.length < 60000 ? out : undefined
+}
+
+// 预览菜单:收藏当前预览的提示词到库(连带参数与一张封面缩略图)
+async function favoriteFromPreview(p: FavoritePayload) {
+  if (!p.prompt.trim()) return
   const item: PromptItem = {
-    id: Date.now() + Math.random().toString(16).slice(2),
-    title: t,
-    prompt: t,
+    id: uid(),
+    prompt: p.prompt,
     category: '未分类',
+    size: p.size,
+    quality: p.quality,
+    background: p.background,
+    thumb: await thumbOf(p.src),
     createdAt: Date.now()
   }
   libItems.value = [item, ...libItems.value]
-  savePrompts(libItems.value)
+  persistLib()
   closePreview()
-  showLib.value = true
+  page.value = 'lib'
 }
 
 // 预览菜单:把当前图用作参考图。接口只认 data URL,Blob 要现转一趟
@@ -554,7 +686,7 @@ async function removeHistoryItem() {
   await removeHistoryRecord(cur.id)
   closePreview()
 }
-// 历史抽屉:直接删除某条记录
+// 历史页:不进预览,直接删掉某条记录
 async function removeHistoryEntry(entry: HistoryEntry) {
   history.value = history.value.filter((h) => h.id !== entry.id)
   await removeHistoryRecord(entry.id)
@@ -564,7 +696,7 @@ async function removeHistoryEntry(entry: HistoryEntry) {
 
 <template>
   <div class="shell">
-    <!-- 品牌 + 全局操作 -->
+    <!-- 品牌 + 视图切换 + 全局操作 -->
     <header class="masthead" :class="{ scrolled }">
       <div class="wordmark">
         <span class="title">
@@ -572,59 +704,64 @@ async function removeHistoryEntry(entry: HistoryEntry) {
           <span class="title-script">Gallery</span>
         </span>
       </div>
-      <nav class="mast-actions">
-        <button class="icob tip-below" @click="showLib = true" data-tip="提示词库" aria-label="提示词库">
+
+      <!-- 居中的视图切换:滑块位置即当前打开的面板 -->
+      <RubberSegment
+        v-model="navView"
+        class="nav-seg"
+        :items="navItems"
+        :radius="999"
+        aria-label="主导航"
+      >
+        <template #home>
+          <svg class="seg-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 10.5 12 4l8 6.5V20a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1z" />
+            <path d="M9.5 21v-6h5v6" />
+          </svg>
+        </template>
+        <template #lib>
           <!-- 摊开的书:表达"收藏成册的提示词库" -->
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <svg class="seg-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M12 7v14" />
             <path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z" />
           </svg>
-        </button>
-        <button
-          class="icob tip-below"
-          :class="{ active: showHistory }"
-          @click="showHistory = true"
-          data-tip="历史"
-          aria-label="历史"
-        >
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        </template>
+        <template #history>
+          <svg class="seg-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <circle cx="12" cy="12" r="9" />
             <path d="M12 7.4V12l2.8 1.9" />
           </svg>
-          <span v-if="history.length" class="icob-badge">{{ history.length }}</span>
-        </button>
-        <button
-          class="icob tip-below"
-          :class="{ active: showSettings, 'icon-btn-warn': !configured() }"
-          @click="showSettings = !showSettings"
-          :data-tip="configured() ? (showSettings ? '关闭设置' : '接口设置') : '未配置接口,点击设置'"
-          :aria-label="configured() ? (showSettings ? '关闭设置' : '接口设置') : '未配置接口,点击设置'"
-        >
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        </template>
+        <template #settings>
+          <svg class="seg-ico" :class="{ 'is-warn': !configured() }" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <circle cx="12" cy="12" r="3.4" />
             <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.03 1.56V21a2 2 0 1 1-4 0v-.09A1.7 1.7 0 0 0 8.96 19.4a1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-1.56-1.03H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.6 8.96 1.7 1.7 0 0 0 4.26 7.09l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 8.96 4.6 1.7 1.7 0 0 0 9.99 3.04V3a2 2 0 1 1 4 0v.09A1.7 1.7 0 0 0 15 4.6 1.7 1.7 0 0 0 16.91 4.26l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 19.4 8.96 1.7 1.7 0 0 0 20.96 9.99H21a2 2 0 1 1 0 4h-.09A1.7 1.7 0 0 0 19.4 15Z" />
           </svg>
-        </button>
+        </template>
+      </RubberSegment>
+
+      <nav class="mast-actions">
         <button
           class="icob tip-below"
           @click="toggleTheme"
           :data-tip="theme === 'dark' ? '切换浅色' : '切换深色'"
           :aria-label="theme === 'dark' ? '切换浅色' : '切换深色'"
         >
-          <svg v-if="theme === 'dark'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <svg v-if="theme === 'dark'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <circle cx="12" cy="12" r="4" />
             <path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" />
           </svg>
-          <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z" />
           </svg>
         </button>
       </nav>
     </header>
 
+    <!-- 视图切换:首页工作台与提示词库是两个平级页面,同时只挂载一个 -->
     <main class="frame">
       <!-- 生图工作台 -->
-      <section class="workbench" aria-label="生图工作台">
+      <section v-if="page === 'home'" class="workbench" aria-label="生图工作台">
         <header class="hero">
           <h1 class="hero-title">Turn your ideas<br />into beautiful images</h1>
           <p class="hero-sub">Create, explore, and organize AI-generated images with ease.</p>
@@ -636,10 +773,11 @@ async function removeHistoryEntry(entry: HistoryEntry) {
             <div class="compose-zone">
               <textarea
                 id="prompt-input"
+                ref="promptEl"
                 v-model="prompt"
                 rows="1"
                 placeholder="描述你想要的画面：一只在樱花树下打盹的橘猫，清晨柔光，电影感，浅景深…"
-                @keydown.enter.exact.prevent="doGenerate"
+                @keydown.enter.exact="onEnter"
               />
 
             </div>
@@ -653,7 +791,7 @@ async function removeHistoryEntry(entry: HistoryEntry) {
                 aria-label="配置"
                 @click="togglePanel('config')"
               >
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M4 7h8M17 7h3M4 17h3M12 17h8" />
                   <circle cx="14.5" cy="7" r="2.3" />
                   <circle cx="9.5" cy="17" r="2.3" />
@@ -667,7 +805,7 @@ async function removeHistoryEntry(entry: HistoryEntry) {
                 aria-label="尺寸"
                 @click="togglePanel('size')"
               >
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                   <!-- 外框 + 对角缩放箭头:表达"尺寸/比例" -->
                   <rect x="3.5" y="3.5" width="17" height="17" rx="3" />
                   <path d="M9.5 14.5 14.5 9.5M9.5 11.6v2.9h2.9M14.5 12.4V9.5h-2.9" />
@@ -681,7 +819,7 @@ async function removeHistoryEntry(entry: HistoryEntry) {
                 aria-label="张数"
                 @click="togglePanel('n')"
               >
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                   <rect x="3.5" y="3.5" width="7" height="7" rx="1.6" />
                   <rect x="13.5" y="3.5" width="7" height="7" rx="1.6" />
                   <rect x="3.5" y="13.5" width="7" height="7" rx="1.6" />
@@ -715,7 +853,7 @@ async function removeHistoryEntry(entry: HistoryEntry) {
                 @click="togglePanel('bg')"
               >
                 <!-- 方框 + 棋盘点:透明底的通用符号 -->
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                   <rect x="3.5" y="3.5" width="17" height="17" rx="2.5" />
                   <path d="M8 8h.01M16 8h.01M12 12h.01M8 16h.01M16 16h.01" stroke-width="2.6" />
                 </svg>
@@ -729,7 +867,7 @@ async function removeHistoryEntry(entry: HistoryEntry) {
                 aria-label="参考图"
                 @click="togglePanel('ref')"
               >
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                   <rect x="3" y="4" width="18" height="16" rx="2.5" />
                   <circle cx="8.5" cy="9.5" r="1.8" />
                   <path d="M4 17.5l4.5-4.5L12 16.5l3-3 5 5" />
@@ -935,9 +1073,19 @@ async function removeHistoryEntry(entry: HistoryEntry) {
         <!-- 历史图墙:输入框下方展示最近生成的图,可收起 -->
         <div v-if="loading || feedItems.length" class="feed-zone" aria-live="polite">
           <div class="section-head">
-            <span class="sec-title">{{ loading ? 'Generating…' : 'Recent creations' }}</span>
+            <span v-if="!loading" class="sec-title">Recent creations</span>
+            <!-- 生成中换成格子波 + 秒表:尺寸与字重都对齐 sec-title,
+                 生成结束时从加载态切回标题不会跳一下 -->
+            <LatticeLoader
+              v-else
+              class="sec-title"
+              label="Generating"
+              :font-size="20"
+              :cell-size="6"
+              :gap="2"
+            />
             <div class="sec-tools">
-              <button v-if="history.length" class="sec-more" @click="showHistory = true">
+              <button v-if="history.length" class="sec-more" @click="page = 'history'">
                 View all
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M9 6l6 6-6 6" />
@@ -990,6 +1138,25 @@ async function removeHistoryEntry(entry: HistoryEntry) {
           </div>
         </div>
       </section>
+
+      <!-- 提示词库 -->
+      <PromptLibrary
+        v-else-if="page === 'lib'"
+        :items="libItems"
+        @use="useLibItem"
+        @remove="removeLibItem"
+        @add="addLibItem"
+        @import="importLibItems"
+      />
+
+      <!-- 历史记录 -->
+      <HistoryPage
+        v-else
+        :items="history"
+        @open="openPreview"
+        @use="usePreviewPrompt"
+        @remove="removeHistoryEntry"
+      />
     </main>
 
     <!-- 接口设置抽屉 -->
@@ -1110,27 +1277,6 @@ async function removeHistoryEntry(entry: HistoryEntry) {
       </Transition>
     </Teleport>
 
-    <!-- 提示词库抽屉 -->
-    <PromptLibrary
-      :items="libItems"
-      :visible="showLib"
-      @close="showLib = false"
-      @use="useLibItem"
-      @remove="removeLibItem"
-      @add="addLibItem"
-      @import="importLibItems"
-    />
-
-    <!-- 历史记录抽屉 -->
-    <HistoryDrawer
-      :items="history"
-      :visible="showHistory"
-      @close="showHistory = false"
-      @open="openPreview"
-      @use="usePreviewPrompt"
-      @remove="removeHistoryEntry"
-    />
-
     <!-- 历史图片预览 -->
     <ImagePreview
       :visible="!!previewEntry"
@@ -1154,12 +1300,20 @@ async function removeHistoryEntry(entry: HistoryEntry) {
 }
 
 .masthead {
-  display: flex;
+  /* 三段式:品牌靠左、视图切换居中、主题按钮紧贴滑块右侧。
+     两侧都是 1fr、中间 auto,中列才会真正居中于容器;
+     主题按钮靠第 3 列的起始边,所以不会把滑块推离中心。
+     列间距取 8px:只有"滑块 ↔ 主题按钮"这一处会真实呈现间距,
+     与参数栏图标簇的 8px 对齐 */
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
   align-items: center;
-  justify-content: space-between;
+  gap: var(--sp-2);
   padding: var(--sp-4) 0;
   position: sticky;
   top: 0;
+  /* 高于全部页面内容;抽屉与图片预览的浮层刻意压在其上 ——
+     否则蒙层盖不住导航,打开抽屉时导航会浮在蒙层之上,看着像坏了 */
   z-index: 10;
 }
 /* 页面顶部时完全透明,融入背景图;滚动后浮出一层通栏毛玻璃,
@@ -1213,57 +1367,47 @@ async function removeHistoryEntry(entry: HistoryEntry) {
   display: flex;
   align-items: center;
   gap: 8px;
+  /* 靠第 3 列的起始边,于是紧挨着中间的滑块;
+     若改成 end 会退回右端,中间的滑块也就不再居中 */
+  justify-self: start;
+}
+/* 居中的视图切换。justify-self 兜住 grid 的默认 stretch,避免被拉伸 */
+.nav-seg {
+  justify-self: center;
+}
+.nav-seg .seg-ico {
+  width: 17px;
+  height: 17px;
+}
+/* 未配置接口时齿轮标红。选中态那层由滑块的反色副本接管,所以排除 .rs-copy */
+.nav-seg :deep(.rs-item:not(.rs-copy)[aria-checked='false'] .is-warn) {
+  color: var(--danger);
 }
 .icob {
   position: relative;
-  width: 36px;
-  height: 36px;
+  /* 规格与参数栏的 .param-btn 对齐:34px 圆胶囊 + 常驻底色和描边。
+     导航原本是 36px 的无边界裸图标,是页面上唯一一处例外。
+     底色和描边压成半透明:导航浮在背景图上,不透明的胶囊在这里
+     比坐在纯色页面里的参数栏重得多 */
+  width: 34px;
+  height: 34px;
   display: flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid transparent;
+  border: 1px solid color-mix(in srgb, var(--line) 80%, transparent);
   border-radius: 999px;
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
   color: var(--text-2);
   transition: color var(--dur) var(--ease), background var(--dur) var(--ease), border-color var(--dur) var(--ease);
 }
 .icob:hover {
   color: var(--text);
   background: var(--bg-elev);
-  border-color: var(--line);
-}
-.icob.active {
-  color: var(--accent);
-  background: var(--accent-soft);
-  border-color: color-mix(in oklch, var(--accent) 30%, transparent);
+  border-color: var(--line-strong);
 }
 .icob svg {
-  width: 18px;
-  height: 18px;
-}
-.icob-badge {
-  position: absolute;
-  top: -5px;
-  right: -5px;
-  min-width: 17px;
+  width: 17px;
   height: 17px;
-  padding: 0 4px;
-  font-size: 10px;
-  font-variant-numeric: tabular-nums;
-  line-height: 17px;
-  text-align: center;
-  border-radius: 999px;
-  background: var(--accent);
-  color: var(--accent-contrast);
-}
-.icon-btn-warn {
-  color: var(--danger);
-  border-color: color-mix(in oklch, var(--danger) 35%, transparent);
-  background: color-mix(in oklch, var(--danger) 8%, transparent);
-}
-.icon-btn-warn:hover {
-  color: var(--danger);
-  background: color-mix(in oklch, var(--danger) 14%, transparent);
-  border-color: color-mix(in oklch, var(--danger) 50%, transparent);
 }
 
 .frame {
@@ -1604,10 +1748,15 @@ async function removeHistoryEntry(entry: HistoryEntry) {
   flex-direction: column;
 }
 .prompt-box textarea {
-  resize: vertical;
+  /* 高度由 fitPrompt() 按内容算(6 行封顶后转内部滚动),
+     所以既不要拖拽角,也不能让浏览器自己先冒出滚动条 */
+  resize: none;
+  overflow-y: hidden;
   line-height: 1.6;
   font-size: 16px;
-  min-height: 40px; /* 默认一行(16px × 1.6 + 上下内边距),可拖拽加高 */
+  /* 一行(16px × 1.6 + 上下内边距 = 39.6)的兜底高度,JS 接管前先撑住;
+     同时是 JS 算高度时的下限 */
+  min-height: 40px;
   padding: 6px 2px 8px;
   border: none;
   border-radius: 0;
@@ -1645,8 +1794,8 @@ async function removeHistoryEntry(entry: HistoryEntry) {
     background var(--dur) var(--ease);
 }
 .param-btn svg {
-  width: 16px;
-  height: 16px;
+  width: 17px;
+  height: 17px;
   flex-shrink: 0;
 }
 .param-btn:hover {
@@ -1952,8 +2101,8 @@ async function removeHistoryEntry(entry: HistoryEntry) {
 }
 .clear-icon svg,
 .gen-icon svg {
-  width: 15px;
-  height: 15px;
+  width: 16px;
+  height: 16px;
 }
 .clear-icon {
   color: var(--text-3);
@@ -2097,6 +2246,11 @@ async function removeHistoryEntry(entry: HistoryEntry) {
   font-weight: 600;
   letter-spacing: -0.01em;
   color: var(--text);
+}
+/* 加载态复用 sec-title 的字族与配色,只有动词的字重是组件内写死的 500,
+   这里抬到 600,免得标题槽位在两种状态间来回变粗细 */
+.sec-title :deep(.lattice-loader__label) {
+  font-weight: 600;
 }
 .sec-tools {
   display: flex;

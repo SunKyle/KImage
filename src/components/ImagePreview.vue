@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { BACKGROUND_OPTIONS, QUALITY_OPTIONS, imageSrc, optionLabel, reuseParamsOf } from '../api'
-import type { HistoryEntry, ResultItem, ReuseParams } from '../types'
+import type { HistoryEntry, ResultItem, ReuseParams, FavoritePayload } from '../types'
 
 const props = defineProps<{
   visible: boolean
@@ -13,7 +13,7 @@ const emit = defineEmits<{
   (e: 'close'): void
   (e: 'navigate', entry: HistoryEntry): void
   (e: 'usePrompt', params: ReuseParams): void
-  (e: 'favorite', prompt: string): void
+  (e: 'favorite', payload: FavoritePayload): void
   (e: 'reference', item: ResultItem): void
   (e: 'remove'): void
 }>()
@@ -146,7 +146,15 @@ onUnmounted(() => {
 function menuAction(kind: 'favorite' | 'reference' | 'remove') {
   if (!props.entry) return
   if (kind === 'favorite') {
-    emit('favorite', props.entry.prompt)
+    // 连参数和当前这张图一起交出去,库里才能既复现参数、又留下封面
+    const item = props.entry.results[active.value]
+    emit('favorite', {
+      prompt: props.entry.prompt,
+      size: props.entry.size,
+      quality: props.entry.quality,
+      background: props.entry.background,
+      src: item ? imageSrc(item) : ''
+    })
   } else if (kind === 'reference') {
     // 交出原始载荷而不是渲染用的 src:主界面要转成 data URL 才能当参考图
     const item = props.entry.results[active.value]
@@ -473,9 +481,10 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
   gap: var(--sp-4);
   padding: var(--sp-4);
   min-height: 0;
+  background: var(--stage-bg);
 }
 /* 图盒按出图比例收缩:高度吃满可用空间,宽度由 aspect-ratio 推出。
-   去掉灰底后,盒子有多余空间也看不见;max-width 兜住超宽图 */
+   max-width 兜住超宽图 */
 .img-wrap {
   position: relative;
   height: 100%;

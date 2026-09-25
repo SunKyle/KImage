@@ -13,6 +13,7 @@
   --surface: #FFFFFF;             /* surface: 卡片/面板 */
   --surface-hover: #EFEFEA;       /* surface-hover */
   --image-bg: #F0EFEC;            /* 图片画布底,内嵌感 */
+  --stage-bg: #F2F2F2;            /* 预览左侧图片区底:衬出图片与 contain 留边 */
   --line: #E8E6E1;                /* 分隔线 */
   --line-strong: rgba(0, 0, 0, 0.16);
   --text: #111111;                /* text-primary */
@@ -73,6 +74,8 @@
   --surface: #171719;
   --surface-hover: #232326;
   --image-bg: #0B0B0D;
+  /* 深色下图片区往「内凹」走,比页面底(--bg)再暗一档 */
+  --stage-bg: #0B0B0D;
   --line: rgba(255, 255, 255, 0.08);
   --line-strong: rgba(255, 255, 255, 0.16);
   --text: #F5F5F5;
