@@ -64,6 +64,29 @@ function applyProvider(p: Provider) {
   if (p.model) draft.value.model = p.model
 }
 
+// 表单校验:接口地址填错就完全发不出请求,所以提交前拦一下并说清原因
+const urlError = ref('')
+function submit() {
+  const url = draft.value.baseUrl.trim()
+  if (!url) {
+    urlError.value = 'Enter a Base URL'
+    return
+  }
+  let ok = false
+  try {
+    const u = new URL(url)
+    ok = (u.protocol === 'http:' || u.protocol === 'https:') && !!u.hostname
+  } catch {
+    ok = false
+  }
+  if (!ok) {
+    urlError.value = 'Must start with http:// or https://'
+    return
+  }
+  urlError.value = ''
+  emit('save', { ...draft.value, baseUrl: url })
+}
+
 // 配置行上的厂商名:老配置没写 vendor 就按域名猜,和主页面用的是同一套推断
 function vendorLabel(c: ApiConfig) {
   return getProvider(c.vendor || inferVendor(c.baseUrl)).label
@@ -90,7 +113,7 @@ function endpointLine(url: string) {
 // 选厂商时先讲清它能吃什么:界面上的参数门控就是照着这份声明来的
 // 能力说明由父级传入(按当前生效接口算),不在本地按草稿算
 const section = computed(() =>
-  props.mode === 'form' ? (draft.value.id ? '编辑接口' : '新增接口') : '已保存的接口'
+  props.mode === 'form' ? (draft.value.id ? 'Edit config' : 'New config') : 'Saved configs'
 )
 
 /* 导出把配置原样写成 JSON —— 包括 API Key。
@@ -103,7 +126,8 @@ function exportJson() {
   a.href = URL.createObjectURL(blob)
   a.download = `kimage-configs-${Date.now()}.json`
   a.click()
-  URL.revokeObjectURL(a.href)
+  // 立刻 revoke 在 WebKit 下偶尔会把下载掐断,等浏览器把文件接走再撤
+  setTimeout(() => URL.revokeObjectURL(a.href), 1500)
 }
 
 // 只负责读文件:内容是不是配置由主界面规整(它才知道现有 id 有哪些)
@@ -126,22 +150,22 @@ function onImportFile(e: Event) {
 </script>
 
 <template>
-  <section class="pg" aria-label="接口设置">
+  <section class="pg" aria-label="API settings">
     <header class="pg-head">
       <div>
-        <h1 class="pg-title">接口设置</h1>
-        <p class="pg-sub">支持任意 OpenAI 兼容的生图接口，配置只保存在本地。</p>
+        <h1 class="pg-title">API settings</h1>
+        <p class="pg-sub">Works with any OpenAI-compatible image API. Configs are stored locally.</p>
       </div>
       <div v-if="mode === 'list'" class="pg-ops">
         <button class="pg-new" @click="emit('create')">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
             <path d="M12 5v14M5 12h14" />
           </svg>
-          新增接口
+          New config
         </button>
         <!-- 导入导出低频,收进菜单,不给标题行添按钮 -->
         <span ref="menuEl" class="menu-wrap">
-          <button class="icon-ghost" :aria-expanded="menuOpen" aria-label="更多" @click="menuOpen = !menuOpen">
+          <button class="icon-ghost" :aria-expanded="menuOpen" aria-label="More" @click="menuOpen = !menuOpen">
             <svg viewBox="0 0 24 24" fill="currentColor">
               <circle cx="12" cy="5.5" r="1.6" />
               <circle cx="12" cy="12" r="1.6" />
@@ -151,9 +175,9 @@ function onImportFile(e: Event) {
           <Transition name="po">
             <div v-if="menuOpen" class="menu">
               <!-- 导出不脱敏,菜单上就写明:这是给备份/迁移用的 -->
-              <button class="mitem" @click="exportJson">导出为 JSON（含 Key）</button>
+              <button class="mitem" @click="exportJson">Export JSON (includes key)</button>
               <label class="mitem file">
-                导入配置
+                Import configs
                 <input type="file" accept=".json" hidden @change="onImportFile" />
               </label>
             </div>
@@ -171,7 +195,7 @@ function onImportFile(e: Event) {
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M15 6l-6 6 6 6" />
         </svg>
-        返回列表
+        Back to list
       </button>
     </div>
 
@@ -185,26 +209,26 @@ function onImportFile(e: Event) {
                  靠绝对定位落在右上角,顺带省掉了一整行高度 -->
             <button class="cfg-main" @click="emit('activate', c)">
               <span class="cfg-head">
-                <span class="cfg-name">{{ c.name || '未命名配置' }}</span>
-                <span v-if="c.id === activeId" class="cfg-active">当前</span>
+                <span class="cfg-name">{{ c.name || 'Untitled config' }}</span>
+                <span v-if="c.id === activeId" class="cfg-active">Current</span>
               </span>
               <span class="cfg-ident">{{ identLine(c) }}</span>
               <span class="cfg-url" :title="c.baseUrl">{{ endpointLine(c.baseUrl) }}</span>
             </button>
             <div class="cfg-ops">
-              <button class="cfg-op" :aria-label="`修改：${c.name || '未命名配置'}`" @click="emit('edit', c)">
+              <button class="cfg-op" :aria-label="`Edit: ${c.name || 'Untitled config'}`" @click="emit('edit', c)">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M12 20h9" />
                   <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
                 </svg>
               </button>
-              <button class="cfg-op" :aria-label="`复制：${c.name || '未命名配置'}`" @click="emit('duplicate', c)">
+              <button class="cfg-op" :aria-label="`Duplicate: ${c.name || 'Untitled config'}`" @click="emit('duplicate', c)">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
                   <rect x="9" y="9" width="11" height="11" rx="2" />
                   <path d="M5 15V6a1 1 0 0 1 1-1h9" />
                 </svg>
               </button>
-              <button class="cfg-op danger" :aria-label="`删除：${c.name || '未命名配置'}`" @click="emit('remove', c)">
+              <button class="cfg-op danger" :aria-label="`Delete: ${c.name || 'Untitled config'}`" @click="emit('remove', c)">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2M6 7l1 12a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-12" />
                 </svg>
@@ -220,16 +244,16 @@ function onImportFile(e: Event) {
               <path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z" />
             </svg>
           </div>
-          <h2 class="none-title">还没有接口</h2>
-          <p class="none-sub">支持任意 OpenAI 兼容的生图接口，配置只存在本地、不会上传。</p>
-          <button class="none-action" @click="emit('create')">新增第一个接口</button>
+          <h2 class="none-title">No configs yet</h2>
+          <p class="none-sub">Works with any OpenAI-compatible image API. Configs stay local and are never uploaded.</p>
+          <button class="none-action" @click="emit('create')">New config</button>
         </div>
       </template>
 
       <!-- ===== 视图二:新增/编辑接口表单 ===== -->
-      <form v-else class="cfg-form" @submit.prevent="emit('save', draft)">
-        <div class="presets" role="group" aria-label="选择厂商">
-          <span class="pg-label">厂商</span>
+      <form v-else class="cfg-form" @submit.prevent="submit">
+        <div class="presets" role="group" aria-label="Select provider">
+          <span class="pg-label">Provider</span>
           <button
             v-for="p in PROVIDERS"
             :key="p.id"
@@ -244,24 +268,35 @@ function onImportFile(e: Event) {
         <p class="vendor-note">{{ capabilityNote }}</p>
 
         <label class="field">
-          <span class="flabel">配置名称</span>
-          <input v-model="draft.name" placeholder="如：豆包主力 / 通义备用" spellcheck="false" />
+          <span class="flabel">Name</span>
+          <input v-model="draft.name" placeholder="e.g. Doubao primary / Tongyi backup" spellcheck="false" />
         </label>
-        <label class="field">
-          <span class="flabel">接口地址 Base URL</span>
-          <input v-model="draft.baseUrl" placeholder="https://example.com/api/v3" spellcheck="false" />
+        <label class="field" :class="{ 'has-err': urlError }">
+          <span class="flabel">Base URL</span>
+          <input
+            v-model="draft.baseUrl"
+            placeholder="https://example.com/api/v3"
+            spellcheck="false"
+            @input="urlError = ''"
+          />
+          <span v-if="urlError" class="field-err">{{ urlError }}</span>
         </label>
         <label class="field">
           <span class="flabel">API Key</span>
-          <input v-model="draft.apiKey" type="password" placeholder="sk-…  (本地服务可留空)" />
+          <input
+            v-model="draft.apiKey"
+            type="password"
+            autocomplete="off"
+            placeholder="sk-…  (optional for local services)"
+          />
         </label>
         <label class="field">
-          <span class="flabel">模型名称</span>
+          <span class="flabel">Model name</span>
           <input v-model="draft.model" placeholder="doubao-seedream-3-0-t2i" spellcheck="false" />
         </label>
 
         <div class="form-foot">
-          <button class="save-btn" type="submit">保存配置</button>
+          <button class="save-btn" type="submit">Save</button>
         </div>
       </form>
     </div>
@@ -289,6 +324,7 @@ function onImportFile(e: Event) {
   font-size: 13px;
   color: var(--text-2);
 }
+/* 与提示词库的「New prompt」同款:黑药丸,标题行主操作 */
 .pg-new {
   display: inline-flex;
   align-items: center;
@@ -296,22 +332,19 @@ function onImportFile(e: Event) {
   height: 34px;
   padding: 0 14px;
   border-radius: 999px;
-  border: 1px solid var(--line);
-  background: var(--surface);
-  color: var(--text);
+  background: var(--cta);
+  color: var(--cta-text);
   font-size: 13px;
+  font-weight: 500;
   cursor: pointer;
-  transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease),
-    color var(--dur) var(--ease);
+  transition: background var(--dur) var(--ease);
 }
 .pg-new svg {
   width: 16px;
   height: 16px;
 }
 .pg-new:hover {
-  border-color: color-mix(in oklch, var(--accent) 45%, var(--line));
-  background: var(--accent-soft);
-  color: var(--accent-strong);
+  background: var(--cta-hover);
 }
 .pg-ops {
   display: flex;
@@ -621,6 +654,15 @@ function onImportFile(e: Event) {
 .field input:focus {
   border-color: var(--accent);
   box-shadow: 0 6px 22px -8px color-mix(in oklch, var(--accent) 40%, transparent);
+}
+.field.has-err input {
+  border-color: var(--danger);
+}
+.field-err {
+  display: block;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--danger);
 }
 .form-foot {
   margin-top: var(--sp-6);

@@ -18,7 +18,7 @@
   --line-strong: rgba(0, 0, 0, 0.16);
   --text: #111111;                /* text-primary */
   --text-2: #6B6B6B;              /* text-secondary */
-  --text-3: #999999;              /* text-tertiary */
+  --text-3: #727272;              /* text-tertiary(浅色面上 ≥4.6:1,小字也能用) */
   --text-4: #C5C5C5;              /* text-disabled */
   --accent: #8B7CFF;              /* Brand Accent: AI状态/Highlight/Focus/Gradient */
   --accent-strong: #7666FA;
@@ -80,7 +80,7 @@
   --line-strong: rgba(255, 255, 255, 0.16);
   --text: #F5F5F5;
   --text-2: #A1A1A1;
-  --text-3: #666666;
+  --text-3: #8A8A8A;              /* text-tertiary(暗色面上 ≥4.6:1) */
   --text-4: #45454A;
   --accent: #A89CFF;
   --accent-strong: #B8ACFF;

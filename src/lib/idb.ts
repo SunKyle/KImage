@@ -19,6 +19,8 @@ const HARD_LIMIT = 500
 export interface PruneResult {
   /** 清掉了几条 */
   removed: number
+  /** 被清掉的记录 id:界面据此把内存里的条目一并摘掉,并释放其图片地址 */
+  removedIds: string[]
   /** 清理前的占用比例,用于向用户解释为什么会清 */
   usageRatio: number
 }
@@ -95,6 +97,7 @@ export async function pruneHistory(): Promise<PruneResult | null> {
   const count = Math.min(Math.max(0, keys.length - MIN_KEEP), want)
   if (count <= 0) return null
 
+  const removedIds = keys.slice(0, count).map((k) => String(k))
   await new Promise<void>((resolve, reject) => {
     const tx = db.transaction(STORE, 'readwrite')
     const store = tx.objectStore(STORE)
@@ -104,7 +107,7 @@ export async function pruneHistory(): Promise<PruneResult | null> {
     tx.onerror = () => reject(tx.error)
   })
 
-  return { removed: count, usageRatio }
+  return { removed: count, removedIds, usageRatio }
 }
 
 export async function putOne<T extends { id: string }>(item: T): Promise<void> {
@@ -131,7 +134,7 @@ export async function deleteOne(id: string): Promise<void> {
 
 export async function urlToBlob(url: string): Promise<Blob> {
   const resp = await fetch(url, { mode: 'cors' })
-  if (!resp.ok) throw new Error(`抓取远端图片失败 ${resp.status}`)
+  if (!resp.ok) throw new Error(`Couldn't fetch the image (${resp.status})`)
   return await resp.blob()
 }
 

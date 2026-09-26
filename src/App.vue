@@ -26,6 +26,7 @@ import {
   imageSrc,
   makeThumb,
   backfillThumbs,
+  releaseEntryMedia,
   QUALITY_OPTIONS,
   BACKGROUND_OPTIONS
 } from './api'
@@ -138,11 +139,13 @@ function focusPrompt() {
 }
 
 // 当前激活配置的名称(未配置时显示占位)
-const activeConfigName = computed(() => config.value.name || config.value.baseUrl || '未配置')
+const activeConfigName = computed(() => config.value.name || config.value.baseUrl || 'Not configured')
 
 // —— 历史图墙(输入框下方,可收起) ——
 const feedOpen = ref(true)
 const FEED_LIMIT = 12
+// 老记录没有 w/h,图片加载完再按真实像素补一下比例(与历史页同一个思路)。key 同 feedItems
+const measured = ref<Record<string, number>>({})
 // 把历史记录里的多张图摊平成图墙,最新的排在最前
 const feedItems = computed(() => {
   const out: Array<{
@@ -154,21 +157,36 @@ const feedItems = computed(() => {
   for (const entry of history.value) {
     for (let i = 0; i < entry.results.length; i++) {
       if (out.length >= FEED_LIMIT) return out
+      const key = `${entry.id}-${i}`
       out.push({
-        key: `${entry.id}-${i}`,
+        key,
         entry,
         item: entry.results[i],
-        ratio: tileRatio(entry.size)
+        ratio: feedRatio(entry, key)
       })
     }
   }
   return out
 })
-// 按记录尺寸算宽高比,让图墙保留原图比例、高低错落
+// 缩略块按图片真实比例排:量到的真实比例 → 入库记的 w/h → 解析所选尺寸 → 方形兜底
+function feedRatio(entry: HistoryEntry, key: string) {
+  const m = measured.value[key]
+  if (m) return m
+  if (entry.w && entry.h) return Math.min(2, Math.max(0.5, entry.w / entry.h))
+  return tileRatio(entry.size)
+}
+// 按记录尺寸算宽高比(生成中的骨架仍按所选尺寸,不用真实比例)
 function tileRatio(size: string) {
   const [w, h] = size.split('x').map(Number)
   if (!w || !h) return 1
   return Math.min(2, Math.max(0.5, w / h))
+}
+// 图墙里没有 w/h 的老记录:图加载完切到真实比例,避免按所选尺寸裁掉一截
+function onFeedLoad(key: string, entry: HistoryEntry, e: Event) {
+  if (measured.value[key] || (entry.w && entry.h)) return
+  const img = e.target as HTMLImageElement
+  if (!img.naturalWidth || !img.naturalHeight) return
+  measured.value[key] = Math.min(2, Math.max(0.5, img.naturalWidth / img.naturalHeight))
 }
 
 // 当前生效的厂商:配置里没写就按域名猜(兼容加字段之前存的老配置)
@@ -180,8 +198,8 @@ const provider = computed<Provider>(() => {
 // 界面上的参数门控本来就照生效配置来,说明文字要是跟着草稿走,两者就对不上了
 const capabilityNote = computed(() => {
   const p = provider.value
-  const t = (c: Cap) => (c === 'yes' ? '支持' : c === 'no' ? '不支持' : '依接口而定')
-  return `当前生效接口：画质 ${t(p.quality)} · 背景 ${t(p.background)} · 图生图走 ${
+  const t = (c: Cap) => (c === 'yes' ? 'Yes' : c === 'no' ? 'No' : 'Varies')
+  return `Active API: quality ${t(p.quality)} · background ${t(p.background)} · image-to-image via ${
     p.edit === 'edits' ? '/images/edits' : '/images/generations'
   }`
 })
@@ -198,18 +216,18 @@ const N_MAX = 10
 
 // 'auto' 是给上游的值,界面上叫"自动"
 function sizeLabel(s: string) {
-  return s === 'auto' ? '自动' : s
+  return s === 'auto' ? 'Auto' : s.replace(/x/g, '×')
 }
 
 // 参数面板底部说明:支持就明说,不确定就提醒可以改回「自动」兜底
 function capHint(c: Cap) {
-  if (c === 'yes') return `当前厂商(${provider.value.label})支持。`
-  if (c === 'no') return `当前厂商(${provider.value.label})不支持,已隐藏。`
-  return '自定义/中转接口是否支持不确定,若上游报错请改回「自动」。'
+  if (c === 'yes') return `Supported by ${provider.value.label}.`
+  if (c === 'no') return `Not supported by ${provider.value.label} — hidden.`
+  return 'Support depends on your API. Switch back to Auto if it errors.'
 }
 
 // 厂商不限尺寸时给的一组常用值
-const FREE_SIZES = ['512x512', '1024x1024', '1024x1792', '1792x1024', '2560x1440', 'auto']
+const FREE_SIZES = ['auto', '512x512', '1024x1024', '1024x1792', '1792x1024', '2560x1440']
 
 // 按厂商能力决定携带哪些扩展参数:已知不支持的一律不发
 function extraParams(): Record<string, string> {
@@ -277,10 +295,10 @@ onBeforeUnmount(() => window.removeEventListener('scroll', onScroll))
 // (RubberSegment 的 v-model 说的是普通字符串)。
 // 必须放在 page 声明之后:getter 引用了它
 const navItems = [
-  { value: 'home', label: '首页' },
-  { value: 'lib', label: '提示词库' },
-  { value: 'history', label: '历史' },
-  { value: 'settings', label: '接口设置' }
+  { value: 'home', label: 'Studio' },
+  { value: 'lib', label: 'Prompt Library' },
+  { value: 'history', label: 'History' },
+  { value: 'settings', label: 'Settings' }
 ]
 const navView = computed({
   get: () => page.value as string,
@@ -302,11 +320,16 @@ const cfgView = ref<'list' | 'form'>('list')
 // 草稿本身由页面组件持有,这里只给种子 —— 于是「返回列表」是真正的放弃修改
 const cfgSeed = ref<ApiConfig | null>(null)
 
-// 换厂商/换模型后,原来的尺寸可能已不在候选里,自动回退到第一个,免得发出上游不认的值
-// (必须放在 config 声明之后,watch 会立刻求值一次,提前会撞上 TDZ)
-watch(sizeOptions, (list) => {
-  if (list.length && !list.includes(size.value)) size.value = list[0]
-})
+// 换厂商/换模型后,原来的尺寸可能已不在候选里,自动回退到第一个,免得发出上游不认的值。
+// immediate 让它立刻跑一次:初始 size 写死 1024x1024,当前厂商未必认;
+// 也正因如此必须放在 config 声明之后,提前会撞上 TDZ
+watch(
+  sizeOptions,
+  (list) => {
+    if (list.length && !list.includes(size.value)) size.value = list[0]
+  },
+  { immediate: true }
+)
 
 onMounted(() => {
   configs.value = loadConfigs()
@@ -339,7 +362,7 @@ function newConfig() {
 }
 // 复制已有配置:基于它生成一份新编辑(切到表单页)
 function duplicateConfig(c: ApiConfig) {
-  cfgSeed.value = { ...c, id: '', name: c.name ? `${c.name} 副本` : '配置副本' }
+  cfgSeed.value = { ...c, id: '', name: c.name ? `${c.name} copy` : 'Config copy' }
   cfgView.value = 'form'
 }
 // 编辑已有配置:带入该配置,切到表单页
@@ -367,9 +390,9 @@ function saveSettings(draft: ApiConfig) {
 // 从地址推导一个默认名称
 function cfgNameFromUrl(url: string): string {
   try {
-    return new URL(url).hostname || '未命名配置'
+    return new URL(url).hostname || 'Untitled config'
   } catch {
-    return '未命名配置'
+    return 'Untitled config'
   }
 }
 // 从表单返回列表视图
@@ -423,7 +446,7 @@ function applySize(s?: string) {
 // 这时必须说一声 —— 否则封面会莫名消失,而用户以为存好了
 function persistLib() {
   if (!savePrompts(libItems.value)) {
-    notice.value = '本地存储空间不足，提示词已存下，但封面缩略图未能保存'
+    notice.value = 'Not enough local storage. Prompts saved, but cover images were not.'
   }
 }
 function useLibItem(item: PromptItem) {
@@ -451,7 +474,7 @@ function importLibItems(items: PromptItem[]) {
     .map((i) => ({
       id: i.id || uid(),
       prompt: i.prompt,
-      category: i.category || '未分类',
+      category: i.category || 'Uncategorized',
       size: i.size,
       quality: i.quality,
       background: i.background,
@@ -544,11 +567,11 @@ function onEnter(e: KeyboardEvent) {
 async function doGenerate() {
   if (loading.value) return
   if (!prompt.value.trim()) {
-    fail('请先输入提示词')
+    fail('Enter a prompt first')
     return
   }
   if (!configured()) {
-    fail('请先在“接口设置”中配置接口地址')
+    fail('Set an API base URL in Settings first')
     openConfigManager()
     return
   }
@@ -592,23 +615,39 @@ async function doGenerate() {
       results: res
     }
     // 缩略图要在入列表和落盘之前补上:入列表后拿到的是响应式代理,
-    // 在代理上改动不会回写到这里的原始对象,而 idb 又只接受原始对象
-    record.thumb = await makeThumb(res[0])
+    // 在代理上改动不会回写到这里的原始对象,而 idb 又只接受原始对象。
+    // 同时把量到的真实像素写进记录,图墙就能按真实比例排,而不是按所选尺寸
+    const t = await makeThumb(res[0])
+    if (t) {
+      record.thumb = t.blob
+      record.w = t.w
+      record.h = t.h
+    }
     history.value = [record, ...history.value]
-    const pruned = await addHistoryRecord(record)
-    if (pruned) {
-      // 磁盘上已经删掉了,内存里也要同步,否则界面还留着早已不存在的记录
-      history.value = history.value.slice(0, Math.max(0, history.value.length - pruned.removed))
-      const pct = Math.round(pruned.usageRatio * 100)
-      notice.value = pct
-        ? `本地存储已用约 ${pct}%，为腾出空间清理了最旧的 ${pruned.removed} 条历史`
-        : `为控制本地占用，清理了最旧的 ${pruned.removed} 条历史`
+    try {
+      const pruned = await addHistoryRecord(record)
+      if (pruned) {
+        // 磁盘上已经删掉了,内存里也要同步,否则界面还留着早已不存在的记录
+        const goneIds = new Set(pruned.removedIds)
+        const gone = history.value.filter((h) => goneIds.has(h.id))
+        history.value = history.value.filter((h) => !goneIds.has(h.id))
+        // 这些图不会再展示了,顺带把 object URL 撤掉,让 Blob 能被回收
+        gone.forEach(releaseEntryMedia)
+        const pct = Math.round(pruned.usageRatio * 100)
+        notice.value = pct
+          ? `Local storage is about ${pct}% full. Removed the oldest ${pruned.removed} history ${pruned.removed === 1 ? 'item' : 'items'} to free space.`
+          : `Removed the oldest ${pruned.removed} history ${pruned.removed === 1 ? 'item' : 'items'} to limit local usage.`
+      }
+    } catch {
+      // 生成是成功的,失败的只是"存进本地":记录先留在内存里(本次会话仍可见),
+      // 但必须如实告知刷新会丢 —— 不能混进下面"生成失败"的提示里
+      notice.value = 'Image generated, but not saved locally. It will be lost on refresh — download it first.'
     }
   } catch (e: any) {
     // 主动终止不是失败,不报错也不入历史
     if (e?.name === 'AbortError') return
     // 走到这里说明请求真的发出去了,可以重试
-    fail(e?.message || '生成失败', true)
+    fail(e?.message || 'Generation failed', true)
   } finally {
     loading.value = false
     controller.value = null
@@ -674,7 +713,7 @@ async function favoriteFromPreview(p: FavoritePayload) {
   const item: PromptItem = {
     id: uid(),
     prompt: p.prompt,
-    category: '未分类',
+    category: 'Uncategorized',
     size: p.size,
     quality: p.quality,
     background: p.background,
@@ -691,7 +730,7 @@ async function favoriteFromPreview(p: FavoritePayload) {
 async function setAsReference(item: ResultItem) {
   const dataUrl = typeof item.data === 'string' ? item.data : await blobToDataURL(item.data)
   if (!dataUrl.startsWith('data:')) {
-    fail('仅本地图片可作为参考图')
+    fail('Only local images can be used as a reference.')
     return
   }
   refImage.value = dataUrl
@@ -706,11 +745,14 @@ async function removeHistoryItem() {
   history.value = history.value.filter((h) => h.id !== cur.id)
   await removeHistoryRecord(cur.id)
   closePreview()
+  // 关闭预览之后再释放:预览还开着时撤地址会让图裂掉
+  releaseEntryMedia(cur)
 }
 // 历史页:不进预览,直接删掉某条记录
 async function removeHistoryEntry(entry: HistoryEntry) {
   history.value = history.value.filter((h) => h.id !== entry.id)
   await removeHistoryRecord(entry.id)
+  releaseEntryMedia(entry)
 }
 /* 标记逐张标:图墙里一块图块就是一张图,所以标在结果项上而不是整条记录上。
    改完必须落盘,否则刷新就丢;界面靠响应式代理更新,而 idb 只吃原始对象,故 toRaw */
@@ -740,7 +782,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
         class="nav-seg"
         :items="navItems"
         :radius="999"
-        aria-label="主导航"
+        aria-label="Main navigation"
       >
         <template #home>
           <svg class="seg-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -773,8 +815,8 @@ async function toggleMark(entry: HistoryEntry, index: number) {
         <button
           class="icob tip-below"
           @click="toggleTheme"
-          :data-tip="theme === 'dark' ? '切换浅色' : '切换深色'"
-          :aria-label="theme === 'dark' ? '切换浅色' : '切换深色'"
+          :data-tip="theme === 'dark' ? 'Switch to light' : 'Switch to dark'"
+          :aria-label="theme === 'dark' ? 'Switch to light' : 'Switch to dark'"
         >
           <svg v-if="theme === 'dark'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <circle cx="12" cy="12" r="4" />
@@ -790,7 +832,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
     <!-- 视图切换:首页工作台与提示词库是两个平级页面,同时只挂载一个 -->
     <main class="frame">
       <!-- 生图工作台 -->
-      <section v-if="page === 'home'" class="workbench page-in" aria-label="生图工作台">
+      <section v-if="page === 'home'" class="workbench page-in" aria-label="Studio">
         <header class="hero">
           <h1 class="hero-title">Turn your ideas<br />into beautiful images</h1>
           <p class="hero-sub">Create, explore, and organize AI-generated images with ease.</p>
@@ -805,19 +847,20 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                 ref="promptEl"
                 v-model="prompt"
                 rows="1"
-                placeholder="描述你想要的画面：一只在樱花树下打盹的橘猫，清晨柔光，电影感，浅景深…"
+                aria-label="Prompt"
+                placeholder="Describe your image: an orange cat dozing in the sun…"
                 @keydown.enter.exact="onEnter"
               />
 
             </div>
 
             <!-- 二、参数 icon 行(横线下方),点击 icon 展开对应选项 -->
-            <div class="param-bar" ref="paramBarEl" role="group" aria-label="生成参数">
+            <div class="param-bar" ref="paramBarEl" role="group" aria-label="Generation parameters">
               <button
                 class="param-btn has-val"
                 :class="{ on: openPanel === 'config', filled: !!configured() }"
-                :data-tip="`配置 · ${activeConfigName}`"
-                aria-label="配置"
+                :data-tip="`API · ${activeConfigName}`"
+                aria-label="API"
                 @click="togglePanel('config')"
               >
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -829,9 +872,24 @@ async function toggleMark(entry: HistoryEntry, index: number) {
               </button>
               <button
                 class="param-btn has-val"
+                :class="{ on: openPanel === 'n' }"
+                :data-tip="`Images · ${n}`"
+                aria-label="Count"
+                @click="togglePanel('n')"
+              >
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="3.5" y="3.5" width="7" height="7" rx="1.6" />
+                  <rect x="13.5" y="3.5" width="7" height="7" rx="1.6" />
+                  <rect x="3.5" y="13.5" width="7" height="7" rx="1.6" />
+                  <rect x="13.5" y="13.5" width="7" height="7" rx="1.6" />
+                </svg>
+                <b class="param-val">{{ n }} {{ n === 1 ? 'image' : 'images' }}</b>
+              </button>
+              <button
+                class="param-btn has-val"
                 :class="{ on: openPanel === 'size' }"
-                :data-tip="`尺寸 · ${sizeLabel(size)}`"
-                aria-label="尺寸"
+                :data-tip="`Size · ${sizeLabel(size)}`"
+                aria-label="Size"
                 @click="togglePanel('size')"
               >
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -841,28 +899,13 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                 </svg>
                 <b class="param-val">{{ sizeLabel(size) }}</b>
               </button>
-              <button
-                class="param-btn has-val"
-                :class="{ on: openPanel === 'n' }"
-                :data-tip="`张数 · ${n} 张`"
-                aria-label="张数"
-                @click="togglePanel('n')"
-              >
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <rect x="3.5" y="3.5" width="7" height="7" rx="1.6" />
-                  <rect x="13.5" y="3.5" width="7" height="7" rx="1.6" />
-                  <rect x="3.5" y="13.5" width="7" height="7" rx="1.6" />
-                  <rect x="13.5" y="13.5" width="7" height="7" rx="1.6" />
-                </svg>
-                <b class="param-val">{{ n }} 张</b>
-              </button>
               <!-- 已知不认画质的厂商直接收起来,免得选了却被上游 400 -->
               <button
                 v-if="provider.quality !== 'no'"
                 class="param-btn has-val"
                 :class="{ on: openPanel === 'quality', filled: quality !== 'auto' }"
-                :data-tip="`画质 · ${optionLabel(QUALITY_OPTIONS, quality)}`"
-                aria-label="画质"
+                :data-tip="`Quality · ${optionLabel(QUALITY_OPTIONS, quality)}`"
+                aria-label="Quality"
                 @click="togglePanel('quality')"
               >
                 <!-- 三根递升的柱子:表达档位高低 -->
@@ -877,8 +920,8 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                 v-if="provider.background !== 'no'"
                 class="param-btn has-val"
                 :class="{ on: openPanel === 'bg', filled: background !== 'auto' }"
-                :data-tip="`背景 · ${optionLabel(BACKGROUND_OPTIONS, background)}`"
-                aria-label="背景"
+                :data-tip="`Background · ${optionLabel(BACKGROUND_OPTIONS, background)}`"
+                aria-label="Background"
                 @click="togglePanel('bg')"
               >
                 <!-- 方框 + 棋盘点:透明底的通用符号 -->
@@ -892,8 +935,8 @@ async function toggleMark(entry: HistoryEntry, index: number) {
               <button
                 class="param-btn"
                 :class="{ on: openPanel === 'ref', filled: !!refImage }"
-                :data-tip="refImage ? '参考图 · 已选' : '参考图 · 未选'"
-                aria-label="参考图"
+                :data-tip="refImage ? 'Reference · Selected' : 'Reference · None'"
+                aria-label="Reference image"
                 @click="togglePanel('ref')"
               >
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -908,8 +951,8 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                 <button
                   v-if="prompt.trim() && !loading"
                   class="clear-icon"
-                  aria-label="清除输入"
-                  data-tip="清除输入"
+                  aria-label="Clear input"
+                  data-tip="Clear"
                   @click="prompt = ''"
                 >
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
@@ -919,8 +962,8 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                 <button
                   class="gen-icon"
                   :disabled="!loading && !prompt.trim()"
-                  :aria-label="loading ? '终止生成' : '生成画面'"
-                  :data-tip="loading ? '终止生成' : '生成画面（Enter）'"
+                  :aria-label="loading ? 'Stop' : 'Generate'"
+                  :data-tip="loading ? 'Stop' : 'Generate with Enter'"
                   @click="loading ? stopGenerate() : doGenerate()"
                 >
                   <!-- 生成中变为方块停止键,点击可终止这一批 -->
@@ -942,7 +985,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                   <!-- 配置 -->
                   <div v-if="shownPanel === 'config'" class="pp-body">
                     <div v-if="configs.length" class="pp-group">
-                      <span class="pp-label">已保存</span>
+                      <span class="pp-label">Saved</span>
                       <button
                         v-for="c in configs"
                         :key="c.id"
@@ -951,13 +994,13 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                         :title="`${c.baseUrl}${c.model ? ' · ' + c.model : ''}`"
                         @click="activateConfig(c)"
                       >
-                        {{ c.name || '未命名配置' }}
+                        {{ c.name || 'Untitled config' }}
                       </button>
                     </div>
                     <!-- 没有已保存配置时给一个入口;有配置时只管切换,管理走顶部齿轮 -->
                     <div v-if="!configs.length" class="pp-group">
-                      <span class="pp-note">还没有保存的配置</span>
-                      <button class="pp-action" @click="openConfigManager">去新增配置</button>
+                      <span class="pp-note">No saved configs</span>
+                      <button class="pp-action" @click="openConfigManager">Add config</button>
                     </div>
                   </div>
 
@@ -965,12 +1008,12 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                   <div v-else-if="shownPanel === 'ref'" class="pp-body">
                     <div class="pp-group">
                       <template v-if="!refImage">
-                        <label class="ref-pick" for="ref-file">＋ 选择本地图片作为参考图</label>
+                        <label class="ref-pick" for="ref-file">+ Choose a reference image</label>
                       </template>
                       <template v-else>
-                        <img class="pp-thumb" :src="refImage" alt="参考图" />
-                        <span class="pp-note">已选用参考图</span>
-                        <button class="pp-action" @click="clearRef">移除</button>
+                        <img class="pp-thumb" :src="refImage" alt="Reference image" />
+                        <span class="pp-note">Reference selected</span>
+                        <button class="pp-action" @click="clearRef">Remove</button>
                       </template>
                     </div>
                   </div>
@@ -978,13 +1021,13 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                   <!-- 尺寸 -->
                   <div v-else-if="shownPanel === 'size'" class="pp-body">
                     <div class="pp-group">
-                      <span class="pp-label">尺寸</span>
+                      <span class="pp-label">Size</span>
                       <button
                         v-for="s in sizeOptions"
                         :key="s"
                         class="preset"
                         :class="{ on: size === s }"
-                        :title="s === 'auto' ? '由上游按提示词自动决定尺寸' : ''"
+                        :title="s === 'auto' ? 'Let the model pick the size' : ''"
                         @click="size = s"
                       >
                         {{ sizeLabel(s) }}
@@ -992,23 +1035,23 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                     </div>
                     <!-- 固定候选的厂商不开放手填:列表已经是全部合法值,填别的只会被上游拒掉 -->
                     <div v-if="sizeFree" class="pp-group">
-                      <span class="pp-label">自定义</span>
+                      <span class="pp-label">Custom</span>
                       <input
                         class="num-input size-input"
                         :value="size"
-                        placeholder="如 1536x1024"
+                        placeholder="e.g. 1536×1024"
                         spellcheck="false"
-                        aria-label="自定义尺寸"
+                        aria-label="Custom size"
                         @change="commitSize"
                       />
-                      <span class="pp-note">宽 × 高,也可填 auto</span>
+                      <span class="pp-note">Width × height, or leave blank</span>
                     </div>
                   </div>
 
                   <!-- 张数 -->
                   <div v-else-if="shownPanel === 'n'" class="pp-body">
                     <div class="pp-group">
-                      <span class="pp-label">张数</span>
+                      <span class="pp-label">Count</span>
                       <button
                         v-for="c in 4"
                         :key="c"
@@ -1016,11 +1059,11 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                         :class="{ on: n === c }"
                         @click="n = c"
                       >
-                        {{ c }} 张
+                        {{ c }} {{ c === 1 ? 'image' : 'images' }}
                       </button>
                     </div>
                     <div class="pp-group">
-                      <span class="pp-label">自定义</span>
+                      <span class="pp-label">Custom</span>
                       <input
                         class="num-input"
                         type="number"
@@ -1028,17 +1071,17 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                         :max="N_MAX"
                         :value="n"
                         :placeholder="`1-${N_MAX}`"
-                        aria-label="自定义张数"
+                        aria-label="Custom count"
                         @change="clampN"
                       />
-                      <span class="pp-note">张,最多 {{ N_MAX }} 张</span>
+                      <span class="pp-note">Up to {{ N_MAX }} images</span>
                     </div>
                   </div>
 
                   <!-- 画质 -->
                   <div v-else-if="shownPanel === 'quality'" class="pp-body">
                     <div class="pp-group">
-                      <span class="pp-label">画质</span>
+                      <span class="pp-label">Quality</span>
                       <button
                         v-for="o in QUALITY_OPTIONS"
                         :key="o.value"
@@ -1050,25 +1093,25 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                         <em class="preset-hint">{{ o.hint }}</em>
                       </button>
                     </div>
-                    <p class="pp-tip">档位越高越清晰,耗时与费用也越高。{{ capHint(provider.quality) }}</p>
+                    <p class="pp-tip">Higher settings mean sharper images, but take longer and cost more. {{ capHint(provider.quality) }}</p>
                   </div>
 
                   <!-- 背景 -->
                   <div v-else-if="shownPanel === 'bg'" class="pp-body">
                     <div class="pp-group">
-                      <span class="pp-label">背景</span>
+                      <span class="pp-label">Background</span>
                       <button
                         v-for="o in BACKGROUND_OPTIONS"
                         :key="o.value"
                         class="preset"
                         :class="{ on: background === o.value }"
-                        :title="o.value === 'auto' ? '由上游决定,不发送该参数' : ''"
+                        :title="o.value === 'auto' ? 'Model decides; not sent' : ''"
                         @click="background = o.value"
                       >
                         {{ o.label }}
                       </button>
                     </div>
-                    <p class="pp-tip">选「透明」可得到无底图,适合做素材。{{ capHint(provider.background) }}</p>
+                    <p class="pp-tip">Choose Transparent for a cut-out with no background — handy for assets. {{ capHint(provider.background) }}</p>
                   </div>
                 </div>
               </div>
@@ -1080,7 +1123,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
           <!-- 存储清理提示:是提醒不是错误,中性配色 + 可手动关掉 -->
           <div v-if="notice" class="note" role="status">
             <span class="note-msg">{{ notice }}</span>
-            <button class="note-close" @click="notice = ''" aria-label="知道了">
+            <button class="note-close" @click="notice = ''" aria-label="Got it">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
                 <path d="M6 6l12 12M18 6L6 18" />
               </svg>
@@ -1092,9 +1135,9 @@ async function toggleMark(entry: HistoryEntry, index: number) {
             <p class="err-msg" :class="{ clipped: !errorOpen }">{{ error }}</p>
             <div v-if="errorLong || canRetry" class="err-ops">
               <button v-if="errorLong" class="err-btn" @click="errorOpen = !errorOpen">
-                {{ errorOpen ? '收起' : '详情' }}
+                {{ errorOpen ? 'Show less' : 'Details' }}
               </button>
-              <button v-if="canRetry" class="err-btn" @click="retry">重试</button>
+              <button v-if="canRetry" class="err-btn" @click="retry">Retry</button>
             </div>
           </div>
         </div>
@@ -1156,10 +1199,16 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                   :title="t.entry.prompt"
                   @click="openPreview(t.entry)"
                 >
-                  <img loading="lazy" :src="imageSrc(t.item)" :alt="t.entry.prompt" />
+                  <img
+                    loading="lazy"
+                    decoding="async"
+                    :src="imageSrc(t.item)"
+                    :alt="t.entry.prompt"
+                    @load="onFeedLoad(t.key, t.entry, $event)"
+                  />
                   <span class="tile-veil">
                     <span class="tile-text">{{ t.entry.prompt }}</span>
-                    <span class="tile-meta">{{ fmtDate(t.entry.createdAt) }} · {{ t.entry.size }}</span>
+                    <span class="tile-meta">{{ fmtDate(t.entry.createdAt) }} · {{ sizeLabel(t.entry.size) }}</span>
                   </span>
                 </button>
               </div>

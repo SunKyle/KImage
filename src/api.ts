@@ -40,7 +40,7 @@ export interface Provider {
 // 兜底项:baseUrl 认不出来时的归宿
 const CUSTOM: Provider = {
   id: 'custom',
-  label: '自定义 / 兼容接口',
+  label: 'Custom / OpenAI-compatible',
   baseUrl: '',
   model: '',
   // 未知厂商一律按"不确定"处理:照常展示参数,但不静默丢弃
@@ -53,7 +53,7 @@ const CUSTOM: Provider = {
 export const PROVIDERS: Provider[] = [
   {
     id: 'openai',
-    label: 'OpenAI(海外)',
+    label: 'OpenAI',
     baseUrl: 'https://api.openai.com/v1',
     model: 'gpt-image-1',
     quality: 'yes',
@@ -63,7 +63,7 @@ export const PROVIDERS: Provider[] = [
   },
   {
     id: 'ark',
-    label: '豆包 Seedream(火山方舟)',
+    label: 'Doubao Seedream (Volcengine Ark)',
     baseUrl: 'https://ark.cn-beijing.volces.com/api/v3',
     model: 'doubao-seedream-3-0-t2i',
     quality: 'no',
@@ -73,7 +73,7 @@ export const PROVIDERS: Provider[] = [
   },
   {
     id: 'dashscope',
-    label: '通义万相(百炼)',
+    label: 'Tongyi Wanxiang (Bailian)',
     baseUrl: 'https://dashscope.aliyuncs.com/api/v1',
     model: 'wanx2.1-t2i-turbo',
     quality: 'no',
@@ -113,15 +113,15 @@ export function allowedSizes(vendorId: string | undefined, model: string): strin
    hint 是界面上给档位的代价注解。
    ------------------------------------------------------------------ */
 export const QUALITY_OPTIONS = [
-  { value: 'auto', label: '自动', hint: '由上游决定' },
-  { value: 'low', label: '低', hint: '更快更省' },
-  { value: 'medium', label: '中', hint: '均衡' },
-  { value: 'high', label: '高', hint: '更细更慢' }
+  { value: 'auto', label: 'Auto', hint: 'Model decides' },
+  { value: 'low', label: 'Low', hint: 'Fast, cheaper' },
+  { value: 'medium', label: 'Medium', hint: 'Balanced' },
+  { value: 'high', label: 'High', hint: 'Finer, slower' }
 ]
 export const BACKGROUND_OPTIONS = [
-  { value: 'auto', label: '自动' },
-  { value: 'transparent', label: '透明' },
-  { value: 'opaque', label: '不透明' }
+  { value: 'auto', label: 'Auto' },
+  { value: 'transparent', label: 'Transparent' },
+  { value: 'opaque', label: 'Opaque' }
 ]
 
 /** 取值 → 界面文案;认不出来的值原样返回,不至于显示空白 */
@@ -146,7 +146,7 @@ export function loadConfigs(): ApiConfig[] {
     const raw = localStorage.getItem('kimage.apiConfig')
     if (raw) {
       const c = JSON.parse(raw)
-      const list: ApiConfig[] = [withVendor({ id: uid(), name: '默认配置', ...c })]
+      const list: ApiConfig[] = [withVendor({ id: uid(), name: 'Default config', ...c })]
       saveConfigs(list)
       return list
     }
@@ -197,7 +197,7 @@ export async function generate(
   })
 
   if (!resp.ok) {
-    let msg = `请求失败 (${resp.status})`
+    let msg = `Request failed (${resp.status})`
     try {
       const body = await resp.json()
       if (body?.error) msg = body.error
@@ -211,7 +211,7 @@ export async function generate(
 
   const data = (await resp.json()) as ImagesResponse
   if (!data.data || data.data.length === 0) {
-    throw new Error('上游未返回任何图片')
+    throw new Error('No images returned by upstream')
   }
 
   // 结果统一落成 Blob:base64 会膨胀 33% 且整段进 JS 堆,Blob 由浏览器放在堆外。
@@ -237,9 +237,10 @@ export async function generate(
 
 /* ===== 图片载荷 → 可渲染的 src =====================================
    新记录是 Blob,渲染时现造 object URL;旧记录是 data URL 字符串,原样返回。
-   object URL 用 WeakMap 缓存且不回收:同一个 Blob 会被图墙、抽屉、预览同时取用,
-   谁先卸载就 revoke 会把其它处弄裂;而 Blob 本身已被 history 持有,
-   多留一个 URL 字符串不构成额外泄漏。
+   object URL 用 WeakMap 缓存:同一个 Blob 会被图墙、抽屉、预览同时取用,
+   所以不能"谁先卸载谁 revoke";但也不能一直留着 —— blob URL 会强引用 Blob,
+   记录被删除/清理后图片字节就回收不了。结论:由主界面在记录真正离开界面时
+   调用 releaseEntryMedia 显式释放。
    ------------------------------------------------------------------ */
 const srcCache = new WeakMap<Blob, string>()
 export function imageSrc(item: ResultItem): string {
@@ -257,6 +258,24 @@ export function imageSrc(item: ResultItem): string {
   return url
 }
 
+/** 释放一个载荷用过的 object URL:不撤销的话,blob URL 会一直强引用住 Blob */
+export function releaseSrc(payload: ResultItem | Blob | undefined) {
+  if (!payload) return
+  const blob =
+    payload instanceof Blob ? payload : typeof payload.data === 'string' ? undefined : payload.data
+  if (!blob) return
+  const url = srcCache.get(blob)
+  if (!url) return
+  URL.revokeObjectURL(url)
+  srcCache.delete(blob)
+}
+
+/** 记录离开界面(删除/被清理)时,把它的原图与缩略图地址一起释放 */
+export function releaseEntryMedia(entry: HistoryEntry) {
+  for (const item of entry.results || []) releaseSrc(item)
+  releaseSrc(entry.thumb)
+}
+
 /* ===== 列表缩略图 ===================================================
    抽屉列表把图缩到 48px 显示,但浏览器仍按原始分辨率解码:几十条一起
    挂载就是几十次全尺寸解码,而打开抽屉的同时还有弹簧动画和抽屉滑入在
@@ -264,18 +283,30 @@ export function imageSrc(item: ResultItem): string {
    入库时顺手做一张小图,列表只渲染它。老记录没有 thumb,退回原图。
    ------------------------------------------------------------------ */
 const THUMB_EDGE = 128
+/** 老记录补缩略图的上限:只补最近这些条,更早的沉在底部,不值得逐张全尺寸解码 */
+const BACKFILL_MAX = 60
 
-export async function makeThumb(item: ResultItem | undefined): Promise<Blob | undefined> {
+/**
+ * 解码一张图,顺带量出真实像素尺寸,并尽量压一张列表缩略图。
+ * 返回 undefined 表示拿不到这张图(item 缺失或解码失败);
+ * 否则一定带回 w/h(图墙按真实比例排版要用),blob 会在图本来就很小、
+ * 压缩无意义时缺省 —— 尺寸照量,缩略图不生成。
+ */
+export async function makeThumb(
+  item: ResultItem | undefined
+): Promise<{ blob?: Blob; w: number; h: number } | undefined> {
   if (!item) return undefined
   try {
     const src = imageSrc(item)
     if (!src) return undefined
     const bmp = await createImageBitmap(await (await fetch(src)).blob())
+    const w = bmp.width
+    const h = bmp.height
     const scale = Math.min(1, THUMB_EDGE / Math.max(bmp.width, bmp.height))
     if (scale >= 1) {
-      // 本来就比缩略图还小,不值得多存一份
+      // 本来就比缩略图还小,不值得多存一份;但尺寸仍要带回去给图墙用
       bmp.close()
-      return undefined
+      return { w, h }
     }
     const c = document.createElement('canvas')
     c.width = Math.max(1, Math.round(bmp.width * scale))
@@ -283,16 +314,16 @@ export async function makeThumb(item: ResultItem | undefined): Promise<Blob | un
     const ctx = c.getContext('2d')
     if (!ctx) {
       bmp.close()
-      return undefined
+      return { w, h }
     }
     ctx.drawImage(bmp, 0, 0, c.width, c.height)
     bmp.close()
     // webp 编码在个别环境下不可用,退回 png(透明图不能走 jpeg,会糊成黑底)
-    return (
+    const blob =
       (await new Promise<Blob | null>((r) => c.toBlob(r, 'image/webp', 0.8))) ??
       (await new Promise<Blob | null>((r) => c.toBlob(r, 'image/png'))) ??
       undefined
-    )
+    return { blob, w, h }
   } catch {
     return undefined
   }
@@ -305,16 +336,20 @@ export function thumbSrc(e: HistoryEntry): string {
 }
 
 /**
- * 给加这个字段之前存下来的老记录补缩略图。
+ * 给加这个字段之前存下来的老记录补缩略图,顺带量出真实像素尺寸。
  * 每张之间留一段间隔,免得一上来就把主线程占满;补完落盘,只跑一次。
  * 任何一张失败都跳过,不影响使用。
  */
 export async function backfillThumbs(list: HistoryEntry[]): Promise<void> {
-  for (const entry of list) {
-    if (entry.thumb) continue
+  // 列表是从新到旧排的:几百条老记录逐条解码要跑好几分钟,只补最近这一段
+  for (const entry of list.slice(0, BACKFILL_MAX)) {
+    // 缩略图和尺寸都有了就不用再解码(尺寸是后来才加的字段,老记录通常缺)
+    if (entry.thumb && entry.w && entry.h) continue
     const t = await makeThumb(entry.results?.[0])
     if (!t) continue
-    entry.thumb = t
+    if (t.blob) entry.thumb = t.blob
+    entry.w = t.w
+    entry.h = t.h
     try {
       await putOne(entry)
     } catch {
@@ -338,7 +373,7 @@ export function reuseParamsOf(e: HistoryEntry): ReuseParams {
 }
 export async function loadHistory() {
   try {
-    const list = await getAll<any>()
+    const list = await getAll<HistoryEntry>()
     return list.sort((a, b) => b.createdAt - a.createdAt)
   } catch {
     return []
@@ -366,8 +401,15 @@ const LIB_KEY = 'kimage.prompts'
 export function loadPrompts(): PromptItem[] {
   try {
     const raw = localStorage.getItem(LIB_KEY)
-    if (raw) return JSON.parse(raw) as PromptItem[]
-    return []
+    if (!raw) return []
+    const list = JSON.parse(raw)
+    // 存的是本地数据,但别信它一定是好的:被写坏(同步工具截断、手改)时
+    // 直接当数组用会让整个库页崩掉,这里滤一遍,坏项丢掉即可
+    if (!Array.isArray(list)) return []
+    return list.filter(
+      (p): p is PromptItem =>
+        !!p && typeof p === 'object' && typeof (p as PromptItem).prompt === 'string'
+    )
   } catch {
     return []
   }

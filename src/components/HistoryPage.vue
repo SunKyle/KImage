@@ -43,14 +43,20 @@ function ratioOfSize(size: string): number | null {
   return Math.min(2, Math.max(0.5, w / h))
 }
 
-/* 解析不出比例时,等图加载完用它的真实比例补上 —— 否则 'auto' 的记录会被
-   硬塞进方形里裁掉一截。先按方形占位,免得图还没到高度算成 0、整墙塌一下再撑开 */
+/* 缩略块按图片真实比例排,而不是按当初选的尺寸 —— 上游可能返回不同比例的图。
+   优先级:加载时量到的真实比例 → 入库时量到的 w/h → 解析 entry.size → 方形兜底。
+   尺寸解析不出来时先按方形占位,免得图还没到、高度算成 0、整墙塌一下再撑开 */
 const measured = ref<Record<string, number>>({})
 function tileRatio(t: Tile) {
-  return ratioOfSize(t.entry.size) ?? measured.value[t.key] ?? 1
+  const m = measured.value[t.key]
+  if (m) return m
+  const { w, h } = t.entry
+  if (w && h) return Math.min(2, Math.max(0.5, w / h))
+  return ratioOfSize(t.entry.size) ?? 1
 }
 function onTileLoad(t: Tile, e: Event) {
-  if (ratioOfSize(t.entry.size)) return
+  // 已经有精确比例(量过,或入库记了 w/h)就不再重复量
+  if (measured.value[t.key] || (t.entry.w && t.entry.h)) return
   const img = e.target as HTMLImageElement
   if (!img.naturalWidth || !img.naturalHeight) return
   measured.value[t.key] = Math.min(2, Math.max(0.5, img.naturalWidth / img.naturalHeight))
@@ -70,25 +76,27 @@ function fmt(ts: number) {
 </script>
 
 <template>
-  <section class="lib" aria-label="历史记录">
+  <section class="lib" aria-label="History">
     <header class="lib-head">
       <div class="lib-title-wrap">
-        <h1 class="lib-title">历史记录</h1>
-        <p class="lib-sub">共 {{ items.length }} 条 · {{ imageCount }} 张图</p>
+        <h1 class="lib-title">History</h1>
+        <p class="lib-sub">
+          {{ items.length }} {{ items.length === 1 ? 'record' : 'records' }} · {{ imageCount }} {{ imageCount === 1 ? 'image' : 'images' }}
+        </p>
       </div>
     </header>
 
     <!-- 保留规则单独占一行:不写出来,记录被自动清掉时用户会以为丢了 -->
     <div class="lib-tools">
-      <div class="mark-filter" role="group" aria-label="筛选">
+      <div class="mark-filter" role="group" aria-label="Filter">
         <button class="chip" :class="{ on: !onlyMarked }" :aria-pressed="!onlyMarked" @click="onlyMarked = false">
-          全部
+          All
         </button>
         <button class="chip" :class="{ on: onlyMarked }" :aria-pressed="onlyMarked" @click="onlyMarked = true">
-          标记 <span class="chip-n">{{ markedCount }}</span>
+          Marked <span class="chip-n">{{ markedCount }}</span>
         </button>
       </div>
-      <p class="lib-note">历史保存在本地，存储空间接近上限时会自动清理最旧的记录</p>
+      <p class="lib-note">Saved locally. Oldest records are cleared automatically when storage runs low.</p>
     </div>
 
     <div v-if="shownTiles.length" class="wall">
@@ -96,13 +104,8 @@ function fmt(ts: number) {
         v-for="t in shownTiles"
         :key="t.key"
         class="tile"
-        role="button"
-        tabindex="0"
         :style="{ aspectRatio: String(tileRatio(t)), ...tileBg(t.entry) }"
-        :aria-label="t.entry.prompt"
         @click="emit('open', t.entry)"
-        @keydown.enter.self.prevent="emit('open', t.entry)"
-        @keydown.space.self.prevent="emit('open', t.entry)"
       >
         <img
           loading="lazy"
@@ -111,6 +114,14 @@ function fmt(ts: number) {
           alt=""
           @load="onTileLoad(t, $event)"
         />
+        <!-- 整块覆盖的"打开预览"按钮:键盘与读屏都走它;
+             外层 div 上的点击只给鼠标兜个底(点浮层空白处也能开) -->
+        <button
+          type="button"
+          class="tile-open"
+          :aria-label="`Open preview: ${t.entry.prompt}`"
+          @click.stop="emit('open', t.entry)"
+        ></button>
         <!-- 标记过的角标常驻:不悬停也要看得出哪些标了 -->
         <span v-if="t.item.marked" class="tile-mark" aria-hidden="true">
           <svg viewBox="0 0 24 24" fill="currentColor">
@@ -122,16 +133,16 @@ function fmt(ts: number) {
           <div class="tile-text">{{ t.entry.prompt }}</div>
           <div class="tile-foot">
             <span class="tile-meta">
-              {{ fmt(t.entry.createdAt) }} · {{ t.entry.size === 'auto' ? '自动' : t.entry.size }}<template
+              {{ fmt(t.entry.createdAt) }} · {{ t.entry.size === 'auto' ? 'Auto' : t.entry.size.replace('x', '×') }}<template
                 v-if="t.entry.results.length > 1"
-              > · {{ t.entry.results.length }} 张</template>
+              > · {{ t.entry.results.length }} images</template>
             </span>
             <!-- 图块本身的点击是打开预览,这几个必须 stop,否则点它们也会跟着开预览 -->
             <div class="tile-ops">
               <button
                 class="top"
                 :class="{ 'top-on': t.item.marked }"
-                :aria-label="t.item.marked ? '取消标记' : '标记这张图'"
+                :aria-label="t.item.marked ? 'Unmark image' : 'Mark image'"
                 :aria-pressed="!!t.item.marked"
                 @click.stop="emit('mark', t.entry, t.index)"
               >
@@ -147,7 +158,7 @@ function fmt(ts: number) {
               </button>
               <button
                 class="top"
-                :aria-label="`使用提示词：${t.entry.prompt.slice(0, 20)}`"
+                :aria-label="`Use prompt: ${t.entry.prompt.slice(0, 20)}`"
                 @click.stop="emit('use', reuseParamsOf(t.entry))"
               >
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
@@ -157,7 +168,7 @@ function fmt(ts: number) {
               </button>
               <button
                 class="top top-del"
-                :aria-label="`删除记录：${t.entry.prompt.slice(0, 20)}`"
+                :aria-label="`Delete: ${t.entry.prompt.slice(0, 20)}`"
                 @click.stop="emit('remove', t.entry)"
               >
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
@@ -180,15 +191,15 @@ function fmt(ts: number) {
           <path d="M12 7.4V12l2.8 1.9" />
         </svg>
       </div>
-      <h2 class="none-title">{{ onlyMarked ? '还没有标记的图片' : '还没有生成记录' }}</h2>
+      <h2 class="none-title">{{ onlyMarked ? 'No marked images yet' : 'No generations yet' }}</h2>
       <p class="none-sub">
         {{
           onlyMarked
-            ? '把鼠标移到图片上，点星标即可标记；标记是按张记的，同一条记录里的不同图互不影响。'
-            : '在首页输入提示词并生成后，结果会自动保存在这里，随时回看与复用。'
+            ? 'Hover an image and click the star to mark it. Marks are per image, so images in a record stay independent.'
+            : 'Generate from the home page and your results are saved here automatically, ready to revisit and reuse.'
         }}
       </p>
-      <button v-if="onlyMarked" class="none-action" @click="onlyMarked = false">查看全部图片</button>
+      <button v-if="onlyMarked" class="none-action" @click="onlyMarked = false">View all</button>
     </div>
   </section>
 </template>
@@ -283,15 +294,25 @@ function fmt(ts: number) {
   background-size: cover;
   background-position: center;
   cursor: zoom-in;
-  outline: none;
   transition: box-shadow var(--dur) var(--ease);
 }
+/* 聚焦态跟着内部按钮走:焦点环由 :focus-within 表达 */
 .tile:hover,
-.tile:focus-visible {
+.tile:focus-within {
   box-shadow: var(--sh-md);
 }
-.tile:focus-visible {
+.tile:focus-within {
   box-shadow: var(--sh-md), 0 0 0 3px var(--accent-soft);
+}
+/* 覆盖整块的打开按钮:透明无边框,聚焦环交给 .tile:focus-within */
+.tile-open {
+  position: absolute;
+  inset: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  cursor: zoom-in;
+  outline: none;
 }
 .tile img {
   display: block;

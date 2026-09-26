@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { ref, computed, nextTick, onMounted, onUnmounted, watch } from 'vue'
 import { BACKGROUND_OPTIONS, QUALITY_OPTIONS, imageSrc, optionLabel, reuseParamsOf } from '../api'
 import type { HistoryEntry, ResultItem, ReuseParams, FavoritePayload } from '../types'
+import { detectMimeFromDataUrl } from '../lib/idb'
 
 const props = defineProps<{
   visible: boolean
@@ -33,7 +34,12 @@ function onDocPointerDown(e: PointerEvent) {
 }
 // 复制后的短暂回执:复制 Prompt 现在是显眼的主操作,必须有反馈
 const copied = ref(false)
+// 复制失败也是一种必须给出的回执:写不进剪贴板时不能假装成功
+const copyFailed = ref(false)
 let copiedTimer: number | undefined
+// 弹层的焦点管理:打开时记住原来的焦点,关闭时还回去;容器负责接住初始焦点
+const panelEl = ref<HTMLElement | null>(null)
+let lastFocused: HTMLElement | null = null
 
 const imgs = computed(() => {
   return props.entry ? props.entry.results.map(imageSrc) : []
@@ -63,12 +69,21 @@ function resetView() {
   expanded.value = false
   menuOpen.value = false
   copied.value = false
+  copyFailed.value = false
   loadedRatio.value = 0
 }
 watch(
   () => props.visible,
   (v) => {
-    if (v) resetView()
+    if (v) {
+      lastFocused = (document.activeElement as HTMLElement) || null
+      resetView()
+      // 焦点先落到弹层上:Tab 从这里开始走,读屏也会念出对话框
+      nextTick(() => panelEl.value?.focus({ preventScroll: true }))
+    } else {
+      lastFocused?.focus?.()
+      lastFocused = null
+    }
   }
 )
 // 翻到别的记录时,单独重置(此时 visible 不变,上面那个 watch 不会触发)
@@ -103,20 +118,53 @@ function next() {
   active.value = (active.value + 1) % imgs.value.length
 }
 
+/** 按载荷真实类型推下载扩展名:结果可能是 jpeg / webp,写死 png 名不对 */
+function extOf(item: ResultItem | undefined): string {
+  const data = item?.data
+  if (data instanceof Blob) {
+    const t = data.type
+    if (t.includes('jpeg')) return 'jpg'
+    if (t.includes('webp')) return 'webp'
+    if (t.includes('gif')) return 'gif'
+    return 'png'
+  }
+  if (typeof data === 'string') {
+    const mime = detectMimeFromDataUrl(data)
+    return mime === 'image/jpeg' ? 'jpg' : mime.split('/')[1] || 'png'
+  }
+  return 'png'
+}
+
 function download() {
   const url = imgs.value[active.value]
+  if (!url) return
   const a = document.createElement('a')
   a.href = url
-  a.download = `kimage-${Date.now()}.png`
+  if (/^https?:/.test(url)) {
+    // 远端图源跨域,download 属性会被浏览器忽略:新窗口打开让用户自行另存
+    a.target = '_blank'
+    a.rel = 'noopener'
+  } else {
+    a.download = `kimage-${Date.now()}.${extOf(props.entry?.results[active.value])}`
+  }
   a.click()
 }
 
-function copyPrompt() {
+async function copyPrompt() {
   if (!props.entry) return
-  navigator.clipboard?.writeText(props.entry.prompt).catch(() => {})
-  copied.value = true
+  copyFailed.value = false
+  try {
+    await navigator.clipboard.writeText(props.entry.prompt)
+    copied.value = true
+  } catch {
+    // 写不进剪贴板(无权限 / 非安全上下文)就如实报错,别显示"已复制"
+    copyFailed.value = true
+  }
   window.clearTimeout(copiedTimer)
-  copiedTimer = window.setTimeout(() => (copied.value = false), 1600)
+  copiedTimer = window.setTimeout(() => {
+    copied.value = false
+    copyFailed.value = false
+  }, 1600)
 }
 
 function useThisPrompt() {
@@ -139,10 +187,41 @@ function fmtElapsed(ms: number) {
   return s >= 10 ? `${Math.round(s)}s` : `${s.toFixed(1)}s`
 }
 
-// 键盘:左右翻本条的多张图,上下翻历史记录
+/** 弹层里当前可见的可聚焦元素,供 Tab 循环使用 */
+function focusables(): HTMLElement[] {
+  const root = panelEl.value
+  if (!root) return []
+  return Array.from(
+    root.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), a[href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+    )
+  ).filter((el) => el.getClientRects().length > 0)
+}
+/** 把 Tab 关在弹层里:走到首/尾时绕回另一端,不让焦点跑到背后的页面 */
+function trapTab(e: KeyboardEvent) {
+  const els = focusables()
+  if (!els.length) return
+  const first = els[0]
+  const last = els[els.length - 1]
+  const cur = document.activeElement as HTMLElement | null
+  if (e.shiftKey) {
+    if (cur === first || cur === panelEl.value) {
+      e.preventDefault()
+      last.focus()
+    }
+  } else if (cur === last) {
+    e.preventDefault()
+    first.focus()
+  }
+}
+// 键盘:左右翻本条的多张图,上下翻历史记录;Esc 分两级,Tab 锁在弹层内
 function onKey(e: KeyboardEvent) {
   if (!props.visible) return
-  if (e.key === 'Escape') close()
+  if (e.key === 'Escape') {
+    // 菜单开着先收菜单,再按一次才关预览
+    if (menuOpen.value) menuOpen.value = false
+    else close()
+  } else if (e.key === 'Tab') trapTab(e)
   else if (e.key === 'ArrowLeft') prev()
   else if (e.key === 'ArrowRight') next()
   else if (e.key === 'ArrowUp') {
@@ -193,7 +272,12 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
     <Transition name="modal">
       <div v-if="visible && entry" class="mask" @click.self="close">
         <div
+          ref="panelEl"
           class="preview"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Image preview"
+          tabindex="-1"
           :style="{ '--ratio': String(boxRatio), '--rail': imgs.length > 1 ? 1 : 0 }"
         >
           <!-- 主体:左图右信息 -->
@@ -201,13 +285,13 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
             <!-- 图片区 -->
             <div class="stage">
               <div class="img-wrap" :style="{ aspectRatio: String(boxRatio) }">
-                <img :src="imgs[active]" :alt="`生成结果 ${active + 1}`" @load="onImgLoad" />
-                <button v-if="imgs.length > 1" class="nav prev tip-below" @click="prev" data-tip="上一张（←）" aria-label="上一张">
+                <img :src="imgs[active]" :alt="`Result ${active + 1}`" @load="onImgLoad" />
+                <button v-if="imgs.length > 1" class="nav prev tip-below" @click="prev" data-tip="Previous (←)" aria-label="Previous">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M15 6l-6 6 6 6" />
                   </svg>
                 </button>
-                <button v-if="imgs.length > 1" class="nav next tip-below" @click="next" data-tip="下一张（→）" aria-label="下一张">
+                <button v-if="imgs.length > 1" class="nav next tip-below" @click="next" data-tip="Next (→)" aria-label="Next">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M9 6l6 6-6 6" />
                   </svg>
@@ -221,10 +305,10 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
                   class="thumb"
                   :class="{ active: i === active }"
                   :style="{ aspectRatio: String(thumbRatio) }"
-                  :aria-label="`第 ${i + 1} 张`"
+                  :aria-label="`Image ${i + 1}`"
                   @click="active = i"
                 >
-                  <img :src="src" :alt="`缩略图 ${i + 1}`" />
+                  <img :src="src" :alt="`Thumbnail ${i + 1}`" />
                 </button>
               </div>
             </div>
@@ -239,8 +323,8 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
                     class="tpill tip-below"
                     :disabled="!canGoUp"
                     @click="goEntry(-1)"
-                    data-tip="更新的记录（↑）"
-                    aria-label="更新的记录"
+                    data-tip="Newer (↑)"
+                    aria-label="Newer"
                   >
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
                       <path d="M6 15l6-6 6 6" />
@@ -251,8 +335,8 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
                     class="tpill tip-below"
                     :disabled="!canGoDown"
                     @click="goEntry(1)"
-                    data-tip="更早的记录（↓）"
-                    aria-label="更早的记录"
+                    data-tip="Older (↓)"
+                    aria-label="Older"
                   >
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
                       <path d="M6 9l6 6 6-6" />
@@ -262,7 +346,7 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
 
                 <div class="toolbar-main">
                   <span ref="menuEl" class="menu-wrap">
-                    <button class="tpill tip-below" @click="menuOpen = !menuOpen" data-tip="更多操作" aria-label="更多操作">
+                    <button class="tpill tip-below" @click="menuOpen = !menuOpen" data-tip="More actions" aria-label="More actions">
                       <svg viewBox="0 0 24 24" fill="currentColor">
                         <circle cx="12" cy="5.5" r="1.6" />
                         <circle cx="12" cy="12" r="1.6" />
@@ -271,13 +355,13 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
                     </button>
                     <Transition name="po">
                       <div v-if="menuOpen" class="menu">
-                        <button class="mitem" @click="menuAction('favorite')">收藏到提示词库</button>
-                        <button class="mitem" @click="menuAction('reference')">用作参考图</button>
-                        <button class="mitem danger" @click="menuAction('remove')">删除该条历史</button>
+                        <button class="mitem" @click="menuAction('favorite')">Save to library</button>
+                        <button class="mitem" @click="menuAction('reference')">Use as reference</button>
+                        <button class="mitem danger" @click="menuAction('remove')">Delete</button>
                       </div>
                     </Transition>
                   </span>
-                  <button class="tpill tip-below" @click="close" data-tip="关闭（Esc）" aria-label="关闭">
+                  <button class="tpill tip-below" @click="close" data-tip="Close (Esc)" aria-label="Close">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
                       <path d="M6 6l12 12M18 6L6 18" />
                     </svg>
@@ -288,28 +372,28 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
               <!-- 提示词:小节标题带分隔线,复制收在标题右侧,贴着它作用的内容 -->
               <section class="block">
                 <header class="blk-head">
-                  <span class="blk-title">提示词</span>
+                  <span class="blk-title">Prompt</span>
                   <!-- 两个动作收在一组:blk-head 是 space-between,直接并排会被推到中间去 -->
                   <div class="blk-acts">
                     <button
                       class="blk-act tip-left"
-                      :class="{ done: copied }"
+                      :class="{ done: copied, fail: copyFailed }"
                       @click="copyPrompt"
-                      data-tip="复制到剪贴板"
-                      :aria-label="copied ? '已复制' : '复制到剪贴板'"
+                      :data-tip="copyFailed ? 'Copy failed — select the text manually' : 'Copy to clipboard'"
+                      :aria-label="copyFailed ? 'Copy failed' : copied ? 'Copied' : 'Copy to clipboard'"
                     >
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
                         <rect x="9" y="9" width="11" height="11" rx="2" />
                         <path d="M5 15V6a1 1 0 0 1 1-1h9" />
                       </svg>
-                      <span>{{ copied ? '已复制' : '复制' }}</span>
+                      <span>{{ copyFailed ? 'Copy failed' : copied ? 'Copied' : 'Copy' }}</span>
                     </button>
                     <button
                       class="blk-act"
                       :class="{ on: marked }"
                       @click="toggleMark"
                       :aria-pressed="marked"
-                      :aria-label="marked ? '取消标记这张图' : '标记这张图'"
+                      :aria-label="marked ? 'Unmark image' : 'Mark image'"
                     >
                       <svg
                         viewBox="0 0 24 24"
@@ -320,29 +404,29 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
                       >
                         <path d="M12 3.6l2.63 5.33 5.88.86-4.25 4.14 1 5.86L12 17.03l-5.26 2.76 1-5.86-4.25-4.14 5.88-.86z" />
                       </svg>
-                      <span>{{ marked ? '已标记' : '标记' }}</span>
+                      <span>{{ marked ? 'Marked' : 'Mark' }}</span>
                     </button>
                   </div>
                 </header>
                 <p class="prompt" :class="{ clipped: !expanded }">{{ entry.prompt }}</p>
                 <button v-if="entry.prompt.length > 120" class="expand-btn" @click="expanded = !expanded">
-                  {{ expanded ? '收起' : '展开' }}
+                  {{ expanded ? 'Collapse' : 'Expand' }}
                 </button>
               </section>
 
               <!-- 参数与时间:放在提示词之后,作为这条记录的"底注" -->
               <div class="side-head">
                 <div class="side-tags">
-                  <span class="tag">{{ entry.size }}</span>
+                  <span class="tag">{{ entry.size === 'auto' ? 'Auto' : entry.size.replace('x', '×') }}</span>
                   <span v-if="entry.model" class="tag tag-model">{{ entry.model }}</span>
                   <!-- 扩展参数只在非默认档时出现:全都是「自动」的记录不必堆一排无信息的标签 -->
                   <span v-if="entry.quality" class="tag">
-                    画质 · {{ optionLabel(QUALITY_OPTIONS, entry.quality) }}
+                    Quality · {{ optionLabel(QUALITY_OPTIONS, entry.quality) }}
                   </span>
                   <span v-if="entry.background" class="tag">
-                    背景 · {{ optionLabel(BACKGROUND_OPTIONS, entry.background) }}
+                    Background · {{ optionLabel(BACKGROUND_OPTIONS, entry.background) }}
                   </span>
-                  <span v-if="entry.hasRef" class="tag">参考图</span>
+                  <span v-if="entry.hasRef" class="tag">Reference</span>
                   <span v-if="entry.elapsedMs" class="tag tag-dim">{{ fmtElapsed(entry.elapsedMs) }}</span>
                 </div>
                 <span class="meta">{{ new Date(entry.createdAt).toLocaleString() }}</span>
@@ -350,8 +434,8 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
 
               <!-- 底部操作:主次并排,占满侧栏宽度 -->
               <div class="side-actions">
-                <button class="act primary" @click="useThisPrompt">使用 Prompt</button>
-                <button class="act" @click="download">下载</button>
+                <button class="act primary" @click="useThisPrompt">Use prompt</button>
+                <button class="act" @click="download">Download</button>
               </div>
             </aside>
           </div>
@@ -721,6 +805,15 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
 .blk-act.on {
   color: var(--accent-strong);
   background: var(--accent-soft);
+}
+/* fail = 复制没写进剪贴板,如实标红 */
+.blk-act.fail {
+  color: var(--danger);
+  background: color-mix(in oklch, var(--danger) 10%, transparent);
+}
+/* 弹层容器只用来接住初始焦点,聚焦环由内部控件承担 */
+.preview:focus {
+  outline: none;
 }
 .prompt {
   font-size: 13px;

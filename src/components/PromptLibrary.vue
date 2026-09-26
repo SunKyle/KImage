@@ -19,7 +19,7 @@ const emit = defineEmits<{
 }>()
 
 const query = ref('')
-const filter = ref('全部')
+const filter = ref('All')
 const menuOpen = ref(false)
 // 菜单展开后点别处收起:低频动作,不该逼用户再点一次 ⋮ 才能走
 const menuEl = ref<HTMLElement | null>(null)
@@ -38,13 +38,13 @@ const draftCategory = ref('')
 const flipped = ref<string | null>(null)
 
 const categories = computed(() => {
-  const set = new Set(props.items.map((i) => i.category || '未分类'))
-  return ['全部', ...set]
+  const set = new Set(props.items.map((i) => i.category || 'Uncategorized'))
+  return ['All', ...set]
 })
 
 const filtered = computed(() => {
   let list = props.items
-  if (filter.value !== '全部') list = list.filter((i) => (i.category || '未分类') === filter.value)
+  if (filter.value !== 'All') list = list.filter((i) => (i.category || 'Uncategorized') === filter.value)
   const q = query.value.trim().toLowerCase()
   if (q) list = list.filter((i) => i.prompt.toLowerCase().includes(q))
   return list
@@ -58,7 +58,7 @@ function flip(id: string) {
    跟提示词抢视线;拼成一行之后它退成背景信息,提示词才立得住 */
 function paramLine(item: PromptItem): string {
   const out: string[] = []
-  if (item.size) out.push(item.size === 'auto' ? '自动' : item.size)
+  if (item.size) out.push(item.size === 'auto' ? 'Auto' : item.size)
   if (item.quality) out.push(optionLabel(QUALITY_OPTIONS, item.quality))
   if (item.background) out.push(optionLabel(BACKGROUND_OPTIONS, item.background))
   return out.join(' · ')
@@ -67,7 +67,7 @@ function paramLine(item: PromptItem): string {
 // 搜索和分类是两套筛选,空态里要能一键把两个都清掉
 function resetFilter() {
   query.value = ''
-  filter.value = '全部'
+  filter.value = 'All'
 }
 
 function startAdd() {
@@ -81,7 +81,7 @@ function addCurrent() {
   emit('add', {
     id: Date.now() + Math.random().toString(16).slice(2),
     prompt: text,
-    category: draftCategory.value.trim() || '未分类',
+    category: draftCategory.value.trim() || 'Uncategorized',
     createdAt: Date.now()
   })
   draftPrompt.value = ''
@@ -98,7 +98,8 @@ function exportJson() {
   a.href = URL.createObjectURL(blob)
   a.download = `kimage-prompts-${Date.now()}.json`
   a.click()
-  URL.revokeObjectURL(a.href)
+  // 立刻 revoke 在 WebKit 下偶尔会把下载掐断,等浏览器把文件接走再撤
+  setTimeout(() => URL.revokeObjectURL(a.href), 1500)
 }
 
 function onImportFile(e: Event) {
@@ -126,12 +127,12 @@ function fmt(t: number) {
 </script>
 
 <template>
-  <section class="lib" aria-label="提示词库">
+  <section class="lib" aria-label="Prompt library">
     <header class="lib-head">
       <div class="lib-title-wrap">
-        <h1 class="lib-title">提示词库</h1>
+        <h1 class="lib-title">Prompt Library</h1>
         <p class="lib-sub">
-          共 {{ items.length }} 条<template v-if="filter !== '全部'"> · 当前分类「{{ filter }}」</template>
+          {{ items.length }} {{ items.length === 1 ? 'prompt' : 'prompts' }}<template v-if="filter !== 'All'"> · Current category "{{ filter }}"</template>
         </p>
       </div>
       <div class="lib-ops">
@@ -139,11 +140,11 @@ function fmt(t: number) {
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
             <path d="M12 5v14M5 12h14" />
           </svg>
-          新建提示词
+          New prompt
         </button>
         <!-- 管理动作低频,收进菜单,不给标题行添按钮 -->
         <span ref="menuEl" class="menu-wrap">
-          <button class="icon-ghost" :aria-expanded="menuOpen" aria-label="更多" @click="menuOpen = !menuOpen">
+          <button class="icon-ghost" :aria-expanded="menuOpen" aria-label="More" @click="menuOpen = !menuOpen">
             <svg viewBox="0 0 24 24" fill="currentColor">
               <circle cx="12" cy="5.5" r="1.6" />
               <circle cx="12" cy="12" r="1.6" />
@@ -152,9 +153,9 @@ function fmt(t: number) {
           </button>
           <Transition name="po">
             <div v-if="menuOpen" class="menu">
-              <button class="mitem" @click="exportJson">导出为 JSON</button>
+              <button class="mitem" @click="exportJson">Export JSON</button>
               <label class="mitem file">
-                导入 JSON
+                Import JSON
                 <input type="file" accept=".json" hidden @change="onImportFile" />
               </label>
             </div>
@@ -165,7 +166,7 @@ function fmt(t: number) {
 
     <!-- 工具栏:整页宽度下分类直接换行,不再像窄抽屉那样横向滚动藏起来 -->
     <div class="lib-tools">
-      <input v-model="query" class="search" placeholder="搜索提示词…" spellcheck="false" />
+      <input v-model="query" class="search" placeholder="Search prompts…" spellcheck="false" />
       <div v-if="categories.length > 1" class="cat-row">
         <button
           v-for="c in categories"
@@ -180,11 +181,11 @@ function fmt(t: number) {
     </div>
 
     <div v-if="showAdd" class="add-form">
-      <input v-model="draftPrompt" placeholder="输入一段提示词" @keydown.enter="addCurrent" />
-      <input v-model="draftCategory" placeholder="分类（默认：未分类）" @keydown.enter="addCurrent" />
+      <input v-model="draftPrompt" placeholder="Enter a prompt" @keydown.enter="addCurrent" />
+      <input v-model="draftCategory" placeholder="Category (default: Uncategorized)" @keydown.enter="addCurrent" />
       <div class="add-ops">
-        <button class="add-go" @click="addCurrent">保存到库</button>
-        <button class="add-cancel" @click="showAdd = false">取消</button>
+        <button class="add-go" @click="addCurrent">Save to library</button>
+        <button class="add-cancel" @click="showAdd = false">Cancel</button>
       </div>
     </div>
 
@@ -197,7 +198,7 @@ function fmt(t: number) {
         role="button"
         tabindex="0"
         :aria-pressed="flipped === item.id"
-        :aria-label="flipped === item.id ? '返回提示词' : '查看这条提示词的出图效果'"
+        :aria-label="flipped === item.id ? 'Back to prompt' : 'View the image for this prompt'"
         @click="flip(item.id)"
         @keydown.enter.self.prevent="flip(item.id)"
         @keydown.space.self.prevent="flip(item.id)"
@@ -207,7 +208,7 @@ function fmt(t: number) {
           <div class="face face-front">
             <div class="card-top">
               <div class="card-meta">
-                <span class="card-cat">{{ item.category || '未分类' }}</span>
+                <span class="card-cat">{{ item.category || 'Uncategorized' }}</span>
                 <span class="card-time">{{ fmt(item.createdAt) }}</span>
               </div>
               <div class="card-text">{{ item.prompt }}</div>
@@ -218,8 +219,8 @@ function fmt(t: number) {
               <div class="ops">
                 <button
                   class="op"
-                  data-tip="使用该提示词"
-                  :aria-label="`使用：${item.prompt.slice(0, 20)}`"
+                  data-tip="Use prompt"
+                  :aria-label="`Use: ${item.prompt.slice(0, 20)}`"
                   @click.stop="emit('use', item)"
                 >
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
@@ -229,8 +230,8 @@ function fmt(t: number) {
                 </button>
                 <button
                   class="op op-del"
-                  data-tip="删除"
-                  :aria-label="`删除：${item.prompt.slice(0, 20)}`"
+                  data-tip="Delete"
+                  :aria-label="`Delete: ${item.prompt.slice(0, 20)}`"
                   @click.stop="emit('remove', item.id)"
                 >
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
@@ -243,7 +244,7 @@ function fmt(t: number) {
           <!-- 背面:整张卡就是这一张图 -->
           <div class="face face-back">
             <img v-if="item.thumb" :src="item.thumb" alt="" />
-            <span v-else class="back-none">这条没有存封面</span>
+            <span v-else class="back-none">No cover saved</span>
           </div>
         </div>
       </li>
@@ -258,16 +259,16 @@ function fmt(t: number) {
           <path d="M9 12h6" />
         </svg>
       </div>
-      <h2 class="none-title">{{ items.length ? '没有匹配的提示词' : '还没有提示词' }}</h2>
+      <h2 class="none-title">{{ items.length ? 'No matching prompts' : 'No prompts yet' }}</h2>
       <p class="none-sub">
         {{
           items.length
-            ? '换个关键词，或把分类切回「全部」。'
-            : '生成图片后打开预览，用「更多操作 → 收藏到提示词库」存下来；也可以直接新建一条。'
+            ? 'Try another keyword, or switch the category back to "All".'
+            : 'Generate an image, then open the preview and choose "More actions → Save to library". You can also add one here.'
         }}
       </p>
-      <button v-if="items.length" class="none-action" @click="resetFilter">清空筛选</button>
-      <button v-else class="none-action" @click="startAdd">新建第一条</button>
+      <button v-if="items.length" class="none-action" @click="resetFilter">Clear filters</button>
+      <button v-else class="none-action" @click="startAdd">New prompt</button>
     </div>
   </section>
 </template>
@@ -643,8 +644,7 @@ function fmt(t: number) {
   gap: 2px;
   margin-left: auto;
 }
-/* 图标用 --text-2 而不是 --text-3:后者在浅色面上只有 2.85:1,
-   达不到非文本元素 3:1 的下限 */
+/* 图标用 --text-2:比 --text-3 重一档,悬停前的分量和正文里的动作图标一致 */
 .op {
   width: 28px;
   height: 28px;
