@@ -8,11 +8,14 @@ import RubberSegment from './components/RubberSegment.vue'
 import LatticeLoader from './components/LatticeLoader.vue'
 import {
   generate,
+  enhancePrompt,
   uid,
   loadConfigs,
   saveConfigs,
   loadActiveId,
   saveActiveId,
+  loadActiveTextId,
+  saveActiveTextId,
   loadHistory,
   addHistoryRecord,
   removeHistoryRecord,
@@ -22,7 +25,6 @@ import {
   getProvider,
   inferVendor,
   allowedSizes,
-  optionLabel,
   imageSrc,
   makeThumb,
   backfillThumbs,
@@ -36,7 +38,12 @@ import type { ApiConfig, FavoritePayload, HistoryEntry, PromptItem, ResultItem, 
 
 // —— 状态 ——
 const prompt = ref('')
-const size = ref('1024x1024')
+// 提示词改写中(防连点、按钮切文案)
+const enhancing = ref(false)
+// 改写前的原稿,空串表示当前没有可撤销的内容。只在点 Undo 或再次改写时更新
+const preEnhance = ref('')
+// 默认交给上游自决:'auto' 在大多数字段里是"最不会错"的一档,选错尺寸比不选更糟
+const size = ref('auto')
 const n = ref(1)
 // 'auto' 表示交给上游自己决定,请求时不带这个参数
 const quality = ref('auto')
@@ -66,8 +73,9 @@ const refImage = ref('') // 图生图参考图 (data URL)
 type Page = 'home' | 'lib' | 'history' | 'settings'
 const page = ref<Page>('home')
 const previewEntry = ref<HistoryEntry | null>(null)
-// 参数 icon 展开的面板:同一时间只开一个,再次点击收起
-type PanelKey = '' | 'ref' | 'size' | 'n' | 'quality' | 'bg' | 'config'
+// 参数 icon 展开的面板:同一时间只开一个,再次点击收起。
+// 只有三项 —— 尺寸/画质/背景/参考图合并成 'more' 一块,参数行默认只露模型与张数
+type PanelKey = '' | 'n' | 'more' | 'config'
 const openPanel = ref<PanelKey>('')
 // 收起动画播放期间保留上一次的面板内容,避免"内容先消失、容器再合拢"的两段跳变
 const shownPanel = ref<PanelKey>('')
@@ -141,6 +149,19 @@ function focusPrompt() {
 // 当前激活配置的名称(未配置时显示占位)
 const activeConfigName = computed(() => config.value.name || config.value.baseUrl || 'Not configured')
 
+/* 文本模型与出图配置并排各占一个胶囊:改写用哪个模型也是一眼该看到的状态。
+   名字优先,没起名字退回模型名 —— 裸地址在胶囊里太长,且对不上"这是哪个模型" */
+const activeTextName = computed(() => {
+  const c = textConfig.value
+  if (!c) return 'Not set'
+  return c.name || c.model || 'Not configured'
+})
+
+// 参数面板按用途分开列出:出图与改写各有各的"当前",混在一排里点谁生效说不清,
+// 而且文本配置被 activateConfig 选中会顶掉出图用的接口
+const imageConfigs = computed(() => configs.value.filter((c) => c.kind !== 'text'))
+const textConfigs = computed(() => configs.value.filter((c) => c.kind === 'text'))
+
 // —— 历史图墙(输入框下方,可收起) ——
 const feedOpen = ref(true)
 const FEED_LIMIT = 12
@@ -211,19 +232,27 @@ const sizeOptions = computed(() => {
 // 尺寸是否由接口自行决定:固定候选的厂商不开放手填,列表已经是全部合法值
 const sizeFree = computed(() => allowedSizes(provider.value.id, config.value.model) === 'free')
 
+/* 收进「更多」里的参数只要有一项不是默认值,入口就点亮 ——
+   否则改过尺寸之后参数行上一点痕迹都没有,像是丢了。
+   size 的基线不能用字面量 'auto':dall-e-3 不开放 auto,初始化会被换成它的第一档,
+   拿 'auto' 当基线会让这家厂商一进页面就亮着 */
+const defaultSize = computed(() =>
+  sizeOptions.value.includes('auto') ? 'auto' : sizeOptions.value[0] || 'auto'
+)
+const moreCustom = computed(
+  () =>
+    size.value !== defaultSize.value ||
+    quality.value !== 'auto' ||
+    background.value !== 'auto' ||
+    !!refImage.value
+)
+
 // 张数上限:多数生图接口一次最多 10 张
 const N_MAX = 10
 
 // 'auto' 是给上游的值,界面上叫"自动"
 function sizeLabel(s: string) {
   return s === 'auto' ? 'Auto' : s.replace(/x/g, '×')
-}
-
-// 参数面板底部说明:支持就明说,不确定就提醒可以改回「自动」兜底
-function capHint(c: Cap) {
-  if (c === 'yes') return `Supported by ${provider.value.label}.`
-  if (c === 'no') return `Not supported by ${provider.value.label} — hidden.`
-  return 'Support depends on your API. Switch back to Auto if it errors.'
 }
 
 // 厂商不限尺寸时给的一组常用值
@@ -314,6 +343,12 @@ const configs = ref<ApiConfig[]>([])
 // 改表单不会动它,只有点了保存才会
 const config = ref<ApiConfig>({ id: '', name: '', baseUrl: '', apiKey: '', model: '' })
 const activeId = ref('')
+// 提示词增强用的文本配置:与出图配置同在一个列表里,只是用途为 'text'。
+// 拷贝一份与 config 同理 —— 改设置页表单不会动它,只有存下/设当前才会。
+// null 表示列表里还没有文本配置(增强按钮会提示去设置页配一条)
+const textConfig = ref<ApiConfig | null>(null)
+// 文本类别当前生效配置的 id,与 activeId 各自独立
+const activeTextId = ref(loadActiveTextId())
 // 接口设置页的视图:'list' = 已保存接口列表,'form' = 新增/编辑接口表单(独立一屏)
 const cfgView = ref<'list' | 'form'>('list')
 // 表单页要编辑/复制的来源;null 表示新增空白。
@@ -321,8 +356,8 @@ const cfgView = ref<'list' | 'form'>('list')
 const cfgSeed = ref<ApiConfig | null>(null)
 
 // 换厂商/换模型后,原来的尺寸可能已不在候选里,自动回退到第一个,免得发出上游不认的值。
-// immediate 让它立刻跑一次:初始 size 写死 1024x1024,当前厂商未必认;
-// 也正因如此必须放在 config 声明之后,提前会撞上 TDZ
+// immediate 让它立刻跑一次,覆盖初始值:默认是 'auto',但 dall-e-3 这类不开放 auto 的
+// 模型会在这里被换成它的第一档 —— 所以必须放在 config 声明之后,提前会撞上 TDZ
 watch(
   sizeOptions,
   (list) => {
@@ -334,10 +369,10 @@ watch(
 onMounted(() => {
   configs.value = loadConfigs()
   activeId.value = loadActiveId()
-  // 选中激活配置;无激活则取第一条
+  // 选中激活配置;无激活则取第一条出图配置(文本配置不能顶出图的当前位置)
   const active =
-    configs.value.find((c) => c.id === activeId.value) ||
-    configs.value[0]
+    configs.value.find((c) => c.id === activeId.value && c.kind !== 'text') ||
+    configs.value.find((c) => c.kind !== 'text')
   if (active) {
     config.value = { ...active }
     // 存着的 activeId 可能指向已被删掉的配置:一并回填成真正选中的那条。
@@ -345,6 +380,19 @@ onMounted(() => {
     if (activeId.value !== active.id) {
       activeId.value = active.id
       saveActiveId(active.id)
+    }
+  }
+  // 文本配置:按 activeTextId 在列表里找用途为 text 的那条;
+  // 没命中(存着的 id 已被删/被改用途)就退而取第一条文本配置并回填 ——
+  // 只有一条时这是显然的选择,比空着好。一条都没有则保持 null
+  const activeText =
+    configs.value.find((c) => c.id === activeTextId.value && c.kind === 'text') ||
+    configs.value.find((c) => c.kind === 'text')
+  if (activeText) {
+    textConfig.value = { ...activeText }
+    if (activeTextId.value !== activeText.id) {
+      activeTextId.value = activeText.id
+      saveActiveTextId(activeText.id)
     }
   }
   libItems.value = loadPrompts()
@@ -381,9 +429,17 @@ function saveSettings(draft: ApiConfig) {
   if (idx >= 0) configs.value[idx] = cfg
   else configs.value.push(cfg)
   saveConfigs(configs.value)
-  config.value = { ...cfg }
-  activeId.value = cfg.id
-  saveActiveId(cfg.id)
+  /* 按用途分派到各自的「当前生效」:两类各自独立,存文本配置不该把出图的当前项顶掉
+     (反之亦然)。同步成副本而不是直接用 cfg —— 之后改表单草稿不能再牵动生效值。 */
+  if (cfg.kind === 'text') {
+    textConfig.value = { ...cfg }
+    activeTextId.value = cfg.id
+    saveActiveTextId(cfg.id)
+  } else {
+    config.value = { ...cfg }
+    activeId.value = cfg.id
+    saveActiveId(cfg.id)
+  }
   // 留在设置页看列表:刚存下的那条会带「当前」标记,比直接跳走更容易确认
   cfgView.value = 'list'
 }
@@ -413,12 +469,29 @@ function activateConfig(c: ApiConfig) {
   activeId.value = c.id
   saveActiveId(c.id)
 }
+// 设某条文本配置为当前生效(与 activateConfig 同一套做法,只是走文本那条通道)
+function activateTextConfig(c: ApiConfig) {
+  textConfig.value = { ...c }
+  activeTextId.value = c.id
+  saveActiveTextId(c.id)
+}
 // 删除一条配置;若删的是激活项,自动激活剩余第一条
 function removeConfig(c: ApiConfig) {
   configs.value = configs.value.filter((x) => x.id !== c.id)
   saveConfigs(configs.value)
+  // 占着各自「当前生效」的那条被删掉时,同样要按用途重新挑一条,免得生效值悬空
+  if (activeTextId.value === c.id) {
+    const nextText = configs.value.find((x) => x.kind === 'text')
+    if (nextText) {
+      activateTextConfig(nextText)
+    } else {
+      textConfig.value = null
+      activeTextId.value = ''
+      saveActiveTextId('')
+    }
+  }
   if (activeId.value === c.id) {
-    const next = configs.value[0]
+    const next = configs.value.find((x) => x.kind !== 'text')
     if (next) {
       config.value = { ...next }
       activeId.value = next.id
@@ -496,18 +569,27 @@ function importConfigs(list: ApiConfig[]) {
       baseUrl: c.baseUrl.trim(),
       apiKey: typeof c.apiKey === 'string' ? c.apiKey : '',
       model: typeof c.model === 'string' ? c.model : '',
-      vendor: typeof c.vendor === 'string' ? c.vendor : 'custom'
+      vendor: typeof c.vendor === 'string' ? c.vendor : 'custom',
+      // 外部文件的脏数据不该让配置错类:认不出是 'text' 的一律当出图
+      kind: c.kind === 'text' ? ('text' as const) : ('image' as const)
     }))
   if (!clean.length) return
   // 追加而不是覆盖:导入是补充,不该把现有配置清掉
   configs.value = [...clean, ...configs.value]
   saveConfigs(configs.value)
-  // 原本一条都没配(生成会被拦下来)时,顺手把导入的第一条设为当前,不然导完照样发不出请求
+  // 原本一条都没配(生成会被拦下来)时,顺手把导入里第一条出图配置设为当前,不然导完照样发不出请求
   if (!configured()) {
-    const first = configs.value[0]
-    config.value = { ...first }
-    activeId.value = first.id
-    saveActiveId(first.id)
+    const first = configs.value.find((c) => c.kind !== 'text')
+    if (first) {
+      config.value = { ...first }
+      activeId.value = first.id
+      saveActiveId(first.id)
+    }
+  }
+  // 文本那边同理:还没有当前生效的文本配置时,取导入进来(或现有)的第一条文本配置
+  if (!textConfig.value) {
+    const nextText = configs.value.find((c) => c.kind === 'text')
+    if (nextText) activateTextConfig(nextText)
   }
 }
 
@@ -663,6 +745,49 @@ function stopGenerate() {
 function retry() {
   if (loading.value) return
   doGenerate()
+}
+
+/* 改写与撤销共用同一个按钮:两件事不会同时可用,拆成两个会让按钮区
+   在"有没有原稿"之间来回换宽度,旁边的清除键跟着跳。
+   三态由现有状态推出来,不另存一份 */
+const canUndo = computed(() => !enhancing.value && !!preEnhance.value)
+const enhanceText = computed(() =>
+  enhancing.value ? 'Enhancing…' : canUndo.value ? 'Undo' : 'Enhance'
+)
+// 撤销态下即使输入框被清空也照常可点:原稿还在,这正是要撤回来的场景
+const enhanceDisabled = computed(() => enhancing.value || (!canUndo.value && !prompt.value.trim()))
+
+/* 提示词改写:用文本模型把当前提示词扩写得更具体,结果填回输入框。
+   改写前的原稿另存一份供 Undo 撤销 —— 不做历史记录,只留最近一次。 */
+async function doEnhance() {
+  // 进行中不重入,防连点
+  if (enhancing.value) return
+  const src = prompt.value.trim()
+  if (!src) return
+  // 改写模型和地址都要有:缺一个都打不通 /chat/completions,借现有的错误出口提示去设置页配
+  const cfg = textConfig.value
+  if (!cfg || !cfg.model || !cfg.baseUrl) {
+    fail('Set up prompt enhancing in API settings first.')
+    return
+  }
+  enhancing.value = true
+  try {
+    const out = await enhancePrompt(cfg, src)
+    // 原稿存的是改写前的完整文本(含可能的首尾空白),Undo 才能一字不差地还原
+    preEnhance.value = prompt.value
+    prompt.value = out
+  } catch (e: any) {
+    fail(e?.message || 'Prompt enhancing failed')
+  } finally {
+    enhancing.value = false
+  }
+}
+
+// 撤销改写:把原稿写回输入框,并清掉撤销点
+function undoEnhance() {
+  if (!preEnhance.value) return
+  prompt.value = preEnhance.value
+  preEnhance.value = ''
 }
 
 // —— 工具 ——
@@ -860,11 +985,13 @@ async function toggleMark(entry: HistoryEntry, index: number) {
 
             <!-- 二、参数 icon 行(横线下方),点击 icon 展开对应选项 -->
             <div class="param-bar" ref="paramBarEl" role="group" aria-label="Generation parameters">
+              <!-- 出图与改写两个模型共用一个胶囊:分两个各带一份图标与内边距,
+                   在参数行里白占近 80px。中间用细线分开,否则两个名字连读成一条 -->
               <button
                 class="param-btn has-val"
                 :class="{ on: openPanel === 'config', filled: !!configured() }"
-                :data-tip="`API · ${activeConfigName}`"
-                aria-label="API"
+                :data-tip="`Image model · ${activeConfigName} / Text model · ${activeTextName}`"
+                :aria-label="`Image model: ${activeConfigName}. Text model: ${activeTextName}`"
                 @click="togglePanel('config')"
               >
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -873,6 +1000,8 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                   <circle cx="9.5" cy="17" r="2.3" />
                 </svg>
                 <b class="param-val param-val-name">{{ activeConfigName }}</b>
+                <span class="param-sep" aria-hidden="true"></span>
+                <b class="param-val param-val-name param-val-sub">{{ activeTextName }}</b>
               </button>
               <button
                 class="param-btn has-val"
@@ -889,69 +1018,46 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                 </svg>
                 <b class="param-val">{{ n }} {{ n === 1 ? 'image' : 'images' }}</b>
               </button>
-              <button
-                class="param-btn has-val"
-                :class="{ on: openPanel === 'size' }"
-                :data-tip="`Size · ${sizeLabel(size)}`"
-                aria-label="Size"
-                @click="togglePanel('size')"
-              >
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <!-- 外框 + 对角缩放箭头:表达"尺寸/比例" -->
-                  <rect x="3.5" y="3.5" width="17" height="17" rx="3" />
-                  <path d="M9.5 14.5 14.5 9.5M9.5 11.6v2.9h2.9M14.5 12.4V9.5h-2.9" />
-                </svg>
-                <b class="param-val">{{ sizeLabel(size) }}</b>
-              </button>
-              <!-- 已知不认画质的厂商直接收起来,免得选了却被上游 400 -->
-              <button
-                v-if="provider.quality !== 'no'"
-                class="param-btn has-val"
-                :class="{ on: openPanel === 'quality', filled: quality !== 'auto' }"
-                :data-tip="`Quality · ${optionLabel(QUALITY_OPTIONS, quality)}`"
-                aria-label="Quality"
-                @click="togglePanel('quality')"
-              >
-                <!-- 三根递升的柱子:表达档位高低 -->
-                <svg viewBox="0 0 24 24" fill="currentColor">
-                  <rect x="4" y="13.5" width="3.2" height="6.5" rx="1.6" />
-                  <rect x="10.4" y="9" width="3.2" height="11" rx="1.6" />
-                  <rect x="16.8" y="4.5" width="3.2" height="15.5" rx="1.6" />
-                </svg>
-                <b class="param-val">{{ optionLabel(QUALITY_OPTIONS, quality) }}</b>
-              </button>
-              <button
-                v-if="provider.background !== 'no'"
-                class="param-btn has-val"
-                :class="{ on: openPanel === 'bg', filled: background !== 'auto' }"
-                :data-tip="`Background · ${optionLabel(BACKGROUND_OPTIONS, background)}`"
-                aria-label="Background"
-                @click="togglePanel('bg')"
-              >
-                <!-- 方框 + 棋盘点:透明底的通用符号 -->
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <rect x="3.5" y="3.5" width="17" height="17" rx="2.5" />
-                  <path d="M8 8h.01M16 8h.01M12 12h.01M8 16h.01M16 16h.01" stroke-width="2.6" />
-                </svg>
-                <b class="param-val">{{ optionLabel(BACKGROUND_OPTIONS, background) }}</b>
-              </button>
-              <!-- 参考图放最后:它是一次性的输入,不是常规参数 -->
+              <!-- 尺寸/画质/背景/参考图收进这一个入口:参数行默认只留模型与张数,
+                   最常改的两个直接可达,其余点开就是完整面板,不必挤成一长排。
+                   有非默认值就点亮,免得改过的参数在行上不留痕迹 -->
               <button
                 class="param-btn"
-                :class="{ on: openPanel === 'ref', filled: !!refImage }"
-                :data-tip="refImage ? 'Reference · Selected' : 'Reference · None'"
-                aria-label="Reference image"
-                @click="togglePanel('ref')"
+                :class="{ on: openPanel === 'more', filled: moreCustom }"
+                data-tip="More parameters"
+                aria-label="More parameters"
+                @click="togglePanel('more')"
               >
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <rect x="3" y="4" width="18" height="16" rx="2.5" />
-                  <circle cx="8.5" cy="9.5" r="1.8" />
-                  <path d="M4 17.5l4.5-4.5L12 16.5l3-3 5 5" />
+                <!-- 2×2 点阵:与上面那几个语义明确的图标区分,专表示"还有更多" -->
+                <svg viewBox="0 0 24 24" fill="currentColor">
+                  <circle cx="9" cy="9" r="1.9" />
+                  <circle cx="15" cy="9" r="1.9" />
+                  <circle cx="9" cy="15" r="1.9" />
+                  <circle cx="15" cy="15" r="1.9" />
                 </svg>
               </button>
 
-              <!-- 清除(次级) + 生成(主按钮),右对齐收在参数行末尾 -->
+              <!-- 改写/清除/生成收在参数行末尾。
+                   改写与撤销是同一个按钮(有原稿可撤时它变成 Undo),
+                   这样按钮区不会在两种状态间变宽变窄 -->
               <div class="prompt-actions">
+                <button
+                  class="enhance-btn"
+                  :class="{ undo: canUndo }"
+                  :disabled="enhanceDisabled"
+                  :aria-label="canUndo ? 'Undo prompt enhancing' : 'Enhance prompt with a text model'"
+                  @click="canUndo ? undoEnhance() : doEnhance()"
+                >
+                  <!-- 四角星 = 增强,回转箭头 = 撤销:同一处换符号,比只换文案先被看到 -->
+                  <svg v-if="canUndo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M4 10.5h9.5a4.75 4.75 0 0 1 0 9.5H9" />
+                    <path d="M7.5 6.5 3.5 10.5l4 4" />
+                  </svg>
+                  <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M12 3.5l1.9 6.6 6.6 1.9-6.6 1.9L12 20.5l-1.9-6.6L3.5 12l6.6-1.9L12 3.5z" />
+                  </svg>
+                  {{ enhanceText }}
+                </button>
                 <button
                   v-if="prompt.trim() && !loading"
                   class="clear-icon"
@@ -988,10 +1094,11 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                 <div class="param-panel">
                   <!-- 配置 -->
                   <div v-if="shownPanel === 'config'" class="pp-body">
-                    <div v-if="configs.length" class="pp-group">
-                      <span class="pp-label">Saved</span>
+                    <!-- 出图与改写分两组,各自标各自的"当前";空组不渲染 -->
+                    <div v-if="imageConfigs.length" class="pp-group">
+                      <span class="pp-label">Image model</span>
                       <button
-                        v-for="c in configs"
+                        v-for="c in imageConfigs"
                         :key="c.id"
                         class="preset"
                         :class="{ on: config.id === c.id }"
@@ -1001,29 +1108,28 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                         {{ c.name || 'Untitled config' }}
                       </button>
                     </div>
-                    <!-- 没有已保存配置时给一个入口;有配置时只管切换,管理走顶部齿轮 -->
+                    <div v-if="textConfigs.length" class="pp-group">
+                      <span class="pp-label">Text model</span>
+                      <button
+                        v-for="c in textConfigs"
+                        :key="c.id"
+                        class="preset"
+                        :class="{ on: textConfig?.id === c.id }"
+                        :title="`${c.baseUrl}${c.model ? ' · ' + c.model : ''}`"
+                        @click="activateTextConfig(c)"
+                      >
+                        {{ c.name || 'Untitled config' }}
+                      </button>
+                    </div>
+                    <!-- 一条都没有时给一个入口;有配置时只管切换,管理走顶部齿轮 -->
                     <div v-if="!configs.length" class="pp-group">
                       <span class="pp-note">No saved configs</span>
                       <button class="pp-action" @click="openConfigManager">Add config</button>
                     </div>
                   </div>
 
-                  <!-- 参考图 -->
-                  <div v-else-if="shownPanel === 'ref'" class="pp-body">
-                    <div class="pp-group">
-                      <template v-if="!refImage">
-                        <label class="ref-pick" for="ref-file">+ Choose a reference image</label>
-                      </template>
-                      <template v-else>
-                        <img class="pp-thumb" :src="refImage" alt="Reference image" />
-                        <span class="pp-note">Reference selected</span>
-                        <button class="pp-action" @click="clearRef">Remove</button>
-                      </template>
-                    </div>
-                  </div>
-
                   <!-- 尺寸 -->
-                  <div v-else-if="shownPanel === 'size'" class="pp-body">
+                  <div v-if="shownPanel === 'more'" class="pp-body">
                     <div class="pp-group">
                       <span class="pp-label">Size</span>
                       <button
@@ -1036,11 +1142,10 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                       >
                         {{ sizeLabel(s) }}
                       </button>
-                    </div>
-                    <!-- 固定候选的厂商不开放手填:列表已经是全部合法值,填别的只会被上游拒掉 -->
-                    <div v-if="sizeFree" class="pp-group">
-                      <span class="pp-label">Custom</span>
+                      <!-- 手填尺寸并进这一行:它只是尺寸的另一种填法,不是独立参数。
+                           固定候选的厂商不开放手填 —— 列表已经是全部合法值,填别的只会被拒 -->
                       <input
+                        v-if="sizeFree"
                         class="num-input size-input"
                         :value="size"
                         placeholder="e.g. 1536×1024"
@@ -1048,12 +1153,11 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                         aria-label="Custom size"
                         @change="commitSize"
                       />
-                      <span class="pp-note">Width × height, or leave blank</span>
                     </div>
                   </div>
 
                   <!-- 张数 -->
-                  <div v-else-if="shownPanel === 'n'" class="pp-body">
+                  <div v-if="shownPanel === 'n'" class="pp-body">
                     <div class="pp-group">
                       <span class="pp-label">Count</span>
                       <button
@@ -1078,12 +1182,11 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                         aria-label="Custom count"
                         @change="clampN"
                       />
-                      <span class="pp-note">Up to {{ N_MAX }} images</span>
                     </div>
                   </div>
 
-                  <!-- 画质 -->
-                  <div v-else-if="shownPanel === 'quality'" class="pp-body">
+                  <!-- 画质:已知不认的厂商不列出来,免得选了却被上游 400 -->
+                  <div v-if="shownPanel === 'more' && provider.quality !== 'no'" class="pp-body">
                     <div class="pp-group">
                       <span class="pp-label">Quality</span>
                       <button
@@ -1097,11 +1200,10 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                         <em class="preset-hint">{{ o.hint }}</em>
                       </button>
                     </div>
-                    <p class="pp-tip">Higher settings mean sharper images, but take longer and cost more. {{ capHint(provider.quality) }}</p>
                   </div>
 
                   <!-- 背景 -->
-                  <div v-else-if="shownPanel === 'bg'" class="pp-body">
+                  <div v-if="shownPanel === 'more' && provider.background !== 'no'" class="pp-body">
                     <div class="pp-group">
                       <span class="pp-label">Background</span>
                       <button
@@ -1115,7 +1217,21 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                         {{ o.label }}
                       </button>
                     </div>
-                    <p class="pp-tip">Choose Transparent for a cut-out with no background — handy for assets. {{ capHint(provider.background) }}</p>
+                  </div>
+
+                  <!-- 参考图放最后:它是一次性的输入,不是常规参数 -->
+                  <div v-if="shownPanel === 'more'" class="pp-body">
+                    <div class="pp-group">
+                      <span class="pp-label">Reference</span>
+                      <template v-if="!refImage">
+                        <label class="ref-pick" for="ref-file">+ Choose a reference image</label>
+                      </template>
+                      <template v-else>
+                        <img class="pp-thumb" :src="refImage" alt="Reference image" />
+                        <span class="pp-note">Reference selected</span>
+                        <button class="pp-action" @click="clearRef">Remove</button>
+                      </template>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -1249,10 +1365,12 @@ async function toggleMark(entry: HistoryEntry, index: number) {
         class="page-in"
         :configs="configs"
         :active-id="activeId"
+        :active-text-id="activeTextId"
         :mode="cfgView"
         :seed="cfgSeed"
         :capability-note="capabilityNote"
         @activate="activateConfig"
+        @activate-text="activateTextConfig"
         @edit="editConfig"
         @duplicate="duplicateConfig"
         @remove="removeConfig"
@@ -1607,6 +1725,19 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* 两个模型名之间的细竖线:少了它,两个名字会连读成一条 */
+.param-sep {
+  flex: none;
+  width: 1px;
+  height: 11px;
+  margin: 0 1px;
+  background: var(--line-strong);
+}
+/* 改写用的文本模型退一档:出图是主流程,它只在按 Enhance 时才起作用。
+   胶囊处于高亮/已填态时会被上面那条 color: inherit 接管,统一成一个颜色 */
+.param-val-sub {
+  color: var(--text-3);
+}
 .param-btn.on .param-val,
 .param-btn.filled .param-val {
   color: inherit;
@@ -1628,11 +1759,16 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   overflow: hidden;
 }
 .param-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
   margin-top: 10px;
   padding: 12px;
   border-radius: var(--r-sm);
   background: var(--bg-elev);
-  max-height: 190px;
+  /* 「更多」面板要一次容下尺寸/画质/背景/参考图四组,190px 会把它切成两屏;
+     用 vh 兜住矮视口,宁可在面板内滚动也不把整个输入区顶下去 */
+  max-height: min(46vh, 340px);
   overflow-y: auto;
   opacity: 0;
   transform: translateY(-4px);
@@ -1668,12 +1804,6 @@ async function toggleMark(entry: HistoryEntry, index: number) {
 .pp-note {
   font-size: 13px;
   color: var(--text-2);
-}
-/* 面板底部的说明文字 */
-.pp-tip {
-  font-size: 12px;
-  line-height: 1.6;
-  color: var(--text-3);
 }
 /* 面板里的紧凑数字输入(自定义张数) */
 .num-input {
@@ -1903,6 +2033,42 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   opacity: 0.45;
   cursor: not-allowed;
   box-shadow: none;
+}
+/* 提示词改写按钮:与参数按钮同尺寸、同描边语言,带文案所以宽度随内容撑开。
+   改写完成后同一个按钮变成撤销态(见 .undo),不再另起一个按钮 */
+.enhance-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+  height: 34px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text-2);
+  font-size: 13px;
+  cursor: pointer;
+  transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease),
+    background var(--dur) var(--ease);
+}
+.enhance-btn svg {
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+}
+.enhance-btn:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--line-strong);
+}
+.enhance-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+/* 撤销态:同一个按钮,压轻一档表示"这是往回走"而不是再改写一次 */
+.enhance-btn.undo {
+  background: none;
+  color: var(--text-3);
 }
 
 /* ===== 历史图墙(输入框下方的最近生成) ===== */

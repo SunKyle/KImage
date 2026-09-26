@@ -182,6 +182,14 @@ function useThisPrompt() {
   close()
 }
 
+/* 把当前这张图作为参考图交给主界面。
+   交出原始载荷而不是渲染用的 src:主界面要转成 data URL 才能当参考图。
+   不在这里 close —— 主界面接管后会自己关预览并滚回顶部 */
+function useAsReference() {
+  const item = props.entry?.results[active.value]
+  if (item) emit('reference', item)
+}
+
 // 标记标的是"当前这张图",所以要跟着 active 走:一条记录里几张图各标各的。
 // 字段和历史图墙共用(entry.results[].marked),这边只负责触发,落盘在主界面
 const marked = computed(() => !!props.entry?.results[active.value]?.marked)
@@ -253,7 +261,7 @@ onUnmounted(() => {
 })
 
 // 菜单动作
-function menuAction(kind: 'favorite' | 'reference' | 'remove') {
+function menuAction(kind: 'favorite' | 'download' | 'remove') {
   if (!props.entry) return
   if (kind === 'favorite') {
     // 连参数和当前这张图一起交出去,库里才能既复现参数、又留下封面
@@ -265,10 +273,8 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
       background: props.entry.background,
       src: item ? imageSrc(item) : ''
     })
-  } else if (kind === 'reference') {
-    // 交出原始载荷而不是渲染用的 src:主界面要转成 data URL 才能当参考图
-    const item = props.entry.results[active.value]
-    if (item) emit('reference', item)
+  } else if (kind === 'download') {
+    download()
   } else if (kind === 'remove') {
     emit('remove')
   }
@@ -365,7 +371,7 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
                     <Transition name="po">
                       <div v-if="menuOpen" class="menu">
                         <button class="mitem" @click="menuAction('favorite')">Save to library</button>
-                        <button class="mitem" @click="menuAction('reference')">Use as reference</button>
+                        <button class="mitem" @click="menuAction('download')">Download</button>
                         <button class="mitem danger" @click="menuAction('remove')">Delete</button>
                       </div>
                     </Transition>
@@ -441,10 +447,12 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
                 <span class="meta">{{ fmtTime(entry.createdAt) }}</span>
               </div>
 
-              <!-- 底部操作:主次并排,占满侧栏宽度 -->
+              <!-- 底部操作:主次并排,占满侧栏宽度。
+                   文案取 "As reference" 而非 "Use as reference":
+                   侧栏 320px 放两个等宽按钮,长一档就会换行折成两行 -->
               <div class="side-actions">
                 <button class="act primary" @click="useThisPrompt">Use prompt</button>
-                <button class="act" @click="download">Download</button>
+                <button class="act" @click="useAsReference">As reference</button>
               </div>
             </aside>
           </div>

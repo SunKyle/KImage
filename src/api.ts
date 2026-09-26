@@ -12,6 +12,8 @@ import {
 
 const CONFIG_KEY = 'kimage.apiConfigs'
 const CONFIG_ACTIVE_KEY = 'kimage.apiActive'
+// 「当前生效的文本配置」记录的 id:文本类别也有自己的当前项,与出图那条各自独立
+const TEXT_ACTIVE_KEY = 'kimage.apiActiveText'
 
 export function uid(): string {
   return Math.random().toString(36).slice(2) + Date.now().toString(36)
@@ -107,6 +109,42 @@ export function allowedSizes(vendorId: string | undefined, model: string): strin
   return getProvider(vendorId).sizes
 }
 
+/* ===== 提示词增强的文本模型预设 ======================================
+   服务于表单里「用途 = text」时的预设行。与出图的 PROVIDERS 分开:
+   两者要填的模型不是一回事(出图填图像模型,这里填对话模型),
+   共用一份预设会互相误导。
+   地址与出图厂商同源,但百炼要单独列一条 —— 它的 /api/v1 是原生协议,
+   对话得走 /compatible-mode/v1,填错会直接 404。
+   -------------------------------------------------------------------- */
+export interface TextProvider {
+  id: string
+  label: string
+  baseUrl: string
+  /* 推荐模型。留空表示这家没有能安全写死的默认值:模型名多带日期版本号,
+     写死很快过期,不如留空让用户自己填 */
+  model?: string
+}
+
+export const TEXT_PROVIDERS: TextProvider[] = [
+  {
+    id: 'openai',
+    label: 'OpenAI',
+    baseUrl: 'https://api.openai.com/v1',
+    model: 'gpt-4o-mini'
+  },
+  {
+    id: 'dashscope-compat',
+    label: 'Bailian (compatible mode)',
+    baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    model: 'qwen-plus'
+  },
+  {
+    id: 'ark',
+    label: 'Volcengine Ark',
+    baseUrl: 'https://ark.cn-beijing.volces.com/api/v3'
+  }
+]
+
 /* ===== 扩展参数的取值与界面文案 =====================================
    放在这里是为了让主界面和历史预览共用同一份文案,避免两处各写一套
    后出现「面板显示低、预览显示 low」这类不一致。
@@ -136,7 +174,7 @@ export function loadConfigs(): ApiConfig[] {
     const raw = localStorage.getItem(CONFIG_KEY)
     if (raw) {
       const arr = JSON.parse(raw)
-      if (Array.isArray(arr)) return (arr as ApiConfig[]).map(withVendor)
+      if (Array.isArray(arr)) return (arr as ApiConfig[]).map(normalizeConfig)
     }
   } catch {
     /* ignore */
@@ -146,7 +184,7 @@ export function loadConfigs(): ApiConfig[] {
     const raw = localStorage.getItem('kimage.apiConfig')
     if (raw) {
       const c = JSON.parse(raw)
-      const list: ApiConfig[] = [withVendor({ id: uid(), name: 'Default config', ...c })]
+      const list: ApiConfig[] = [normalizeConfig({ id: uid(), name: 'Default config', ...c })]
       saveConfigs(list)
       return list
     }
@@ -156,9 +194,16 @@ export function loadConfigs(): ApiConfig[] {
   return []
 }
 
-// 补齐 vendor(加这个字段之前存下来的配置没有它)
-function withVendor(c: ApiConfig): ApiConfig {
-  return c.vendor ? c : { ...c, vendor: inferVendor(c.baseUrl) }
+/* 补齐加字段之前存下来的配置缺的字段:
+   - vendor:没有就按域名猜;
+   - kind:没有(或读到别的值)一律当 'image' —— 加这个字段之前存的都是出图配置,
+     而且外部脏数据不该让这条配置错类或消失 */
+function normalizeConfig(c: ApiConfig): ApiConfig {
+  return {
+    ...c,
+    vendor: c.vendor || inferVendor(c.baseUrl),
+    kind: c.kind === 'text' ? 'text' : 'image'
+  }
 }
 
 export function saveConfigs(list: ApiConfig[]) {
@@ -171,6 +216,15 @@ export function loadActiveId(): string {
 
 export function saveActiveId(id: string) {
   localStorage.setItem(CONFIG_ACTIVE_KEY, id)
+}
+
+// 文本类别的当前生效配置 id:与出图那条互不影响,两条各存各的
+export function loadActiveTextId(): string {
+  return localStorage.getItem(TEXT_ACTIVE_KEY) || ''
+}
+
+export function saveActiveTextId(id: string) {
+  localStorage.setItem(TEXT_ACTIVE_KEY, id)
 }
 
 /**
@@ -233,6 +287,44 @@ export async function generate(
       return { type: 'url', data: '' }
     })
   )
+}
+
+/**
+ * 调用后端代理改写提示词。
+ * 走文本模型的 /chat/completions(图像模型只出图、改不了提示词),
+ * 用的是「用途 = text」那条配置的地址、密钥与模型。返回扩写后的提示词。
+ * 未配置时由调用方先拦下,这里不重复判断。
+ */
+export async function enhancePrompt(cfg: ApiConfig, prompt: string): Promise<string> {
+  const resp = await fetch('/api/enhance', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      prompt,
+      // 后端 /api/enhance 收的字段名仍是 textModel,路由不用改
+      textModel: cfg.model,
+      baseUrl: cfg.baseUrl,
+      apiKey: cfg.apiKey
+    })
+  })
+
+  if (!resp.ok) {
+    let msg = `Request failed (${resp.status})`
+    try {
+      const body = await resp.json()
+      if (body?.error) msg = body.error
+      // 附带上游原始报错 detail，便于定位 503/4xx 原因
+      if (body?.detail) msg = `${msg} — ${body.detail}`
+    } catch {
+      /* ignore */
+    }
+    throw new Error(msg)
+  }
+
+  const data = (await resp.json()) as { prompt?: string }
+  const out = typeof data.prompt === 'string' ? data.prompt.trim() : ''
+  if (!out) throw new Error('Upstream returned no text to use')
+  return out
 }
 
 /* ===== 图片载荷 → 可渲染的 src =====================================

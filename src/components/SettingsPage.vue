@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch, onMounted, onBeforeUnmount } from 'vue'
-import { PROVIDERS, getProvider, inferVendor } from '../api'
-import type { Provider } from '../api'
+import { PROVIDERS, TEXT_PROVIDERS, getProvider, inferVendor } from '../api'
+import type { Provider, TextProvider } from '../api'
 import type { ApiConfig } from '../types'
 
 /* 接口设置:独立页面。
@@ -11,7 +11,11 @@ import type { ApiConfig } from '../types'
 
 const props = defineProps<{
   configs: ApiConfig[]
+  /* 出图类别里当前生效那条的 id */
   activeId: string
+  /* 提示词增强类别里当前生效那条的 id。与 activeId 各自独立:
+     两类配置同在一个列表里,但「当前」是分开记的 */
+  activeTextId: string
   mode: 'list' | 'form'
   /* 编辑/复制的来源;null 表示新增空白 */
   seed: ApiConfig | null
@@ -22,6 +26,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (e: 'activate', c: ApiConfig): void
+  (e: 'activateText', c: ApiConfig): void
   (e: 'edit', c: ApiConfig): void
   (e: 'duplicate', c: ApiConfig): void
   (e: 'remove', c: ApiConfig): void
@@ -44,7 +49,8 @@ onMounted(() => document.addEventListener('pointerdown', onDocPointerDown))
 onBeforeUnmount(() => document.removeEventListener('pointerdown', onDocPointerDown))
 
 function blank(): ApiConfig {
-  return { id: '', name: '', baseUrl: '', apiKey: '', model: '', vendor: 'custom' }
+  // 新增默认做出图:绝大多数人的第一诉求是出图,文本配置是后来才补的
+  return { id: '', name: '', baseUrl: '', apiKey: '', model: '', vendor: 'custom', kind: 'image' }
 }
 
 // 灌草稿:seed 一变就重置一次,编辑、复制、新增都走这里
@@ -56,6 +62,33 @@ watch(
   },
   { immediate: true }
 )
+
+// 草稿当前用途:老配置没有 kind 时按出图算
+const isText = computed(() => (draft.value.kind || 'image') === 'text')
+
+/* 切换用途:只切 kind 并换掉下面的预设行。
+   已填的 baseUrl / apiKey 保留 —— 地址与密钥常常同源,用户可能刚填好,不该被清掉;
+   但 model 一定要清空:图像模型名拿去打 /chat/completions 必错,反过来也一样,
+   留着只会让人以为还能用。 */
+function setPurpose(kind: 'image' | 'text') {
+  if (draft.value.kind === kind) return
+  draft.value.kind = kind
+  draft.value.model = ''
+}
+
+/* 预设只补地址与推荐模型,密钥一律不动 —— 换一家预设不该把已填的 key 冲掉。
+   与下面的 applyProvider 同一套规矩。 */
+function applyTextProvider(p: TextProvider) {
+  draft.value.baseUrl = p.baseUrl
+  if (p.model) draft.value.model = p.model
+}
+
+/* 高亮当前地址命中哪个预设:草稿里没有 vendor 字段,直接比地址,
+   省得为了高亮再存一个状态。尾斜杠与大小写不该影响判断 */
+function textPresetOn(p: TextProvider) {
+  const norm = (u: string) => (u || '').trim().replace(/\/+$/, '').toLowerCase()
+  return norm(draft.value.baseUrl) === norm(p.baseUrl)
+}
 
 // 选厂商:已知厂商顺带填入它的默认地址与模型;自定义只记身份,不动用户已填的内容
 function applyProvider(p: Provider) {
@@ -110,11 +143,29 @@ function endpointLine(url: string) {
   }
 }
 
-// 选厂商时先讲清它能吃什么:界面上的参数门控就是照着这份声明来的
-// 能力说明由父级传入(按当前生效接口算),不在本地按草稿算
-const section = computed(() =>
-  props.mode === 'form' ? (draft.value.id ? 'Edit config' : 'New config') : 'Saved configs'
+/* 列表按用途分两组渲染:两组各自判「当前」(出图比 activeId,文本比 activeTextId),
+   所以把组连同判据一起列成数据,模板里只写一份卡片。空组直接滤掉,不渲染 */
+const groups = computed(() =>
+  [
+    {
+      key: 'image',
+      label: 'Image generation',
+      tag: 'Image',
+      items: props.configs.filter((c) => c.kind !== 'text'),
+      activeId: props.activeId
+    },
+    {
+      key: 'text',
+      label: 'Prompt enhancing',
+      tag: 'Text',
+      items: props.configs.filter((c) => c.kind === 'text'),
+      activeId: props.activeTextId
+    }
+  ].filter((g) => g.items.length)
 )
+
+// 分区行只在表单态用(列表态已按用途分组,各组自带组名),保持英文文案
+const section = computed(() => (draft.value.id ? 'Edit config' : 'New config'))
 
 /* 导出把配置原样写成 JSON —— 包括 API Key。
    不带 Key 的备份没有意义(换台机器导回去还是要一条条补),
@@ -186,12 +237,11 @@ function onImportFile(e: Event) {
       </div>
     </header>
 
-    <!-- 分区行:列表显示条数,表单显示当前在新增还是编辑,并给一条回程 -->
-    <div class="pg-bar">
-      <span class="pg-label">
-        {{ section }}<template v-if="mode === 'list'"> · {{ configs.length }}</template>
-      </span>
-      <button v-if="mode === 'form'" class="pg-back" @click="emit('cancel')">
+    <!-- 分区行:只在表单态显示(当前在新增还是编辑),并给一条回程。
+         列表态不显示 —— 下面已按用途分了两组,各组自带组名,再顶一个总标题是重复 -->
+    <div v-if="mode === 'form'" class="pg-bar">
+      <span class="pg-label">{{ section }}</span>
+      <button class="pg-back" @click="emit('cancel')">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M15 6l-6 6 6 6" />
         </svg>
@@ -203,39 +253,54 @@ function onImportFile(e: Event) {
     <div class="pg-wrap">
       <!-- ===== 视图一:已保存的接口列表 ===== -->
       <template v-if="mode === 'list'">
-        <ul v-if="configs.length" class="cfg-grid">
-          <li v-for="c in configs" :key="c.id" class="cfg-card" :class="{ on: c.id === activeId }">
-            <!-- 主体点击 = 切为当前生效。操作按钮不能塞进来(按钮不能嵌套),所以是兄弟节点,
-                 靠绝对定位落在右上角,顺带省掉了一整行高度 -->
-            <button class="cfg-main" @click="emit('activate', c)">
-              <span class="cfg-head">
-                <span class="cfg-name">{{ c.name || 'Untitled config' }}</span>
-                <span v-if="c.id === activeId" class="cfg-active">Current</span>
-              </span>
-              <span class="cfg-ident">{{ identLine(c) }}</span>
-              <span class="cfg-url" :title="c.baseUrl">{{ endpointLine(c.baseUrl) }}</span>
-            </button>
-            <div class="cfg-ops">
-              <button class="cfg-op" :aria-label="`Edit: ${c.name || 'Untitled config'}`" @click="emit('edit', c)">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M12 20h9" />
-                  <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
-                </svg>
-              </button>
-              <button class="cfg-op" :aria-label="`Duplicate: ${c.name || 'Untitled config'}`" @click="emit('duplicate', c)">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                  <rect x="9" y="9" width="11" height="11" rx="2" />
-                  <path d="M5 15V6a1 1 0 0 1 1-1h9" />
-                </svg>
-              </button>
-              <button class="cfg-op danger" :aria-label="`Delete: ${c.name || 'Untitled config'}`" @click="emit('remove', c)">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2M6 7l1 12a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-12" />
-                </svg>
-              </button>
+        <!-- 按用途分两组渲染,空组不渲染(groups 里已滤掉);
+             两块都为空时才是「一条配置都没有」 -->
+        <template v-if="groups.length">
+          <template v-for="g in groups" :key="g.key">
+            <div class="pg-bar">
+              <span class="pg-label">{{ g.label }} · {{ g.items.length }}</span>
             </div>
-          </li>
-        </ul>
+            <ul class="cfg-grid">
+              <li v-for="c in g.items" :key="c.id" class="cfg-card" :class="{ on: c.id === g.activeId }">
+                <!-- 主体点击 = 把这条设为该类别的当前生效(出图走 activate,文本走 activateText)。
+                     操作按钮不能塞进来(按钮不能嵌套),所以是兄弟节点,
+                     靠绝对定位落在右上角,顺带省掉了一整行高度 -->
+                <button
+                  class="cfg-main"
+                  @click="g.key === 'text' ? emit('activateText', c) : emit('activate', c)"
+                >
+                  <span class="cfg-head">
+                    <span class="cfg-name">{{ c.name || 'Untitled config' }}</span>
+                    <!-- 用途小徽章:同一张列表里混着两类,得一眼看出这条属于哪类 -->
+                    <span class="cfg-tag">{{ g.tag }}</span>
+                    <span v-if="c.id === g.activeId" class="cfg-active">Current</span>
+                  </span>
+                  <span class="cfg-ident">{{ identLine(c) }}</span>
+                  <span class="cfg-url" :title="c.baseUrl">{{ endpointLine(c.baseUrl) }}</span>
+                </button>
+                <div class="cfg-ops">
+                  <button class="cfg-op" :aria-label="`Edit: ${c.name || 'Untitled config'}`" @click="emit('edit', c)">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M12 20h9" />
+                      <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+                    </svg>
+                  </button>
+                  <button class="cfg-op" :aria-label="`Duplicate: ${c.name || 'Untitled config'}`" @click="emit('duplicate', c)">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                      <rect x="9" y="9" width="11" height="11" rx="2" />
+                      <path d="M5 15V6a1 1 0 0 1 1-1h9" />
+                    </svg>
+                  </button>
+                  <button class="cfg-op danger" :aria-label="`Delete: ${c.name || 'Untitled config'}`" @click="emit('remove', c)">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2M6 7l1 12a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-12" />
+                    </svg>
+                  </button>
+                </div>
+              </li>
+            </ul>
+          </template>
+        </template>
 
         <div v-else class="pg-none">
           <div class="none-ico" aria-hidden="true">
@@ -252,20 +317,62 @@ function onImportFile(e: Event) {
 
       <!-- ===== 视图二:新增/编辑接口表单 ===== -->
       <form v-else class="cfg-form" @submit.prevent="submit">
-        <div class="presets" role="group" aria-label="Select provider">
-          <span class="pg-label">Provider</span>
+        <!-- 用途:这条配置用来出图还是改写提示词。两类各自有「当前生效」,互不影响 -->
+        <div class="presets" role="group" aria-label="Config purpose">
+          <span class="pg-label">Purpose</span>
           <button
-            v-for="p in PROVIDERS"
-            :key="p.id"
             type="button"
             class="preset"
-            :class="{ on: (draft.vendor || 'custom') === p.id }"
-            @click="applyProvider(p)"
+            :class="{ on: !isText }"
+            @click="setPurpose('image')"
           >
-            {{ p.label }}
+            Image generation
+          </button>
+          <button
+            type="button"
+            class="preset"
+            :class="{ on: isText }"
+            @click="setPurpose('text')"
+          >
+            Prompt enhancing
           </button>
         </div>
-        <p class="vendor-note">{{ capabilityNote }}</p>
+
+        <!-- 预设随用途切换数据源:出图用图像模型预设,文本用对话模型预设 -->
+        <div class="presets" role="group" aria-label="Select provider">
+          <span class="pg-label">Provider</span>
+          <template v-if="!isText">
+            <button
+              v-for="p in PROVIDERS"
+              :key="p.id"
+              type="button"
+              class="preset"
+              :class="{ on: (draft.vendor || 'custom') === p.id }"
+              @click="applyProvider(p)"
+            >
+              {{ p.label }}
+            </button>
+          </template>
+          <template v-else>
+            <button
+              v-for="p in TEXT_PROVIDERS"
+              :key="p.id"
+              type="button"
+              class="preset"
+              :class="{ on: textPresetOn(p) }"
+              @click="applyTextProvider(p)"
+            >
+              {{ p.label }}
+            </button>
+          </template>
+        </div>
+        <p class="vendor-note">
+          {{
+            isText
+              ? 'Text models are called through /chat/completions. For Bailian, pick the compatible-mode address.'
+              : capabilityNote
+          }}
+        </p>
 
         <label class="field">
           <span class="flabel">Name</span>
@@ -292,7 +399,11 @@ function onImportFile(e: Event) {
         </label>
         <label class="field">
           <span class="flabel">Model name</span>
-          <input v-model="draft.model" placeholder="doubao-seedream-3-0-t2i" spellcheck="false" />
+          <input
+            v-model="draft.model"
+            :placeholder="isText ? 'gpt-4o-mini' : 'doubao-seedream-3-0-t2i'"
+            spellcheck="false"
+          />
         </label>
 
         <div class="form-foot">
@@ -559,6 +670,17 @@ function onImportFile(e: Event) {
   background: color-mix(in oklch, var(--accent) 14%, transparent);
   border: 1px solid color-mix(in oklch, var(--accent) 30%, transparent);
 }
+/* 用途小徽章:和 .cfg-active 同一套胶囊语言,但走中性色 ——
+   它标的是分类(这条是出图还是文本),不是状态,不该和「当前」抢强调色 */
+.cfg-tag {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  font-size: 11px;
+  border-radius: 999px;
+  color: var(--text-2);
+  background: var(--surface);
+  border: 1px solid var(--line);
+}
 /* 操作压在右上角:DOM 上排在主体之后且带定位,所以点击落在按钮上、
    不会穿透到下面那层"切为当前" */
 .cfg-ops {
@@ -678,7 +800,7 @@ function onImportFile(e: Event) {
   cursor: pointer;
   transition: background var(--dur) var(--ease);
 }
-.save-btn:hover {
+.save-btn:hover:not(:disabled) {
   background: var(--accent-strong);
 }
 

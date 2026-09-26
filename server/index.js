@@ -130,6 +130,17 @@ function rateLimit(req, res, next) {
 /** 上游多久没响应就中断。Vercel 上另有平台执行上限,两者独立 */
 const UPSTREAM_TIMEOUT_MS = 120_000
 
+/* 提示词改写的系统提示。只输出改写结果、保持原意,并补足画面细节;
+   限 90 词是为了别把输出撑太长,回填到输入框还能一眼读完 */
+const SYSTEM_PROMPT = `You rewrite prompts for an image-generation model.
+
+Rules:
+- Output only the rewritten prompt. No preamble, no explanation, no quotes, no markdown.
+- Keep the subject, intent and any text to be rendered exactly as given.
+- Never introduce new subjects, objects or claims that change the meaning.
+- Add concrete visual detail: composition, lighting, lens and depth of field, material, color, mood, style.
+- Stay under 90 words, one paragraph.`
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const DIST = path.resolve(__dirname, '../dist')
 
@@ -213,6 +224,12 @@ app.post('/api/generate', rateLimit, async (req, res) => {
     ...(background ? { background } : {})
   }
 
+  /* 'auto' 是我们自己的语义(交给上游自决),不能把字面量透传:
+     只有 OpenAI 系认 size: "auto",其余厂商收到这个值会直接报错。
+     不带该参数时上游就用它自己的默认尺寸 —— 与 quality / background
+     的"选了 auto 就不发"是同一条规矩。 */
+  const sendSize = !!size && size !== 'auto'
+
   // 图生图:gpt-image 等模型不接受 JSON 里的 data-url base64,
   // 必须走 multipart 文件上传(或在个别服务下传公网 URL)。
   let payload
@@ -224,7 +241,7 @@ app.post('/api/generate', rateLimit, async (req, res) => {
     if (model) fd.append('model', model)
     fd.append('prompt', prompt)
     fd.append('n', String(n))
-    fd.append('size', size)
+    if (sendSize) fd.append('size', size)
     for (const [k, v] of Object.entries(extras)) fd.append(k, String(v))
     fd.append('image', new Blob([Buffer.from(b64, 'base64')], { type: mime }), `image.${type}`)
     payload = fd // fetch 自动设置 multipart boundary
@@ -234,7 +251,7 @@ app.post('/api/generate', rateLimit, async (req, res) => {
       model: model || undefined,
       prompt,
       n,
-      size,
+      ...(sendSize ? { size } : {}),
       ...extras
     })
   }
@@ -295,6 +312,127 @@ app.post('/api/generate', rateLimit, async (req, res) => {
         return res.status(504).json({
           error: 'Upstream timed out. Try again or use fewer images.',
           detail: `No response after ${UPSTREAM_TIMEOUT_MS / 1000} seconds. Try again or use fewer images.`
+        })
+      }
+      return
+    }
+    // undici(Node fetch)遇到连接层失败时只抛 "fetch failed",
+    // 真正的原因(DNS/TCP/TLS)藏在 e.cause 里,这里一并透出,否则无法排查
+    const cause = e?.cause
+    const code = cause?.code || cause?.errno || ''
+    const reason = [code, cause?.message].filter(Boolean).join(' ') || String(e)
+    const hint = CONNECT_HINTS[code] || ''
+    // 生产环境只回显目标主机名:完整地址会被当成内网探测器用
+    const where = PROD_LIKE ? targetUrl.host : target
+    return res.status(502).json({
+      error: 'Upstream request failed',
+      detail: `${where} — ${reason}. ${hint}`
+    })
+  } finally {
+    clearTimeout(timer)
+  }
+})
+
+/**
+ * 提示词改写代理。
+ * 图像模型只出图、改不了提示词,所以这里不转发给 /images/*,而是把请求
+ * 交给文本模型的 /chat/completions,让上游把提示词扩写得更具体、更有画面感。
+ * baseUrl / apiKey / textModel 由前端单独一份「提示词增强」配置提供,
+ * 与生图的接口配置互不影响 —— 两件事常常不是同一个服务商。
+ */
+app.post('/api/enhance', rateLimit, async (req, res) => {
+  const { prompt, textModel, baseUrl, apiKey } = req.body || {}
+
+  if (!prompt) {
+    return res.status(400).json({ error: 'Enter a prompt first' })
+  }
+  if (!baseUrl) {
+    return res.status(400).json({ error: 'Configure your Base URL first' })
+  }
+  // 文本模型单独配:出图模型是图像模型,打不通 /chat/completions
+  if (!textModel) {
+    return res.status(400).json({ error: 'Set a text model in API settings first' })
+  }
+
+  const target = baseUrl.replace(/\/+$/, '') + '/chat/completions'
+
+  // 目标校验:协议 + 网段(见 assertSafeTarget)。不通过就没必要再往下走
+  let targetUrl
+  try {
+    targetUrl = await assertSafeTarget(target)
+  } catch (e) {
+    return res.status(400).json({ error: e.message })
+  }
+
+  const headers = { 'Content-Type': 'application/json' }
+  if (apiKey) {
+    headers['Authorization'] = `Bearer ${apiKey}`
+  }
+
+  // 前端点"终止"会断开连接;这里同步中断对上游的请求,
+  // 并借此判断连接是否还在,避免往已断开的响应里写数据。
+  // 另外挂一个超时:上游长时间不返回时主动中断,别把连接一直占着
+  const ac = new AbortController()
+  let timedOut = false
+  const timer = setTimeout(() => {
+    timedOut = true
+    ac.abort()
+  }, UPSTREAM_TIMEOUT_MS)
+  res.on('close', () => {
+    if (!res.writableEnded) ac.abort()
+  })
+
+  try {
+    const upstream = await fetch(target, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        model: textModel,
+        messages: [
+          { role: 'system', content: SYSTEM_PROMPT },
+          { role: 'user', content: prompt }
+        ],
+        temperature: 0.7
+      }),
+      signal: ac.signal,
+      dispatcher: dispatcherFor(target)
+    })
+
+    const text = await upstream.text()
+
+    if (!upstream.ok) {
+      // 上游报错可能很长(堆栈/回显整段提示词),截断后再回显
+      return res.status(upstream.status).json({
+        error: `Upstream returned an error (${upstream.status})`,
+        detail: text.slice(0, 600)
+      })
+    }
+
+    // 取第一条回复的正文;解析失败或字段缺失都按"没拿到文本"处理
+    let out = ''
+    try {
+      out = String(JSON.parse(text)?.choices?.[0]?.message?.content || '').trim()
+    } catch {
+      out = ''
+    }
+    if (!out) {
+      return res.status(502).json({
+        error: 'Upstream returned no text to use',
+        detail: text.slice(0, 600)
+      })
+    }
+
+    res.json({ prompt: out })
+  } catch (e) {
+    // 响应已经发出,无需也无法再回
+    if (res.headersSent) return
+    // 超时中断与"用户点了终止"都抛 AbortError,靠 timedOut 区分:
+    // 前者要给出明确回执,后者静默收场
+    if (e?.name === 'AbortError') {
+      if (timedOut) {
+        return res.status(504).json({
+          error: 'Upstream timed out. Try again.',
+          detail: `No response after ${UPSTREAM_TIMEOUT_MS / 1000} seconds. Try again.`
         })
       }
       return
