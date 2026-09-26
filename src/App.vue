@@ -17,7 +17,8 @@ import {
   PhX,
   PhArrowRight,
   PhCaretRight,
-  PhCaretDown
+  PhCaretDown,
+  PhImage
 } from '@phosphor-icons/vue'
 import PromptLibrary from './components/PromptLibrary.vue'
 import ImagePreview from './components/ImagePreview.vue'
@@ -45,6 +46,7 @@ import {
   inferVendor,
   allowedSizes,
   imageSrc,
+  thumbSrc,
   makeThumb,
   backfillThumbs,
   releaseEntryMedia,
@@ -230,6 +232,15 @@ function onFeedLoad(key: string, entry: HistoryEntry, e: Event) {
   if (!img.naturalWidth || !img.naturalHeight) return
   measured.value[key] = Math.min(2, Math.max(0.5, img.naturalWidth / img.naturalHeight))
 }
+
+/* 首屏视觉锚点:最近一条记录的第一张图,斜放在标题右后方。
+   对生图站来说最好的封面就是作品本身 —— 现在首屏是一片空白的大字。
+   取 thumbSrc 而不是原图:垫底的装饰不该为了首屏去解码一张全尺寸大图,
+   那个代价(几十万像素、主线程被占住)远大于它在 216px 里的收益 */
+const heroArt = computed(() => {
+  const e = history.value[0]
+  return e && e.results?.length ? thumbSrc(e) : ''
+})
 
 // 当前生效的厂商:配置里没写就按域名猜(兼容加字段之前存的老配置)
 const provider = computed<Provider>(() => {
@@ -1066,6 +1077,19 @@ async function toggleMark(entry: HistoryEntry, index: number) {
       <!-- 生图工作台 -->
       <section v-if="page === 'home'" class="workbench page-in" aria-label="Studio">
         <header class="hero">
+          <!-- 首屏视觉锚点:最近一张作品斜放在标题右后方。
+               纯装饰 —— aria-hidden 且不吃点击,同一张图在图墙里就在,
+               不给首屏再养一套交互;文字层级都压在它上面 -->
+          <div v-if="heroArt" class="hero-art" aria-hidden="true">
+            <span class="hero-art-card">
+              <img :src="heroArt" alt="" decoding="async" />
+            </span>
+            <span class="hero-art-chip">
+              <PhImage aria-hidden="true" />
+              Latest creation
+            </span>
+          </div>
+
           <p class="hero-eyebrow">AI Image Studio</p>
           <h1 class="hero-title">Turn your ideas<br />into beautiful images</h1>
           <p class="hero-sub">Create, explore, and organize AI-generated images with ease.</p>
@@ -1711,6 +1735,71 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   letter-spacing: var(--ls-wide);
   position: relative;
   z-index: 1;
+}
+/* —— 首屏视觉锚点 ——
+   只在 .shell 达到最大宽度(1080)之后出现:它靠标题两侧的留白活命,
+   窄一档标题就会压到图上。1080 以上 .hero 的内宽恒为 1000,
+   所以这套坐标是固定的,不随视口漂移。
+   留白也据此定的:标题最宽那行约 515px,居中占 242~758;
+   卡片从 794 起,即便标题比我估的宽一成也不会碰上。
+   刻意不给 .hero 加右内边距把文字推左 —— 那会让标题和下面的输入框错位,
+   两者本来就该在同一条中轴上 */
+.hero-art {
+  position: absolute;
+  top: 50%;
+  /* 不退这几像素的话,旋转后的右上角会伸到 .hero 之外被 overflow 切平 */
+  right: 6px;
+  width: 200px;
+  aspect-ratio: 4 / 3;
+  transform: translateY(-50%);
+  /* 装饰层:既不接收点击,也不参与层叠竞争 */
+  pointer-events: none;
+  z-index: 0;
+}
+.hero-art-card {
+  position: absolute;
+  inset: 0;
+  display: block;
+  border-radius: var(--r);
+  overflow: hidden;
+  background: var(--image-bg);
+  box-shadow: var(--sh-md);
+  /* 倾斜是这张图不算作版式一部分的方式:它是一枚贴上去的实物 */
+  transform: rotate(-4deg);
+}
+.hero-art-card img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+/* 说明这是"最新一张"的标签。刻意不跟着卡片倾斜:
+   斜着的字读起来费劲,而且它是界面语言,不是那张照片的一部分 */
+.hero-art-chip {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 9px;
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: var(--fs-micro);
+  font-weight: 500;
+  box-shadow: var(--sh-sm);
+}
+.hero-art-chip svg {
+  width: 13px;
+  height: 13px;
+  color: var(--text-3);
+}
+@media (max-width: 1079px) {
+  /* 窄屏藏掉:它不是内容,抢首屏高度不划算 */
+  .hero-art {
+    display: none;
+  }
 }
 .composer {
   max-width: 840px;
