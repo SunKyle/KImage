@@ -1200,7 +1200,6 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                   :key="t.key"
                   class="tile"
                   :style="{ aspectRatio: String(t.ratio) }"
-                  :title="t.entry.prompt"
                   @click="openPreview(t.entry)"
                 >
                   <img
@@ -1210,8 +1209,9 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                     :alt="t.entry.prompt"
                     @load="onFeedLoad(t.key, t.entry, $event)"
                   />
+                  <!-- 悬停只浮出时间与尺寸:提示词动辄两三行,压在缩略图上把图挡掉大半,
+                       而这块砖是用来扫图的;要读提示词点开预览即可 -->
                   <span class="tile-veil">
-                    <span class="tile-text">{{ t.entry.prompt }}</span>
                     <span class="tile-meta">{{ fmtDate(t.entry.createdAt) }} · {{ sizeLabel(t.entry.size) }}</span>
                   </span>
                 </button>
@@ -2011,14 +2011,15 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   cursor: default;
   animation: none;
 }
-/* 角标:默认隐去,悬停/聚焦时浮出提示词与时间 */
+/* 角标:默认隐去,悬停/聚焦时浮出时间与尺寸。
+   不放提示词 —— 两行文字会把缩略图挡掉大半,读提示词交给预览卡 */
 .tile-veil {
   position: absolute;
   inset: auto 0 0;
   display: flex;
   flex-direction: column;
   gap: 2px;
-  padding: 26px 12px 10px;
+  padding: 18px 12px 10px;
   text-align: left;
   color: #fff;
   background: linear-gradient(to top, rgba(0, 0, 0, 0.62), transparent);
@@ -2028,14 +2029,6 @@ async function toggleMark(entry: HistoryEntry, index: number) {
 .tile:hover .tile-veil,
 .tile:focus-visible .tile-veil {
   opacity: 1;
-}
-.tile-text {
-  font-size: 12px;
-  line-height: 1.5;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
 }
 .tile-meta {
   font-size: 11px;
