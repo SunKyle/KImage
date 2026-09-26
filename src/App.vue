@@ -2141,16 +2141,18 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   cursor: not-allowed;
   box-shadow: none;
 }
-/* 提示词改写:与参数按钮同尺寸、同描边语言,带文案所以宽度随内容撑开。
-   改写完成后同一个按钮变成撤销态(见 .undo),不再另起一个按钮。
-   描边与底色由外层 .enhance-split 提供 —— 按钮和档位切换要读成一个控件 */
+/* 提示词改写:与参数按钮同尺寸、同描边语言。
+   描边由外层 .enhance-split 提供 —— 按钮和档位切换要读成一个控件。
+   底色透明、高 34px:和旁边的清除键、生成键完全同规格,
+   否则这一排里会出现三个填色不同、差 2px 高的控件 */
 .enhance-split {
   display: inline-flex;
   align-items: stretch;
   flex-shrink: 0;
+  height: 34px;
   border: 1px solid var(--line);
   border-radius: 999px;
-  background: var(--surface);
+  background: transparent;
   overflow: hidden;
   transition: border-color var(--dur) var(--ease);
 }
@@ -2183,7 +2185,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   align-items: center;
   gap: 5px;
   flex-shrink: 0;
-  height: 34px;
+  /* 高度交给外层:自己再定 34px 会把带描边的外层撑到 36px */
   padding: 0 12px;
   border: none;
   background: none;
@@ -2192,9 +2194,10 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   cursor: pointer;
   transition: color var(--dur) var(--ease), background var(--dur) var(--ease);
 }
+/* 16px 与清除键、生成键的图标同档 */
 .enhance-btn svg {
-  width: 15px;
-  height: 15px;
+  width: 16px;
+  height: 16px;
   flex-shrink: 0;
 }
 .enhance-btn:hover:not(:disabled) {
@@ -2420,6 +2423,29 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   /* iOS Safari 聚焦字号 <16px 的输入框会放大整页,面板内的数字/尺寸输入提到 16px */
   .num-input {
     font-size: 16px;
+  }
+  /* 底部三个动作键跟着参数胶囊一起升到 40px:触控目标要一致,
+     只升一半的话它们会比左边那排小一圈,手指点起来也明显更难点中 */
+  .enhance-split {
+    height: 40px;
+  }
+  .clear-icon,
+  .gen-icon {
+    width: 40px;
+    height: 40px;
+  }
+  .clear-icon svg,
+  .gen-icon svg,
+  .enhance-btn svg {
+    width: 18px;
+    height: 18px;
+  }
+  /* 档位开关也得够宽:桌面靠左右内边距到约 29px,手指点不准。
+     改成定宽居中,图标仍比主键小一档 —— 它是这个控件里的次级动作 */
+  .enhance-mode {
+    justify-content: center;
+    min-width: 40px;
+    padding: 0;
   }
 }
 </style>
