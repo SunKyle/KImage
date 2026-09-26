@@ -157,6 +157,25 @@ Rules:
 // 改写强度:保守档给低温度,让它贴着原句走;重构档放开,否则出来的东西没差别
 const ENHANCE_TEMPERATURE = { quick: 0.4, creative: 0.9 }
 
+/* 目标出图模型对提示词结构的偏好。改写是写给下游那个模型看的,
+   同一段文字喂给 gpt-image 和喂给 SD 系模型,该有的样子完全不同:
+   前者自己会再改写一遍,堆标签只会被削掉;后者恰恰靠标签密度吃饭。
+   表里没有的厂商走 GENERIC —— 不硬套已知风格,宁可给一句中性的结构建议。 */
+const NATURAL_STYLE = `Structure: natural-language sentences with dense, concrete detail. A narrative flow is welcome and multi-clause sentences are fine.`
+const TARGET_STYLE = {
+  // 服务端还会用 GPT 再改写一次,所以"少而清楚"比"多而杂"更容易被保留下来
+  openai: `Structure: one flowing descriptive sentence. This model rewrites prompts on its own before generating, so stacked keyword tags and piled-up adjectives tend to get trimmed or conflict — say fewer things, more clearly.`,
+  ark: NATURAL_STYLE,
+  dashscope: NATURAL_STYLE
+}
+const GENERIC_STYLE = `Structure: a comma-separated series of short phrases rather than full sentences. Keyword density matters more than grammar.`
+
+/** 把目标模型与其结构偏好拼成一段附加说明;认不出来就只说清目标是谁 */
+function targetNote(vendor, model) {
+  const style = TARGET_STYLE[vendor] || GENERIC_STYLE
+  return `\n\nTarget image model: ${model || 'unspecified'}\n${style}`
+}
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const DIST = path.resolve(__dirname, '../dist')
 
@@ -357,7 +376,7 @@ app.post('/api/generate', rateLimit, async (req, res) => {
  * 与生图的接口配置互不影响 —— 两件事常常不是同一个服务商。
  */
 app.post('/api/enhance', rateLimit, async (req, res) => {
-  const { prompt, textModel, baseUrl, apiKey, mode } = req.body || {}
+  const { prompt, textModel, baseUrl, apiKey, mode, targetVendor, targetModel } = req.body || {}
 
   // 只认两档,其余(含老前端不传)一律按保守档处理
   const enhanceMode = mode === 'creative' ? 'creative' : 'quick'
@@ -408,7 +427,8 @@ app.post('/api/enhance', rateLimit, async (req, res) => {
       body: JSON.stringify({
         model: textModel,
         messages: [
-          { role: 'system', content: ENHANCE_PROMPTS[enhanceMode] },
+          // 附上目标出图模型的结构偏好:同一段文字,各家的正确写法不一样
+          { role: 'system', content: ENHANCE_PROMPTS[enhanceMode] + targetNote(targetVendor, targetModel) },
           { role: 'user', content: prompt }
         ],
         temperature: ENHANCE_TEMPERATURE[enhanceMode]

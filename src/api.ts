@@ -298,14 +298,24 @@ export type EnhanceMode = 'quick' | 'creative'
  * 走文本模型的 /chat/completions(图像模型只出图、改不了提示词),
  * 用的是「用途 = text」那条配置的地址、密钥与模型。返回扩写后的提示词。
  * 未配置时由调用方先拦下,这里不重复判断。
+ *
+ * target 是这次改写最终要喂给谁(出图接口的厂商与模型):
+ * 各家对提示词结构的偏好不一样,服务端据此调整输出的写法。
  */
-export async function enhancePrompt(cfg: ApiConfig, prompt: string, mode: EnhanceMode): Promise<string> {
+export async function enhancePrompt(
+  cfg: ApiConfig,
+  prompt: string,
+  mode: EnhanceMode,
+  target: { vendor: string; model: string }
+): Promise<string> {
   const resp = await fetch('/api/enhance', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       prompt,
       mode,
+      targetVendor: target.vendor,
+      targetModel: target.model,
       // 后端 /api/enhance 收的字段名仍是 textModel,路由不用改
       textModel: cfg.model,
       baseUrl: cfg.baseUrl,

@@ -648,6 +648,10 @@ function onEnter(e: KeyboardEvent) {
 
 async function doGenerate() {
   if (loading.value) return
+  /* 改写回来时会整体覆盖提示词。此刻发出去的图,用的是改写到一半的内容,
+     而用户看到的输入框马上就要变成另一段文字 —— 这批图会和界面对不上。
+     按钮那边也置灰了,这里再拦一道是因为回车也能触发生成 */
+  if (enhancing.value) return
   if (!prompt.value.trim()) {
     fail('Enter a prompt first')
     return
@@ -751,15 +755,13 @@ function retry() {
    在"有没有原稿"之间来回换宽度,旁边的清除键跟着跳。
    三态由现有状态推出来,不另存一份 */
 const canUndo = computed(() => !enhancing.value && !!preEnhance.value)
-const enhanceText = computed(() =>
-  enhancing.value
-    ? 'Enhancing…'
-    : canUndo.value
-      ? 'Undo'
-      : enhanceMode.value === 'creative'
-        ? 'Creative enhance'
-        : 'Quick enhance'
-)
+/* 按钮上只写档位名:"enhance" 已经在四角星图标和它所在的位置里说完了,
+   再写一遍只是把按钮撑长。改写中同样带档位,顺带说明这次跑的是哪一档 */
+const enhanceText = computed(() => {
+  if (canUndo.value) return 'Undo'
+  const mode = enhanceMode.value === 'creative' ? 'Creative' : 'Quick'
+  return enhancing.value ? `${mode}…` : mode
+})
 // 撤销态下即使输入框被清空也照常可点:原稿还在,这正是要撤回来的场景
 const enhanceDisabled = computed(() => enhancing.value || (!canUndo.value && !prompt.value.trim()))
 
@@ -787,7 +789,11 @@ async function doEnhance() {
   }
   enhancing.value = true
   try {
-    const out = await enhancePrompt(cfg, src, enhanceMode.value)
+    // 告诉服务端这次改写是给出图那条配置的:各家偏好不同,写法要跟着变
+    const out = await enhancePrompt(cfg, src, enhanceMode.value, {
+      vendor: provider.value.id,
+      model: config.value.model
+    })
     // 原稿存的是改写前的完整文本(含可能的首尾空白),Undo 才能一字不差地还原
     preEnhance.value = prompt.value
     prompt.value = out
@@ -986,11 +992,15 @@ async function toggleMark(entry: HistoryEntry, index: number) {
           <div class="prompt-box">
             <!-- 一、输入区(横线上方) -->
             <div class="compose-zone">
+              <!-- 改写期间只读:改写结果要整体覆盖回来,中途改字会和它打架。
+                   用 readonly 而不是 disabled —— 后者会掉焦、框体变灰,
+                   而这段时间很短,不该让输入框看起来坏掉了 -->
               <textarea
                 id="prompt-input"
                 ref="promptEl"
                 v-model="prompt"
                 rows="1"
+                :readonly="enhancing"
                 aria-label="Prompt"
                 placeholder="Describe your image: an orange cat dozing in the sun…"
                 @keydown.enter.exact="onEnter"
@@ -1063,7 +1073,8 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                     class="enhance-btn"
                     :class="{ undo: canUndo }"
                     :disabled="enhanceDisabled"
-                    :aria-label="canUndo ? 'Undo prompt enhancing' : `Enhance prompt (${enhanceMode})`"
+                    :data-tip="canUndo ? 'Undo' : `Rewrite the prompt · ${enhanceMode === 'creative' ? 'Creative' : 'Quick'}`"
+                    :aria-label="canUndo ? 'Undo prompt rewrite' : `Rewrite the prompt (${enhanceMode})`"
                     @click="canUndo ? undoEnhance() : doEnhance()"
                   >
                     <!-- 四角星 = 增强,回转箭头 = 撤销:同一处换符号,比只换文案先被看到 -->
@@ -1076,11 +1087,14 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                     </svg>
                     {{ enhanceText }}
                   </button>
-                  <!-- 只两档,点一下来回切,不用下拉 -->
+                  <!-- 只两档,点一下来回切,不用下拉。
+                       改写中禁用:请求已经发出去了,这时换档只会让按钮上的
+                       档位名和正在跑的那一档对不上 -->
                   <button
                     class="enhance-mode"
-                    :data-tip="`Switch to ${nextModeLabel} enhance`"
-                    :aria-label="`Switch to ${nextModeLabel} enhance`"
+                    :disabled="enhancing"
+                    :data-tip="`Switch to ${nextModeLabel}`"
+                    :aria-label="`Switch to ${nextModeLabel} mode`"
                     @click="toggleEnhanceMode"
                   >
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -1089,7 +1103,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                   </button>
                 </div>
                 <button
-                  v-if="prompt.trim() && !loading"
+                  v-if="prompt.trim() && !loading && !enhancing"
                   class="clear-icon"
                   aria-label="Clear input"
                   data-tip="Clear"
@@ -1101,9 +1115,9 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                 </button>
                 <button
                   class="gen-icon"
-                  :disabled="!loading && !prompt.trim()"
+                  :disabled="!loading && (enhancing || !prompt.trim())"
                   :aria-label="loading ? 'Stop' : 'Generate'"
-                  :data-tip="loading ? 'Stop' : 'Generate with Enter'"
+                  :data-tip="loading ? 'Stop' : enhancing ? 'Rewriting the prompt…' : 'Generate with Enter'"
                   @click="loading ? stopGenerate() : doGenerate()"
                 >
                   <!-- 生成中变为方块停止键,点击可终止这一批 -->
@@ -1727,14 +1741,17 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   color: var(--text);
   border-color: var(--line-strong);
 }
+/* 展开态与"已改过"态都走中性灰:胶囊在这页只是参数的状态显示,
+   用紫色会跟页面里唯一该抢注意力的生成键争视线。
+   两者靠底色区分 —— 展开有底,仅改过只加重描边 */
 .param-btn.on {
-  color: var(--accent-strong);
-  border-color: color-mix(in oklch, var(--accent) 45%, transparent);
-  background: var(--accent-soft);
+  color: var(--text);
+  border-color: var(--line-strong);
+  background: var(--bg-elev);
 }
 .param-btn.filled {
-  border-color: color-mix(in oklch, var(--accent) 40%, transparent);
-  color: var(--accent-strong);
+  border-color: var(--line-strong);
+  color: var(--text);
 }
 /* 带数值的参数(尺寸/张数):图标右侧直接露出当前值,宽度随内容撑开 */
 .param-btn.has-val {
@@ -1866,16 +1883,18 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   text-align: left;
   padding-left: 12px;
 }
+/* 面板里的文字动作用中性灰:它是个胶囊形状,和上面那排选项同处一个面板,
+   一个紫胶囊夹在灰胶囊中间会显得没做完 */
 .pp-action {
   font-size: 13px;
-  color: var(--accent);
+  color: var(--text);
   padding: 5px 10px;
-  border: 1px solid color-mix(in oklch, var(--accent) 35%, transparent);
+  border: 1px solid var(--line-strong);
   border-radius: 999px;
   transition: background var(--dur) var(--ease);
 }
 .pp-action:hover {
-  background: var(--accent-soft);
+  background: var(--surface-hover);
 }
 
 .preset {
@@ -1888,14 +1907,23 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   transition: border-color var(--dur) var(--ease), color var(--dur) var(--ease),
     background var(--dur) var(--ease);
 }
+/* 面板里的选项胶囊同样去紫:它和外层胶囊是一组,外层转灰后里面还紫着会脱节 */
 .preset:hover {
-  border-color: var(--accent);
-  color: var(--accent);
+  border-color: var(--line-strong);
+  color: var(--text);
 }
+/* 选中态用墨色实心药丸:这是全站"当前项"的语言(生成键、导航滑块同一套)。
+   灰底那版压得太轻,一排白胶囊里几乎看不出选的是哪个。
+   借 --cta 而不是写死黑色:它在暗色主题会自动反相成白底黑字 */
 .preset.on {
-  background: var(--accent-soft);
-  border-color: var(--accent);
-  color: var(--accent-strong);
+  background: var(--cta);
+  border-color: var(--cta);
+  color: var(--cta-text);
+}
+.preset.on:hover {
+  background: var(--cta-hover);
+  border-color: var(--cta-hover);
+  color: var(--cta-text);
 }
 /* 带注解的胶囊(画质档位):主标签 + 一句代价说明,同一行排布 */
 .preset-rich {
@@ -1910,7 +1938,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   transition: color var(--dur) var(--ease);
 }
 .preset-rich:hover .preset-hint {
-  color: var(--accent);
+  color: var(--text-2);
 }
 .preset-rich.on .preset-hint {
   color: inherit;
@@ -1928,8 +1956,8 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   transition: all var(--dur) var(--ease);
 }
 .ref-pick:hover {
-  border-color: var(--accent);
-  color: var(--accent);
+  border-color: var(--line-strong);
+  color: var(--text);
 }
 
 .err {
@@ -2093,7 +2121,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   cursor: pointer;
   transition: color var(--dur) var(--ease), background var(--dur) var(--ease);
 }
-.enhance-mode:hover {
+.enhance-mode:hover:not(:disabled) {
   color: var(--text);
   background: var(--bg-elev);
 }
@@ -2124,7 +2152,8 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   color: var(--text);
   background: var(--bg-elev);
 }
-.enhance-btn:disabled {
+.enhance-btn:disabled,
+.enhance-mode:disabled {
   opacity: 0.45;
   cursor: not-allowed;
 }
