@@ -21,7 +21,6 @@ const emit = defineEmits<{
 }>()
 
 const active = ref(0)
-const expanded = ref(false)
 const menuOpen = ref(false)
 // 菜单展开后点别处收起。ref 挂在包着按钮和菜单的那层上:
 // 只监听菜单的话,点按钮收起会先被判成"外部点击",关掉又被 click 打开,反而关不上
@@ -66,7 +65,6 @@ function onImgLoad(e: Event) {
 // 每次打开、或上下翻到另一条记录,都回到初始视图
 function resetView() {
   active.value = 0
-  expanded.value = false
   menuOpen.value = false
   copied.value = false
   copyFailed.value = false
@@ -93,6 +91,17 @@ watch(
     if (props.visible) resetView()
   }
 )
+
+/** 时间戳取 "Sep 26, 18:52":toLocaleString 近 20 个字符,定宽侧栏里会被省略号吃掉 */
+function fmtTime(ts: number) {
+  return new Date(ts).toLocaleString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false
+  })
+}
 
 // —— 记录导航:上下翻的是历史,左右翻的是本条内的多张图 ——
 const entryIndex = computed(() => {
@@ -408,17 +417,17 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
                     </button>
                   </div>
                 </header>
-                <p class="prompt" :class="{ clipped: !expanded }">{{ entry.prompt }}</p>
-                <button v-if="entry.prompt.length > 120" class="expand-btn" @click="expanded = !expanded">
-                  {{ expanded ? 'Collapse' : 'Expand' }}
-                </button>
+                <div class="prompt-scroll">
+                  <p class="prompt">{{ entry.prompt }}</p>
+                </div>
               </section>
 
               <!-- 参数与时间:放在提示词之后,作为这条记录的"底注" -->
               <div class="side-head">
                 <div class="side-tags">
-                  <span class="tag">{{ entry.size === 'auto' ? 'Auto' : entry.size.replace('x', '×') }}</span>
+                  <!-- 模型放首位:它是这条记录最关键的来源信息,尺寸退到其后 -->
                   <span v-if="entry.model" class="tag tag-model">{{ entry.model }}</span>
+                  <span class="tag">{{ entry.size === 'auto' ? 'Auto' : entry.size.replace('x', '×') }}</span>
                   <!-- 扩展参数只在非默认档时出现:全都是「自动」的记录不必堆一排无信息的标签 -->
                   <span v-if="entry.quality" class="tag">
                     Quality · {{ optionLabel(QUALITY_OPTIONS, entry.quality) }}
@@ -429,7 +438,7 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
                   <span v-if="entry.hasRef" class="tag">Reference</span>
                   <span v-if="entry.elapsedMs" class="tag tag-dim">{{ fmtElapsed(entry.elapsedMs) }}</span>
                 </div>
-                <span class="meta">{{ new Date(entry.createdAt).toLocaleString() }}</span>
+                <span class="meta">{{ fmtTime(entry.createdAt) }}</span>
               </div>
 
               <!-- 底部操作:主次并排,占满侧栏宽度 -->
@@ -463,7 +472,9 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
   /* 出图比例(--ratio)与是否带缩略图条(--rail,0/1)由组件按当前这张图注入 */
   --prev-h: min(92vh, 880px);
   --stage-pad: var(--sp-4);
-  --side-w: 300px;
+  /* 320px 而不是 300px:300 减去左右各 24 的内边距只剩 252,
+     提示词换行太密、参数标签一行排不下三个 */
+  --side-w: 320px;
   --thumb-w: 46px;
 
   /* 高度取确定值,不随内容伸缩:展开提示词只在侧栏内部滚动,卡片高度保持不变 */
@@ -714,7 +725,8 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
   padding: var(--sp-4) var(--sp-5) var(--sp-5);
   border-left: 1px solid var(--line);
   gap: var(--sp-5);
-  overflow-y: auto;
+  /* 整栏不滚:只有提示词那块在自己内部滚,工具栏、参数与底部操作始终留在原位 */
+  overflow: hidden;
 }
 /* 参数标签与时间是一组:时间贴着标签下方,间距比小节之间紧一档 */
 .side-head {
@@ -746,8 +758,10 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
 /* 耗时属于度量值,比参数标签更低一级,再退一档灰 */
 .tag-dim {
   color: var(--text-3);
+  /* 耗时是度量值,等宽数字免得 1.2s 与 12.3s 宽窄不一 */
+  font-variant-numeric: tabular-nums;
 }
-/* 时间可能被本地化成较长的串,允许截断,别把操作簇挤走 */
+/* 时间已压到 "Sep 26, 18:52",仍留截断兜底:不同语言环境长度会变 */
 .meta {
   /* 补上与胶囊等宽的缩进,让时间戳的文字和标签内的文字共用一条左边线 */
   padding-left: var(--tag-pad-x);
@@ -757,6 +771,23 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
   white-space: nowrap;
   font-size: 12px;
   color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+/* 提示词小节吃掉侧栏的剩余高度,再在里面划出滚动区:
+   长提示词只把这一个区域撑出滚动条,不会把下面的参数和按钮推出视野 */
+.block {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+/* min-height 必须归零:flex 子项默认不肯收缩到内容以下,不归零滚动条就不出现 */
+.prompt-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  /* 给滚动条留一点余地,免得文字贴着它 */
+  padding-right: 4px;
 }
 /* 侧栏小节:标题带一条分隔线,把长侧栏切出层次 */
 .blk-head {
@@ -815,36 +846,20 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
 .preview:focus {
   outline: none;
 }
+/* 提示词是这张卡真正的主角:给正文色、并比按钮再大一档,
+   参数标签退到 --text-2 去当注脚 */
 .prompt {
-  font-size: 13px;
-  line-height: 1.7;
-  color: var(--text-2);
+  font-size: 15px;
+  line-height: 1.75;
+  color: var(--text);
   white-space: pre-wrap;
 }
-.prompt.clipped {
-  display: -webkit-box;
-  -webkit-line-clamp: 4;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
-.expand-btn {
-  align-self: flex-start;
-  margin-top: var(--sp-2);
-  padding: 5px 10px;
-  margin-left: -10px;
-  font-size: 12px;
-  color: var(--accent);
-  border-radius: 999px;
-  transition: background var(--dur) var(--ease);
-}
-.expand-btn:hover {
-  background: var(--accent-soft);
-}
-/* 底部操作并排,等分侧栏宽度,和顶部的胶囊形成一轻一重的收尾 */
+/* 提示词不再折叠:内容长了就在 .prompt-scroll 里滚,不必先点一次「展开」 */
+/* 底部操作并排,等分侧栏宽度,和顶部的胶囊形成一轻一重的收尾。
+   留白已由 .block 的 flex: 1 吃掉,不再需要 margin-top: auto 把它顶到底 */
 .side-actions {
   display: flex;
   gap: var(--sp-2);
-  margin-top: auto;
   padding-top: var(--sp-3);
 }
 .act {
@@ -914,7 +929,16 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
   .side {
     border-left: none;
     border-top: 1px solid var(--line);
+    overflow: visible;
+  }
+  /* 竖排后卡片高度由内容决定,「区域内滚」失去约束:
+     取消 flex 分配与滚动,把高度交还给内容,整页滚更自然 */
+  .block {
+    flex: none;
+  }
+  .prompt-scroll {
     overflow-y: visible;
+    padding-right: 0;
   }
 }
 </style>
