@@ -1,6 +1,13 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
-import { PhPlus, PhDotsThreeVertical, PhArrowLineUp, PhTrash, PhArchive } from '@phosphor-icons/vue'
+import {
+  PhPlus,
+  PhDotsThreeVertical,
+  PhArrowLineUp,
+  PhTrash,
+  PhArchive,
+  PhImage
+} from '@phosphor-icons/vue'
 import { BACKGROUND_OPTIONS, QUALITY_OPTIONS, optionLabel } from '../api'
 import type { PromptItem } from '../types'
 
@@ -35,8 +42,6 @@ onBeforeUnmount(() => document.removeEventListener('pointerdown', onDocPointerDo
 const showAdd = ref(false)
 const draftPrompt = ref('')
 const draftCategory = ref('')
-// 翻到背面的那张卡(存 id):同时只翻一张,网格里翻开好几张会找不到焦点
-const flipped = ref<string | null>(null)
 
 const categories = computed(() => {
   const set = new Set(props.items.map((i) => i.category || 'Uncategorized'))
@@ -50,10 +55,6 @@ const filtered = computed(() => {
   if (q) list = list.filter((i) => i.prompt.toLowerCase().includes(q))
   return list
 })
-
-function flip(id: string) {
-  flipped.value = flipped.value === id ? null : id
-}
 
 /* 参数拼成一行用 · 连接。原来三个描边小胶囊在 322px 的卡里是三个小盒子,
    跟提示词抢视线;拼成一行之后它退成背景信息,提示词才立得住 */
@@ -185,56 +186,44 @@ function fmt(t: number) {
     </div>
 
     <ul v-if="filtered.length" class="lib-grid">
-      <li
-        v-for="item in filtered"
-        :key="item.id"
-        class="card"
-        :class="{ on: flipped === item.id }"
-        role="button"
-        tabindex="0"
-        :aria-pressed="flipped === item.id"
-        :aria-label="flipped === item.id ? 'Back to prompt' : 'View the image for this prompt'"
-        @click="flip(item.id)"
-        @keydown.enter.self.prevent="flip(item.id)"
-        @keydown.space.self.prevent="flip(item.id)"
-      >
-        <div class="flip-inner">
-          <!-- 正面:分类 + 提示词 + 参数/操作。脚注也在这里面,整张卡才是同一块在转 -->
-          <div class="face face-front">
-            <div class="card-top">
-              <div class="card-meta">
-                <span class="card-cat">{{ item.category || 'Uncategorized' }}</span>
-                <span class="card-time">{{ fmt(item.createdAt) }}</span>
-              </div>
-              <div class="card-text">{{ item.prompt }}</div>
-            </div>
-            <div class="card-foot">
-              <span class="card-params">{{ paramLine(item) }}</span>
-              <!-- 卡片的点击是翻面,这两个必须 stop,否则点它们也会跟着翻 -->
-              <div class="ops">
-                <button
-                  class="op"
-                  data-tip="Use prompt"
-                  :aria-label="`Use: ${item.prompt.slice(0, 20)}`"
-                  @click.stop="emit('use', item)"
-                >
-                  <PhArrowLineUp aria-hidden="true" />
-                </button>
-                <button
-                  class="op op-del"
-                  data-tip="Delete"
-                  :aria-label="`Delete: ${item.prompt.slice(0, 20)}`"
-                  @click.stop="emit('remove', item.id)"
-                >
-                  <PhTrash aria-hidden="true" />
-                </button>
-              </div>
-            </div>
+      <!-- 卡片不再整块可点:以前点一下是翻面看封面,而那一面是唯一有图的地方,
+           既没有视觉提示、也只是把 320px 的图放大到卡宽。现在封面直接铺在正面,
+           点击这个动作就没有必要了 —— 留在卡上的只有两个真动作(取用 / 删除) -->
+      <li v-for="item in filtered" :key="item.id" class="card">
+        <div class="cover">
+          <img v-if="item.thumb" :src="item.thumb" alt="" />
+          <!-- 手动新建的提示词没有配图。做成一块安静的底,不画"缺图"的警示 ——
+               它只是没存过封面,不是出错 -->
+          <span v-else class="cover-none" aria-hidden="true">
+            <PhImage />
+          </span>
+        </div>
+        <div class="card-body">
+          <div class="card-meta">
+            <span class="card-cat">{{ item.category || 'Uncategorized' }}</span>
+            <span class="card-time">{{ fmt(item.createdAt) }}</span>
           </div>
-          <!-- 背面:整张卡就是这一张图 -->
-          <div class="face face-back">
-            <img v-if="item.thumb" :src="item.thumb" alt="" />
-            <span v-else class="back-none">No cover saved</span>
+          <div class="card-text">{{ item.prompt }}</div>
+        </div>
+        <div class="card-foot">
+          <span class="card-params">{{ paramLine(item) }}</span>
+          <div class="ops">
+            <button
+              class="op"
+              data-tip="Use prompt"
+              :aria-label="`Use: ${item.prompt.slice(0, 20)}`"
+              @click="emit('use', item)"
+            >
+              <PhArrowLineUp aria-hidden="true" />
+            </button>
+            <button
+              class="op op-del"
+              data-tip="Delete"
+              :aria-label="`Delete: ${item.prompt.slice(0, 20)}`"
+              @click="emit('remove', item.id)"
+            >
+              <PhTrash aria-hidden="true" />
+            </button>
           </div>
         </div>
       </li>
@@ -472,137 +461,99 @@ function fmt(t: number) {
   color: var(--text);
 }
 
-/* 网格:auto-fill 让列数跟着容器走。三列是刻意的 —— 卡片宽度决定了背面图片的
-   放大倍数:320px 的封面铺到 ~293px 是略微缩小,清晰;排成两列(490px)就要放大
-   1.5 倍,2x 屏上明显糊。卡片面积比原来的扁条更大,只是方了 */
+/* 网格:定宽多列,与首页图墙、历史图墙同一套排法 ——
+   卡片高矮不一,定宽多列比 auto-fill 网格更能把空格子吃掉,排得紧凑 */
 .lib-grid {
   list-style: none;
-  /* 和历史图墙同一套排法:固定列宽,列数由容器宽度自己算 ——
-     卡片高矮不一,定宽多列比 auto-fill 网格更能把空格子吃掉,排得紧凑 */
   margin-top: var(--sp-5);
   column-width: 240px;
   column-gap: var(--sp-3);
-  /* 提示词的显示上限(行数)—— 卡片的最大高度由它定。
-     要调卡片的最高高度改这一个值即可,.card-text 那边不用动 */
-  --card-text-lines: 8;
+  /* 提示词的显示上限(行数)。封面已经占了上半张卡,正文再给满会让卡片长成
+     一条 1:2 的白条,整墙扫不动 —— 完整提示词去预览卡读。
+     要调卡片的最大高度只改这一个值,.card-text 那边不用动 */
+  --card-text-lines: 4;
 }
 .card {
-  position: relative;
   /* 多列布局下纵向间距要靠 margin:column-gap 只管列与列之间,管不了上下;
      break-inside 防止一张卡被拆到两列去 */
   margin: 0 0 var(--sp-3);
   break-inside: avoid;
+  /* 圆角靠 overflow 裁封面:图要铺到卡片边缘,不能留白边 */
+  overflow: hidden;
   border: 1px solid var(--line);
   border-radius: var(--r);
   background: var(--surface);
-  cursor: pointer;
-  outline: none;
-  /* 转的是卡片自己:底色和描边都是它的,所以整张一起转。
-     透视不放在祖先上,而是写进 transform 里 —— 祖先上的 perspective 是一个
-     大平面、所有卡片共用一个消失点,网格边缘的卡会被拉歪。
-     preserve-3d 让里面两个面的 rotateY 和这张卡合在同一个 3D 空间里 */
-  transform-style: preserve-3d;
-  transition: transform 560ms var(--ease), border-color var(--dur) var(--ease),
-    box-shadow var(--dur) var(--ease);
+  transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease),
+    transform var(--dur) var(--ease);
 }
-.card.on {
-  transform: perspective(1600px) rotateY(180deg);
-}
+/* 悬停/聚焦时整张卡离开纸面一点。只抬 2px —— 再多会像在跳,
+   这里要的只是"这张被指到了";阴影升到 --sh-md,与首页图砖取齐 */
 .card:hover,
-.card:focus-visible {
+.card:focus-within {
   border-color: var(--line-strong);
-  box-shadow: var(--sh-sm);
-}
-/* 键盘聚焦要有看得见的环,只靠描边变色对键盘用户几乎不可辨 */
-.card:focus-visible {
-  box-shadow: var(--sh-sm), 0 0 0 3px var(--accent-soft);
+  box-shadow: var(--sh-md);
+  transform: translateY(-2px);
 }
 
-/* —— 翻面 ——
-   两个面用 grid 叠在同一个格子里(不是绝对定位),容器高度由较高的那一面自然决定,
-   于是既不需要定高、也不依赖 aspect-ratio,少两个会被静默忽略的属性。
-
-   可见性用透明度兜底,不单靠 backface-visibility:后者在祖先带
-   overflow / transform / filter 时会被压平失效,那时两个面会上下排开同时显示,
-   点一下也没有任何视觉反馈 —— 正是之前踩到的样子。
-   延迟 220ms(翻转大约走到侧面时)再换面,肉眼看不出来。
-
-   pointer-events 必须跟着换:透明元素照样能被点中,否则翻到背面后
-   还会点到正面那层已经看不见的操作按钮。
-
-   高度不给死:由正面(提示词)的内容决定,短提示词就是矮卡。
-   背面之所以不会反过来把卡撑高,是因为它的图是 flex 项且 min-height: 0 ——
-   能缩到 0 就没有固有高度参与,格子高度只看正面;少了这一条,
-   卡会被图的原始比例顶开,自适应就失效了 */
-.flip-inner {
-  display: grid;
-  transform-style: preserve-3d;
-}
-.face {
-  grid-area: 1 / 1;
-  display: flex;
-  flex-direction: column;
-  /* 圆角是整圈的:两个面各占满整张卡,不再是只盖上半个 */
-  border-radius: calc(var(--r) - 1px);
+/* —— 封面 ——
+   库页原先把封面藏在翻面背后,那是全站唯一一处"图不在正面"的地方,而翻面这件事
+   没有任何视觉提示 —— 于是整墙读起来是一叠白纸。库里存的是提示词,但提示词是
+   写给图看的,封面放正面之后这一页才和首页图墙、历史图墙是同一套语言 */
+.cover {
+  position: relative;
+  /* 固定正方形并裁切,不跟每张图的真实比例走 ——
+     提示词长短本来就不一,封面高度再浮动的话,每张卡的正文起点都不一样,整墙扫不动。
+     选 1:1 是因为它对混合比例是最不亏的那一档:本站最常见的输出就是 1024×1024,
+     那它是零裁切;横图(3:2)保留 2/3 宽度,竖图(2:3)保留 2/3 高度。
+     换成 4:3 看着更"照片",但竖图只剩一半高度,封面就认不出是哪张了 */
+  aspect-ratio: 1 / 1;
   overflow: hidden;
-  backface-visibility: hidden;
-  -webkit-backface-visibility: hidden;
-  transition: opacity 120ms linear 220ms;
+  background: var(--image-bg);
 }
-.face-front {
-  background: var(--surface);
-  opacity: 1;
-  pointer-events: auto;
+.cover img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  transition: transform 600ms var(--ease);
 }
-.face-back {
+/* 与首页图砖同一档反馈:悬停时封面极缓推近 */
+.card:hover .cover img {
+  transform: scale(1.04);
+}
+/* 手动新建的提示词没有配图,做成一块安静的底。
+   不画"缺图"的警示 —— 它只是没存过封面,不是出错 */
+.cover-none {
+  position: absolute;
+  inset: 0;
+  display: flex;
   align-items: center;
   justify-content: center;
-  /* 不留内边距:图直接铺到卡片边缘,留边交给 contain 自己算,
-     这样背面是一张实心的照片卡,而不是灰框里漂着一张小图 */
-  background: var(--stage-bg);
-  opacity: 0;
-  pointer-events: none;
-  transform: rotateY(180deg);
+  color: var(--text-4);
 }
-.card.on .face-front {
-  opacity: 0;
-  pointer-events: none;
+.cover-none svg {
+  width: 24px;
+  height: 24px;
 }
-.card.on .face-back {
-  opacity: 1;
-  pointer-events: auto;
-}
-/* flex:1 让它吃掉剩下的高度,配 contain 完整显示且不变形。
-   不用百分比高度,是为了避开"父高由内容决定"时的循环引用 */
-.face-back img {
-  flex: 1;
-  min-height: 0;
-  width: 100%;
-  object-fit: contain;
-}
-/* 内边距放在上半块而不是 .face 上;脚注与正文之间靠留白分开,不再画横线 */
-.card-top {
-  flex: 1;
+/* 脚注与正文之间靠留白分开,不画横线 */
+.card-body {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding: var(--sp-4);
-}
-.back-none {
-  font-size: var(--fs-sm);
-  color: var(--text-2);
+  gap: var(--sp-2);
+  padding: var(--sp-4) var(--sp-4) var(--sp-3);
 }
 
+/* 分类是全大写微标签,和首屏标题上方那行是同一档读音 ——
+   全站只有这两处用这种"拉开字距的小字",于是它们自动成了一组:
+   一处说这是什么站,一处说这条属于哪一类。
+   字号压到 11px 是为了让它安静下来:提示词才是这张卡最重的元素 */
 .card-meta {
   display: flex;
   align-items: baseline;
-  gap: 8px;
-  /* 分类与时间同为 12px,靠字重和位置区分。
-     原来分类是个 11px 小胶囊 —— 去掉那个描边盒子之后这一行安静下来,
-     提示词才能真正成为卡片里最重的元素 */
-  font-size: var(--fs-xs);
+  gap: var(--sp-2);
+  font-size: var(--fs-micro);
   line-height: 1.4;
-  color: var(--text-2);
+  color: var(--text-3);
 }
 .card-cat {
   /* 分类是用户自己填的,可能很长;列变窄后要能自己截断,不能把右边的时间挤掉 */
@@ -611,21 +562,25 @@ function fmt(t: number) {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-weight: 500;
+  letter-spacing: var(--ls-eyebrow);
+  text-transform: uppercase;
 }
 .card-time {
+  /* 时间不能被压:分类已经会自己截断,这里再跟着缩就两边都读不全 */
+  flex: none;
   margin-left: auto;
+  font-variant-numeric: tabular-nums;
 }
 .card-text {
   /* 提示词是这张卡的主角:字号最大、颜色最深。
-     高度不再靠垂直居中去填满统一卡片 —— 卡本身就只见这么高。
-     line-clamp 就是这张卡的"最大高度":几行就显示几行,超过就截断,
-     行数由 .lib-grid 上的 --card-text-lines 统一控制 */
+     line-clamp 就是这张卡的最大高度:几行就显示几行,行数由
+     .lib-grid 上的 --card-text-lines 统一控制 */
   display: -webkit-box;
   -webkit-box-orient: vertical;
-  -webkit-line-clamp: var(--card-text-lines, 8);
+  -webkit-line-clamp: var(--card-text-lines, 4);
   overflow: hidden;
   font-size: var(--fs-md);
-  line-height: 1.62;
+  line-height: 1.58;
   color: var(--text);
 }
 .ops {
@@ -669,7 +624,7 @@ function fmt(t: number) {
 .card-foot {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: var(--sp-2);
   padding: 0 var(--sp-4) var(--sp-4);
 }
 /* 参数是一行文字,不是三个小胶囊:它只是背景信息,
@@ -731,13 +686,6 @@ function fmt(t: number) {
 .none-action:hover {
   border-color: var(--line-strong);
   background: var(--bg-elev);
-}
-
-/* 关闭动效时仍然能翻,只是不再有过渡 */
-@media (prefers-reduced-motion: reduce) {
-  .card {
-    transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
-  }
 }
 
 .po-enter-active,
