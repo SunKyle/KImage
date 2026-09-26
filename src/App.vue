@@ -248,7 +248,11 @@ const capabilityNote = computed(() => {
 // 尺寸候选随厂商(以及 OpenAI 的模型代次)变化
 const sizeOptions = computed(() => {
   const list = allowedSizes(provider.value.id, config.value.model)
-  return Array.isArray(list) ? list : FREE_SIZES
+  const base = Array.isArray(list) ? list : FREE_SIZES
+  /* 上游没有 auto 档就把这一项摘掉:留着它,界面会显示"自动",而请求里
+     根本带不了这个参数(带了就 400),于是每次都拿上游的默认尺寸 ——
+     看起来像"模型没按 prompt 定比例",其实是我们自己把这一档抹掉了 */
+  return provider.value.autoSize ? base : base.filter((s) => s !== 'auto')
 })
 // 尺寸是否由接口自行决定:固定候选的厂商不开放手填,列表已经是全部合法值
 const sizeFree = computed(() => allowedSizes(provider.value.id, config.value.model) === 'free')
@@ -276,8 +280,11 @@ function sizeLabel(s: string) {
   return s === 'auto' ? 'Auto' : s.replace(/x/g, '×')
 }
 
-// 厂商不限尺寸时给的一组常用值
-const FREE_SIZES = ['auto', '512x512', '1024x1024', '1024x1792', '1792x1024', '2560x1440']
+/* 厂商不限尺寸时给的一组常用值。
+   顺序即优先级:不认 auto 的厂商会把 auto 摘掉,剩下的第一项就成了默认尺寸,
+   所以按"最常用"排而不是按尺寸递增 —— 1024x1024 是这类接口的通用默认值,
+   排在 512x512 前面,免得摘掉 auto 之后默认掉到 512 去 */
+const FREE_SIZES = ['auto', '1024x1024', '1024x1792', '1792x1024', '512x512', '2560x1440']
 
 // 按厂商能力决定携带哪些扩展参数:已知不支持的一律不发
 function extraParams(): Record<string, string> {

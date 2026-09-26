@@ -266,11 +266,12 @@ app.post('/api/generate', rateLimit, async (req, res) => {
     ...(background ? { background } : {})
   }
 
-  /* 'auto' 是我们自己的语义(交给上游自决),不能把字面量透传:
-     只有 OpenAI 系认 size: "auto",其余厂商收到这个值会直接报错。
-     不带该参数时上游就用它自己的默认尺寸 —— 与 quality / background
-     的"选了 auto 就不发"是同一条规矩。 */
-  const sendSize = !!size && size !== 'auto'
+  /* size 如实转发,包括字面量 'auto' —— 它是上游的一个真实取值(模型按 prompt
+     定比例),跟"不发这个参数"不是一回事:不发时上游用自己的默认尺寸,多数是 1:1。
+     哪些厂商认 auto 由前端判断(厂商表在 src/api.ts,只有那里知道 baseUrl 是谁),
+     不认的厂商候选里不会出现 auto,所以这里不需要再拦一道。
+     注意 quality / background 的 auto 不同:那两个是我们的"不传"哨兵值,
+     上游没有对应的 'auto' 取值,所以仍然只在显式选择时才带上。 */
 
   // 图生图:gpt-image 等模型不接受 JSON 里的 data-url base64,
   // 必须走 multipart 文件上传(或在个别服务下传公网 URL)。
@@ -283,7 +284,7 @@ app.post('/api/generate', rateLimit, async (req, res) => {
     if (model) fd.append('model', model)
     fd.append('prompt', prompt)
     fd.append('n', String(n))
-    if (sendSize) fd.append('size', size)
+    if (size) fd.append('size', size)
     for (const [k, v] of Object.entries(extras)) fd.append(k, String(v))
     fd.append('image', new Blob([Buffer.from(b64, 'base64')], { type: mime }), `image.${type}`)
     payload = fd // fetch 自动设置 multipart boundary
@@ -293,7 +294,7 @@ app.post('/api/generate', rateLimit, async (req, res) => {
       model: model || undefined,
       prompt,
       n,
-      ...(sendSize ? { size } : {}),
+      ...(size ? { size } : {}),
       ...extras
     })
   }

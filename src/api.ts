@@ -35,6 +35,11 @@ export interface Provider {
   background: Cap
   /** 允许的尺寸;'free' 表示由接口自行决定 */
   sizes: string[] | 'free'
+  /* 上游有没有"自己决定尺寸"这一档。
+     size: "auto" 是一个真实取值(让模型按 prompt 定比例),不等于"不发这个参数" ——
+     不发时上游用自己的默认尺寸,多数就是 1:1。所以只有认 auto 的厂商才给这一档,
+     其余厂商的候选列表里不能出现 auto,否则界面在骗人,发出去的请求跟没选一样 */
+  autoSize: boolean
   /** 图生图打哪个端点 */
   edit: 'generations' | 'edits'
 }
@@ -49,6 +54,10 @@ const CUSTOM: Provider = {
   quality: 'unknown',
   background: 'unknown',
   sizes: 'free',
+  /* 未知厂商按"认 auto"处理:这里的兜底对象就是 OpenAI 兼容代理,
+     如实转发比静默降级好 —— 真发错了会报错提示,而静默丢掉参数只会让人
+     以为模型没按 prompt 定比例 */
+  autoSize: true,
   edit: 'generations'
 }
 
@@ -61,6 +70,7 @@ export const PROVIDERS: Provider[] = [
     quality: 'yes',
     background: 'yes',
     sizes: ['auto', '1024x1024', '1536x1024', '1024x1536'],
+    autoSize: true,
     edit: 'edits'
   },
   {
@@ -71,6 +81,8 @@ export const PROVIDERS: Provider[] = [
     quality: 'no',
     background: 'no',
     sizes: 'free',
+    // Ark 的 size 是枚举,收到 "auto" 会直接报错;它也没有"模型自定比例"这一档
+    autoSize: false,
     edit: 'generations'
   },
   {
@@ -81,6 +93,8 @@ export const PROVIDERS: Provider[] = [
     quality: 'no',
     background: 'no',
     sizes: 'free',
+    // 万相的 size 同样是枚举,没有 auto 档
+    autoSize: false,
     edit: 'generations'
   },
   CUSTOM
