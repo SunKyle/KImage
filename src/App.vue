@@ -891,6 +891,33 @@ function fmtDate(ts: number) {
   return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
 }
 
+/* 短标题结尾要摘掉的虚词。放模块级是为了不每次调用都重建正则 */
+const TAIL_STOP =
+  /\s+(of|in|on|at|with|and|or|for|to|from|by|the|a|an|as|into|over|under|that|is|are)$/i
+
+/* 图砖上的短标题:从提示词开头取几个词,让每块砖有名字可认。
+   不新增字段存它 —— 提示词本来就在历史记录里,派生得出来的东西不必再落一份盘,
+   这样已有记录也立刻有标题,不用迁移。
+   完整提示词仍然只挂在 img 的 alt 上(读屏能拿到),角标里不出现,免得挡图 */
+function tileTitle(prompt: string) {
+  const s = (prompt || '').replace(/\s+/g, ' ').trim()
+  if (!s) return 'Untitled'
+  const cap = (t: string) => t.charAt(0).toUpperCase() + t.slice(1)
+  /* 拉丁文按词切,顺便去掉开头的冠词:
+     "A cinematic portrait of a girl" 里的 A 只是语法,做了标题就是噪声 */
+  if (!/[\u3400-\u9fff]/.test(s)) {
+    const cut = s.replace(/^(a|an|the)\s+/i, '').split(' ').slice(0, 4).join(' ')
+    /* 切在虚词上收不住尾:"cinematic portrait of a" 读起来像被截断,
+       所以把结尾的 of / in / the 这类非实词摘掉,直到落在一个实词上 */
+    let out = cut
+    while (TAIL_STOP.test(out)) out = out.replace(TAIL_STOP, '')
+    // 整句都是虚词的极端情况:别返回空串,退回没修过的结果
+    return cap(out || cut)
+  }
+  // 中日韩没有空格,按词切会把整句糊上来,所以按字截
+  return s.slice(0, 12)
+}
+
 function openPreview(entry: HistoryEntry) {
   previewEntry.value = entry
 }
@@ -1039,6 +1066,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
       <!-- 生图工作台 -->
       <section v-if="page === 'home'" class="workbench page-in" aria-label="Studio">
         <header class="hero">
+          <p class="hero-eyebrow">AI Image Studio</p>
           <h1 class="hero-title">Turn your ideas<br />into beautiful images</h1>
           <p class="hero-sub">Create, explore, and organize AI-generated images with ease.</p>
         </header>
@@ -1389,9 +1417,10 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                     :alt="t.entry.prompt"
                     @load="onFeedLoad(t.key, t.entry, $event)"
                   />
-                  <!-- 悬停只浮出时间与尺寸:提示词动辄两三行,压在缩略图上把图挡掉大半,
-                       而这块砖是用来扫图的;要读提示词点开预览即可 -->
+                  <!-- 悬停浮出短标题与元信息:提示词动辄两三行,压在缩略图上把图挡掉大半,
+                       而这块砖是用来扫图的;要读完整提示词点开预览即可 -->
                   <span class="tile-veil">
+                    <span class="tile-name">{{ tileTitle(t.entry.prompt) }}</span>
                     <span class="tile-meta">{{ fmtDate(t.entry.createdAt) }} · {{ sizeLabel(t.entry.size) }}</span>
                   </span>
                 </button>
@@ -1647,9 +1676,23 @@ async function toggleMark(entry: HistoryEntry, index: number) {
 .hero {
   position: relative;
   text-align: center;
-  /* 顶部留白收窄,让标题与输入框整体上移,首屏更快进入内容 */
-  padding: clamp(24px, 3.5vw, 44px) var(--sp-4) var(--sp-5);
+  /* 顶部留白收窄,让标题与输入框整体上移,首屏更快进入内容。
+     上一行加了微标签之后又收了一档:标签本身占掉一行的高度,
+     不补回来的话标题与输入框会被推低,首屏就挤了 */
+  padding: clamp(16px, 3vw, 34px) var(--sp-4) var(--sp-5);
   overflow: hidden;
+}
+/* 分类微标签:先说"这是什么",再说"它有多好"。
+   全大写 + 拉开字距,和下面的大标题是两种读音,不会被当成同一句话的头 */
+.hero-eyebrow {
+  margin-bottom: var(--sp-3);
+  color: var(--text-3);
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  letter-spacing: var(--ls-eyebrow);
+  text-transform: uppercase;
+  position: relative;
+  z-index: 1;
 }
 .hero-title {
   font-family: var(--font-sans);
@@ -2290,8 +2333,8 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   cursor: default;
   animation: none;
 }
-/* 角标:默认隐去,悬停/聚焦时浮出时间与尺寸。
-   不放提示词 —— 两行文字会把缩略图挡掉大半,读提示词交给预览卡 */
+/* 角标:默认隐去,悬停/聚焦时浮出短标题与元信息。
+   不放完整提示词 —— 两行文字会把缩略图挡掉大半,读提示词交给预览卡 */
 .tile-veil {
   position: absolute;
   inset: auto 0 0;
@@ -2308,6 +2351,17 @@ async function toggleMark(entry: HistoryEntry, index: number) {
 .tile:hover .tile-veil,
 .tile:focus-visible .tile-veil {
   opacity: 1;
+}
+/* 标题比元信息重一档:图砖先被"叫什么"抓住,时间尺寸是补注 */
+.tile-name {
+  font-size: var(--fs-base);
+  font-weight: 500;
+  letter-spacing: var(--ls-tight);
+  /* 只留一行。提示词长短不一,不裁的话长的会把图盖掉一半 —— 
+     这跟"不放完整提示词"是同一条理由 */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .tile-meta {
   font-size: var(--fs-micro);
