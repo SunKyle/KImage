@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import { BACKGROUND_OPTIONS, QUALITY_OPTIONS, optionLabel } from '../api'
 import type { PromptItem } from '../types'
 
@@ -21,6 +21,16 @@ const emit = defineEmits<{
 const query = ref('')
 const filter = ref('全部')
 const menuOpen = ref(false)
+// 菜单展开后点别处收起:低频动作,不该逼用户再点一次 ⋮ 才能走
+const menuEl = ref<HTMLElement | null>(null)
+function onDocPointerDown(e: PointerEvent) {
+  if (!menuOpen.value) return
+  const t = e.target as Node | null
+  if (t && menuEl.value?.contains(t)) return
+  menuOpen.value = false
+}
+onMounted(() => document.addEventListener('pointerdown', onDocPointerDown))
+onBeforeUnmount(() => document.removeEventListener('pointerdown', onDocPointerDown))
 const showAdd = ref(false)
 const draftPrompt = ref('')
 const draftCategory = ref('')
@@ -132,7 +142,7 @@ function fmt(t: number) {
           新建提示词
         </button>
         <!-- 管理动作低频,收进菜单,不给标题行添按钮 -->
-        <span class="menu-wrap">
+        <span ref="menuEl" class="menu-wrap">
           <button class="icon-ghost" :aria-expanded="menuOpen" aria-label="更多" @click="menuOpen = !menuOpen">
             <svg viewBox="0 0 24 24" fill="currentColor">
               <circle cx="12" cy="5.5" r="1.6" />
@@ -476,16 +486,21 @@ function fmt(t: number) {
    1.5 倍,2x 屏上明显糊。卡片面积比原来的扁条更大,只是方了 */
 .lib-grid {
   list-style: none;
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-  gap: var(--sp-4);
+  /* 和历史图墙同一套排法:固定列宽,列数由容器宽度自己算 ——
+     卡片高矮不一,定宽多列比 auto-fill 网格更能把空格子吃掉,排得紧凑 */
   margin-top: var(--sp-5);
+  column-width: 240px;
+  column-gap: var(--sp-3);
+  /* 提示词的显示上限(行数)—— 卡片的最大高度由它定。
+     要调卡片的最高高度改这一个值即可,.card-text 那边不用动 */
+  --card-text-lines: 8;
 }
 .card {
   position: relative;
-  /* grid 让 .flip-inner 铺满整张卡:同一行的卡片被长提示词撑高时,
-     两面的白底和图片底才跟着铺满,不会在卡片下方露出一条空边 */
-  display: grid;
+  /* 多列布局下纵向间距要靠 margin:column-gap 只管列与列之间,管不了上下;
+     break-inside 防止一张卡被拆到两列去 */
+  margin: 0 0 var(--sp-3);
+  break-inside: avoid;
   border: 1px solid var(--line);
   border-radius: var(--r);
   background: var(--surface);
@@ -522,10 +537,14 @@ function fmt(t: number) {
    延迟 220ms(翻转大约走到侧面时)再换面,肉眼看不出来。
 
    pointer-events 必须跟着换:透明元素照样能被点中,否则翻到背面后
-   还会点到正面那层已经看不见的操作按钮 */
+   还会点到正面那层已经看不见的操作按钮。
+
+   高度不给死:由正面(提示词)的内容决定,短提示词就是矮卡。
+   背面之所以不会反过来把卡撑高,是因为它的图是 flex 项且 min-height: 0 ——
+   能缩到 0 就没有固有高度参与,格子高度只看正面;少了这一条,
+   卡会被图的原始比例顶开,自适应就失效了 */
 .flip-inner {
   display: grid;
-  min-height: 300px;
   transform-style: preserve-3d;
 }
 .face {
@@ -595,6 +614,11 @@ function fmt(t: number) {
   color: var(--text-2);
 }
 .card-cat {
+  /* 分类是用户自己填的,可能很长;列变窄后要能自己截断,不能把右边的时间挤掉 */
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-weight: 500;
 }
 .card-time {
@@ -602,12 +626,12 @@ function fmt(t: number) {
 }
 .card-text {
   /* 提示词是这张卡的主角:字号最大、颜色最深。
-     在剩余空间里垂直居中 —— 卡片高度是统一的,短提示词若贴着顶,
-     下面会空出一大块,看着像没加载完 */
-  margin: auto 0;
+     高度不再靠垂直居中去填满统一卡片 —— 卡本身就只见这么高。
+     line-clamp 就是这张卡的"最大高度":几行就显示几行,超过就截断,
+     行数由 .lib-grid 上的 --card-text-lines 统一控制 */
   display: -webkit-box;
   -webkit-box-orient: vertical;
-  -webkit-line-clamp: 8;
+  -webkit-line-clamp: var(--card-text-lines, 8);
   overflow: hidden;
   font-size: 15px;
   line-height: 1.62;

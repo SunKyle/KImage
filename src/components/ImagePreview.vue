@@ -16,11 +16,21 @@ const emit = defineEmits<{
   (e: 'favorite', payload: FavoritePayload): void
   (e: 'reference', item: ResultItem): void
   (e: 'remove'): void
+  (e: 'mark', entry: HistoryEntry, index: number): void
 }>()
 
 const active = ref(0)
 const expanded = ref(false)
 const menuOpen = ref(false)
+// 菜单展开后点别处收起。ref 挂在包着按钮和菜单的那层上:
+// 只监听菜单的话,点按钮收起会先被判成"外部点击",关掉又被 click 打开,反而关不上
+const menuEl = ref<HTMLElement | null>(null)
+function onDocPointerDown(e: PointerEvent) {
+  if (!menuOpen.value) return
+  const t = e.target as Node | null
+  if (t && menuEl.value?.contains(t)) return
+  menuOpen.value = false
+}
 // 复制后的短暂回执:复制 Prompt 现在是显眼的主操作,必须有反馈
 const copied = ref(false)
 let copiedTimer: number | undefined
@@ -115,6 +125,14 @@ function useThisPrompt() {
   close()
 }
 
+// 标记标的是"当前这张图",所以要跟着 active 走:一条记录里几张图各标各的。
+// 字段和历史图墙共用(entry.results[].marked),这边只负责触发,落盘在主界面
+const marked = computed(() => !!props.entry?.results[active.value]?.marked)
+function toggleMark() {
+  if (!props.entry) return
+  emit('mark', props.entry, active.value)
+}
+
 // 耗时:10 秒以内保留一位小数,再长就取整,避免数字跳动太碎
 function fmtElapsed(ms: number) {
   const s = ms / 1000
@@ -136,9 +154,13 @@ function onKey(e: KeyboardEvent) {
     goEntry(1)
   }
 }
-onMounted(() => window.addEventListener('keydown', onKey))
+onMounted(() => {
+  window.addEventListener('keydown', onKey)
+  document.addEventListener('pointerdown', onDocPointerDown)
+})
 onUnmounted(() => {
   window.removeEventListener('keydown', onKey)
+  document.removeEventListener('pointerdown', onDocPointerDown)
   window.clearTimeout(copiedTimer)
 })
 
@@ -239,7 +261,7 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
                 </div>
 
                 <div class="toolbar-main">
-                  <span class="menu-wrap">
+                  <span ref="menuEl" class="menu-wrap">
                     <button class="tpill tip-below" @click="menuOpen = !menuOpen" data-tip="更多操作" aria-label="更多操作">
                       <svg viewBox="0 0 24 24" fill="currentColor">
                         <circle cx="12" cy="5.5" r="1.6" />
@@ -267,19 +289,40 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
               <section class="block">
                 <header class="blk-head">
                   <span class="blk-title">提示词</span>
-                  <button
-                    class="blk-act tip-left"
-                    :class="{ done: copied }"
-                    @click="copyPrompt"
-                    data-tip="复制到剪贴板"
-                    :aria-label="copied ? '已复制' : '复制到剪贴板'"
-                  >
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                      <rect x="9" y="9" width="11" height="11" rx="2" />
-                      <path d="M5 15V6a1 1 0 0 1 1-1h9" />
-                    </svg>
-                    <span>{{ copied ? '已复制' : '复制' }}</span>
-                  </button>
+                  <!-- 两个动作收在一组:blk-head 是 space-between,直接并排会被推到中间去 -->
+                  <div class="blk-acts">
+                    <button
+                      class="blk-act tip-left"
+                      :class="{ done: copied }"
+                      @click="copyPrompt"
+                      data-tip="复制到剪贴板"
+                      :aria-label="copied ? '已复制' : '复制到剪贴板'"
+                    >
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                        <rect x="9" y="9" width="11" height="11" rx="2" />
+                        <path d="M5 15V6a1 1 0 0 1 1-1h9" />
+                      </svg>
+                      <span>{{ copied ? '已复制' : '复制' }}</span>
+                    </button>
+                    <button
+                      class="blk-act"
+                      :class="{ on: marked }"
+                      @click="toggleMark"
+                      :aria-pressed="marked"
+                      :aria-label="marked ? '取消标记这张图' : '标记这张图'"
+                    >
+                      <svg
+                        viewBox="0 0 24 24"
+                        :fill="marked ? 'currentColor' : 'none'"
+                        stroke="currentColor"
+                        stroke-width="1.8"
+                        stroke-linejoin="round"
+                      >
+                        <path d="M12 3.6l2.63 5.33 5.88.86-4.25 4.14 1 5.86L12 17.03l-5.26 2.76 1-5.86-4.25-4.14 5.88-.86z" />
+                      </svg>
+                      <span>{{ marked ? '已标记' : '标记' }}</span>
+                    </button>
+                  </div>
                 </header>
                 <p class="prompt" :class="{ clipped: !expanded }">{{ entry.prompt }}</p>
                 <button v-if="entry.prompt.length > 120" class="expand-btn" @click="expanded = !expanded">
@@ -404,8 +447,8 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
     background var(--dur) var(--ease);
 }
 .tpill svg {
-  width: 15px;
-  height: 15px;
+  width: 17px;
+  height: 17px;
 }
 /* 只有禁用态(翻到头的那一端)不参与悬停反馈 */
 .tpill:not(:disabled):hover {
@@ -525,8 +568,8 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
     border-color var(--dur) var(--ease), transform 120ms var(--ease);
 }
 .nav svg {
-  width: 16px;
-  height: 16px;
+  width: 18px;
+  height: 18px;
 }
 .nav:hover {
   background: var(--surface);
@@ -647,7 +690,13 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
   letter-spacing: -0.005em;
   color: var(--text-2);
 }
-/* 小节内的图标动作:默认弱化,悬停才浮出,免得和正文抢注意力 */
+/* 小节内的图标动作:默认弱化,悬停才浮出,免得和正文抢注意力。
+   两个动作收在 .blk-acts 里 —— blk-head 是 space-between,直接并排会被推到中间 */
+.blk-acts {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
 .blk-act {
   display: inline-flex;
   align-items: center;
@@ -660,15 +709,16 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
   transition: color var(--dur) var(--ease), background var(--dur) var(--ease);
 }
 .blk-act svg {
-  width: 13px;
-  height: 13px;
+  width: 15px;
+  height: 15px;
 }
 .blk-act:hover {
   color: var(--accent);
   background: var(--accent-soft);
 }
-/* 复制成功后的回执:换成强调色,1.6 秒后自行复原 */
-.blk-act.done {
+/* done = 复制成功后的短暂回执(1.6 秒);on = 这张图已被标记的常驻状态 */
+.blk-act.done,
+.blk-act.on {
   color: var(--accent-strong);
   background: var(--accent-soft);
 }
