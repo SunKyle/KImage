@@ -266,14 +266,6 @@ app.post('/api/generate', rateLimit, async (req, res) => {
   if (isGemini && !model) {
     return res.status(400).json({ error: 'Set an image model in API settings first' })
   }
-  /* Gemini 的图生图还没接:原生协议收参考图的方式是在 parts 里再放一段 inlineData。
-     与其静默把用户的参考图丢掉,不如直接说清 */
-  if (isGemini && isImageGen) {
-    return res.status(400).json({
-      error: 'Gemini image-to-image is not available yet',
-      detail: 'Remove the reference image to generate from text only, or switch to another provider.'
-    })
-  }
 
   /* 两条协议的路径不一样。谁走哪条由前端按 (厂商, 模型) 判定 ——
      中转站自己也是按模型名分流,我们跟它不一致就会打到它不实现的那条路上
@@ -309,15 +301,15 @@ app.post('/api/generate', rateLimit, async (req, res) => {
         ...(background ? { background } : {})
       }
 
-  /* size 如实转发,包括字面量 'auto' —— 它是上游的一个真实取值(模型按 prompt
-     定比例),跟"不发这个参数"不是一回事:不发时上游用自己的默认尺寸,多数是 1:1。
-     哪些厂商认 auto 由前端判断(厂商表在 src/api.ts,只有那里知道 baseUrl 是谁),
-     不认的厂商候选里不会出现 auto,所以这里不需要再拦一道。
+  /* size 如实转发(OpenAI 那条路),包括字面量 'auto' —— 它是上游的一个真实取值
+     (模型按 prompt 定比例),跟"不发这个参数"不是一回事:不发时上游用自己的默认尺寸,
+     多数是 1:1。哪些厂商认 auto 由前端判断(厂商表在 src/api.ts,只有那里知道
+     baseUrl 是谁),不认的厂商候选里不会出现 auto,所以这里不需要再拦一道。
      注意 quality / background 的 auto 不同:那两个是我们的"不传"哨兵值,
-     上游没有对应的 'auto' 取值,所以仍然只在显式选择时才带上。 */
+     上游没有对应的 'auto' 取值,所以仍然只在显式选择时才带上。
+     Gemini 那条路是例外:它根本没有 size 参数,size 会被约分成宽高比(见 geminiRatio)。 */
 
-  // 图生图:gpt-image 等模型不接受 JSON 里的 data-url base64,
-  // 必须走 multipart 文件上传(或在个别服务下传公网 URL)。
+  /* 两条路的请求体完全不同,各自成段 */
   let payload
   if (isGemini) {
     headers['Content-Type'] = 'application/json'
@@ -326,11 +318,23 @@ app.post('/api/generate', rateLimit, async (req, res) => {
     const gen = {}
     if (ratio) gen.imageConfig = { aspectRatio: ratio }
     if (n > 1) gen.candidateCount = n
+    /* 图生图在原生协议里不是另一个端点,而是同一个端点多给一段 parts:
+       文字在前、参考图在后。mime 必须从 data URL 里读,不能写死 ——
+       参考图可能是历史里的 PNG/WebP(原样带过来),也可能是
+       compressImage 压过的 JPEG */
+    const parts = [{ text: prompt }]
+    if (isImageGen) {
+      const [meta, b64] = image.split(',')
+      const mime = (meta.match(/data:([^;]+)/) || [])[1] || 'image/jpeg'
+      parts.push({ inlineData: { mimeType: mime, data: b64 } })
+    }
     payload = JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
+      contents: [{ parts }],
       ...(Object.keys(gen).length ? { generationConfig: gen } : {})
     })
   } else if (isImageGen) {
+    // OpenAI 系图生图:gpt-image 等模型不接受 JSON 里的 data-url base64,
+    // 必须走 multipart 文件上传(或在个别服务下传公网 URL)
     const [meta, b64] = image.split(',')
     const mime = (meta.match(/data:([^;]+)/) || [])[1] || 'image/jpeg'
     const type = mime.includes('png') ? 'png' : 'jpeg'

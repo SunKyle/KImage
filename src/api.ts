@@ -93,8 +93,9 @@ const GEMINI: Provider = {
   sizes: ['auto', '1024x1024', '1536x1024', '1024x1536', '1792x1024', '1024x1792'],
   /* 实测:不发宽高比时它自己给 16:9,所以 auto 是实打实的"模型自决",不是空话 */
   autoSize: true,
-  /* 图生图暂不可用。原生协议其实能收参考图(parts 里再放一段 inlineData),
-     但那条路还没接,界面允许挂参考图而它会失败,所以先只在文档里记着 */
+  /* 这个字段只对 OpenAI 那条路有意义(决定打 /images/edits 还是 /images/generations)。
+     Gemini 的图生图不是换端点,而是在同一个 :generateContent 的 parts 里多给一段
+     inlineData,由代理按协议分支处理,所以这里填什么都用不上 */
   edit: 'generations',
   protocol: 'gemini'
 }

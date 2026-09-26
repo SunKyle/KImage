@@ -242,9 +242,15 @@ const provider = computed<Provider>(() => {
 const capabilityNote = computed(() => {
   const p = provider.value
   const t = (c: Cap) => (c === 'yes' ? 'Yes' : c === 'no' ? 'No' : 'Varies')
-  return `Active API: quality ${t(p.quality)} · background ${t(p.background)} · image-to-image via ${
-    p.edit === 'edits' ? '/images/edits' : '/images/generations'
-  }`
+  /* Gemini 的图生图没有独立端点:参考图是同一个 :generateContent 里的另一段 parts。
+     照 edit 字段写就会显示成 /images/generations,那是错的 */
+  const i2i =
+    p.protocol === 'gemini'
+      ? ':generateContent'
+      : p.edit === 'edits'
+        ? '/images/edits'
+        : '/images/generations'
+  return `Active API: quality ${t(p.quality)} · background ${t(p.background)} · image-to-image via ${i2i}`
 })
 // 尺寸候选随厂商(以及 OpenAI 的模型代次)变化
 const sizeOptions = computed(() => {
