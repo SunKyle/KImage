@@ -17,6 +17,9 @@ const props = withDefaults(
     size?: 'sm' | 'md' | 'lg'
     radius?: number
     inset?: number
+    /** 轨道高度,覆盖 size 预设。用于「轨道加高、滑块高度不变」的场合:
+        只调 inset 会连带把滑块压小,要拉开白底与滑块的高度差就得两个一起给 */
+    height?: number
     equalSlots?: boolean
     stretch?: number
     squash?: number
@@ -334,7 +337,7 @@ const trackStyle = computed(() => ({
   '--rs-radius': `${props.radius}px`,
   '--rs-inset': `${props.inset}px`,
   '--rs-thumb-radius': `${thumbRadius.value}px`,
-  '--rs-h': `${preset.value.height}px`,
+  '--rs-h': `${props.height ?? preset.value.height}px`,
   '--rs-font': `${preset.value.font}px`,
   '--rs-pad': `${preset.value.pad}px`,
   '--rs-min': `${preset.value.min}px`
@@ -374,7 +377,7 @@ watch(index, (i) => {
 })
 
 watch(
-  [listKey, () => props.size, () => props.inset, () => props.equalSlots, () => props.radius],
+  [listKey, () => props.size, () => props.inset, () => props.height, () => props.equalSlots, () => props.radius],
   () => {
     committed.value = index.value
     measure()

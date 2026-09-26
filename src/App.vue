@@ -776,12 +776,16 @@ async function toggleMark(entry: HistoryEntry, index: number) {
         </span>
       </div>
 
-      <!-- 居中的视图切换:滑块位置即当前打开的面板 -->
+      <!-- 居中的视图切换:滑块位置即当前打开的面板。
+           轨道 40px / 内边距 5px,滑块因此留在 30px:
+           原来 36/3 时白底只比黑色选中底高 3px,两者看起来一样高 -->
       <RubberSegment
         v-model="navView"
         class="nav-seg"
         :items="navItems"
         :radius="999"
+        :height="40"
+        :inset="5"
         aria-label="Main navigation"
       >
         <template #home>
@@ -1358,9 +1362,11 @@ async function toggleMark(entry: HistoryEntry, index: number) {
 .nav-seg {
   justify-self: center;
 }
+/* 17px 是照 34px 胶囊定的,导航条加高到 40px 后配套提到 19px,
+   与主题按钮的图标同档,两个控件在一行里视觉重量才对得上 */
 .nav-seg .seg-ico {
-  width: 17px;
-  height: 17px;
+  width: 19px;
+  height: 19px;
 }
 /* 未配置接口时齿轮标红。选中态那层由滑块的反色副本接管,所以排除 .rs-copy */
 .nav-seg :deep(.rs-item:not(.rs-copy)[aria-checked='false'] .is-warn) {
@@ -1368,12 +1374,11 @@ async function toggleMark(entry: HistoryEntry, index: number) {
 }
 .icob {
   position: relative;
-  /* 规格与参数栏的 .param-btn 对齐:34px 圆胶囊 + 常驻底色和描边。
-     导航原本是 36px 的无边界裸图标,是页面上唯一一处例外。
+  /* 40px 对齐同一行的 .nav-seg(轨道加高后的实际外高),整条导航读作一个高度;
      底色和描边压成半透明:导航浮在背景图上,不透明的胶囊在这里
      比坐在纯色页面里的参数栏重得多 */
-  width: 34px;
-  height: 34px;
+  width: 40px;
+  height: 40px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1389,8 +1394,8 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   border-color: var(--line-strong);
 }
 .icob svg {
-  width: 17px;
-  height: 17px;
+  width: 19px;
+  height: 19px;
 }
 
 .frame {
@@ -2076,6 +2081,46 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   }
   .prompt-box {
     border-radius: var(--r);
+  }
+  /* 导航改两行:第一行品牌与主题按钮分居两端,第二行视图切换占满整行居中。
+     三栏(1fr auto 1fr)在 375px 下左右各只剩约 60px,品牌字标会被挤坏 */
+  .masthead {
+    grid-template-columns: 1fr auto;
+    padding: var(--sp-3) 0;
+  }
+  .wordmark {
+    grid-row: 1;
+    grid-column: 1;
+    justify-self: start;
+  }
+  .mast-actions {
+    grid-row: 1;
+    grid-column: 2;
+    justify-self: end;
+  }
+  .nav-seg {
+    grid-row: 2;
+    grid-column: 1 / -1;
+    justify-self: center;
+  }
+  /* 触控目标放大到 40px:34px 在手机上容易点错,40px 兼顾参数栏不至于过高 */
+  .param-btn {
+    width: 40px;
+    height: 40px;
+  }
+  .param-btn svg {
+    width: 18px;
+    height: 18px;
+  }
+  /* 桌面 19px,窄屏跟着胶囊一起再提一档,图标与圆底的比例才不会显得变空。
+     .icob 本体不再单列:桌面已是 40px,这里再写一遍是死规则 */
+  .icob svg {
+    width: 20px;
+    height: 20px;
+  }
+  /* iOS Safari 聚焦字号 <16px 的输入框会放大整页,面板内的数字/尺寸输入提到 16px */
+  .num-input {
+    font-size: 16px;
   }
 }
 </style>

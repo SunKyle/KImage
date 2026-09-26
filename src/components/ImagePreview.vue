@@ -922,9 +922,23 @@ function menuAction(kind: 'favorite' | 'reference' | 'remove') {
   }
   .stage {
     /* 竖排后这一行的高度由内容决定,图盒的 height:100% 会失去依据,
-       所以这里给一个确定高度,顺带保证图片有足够的展示空间 */
-    height: 56vh;
+       所以这里给一个确定高度,顺带保证图片有足够的展示空间;
+       窄屏从 56vh 收到 48vh:375×812 下留给下方侧栏的高度从约 250px 提到约 320px */
+    height: 48vh;
     min-height: 260px;
+  }
+  /* 触控目标放大到 40px:34px 在手机上容易点错 */
+  .tpill {
+    width: 40px;
+    height: 40px;
+  }
+  .tpill svg {
+    width: 18px;
+    height: 18px;
+  }
+  /* 底部两个主次按钮同步加厚,与放大的图标按钮观感一致 */
+  .act {
+    padding: 13px 16px;
   }
   .side {
     border-left: none;

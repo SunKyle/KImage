@@ -733,4 +733,12 @@ function onImportFile(e: Event) {
   border-color: var(--line-strong);
   background: var(--bg-elev);
 }
+
+/* 窄屏:输入框提到 16px,防止 iOS Safari 聚焦时放大整页。
+   字段行本就是 label 独占一行 + input 宽度 100% 的上下堆叠,无需改动 */
+@media (max-width: 640px) {
+  .field input {
+    font-size: 16px;
+  }
+}
 </style>

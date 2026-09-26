@@ -476,4 +476,11 @@ function fmt(ts: number) {
   border-color: var(--line-strong);
   background: var(--bg-elev);
 }
+
+/* 窄屏:标题收一档,避免与右上角操作按钮挤压 */
+@media (max-width: 640px) {
+  .lib-title {
+    font-size: 20px;
+  }
+}
 </style>

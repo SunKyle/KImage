@@ -760,4 +760,18 @@ function fmt(t: number) {
   opacity: 0;
   transform: translateY(-4px);
 }
+
+/* 窄屏:标题收一档避免与右上角操作按钮挤压;
+   输入框提到 16px,防止 iOS Safari 聚焦时放大整页 */
+@media (max-width: 640px) {
+  .lib-title {
+    font-size: 20px;
+  }
+  .search {
+    font-size: 16px;
+  }
+  .add-form input {
+    font-size: 16px;
+  }
+}
 </style>
