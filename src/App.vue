@@ -170,10 +170,6 @@ function tileRatio(size: string) {
   if (!w || !h) return 1
   return Math.min(2, Math.max(0.5, w / h))
 }
-// 图墙列数随图数自适应,免得太少时被压成窄条
-const feedCols = computed(() =>
-  Math.min(4, Math.max(1, feedItems.value.length + (loading.value ? Math.max(1, running.value.n) : 0)))
-)
 
 // 当前生效的厂商:配置里没写就按域名猜(兼容加字段之前存的老配置)
 const provider = computed<Provider>(() => {
@@ -1143,7 +1139,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
 
           <div class="fold" :class="{ open: feedOpen }">
             <div class="fold-inner">
-              <div class="feed-grid" :class="`cols-${feedCols}`">
+              <div class="feed-grid">
                 <div
                   v-for="k in loading ? (running.n > 0 ? running.n : 1) : 0"
                   :key="`sk-${k}`"
@@ -1916,24 +1912,17 @@ async function toggleMark(entry: HistoryEntry, index: number) {
 
 /* 图墙:多列瀑布流,图片按原始比例高低错落 */
 .feed-grid {
+  /* 定宽多列,和历史图墙同一套:列数只由容器宽度决定,不随图片数量变。
+     之前列数是 min(4, 图数 + 生成中张数) 算出来的,后果有两个 ——
+     第一次生成时只有 1 列,占位块会铺满整行(约 1000px 的正方块);
+     而且每多生成一张就换一次列数,已有的图全部重排、尺寸跟着变 */
+  column-width: 240px;
   column-gap: var(--sp-3);
   opacity: 0;
   transition: opacity var(--dur) var(--ease);
 }
 .fold.open .feed-grid {
   opacity: 1;
-}
-.feed-grid.cols-1 {
-  column-count: 1;
-}
-.feed-grid.cols-2 {
-  column-count: 2;
-}
-.feed-grid.cols-3 {
-  column-count: 3;
-}
-.feed-grid.cols-4 {
-  column-count: 4;
 }
 .tile {
   position: relative;
@@ -2028,19 +2017,8 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   }
 }
 
-@media (max-width: 860px) {
-  /* 窄屏收窄列数,保证图块仍有足够宽度 */
-  .feed-grid.cols-3,
-  .feed-grid.cols-4 {
-    column-count: 2;
-  }
-}
+/* 窄屏不用再专门收窄列数了:定宽多列会自己退成一列 */
 @media (max-width: 640px) {
-  .feed-grid.cols-2,
-  .feed-grid.cols-3,
-  .feed-grid.cols-4 {
-    column-count: 1;
-  }
   .feed-grid {
     column-gap: var(--sp-2);
   }
