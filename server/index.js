@@ -170,6 +170,13 @@ const TARGET_STYLE = {
 }
 const GENERIC_STYLE = `Structure: a comma-separated series of short phrases rather than full sentences. Keyword density matters more than grammar.`
 
+/* 图生图时的附加要求。改写模型看不到参考图,只能靠用户这句话判断,
+   不点明这一点它会把整幅画面重新描述一遍 —— 参考图里已有的东西白写一次,
+   还会和参考图打架;更糟的是它可能编出参考图里根本没有的元素。 */
+const REF_NOTE = `\n\nThis is an image-to-image edit. The image model receives a reference image that you cannot see.
+- Describe only what should change and what must be preserved. Do not re-describe the whole scene.
+- Never assume or invent details about the reference image beyond what the prompt itself states.`
+
 /** 把目标模型与其结构偏好拼成一段附加说明;认不出来就只说清目标是谁 */
 function targetNote(vendor, model) {
   const style = TARGET_STYLE[vendor] || GENERIC_STYLE
@@ -376,7 +383,7 @@ app.post('/api/generate', rateLimit, async (req, res) => {
  * 与生图的接口配置互不影响 —— 两件事常常不是同一个服务商。
  */
 app.post('/api/enhance', rateLimit, async (req, res) => {
-  const { prompt, textModel, baseUrl, apiKey, mode, targetVendor, targetModel } = req.body || {}
+  const { prompt, textModel, baseUrl, apiKey, mode, targetVendor, targetModel, hasRef } = req.body || {}
 
   // 只认两档,其余(含老前端不传)一律按保守档处理
   const enhanceMode = mode === 'creative' ? 'creative' : 'quick'
@@ -427,8 +434,8 @@ app.post('/api/enhance', rateLimit, async (req, res) => {
       body: JSON.stringify({
         model: textModel,
         messages: [
-          // 附上目标出图模型的结构偏好:同一段文字,各家的正确写法不一样
-          { role: 'system', content: ENHANCE_PROMPTS[enhanceMode] + targetNote(targetVendor, targetModel) },
+          // 顺序有讲究:先两档的基本规则,再图生图的变更导向,最后目标模型的结构偏好
+          { role: 'system', content: ENHANCE_PROMPTS[enhanceMode] + (hasRef ? REF_NOTE : '') + targetNote(targetVendor, targetModel) },
           { role: 'user', content: prompt }
         ],
         temperature: ENHANCE_TEMPERATURE[enhanceMode]

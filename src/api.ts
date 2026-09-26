@@ -293,29 +293,39 @@ export async function generate(
    档位差异全在服务端的系统提示里,前端只负责把它传下去 */
 export type EnhanceMode = 'quick' | 'creative'
 
+// 改写请求里除提示词以外的输入。参数已经够多,收成一个对象免得调用点排成一长串
+export interface EnhanceOpts {
+  mode: EnhanceMode
+  /* 这次改写最终要喂给谁(出图接口的厂商与模型):
+     各家对提示词结构的偏好不一样,服务端据此调整输出的写法 */
+  targetVendor: string
+  targetModel: string
+  /* 是否图生图。有参考图时提示词的角色完全不同 —— 是"改什么"而不是"画什么" */
+  hasRef: boolean
+}
+
 /**
  * 调用后端代理改写提示词。
  * 走文本模型的 /chat/completions(图像模型只出图、改不了提示词),
  * 用的是「用途 = text」那条配置的地址、密钥与模型。返回扩写后的提示词。
  * 未配置时由调用方先拦下,这里不重复判断。
- *
- * target 是这次改写最终要喂给谁(出图接口的厂商与模型):
- * 各家对提示词结构的偏好不一样,服务端据此调整输出的写法。
  */
 export async function enhancePrompt(
   cfg: ApiConfig,
   prompt: string,
-  mode: EnhanceMode,
-  target: { vendor: string; model: string }
+  opts: EnhanceOpts,
+  signal?: AbortSignal
 ): Promise<string> {
   const resp = await fetch('/api/enhance', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
+    signal,
     body: JSON.stringify({
       prompt,
-      mode,
-      targetVendor: target.vendor,
-      targetModel: target.model,
+      mode: opts.mode,
+      targetVendor: opts.targetVendor,
+      targetModel: opts.targetModel,
+      hasRef: opts.hasRef,
       // 后端 /api/enhance 收的字段名仍是 textModel,路由不用改
       textModel: cfg.model,
       baseUrl: cfg.baseUrl,

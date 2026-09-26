@@ -40,6 +40,8 @@ import type { ApiConfig, FavoritePayload, HistoryEntry, PromptItem, ResultItem, 
 const prompt = ref('')
 // 提示词改写中(防连点、按钮切文案)
 const enhancing = ref(false)
+// 改写请求的中断手柄,与生图的 controller 各管各的:两件事互不影响
+const enhanceController = ref<AbortController | null>(null)
 // 改写前的原稿,空串表示当前没有可撤销的内容。只在点 Undo 或再次改写时更新
 const preEnhance = ref('')
 // 默认交给上游自决:'auto' 在大多数字段里是"最不会错"的一档,选错尺寸比不选更糟
@@ -758,12 +760,30 @@ const canUndo = computed(() => !enhancing.value && !!preEnhance.value)
 /* 按钮上只写档位名:"enhance" 已经在四角星图标和它所在的位置里说完了,
    再写一遍只是把按钮撑长。改写中同样带档位,顺带说明这次跑的是哪一档 */
 const enhanceText = computed(() => {
+  if (enhancing.value) return 'Stop'
+  if (canUndo.value) return 'Undo'
+  return enhanceMode.value === 'creative' ? 'Creative' : 'Quick'
+})
+/* 只有"空闲、没得可撤、输入框也空着"才禁用。
+   改写中必须可点 —— 那个位置就是中断键,和生成键跑起来变方块停止是同一套;
+   可撤销时同样可点,哪怕输入框被清空了:原稿还在,那正是要撤回来的场景 */
+const enhanceDisabled = computed(() => !enhancing.value && !canUndo.value && !prompt.value.trim())
+
+/* 悬停提示:说清这次点下去会用哪一档。
+   选了参考图时补一句 —— 那时改写是"改什么"而不是"画什么",结果明显更短,
+   不点明会让人以为是自己写坏了或者模型变笨了 */
+const enhanceTip = computed(() => {
+  if (enhancing.value) return 'Stop rewriting'
   if (canUndo.value) return 'Undo'
   const mode = enhanceMode.value === 'creative' ? 'Creative' : 'Quick'
-  return enhancing.value ? `${mode}…` : mode
+  return `Rewrite the prompt · ${mode}${refImage.value ? ' · Image-to-image' : ''}`
 })
-// 撤销态下即使输入框被清空也照常可点:原稿还在,这正是要撤回来的场景
-const enhanceDisabled = computed(() => enhancing.value || (!canUndo.value && !prompt.value.trim()))
+// 读屏也该知道是图生图:它看不到悬停提示,更看不到参考图缩略图
+const enhanceAria = computed(() => {
+  if (enhancing.value) return 'Stop rewriting'
+  if (canUndo.value) return 'Undo prompt rewrite'
+  return `Rewrite the prompt, ${enhanceMode.value} mode${refImage.value ? ', image-to-image' : ''}`
+})
 
 /* 改写档位:只两档,所以切换键直接来回切,不做下拉菜单 ——
    两种状态用不着菜单那套浮层、外部点击收起和箭头图标。
@@ -788,20 +808,45 @@ async function doEnhance() {
     return
   }
   enhancing.value = true
+  enhanceController.value = new AbortController()
   try {
-    // 告诉服务端这次改写是给出图那条配置的:各家偏好不同,写法要跟着变
-    const out = await enhancePrompt(cfg, src, enhanceMode.value, {
-      vendor: provider.value.id,
-      model: config.value.model
-    })
+    const out = await enhancePrompt(
+      cfg,
+      src,
+      {
+        mode: enhanceMode.value,
+        // 这次改写是给出图那条配置的:各家偏好不同,写法要跟着变
+        targetVendor: provider.value.id,
+        targetModel: config.value.model,
+        // 有参考图时提示词该写成"改什么",而不是重新描述整幅画面
+        hasRef: !!refImage.value
+      },
+      enhanceController.value.signal
+    )
     // 原稿存的是改写前的完整文本(含可能的首尾空白),Undo 才能一字不差地还原
     preEnhance.value = prompt.value
     prompt.value = out
   } catch (e: any) {
+    // 主动中断不算失败:不报错,输入框保持原样(和生成那边的处理一致)
+    if (e?.name === 'AbortError') return
     fail(e?.message || 'Prompt enhancing failed')
   } finally {
     enhancing.value = false
+    enhanceController.value = null
   }
+}
+
+// 中断改写:断开请求。服务端那边会跟着中断对上游的调用(见 /api/enhance 的 res.on('close'))
+function stopEnhance() {
+  enhanceController.value?.abort()
+}
+
+/* 按钮一个位置承担三件事:改写、中断、撤销。同一时刻只会有一件是当前的,
+   拆成三个按钮会把按钮区撑宽,而且用户还得先找哪个是自己的状态 */
+function onEnhanceClick() {
+  if (enhancing.value) stopEnhance()
+  else if (canUndo.value) undoEnhance()
+  else doEnhance()
 }
 
 // 撤销改写:把原稿写回输入框,并清掉撤销点
@@ -1073,12 +1118,16 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                     class="enhance-btn"
                     :class="{ undo: canUndo }"
                     :disabled="enhanceDisabled"
-                    :data-tip="canUndo ? 'Undo' : `Rewrite the prompt · ${enhanceMode === 'creative' ? 'Creative' : 'Quick'}`"
-                    :aria-label="canUndo ? 'Undo prompt rewrite' : `Rewrite the prompt (${enhanceMode})`"
-                    @click="canUndo ? undoEnhance() : doEnhance()"
+                    :data-tip="enhanceTip"
+                    :aria-label="enhanceAria"
+                    @click="onEnhanceClick"
                   >
-                    <!-- 四角星 = 增强,回转箭头 = 撤销:同一处换符号,比只换文案先被看到 -->
-                    <svg v-if="canUndo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <!-- 三态各换符号:运行中 = 方块停止(与生成键同一套语言),
+                         可撤销 = 回转箭头,其余 = 四角星 -->
+                    <svg v-if="enhancing" viewBox="0 0 24 24" fill="currentColor">
+                      <rect x="7" y="7" width="10" height="10" rx="1.6" />
+                    </svg>
+                    <svg v-else-if="canUndo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                       <path d="M4 10.5h9.5a4.75 4.75 0 0 1 0 9.5H9" />
                       <path d="M7.5 6.5 3.5 10.5l4 4" />
                     </svg>
