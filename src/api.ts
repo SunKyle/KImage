@@ -97,6 +97,26 @@ export const PROVIDERS: Provider[] = [
     autoSize: false,
     edit: 'generations'
   },
+  {
+    id: 'gemini',
+    label: 'Google Gemini',
+    // 兼容层地址:只有 /v1beta/openai 之下才有 /images/generations 与 /chat/completions
+    baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
+    model: 'gemini-2.5-flash-image',
+    /* 兼容层文档写明:除 prompt / model / n / size / response_format 之外的参数
+       一律静默忽略,所以这两档直接标成不支持 —— 否则界面给了一排按不动的开关 */
+    quality: 'no',
+    background: 'no',
+    sizes: 'free',
+    /* 默认交回上游:auto 承诺的就是"模型按 prompt 自己定比例",与 Gemini 的行为一致。
+       其余候选给常用像素值 —— 兼容层文档只列了 size 这个参数名、没给合法取值,
+       所以保留手填余地(尺寸自由时会开出自定义输入),真不认还能自己试。 */
+    autoSize: true,
+    /* 图生图暂不可用:Gemini 兼容层没有 edits 端点,而代理对非 OpenAI 厂商会把参考图
+       以 multipart 打到 /images/generations,那边只吃 JSON。真正的图生图要走
+       chat 带图输入或原生 :generateContent,是另一套请求体与响应解析 */
+    edit: 'generations'
+  },
   CUSTOM
 ]
 
@@ -107,6 +127,13 @@ export function getProvider(id: string | undefined): Provider {
 /** 老配置没有 vendor 字段时按域名猜,省得用户重配一遍 */
 export function inferVendor(baseUrl: string): string {
   const h = (baseUrl || '').toLowerCase()
+  /* gemini 必须排在 openai 前面:Gemini 的兼容层地址是
+     .../v1beta/openai,也含 "openai" 这个词,顺序反了就会把它当成 OpenAI,
+     于是尺寸候选、quality/background 门控、图生图端点全都按错的那家来。
+     只认 generativelanguage(AI Studio 的 Gemini API 主机),故意不认
+     aiplatform.googleapis.com —— 那是 Vertex,鉴权要 GCP access token、
+     模型名还带 google/ 前缀,和这里不是一套,硬认出来只会误导 */
+  if (h.includes('generativelanguage')) return 'gemini'
   if (h.includes('openai')) return 'openai'
   if (h.includes('volces') || h.includes('ark.cn')) return 'ark'
   if (h.includes('dashscope') || h.includes('aliyun')) return 'dashscope'
