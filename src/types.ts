@@ -96,9 +96,3 @@ export interface ReuseParams {
   quality?: string
   background?: string
 }
-
-// 通用 OpenAI /images/generations 响应格式
-export interface ImagesResponse {
-  created?: number
-  data: Array<{ url?: string; b64_json?: string; revised_prompt?: string }>
-}

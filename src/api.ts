@@ -1,4 +1,4 @@
-import type { ApiConfig, GenParams, HistoryEntry, ImagesResponse, PromptItem, ResultItem, ReuseParams } from './types'
+import type { ApiConfig, GenParams, HistoryEntry, PromptItem, ResultItem, ReuseParams } from './types'
 import type { PruneResult } from './lib/idb'
 import {
   getAll,
@@ -26,6 +26,11 @@ export function uid(): string {
    -------------------------------------------------------------------- */
 export type Cap = 'yes' | 'no' | 'unknown'
 
+/* 出图走哪套协议。不是"厂商"的另一种说法 —— 同一家中转上,
+   OpenAI 系模型打 /images/generations,Gemini 系模型得打原生的
+   :generateContent,两条路的请求体和响应体都不一样 */
+export type Protocol = 'openai' | 'gemini'
+
 export interface Provider {
   id: string
   label: string
@@ -42,6 +47,7 @@ export interface Provider {
   autoSize: boolean
   /** 图生图打哪个端点 */
   edit: 'generations' | 'edits'
+  protocol: Protocol
 }
 
 // 兜底项:baseUrl 认不出来时的归宿
@@ -58,7 +64,39 @@ const CUSTOM: Provider = {
      如实转发比静默降级好 —— 真发错了会报错提示,而静默丢掉参数只会让人
      以为模型没按 prompt 定比例 */
   autoSize: true,
-  edit: 'generations'
+  edit: 'generations',
+  protocol: 'openai'
+}
+
+/* Gemini 出图:走原生 :generateContent,不是 OpenAI 的 /images/generations。
+   实测(2026-09,对一家中转):原生路径同步返回,出图在
+   candidates[].content.parts[].inlineData.data,宽高比走
+   generationConfig.imageConfig.aspectRatio —— 传 2:3 拿到 848×1264。
+   注意不要用它的 OpenAI 兼容层:那条路上中转会回
+   "Images API is not supported for this platform" */
+const GEMINI: Provider = {
+  id: 'gemini',
+  label: 'Google Gemini',
+  /* 主机根地址,不带版本号:原生路径由代理拼成
+     {baseUrl}/v1beta/models/{model}:generateContent。
+     中转站也按同一套拼(前提是把中转地址填成它的根,如 https://xxx.com),
+     所以同一条预设同时服务"Google 直连"和"中转"两种填法 */
+  baseUrl: 'https://generativelanguage.googleapis.com',
+  model: 'gemini-2.5-flash-image',
+  /* 原生请求体里根本没有 quality / background 这两个字段,多给一个未知字段
+     会被 Google 拒掉。标成不支持,界面就不会给出按不动的开关 */
+  quality: 'no',
+  background: 'no',
+  /* 给的都是能干净约分成 Gemini 认的宽高比的档位:
+     1024x1024→1:1、1536x1024→3:2、1024x1536→2:3、1792x1024→16:9、1024x1792→9:16。
+     约不出来的值不发这个参数(见 server 的 geminiRatio),不做隐式近似 */
+  sizes: ['auto', '1024x1024', '1536x1024', '1024x1536', '1792x1024', '1024x1792'],
+  /* 实测:不发宽高比时它自己给 16:9,所以 auto 是实打实的"模型自决",不是空话 */
+  autoSize: true,
+  /* 图生图暂不可用。原生协议其实能收参考图(parts 里再放一段 inlineData),
+     但那条路还没接,界面允许挂参考图而它会失败,所以先只在文档里记着 */
+  edit: 'generations',
+  protocol: 'gemini'
 }
 
 export const PROVIDERS: Provider[] = [
@@ -71,7 +109,8 @@ export const PROVIDERS: Provider[] = [
     background: 'yes',
     sizes: ['auto', '1024x1024', '1536x1024', '1024x1536'],
     autoSize: true,
-    edit: 'edits'
+    edit: 'edits',
+    protocol: 'openai'
   },
   {
     id: 'ark',
@@ -83,7 +122,8 @@ export const PROVIDERS: Provider[] = [
     sizes: 'free',
     // Ark 的 size 是枚举,收到 "auto" 会直接报错;它也没有"模型自定比例"这一档
     autoSize: false,
-    edit: 'generations'
+    edit: 'generations',
+    protocol: 'openai'
   },
   {
     id: 'dashscope',
@@ -95,41 +135,36 @@ export const PROVIDERS: Provider[] = [
     sizes: 'free',
     // 万相的 size 同样是枚举,没有 auto 档
     autoSize: false,
-    edit: 'generations'
+    edit: 'generations',
+    protocol: 'openai'
   },
-  {
-    id: 'gemini',
-    label: 'Google Gemini',
-    // 兼容层地址:只有 /v1beta/openai 之下才有 /images/generations 与 /chat/completions
-    baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
-    model: 'gemini-2.5-flash-image',
-    /* 兼容层文档写明:除 prompt / model / n / size / response_format 之外的参数
-       一律静默忽略,所以这两档直接标成不支持 —— 否则界面给了一排按不动的开关 */
-    quality: 'no',
-    background: 'no',
-    sizes: 'free',
-    /* 默认交回上游:auto 承诺的就是"模型按 prompt 自己定比例",与 Gemini 的行为一致。
-       其余候选给常用像素值 —— 兼容层文档只列了 size 这个参数名、没给合法取值,
-       所以保留手填余地(尺寸自由时会开出自定义输入),真不认还能自己试。 */
-    autoSize: true,
-    /* 图生图暂不可用:Gemini 兼容层没有 edits 端点,而代理对非 OpenAI 厂商会把参考图
-       以 multipart 打到 /images/generations,那边只吃 JSON。真正的图生图要走
-       chat 带图输入或原生 :generateContent,是另一套请求体与响应解析 */
-    edit: 'generations'
-  },
+  GEMINI,
   CUSTOM
 ]
 
-export function getProvider(id: string | undefined): Provider {
-  return PROVIDERS.find((p) => p.id === id) || CUSTOM
+/* Gemini 系图像模型的模型名:各家中转给它们起的别名五花八门(banana2-4k、
+   nano-banana-pro…),但都绕不开这几个词根 */
+const GEMINI_IMAGE_RE = /^(gemini|imagen|banana|nano-?banana)/i
+
+/* 能力表按 (厂商, 模型) 解析,不只是厂商 ——
+   中转站自己就是看模型名决定后端的,我们必须跟它一致:同一个地址上,
+   OpenAI 系模型走 /images/generations,Gemini 系模型走原生 :generateContent,
+   判错就会打到对方不实现的那条路上(实测会回
+   "Images API is not supported for this platform")。
+   model 参数可选,不传时退回按厂商判断 */
+export function getProvider(id: string | undefined, model = ''): Provider {
+  const p = PROVIDERS.find((x) => x.id === id)
+  if (!p) return CUSTOM
+  if (p.id === 'custom' && GEMINI_IMAGE_RE.test(model)) return GEMINI
+  return p
 }
 
 /** 老配置没有 vendor 字段时按域名猜,省得用户重配一遍 */
 export function inferVendor(baseUrl: string): string {
   const h = (baseUrl || '').toLowerCase()
-  /* gemini 必须排在 openai 前面:Gemini 的兼容层地址是
-     .../v1beta/openai,也含 "openai" 这个词,顺序反了就会把它当成 OpenAI,
-     于是尺寸候选、quality/background 门控、图生图端点全都按错的那家来。
+  /* gemini 必须排在 openai 前面:Gemini 的 OpenAI 兼容层地址是
+     .../v1beta/openai,含 "openai" 这个词,顺序反了就会把它当成 OpenAI,
+     于是尺寸候选、quality/background 门控、出图协议全都按错的那家来。
      只认 generativelanguage(AI Studio 的 Gemini API 主机),故意不认
      aiplatform.googleapis.com —— 那是 Vertex,鉴权要 GCP access token、
      模型名还带 google/ 前缀,和这里不是一套,硬认出来只会误导 */
@@ -285,8 +320,12 @@ export async function generate(
       baseUrl: config.baseUrl,
       apiKey: config.apiKey,
       model: config.model || undefined,
-      // 厂商决定代理打哪个端点(OpenAI 图生图走 /images/edits,其余走 /generations)
-      vendor: config.vendor || inferVendor(config.baseUrl)
+      /* 两条都发:vendor 决定 OpenAI 那条路打 /images/generations 还是 /images/edits,
+         protocol 决定整条请求走 OpenAI 形状还是 Gemini 原生形状。
+         两者分开是因为中转站上"厂商"和"协议"并不一一对应 ——
+         同一个 custom 地址,Gemini 系模型必须走原生协议 */
+      vendor: config.vendor || inferVendor(config.baseUrl),
+      protocol: getProvider(config.vendor || inferVendor(config.baseUrl), config.model).protocol
     }),
     signal
   })
@@ -304,18 +343,41 @@ export async function generate(
     throw new Error(msg)
   }
 
-  const data = (await resp.json()) as ImagesResponse
-  if (!data.data || data.data.length === 0) {
+  /* 出图位置两家不一样,所以先把两条协议的结果都摊成同一个形状再看:
+     - OpenAI:      data[].b64_json | data[].url
+     - Gemini 原生: candidates[].content.parts[].inlineData.data
+       字段名还有 camelCase(inlineData/mimeType)和 snake_case(inline_data/mime_type)
+       两种 —— 我们实测那家中转的两种填法各回一套,都收 */
+  const data = (await resp.json()) as {
+    data?: Array<{ b64_json?: string; url?: string }>
+    candidates?: Array<{
+      content?: {
+        parts?: Array<{
+          inlineData?: { data?: string; mimeType?: string }
+          inline_data?: { data?: string; mime_type?: string }
+        }>
+      }
+    }>
+  }
+  const found: Array<{ b64?: string; url?: string }> = []
+  for (const item of data.data || []) found.push({ b64: item.b64_json, url: item.url })
+  for (const c of data.candidates || []) {
+    for (const part of c.content?.parts || []) {
+      const inline = part.inlineData || part.inline_data
+      if (inline?.data) found.push({ b64: inline.data })
+    }
+  }
+  if (!found.length) {
     throw new Error('No images returned by upstream')
   }
 
   // 结果统一落成 Blob:base64 会膨胀 33% 且整段进 JS 堆,Blob 由浏览器放在堆外。
   // b64 按真实格式(JPEG/PNG/…)标注 MIME,避免硬编码 png 导致裂图。
   return await Promise.all(
-    data.data.map(async (item): Promise<ResultItem> => {
-      if (item.b64_json) {
-        const mime = detectMimeFromDataUrl(item.b64_json)
-        return { type: 'b64', data: base64ToBlob(item.b64_json, mime) }
+    found.map(async (item): Promise<ResultItem> => {
+      if (item.b64) {
+        const mime = detectMimeFromDataUrl(item.b64)
+        return { type: 'b64', data: base64ToBlob(item.b64, mime) }
       }
       if (item.url) {
         try {

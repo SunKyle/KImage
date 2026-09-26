@@ -210,12 +210,31 @@ const CONNECT_HINTS = {
     'The TLS chain includes a self-signed certificate, often from a local proxy tool. Add the root certificate to NODE_EXTRA_CA_CERTS.'
 }
 
+/* Gemini 认的宽高比是它自己那套字符串(见其图像模型规格)。我们把 size 里的
+   "WxH" 约分后去匹配;匹配不上就不发这个参数,让模型用默认比例 ——
+   而不是硬近似到某个比例上(项目里一贯不做隐式猜测)。
+   实测:不发时它默认给 16:9(1408×768);发 2:3 拿到 848×1264。 */
+const GEMINI_RATIOS = new Set(['1:1', '3:2', '2:3', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9'])
+function geminiRatio(size) {
+  if (!size || size === 'auto') return ''
+  const m = String(size).match(/^(\d{1,5})x(\d{1,5})$/i)
+  if (!m) return ''
+  const w = Number(m[1])
+  const h = Number(m[2])
+  const gcd = (a, b) => (b ? gcd(b, a % b) : a)
+  const d = gcd(w, h)
+  const r = `${w / d}:${h / d}`
+  return GEMINI_RATIOS.has(r) ? r : ''
+}
+
 /**
  * 通用图像生成代理。
  * 前端把配置(prompt / size / n / model / baseUrl / apiKey)POST 过来,
- * 后端转发给任意 OpenAI 兼容的 /images/generations 接口。
- * 这样可兼容豆包 Seedream、通义万相、Flux、以及各大模型生图 API,
- * 同时避免前端直接调第三方接口遇到跨域问题。
+ * 后端按 protocol 转发:
+ *   - 'openai'(默认):任意 OpenAI 兼容的 /images/generations ——
+ *     豆包 Seedream、通义万相、Flux 以及各大中转都按这一套;
+ *   - 'gemini':Gemini 原生的 :generateContent,路径、请求体、响应体都是另一套。
+ * 两条都走同一个出口,是为了避开前端直调第三方接口的跨域问题。
  */
 app.post('/api/generate', rateLimit, async (req, res) => {
   const {
@@ -229,7 +248,8 @@ app.post('/api/generate', rateLimit, async (req, res) => {
     image,
     quality,
     background,
-    vendor
+    vendor,
+    protocol
   } = req.body || {}
 
   if (!prompt) {
@@ -241,10 +261,29 @@ app.post('/api/generate', rateLimit, async (req, res) => {
   }
 
   const isImageGen = image && typeof image === 'string' && image.startsWith('data:image')
+  const isGemini = protocol === 'gemini'
 
-  // OpenAI 的图生图走 /images/edits,其余厂商仍在 /images/generations 上用 multipart 传参考图
-  const endpoint = isImageGen && vendor === 'openai' ? '/images/edits' : '/images/generations'
-  const target = baseUrl.replace(/\/+$/, '') + endpoint
+  if (isGemini && !model) {
+    return res.status(400).json({ error: 'Set an image model in API settings first' })
+  }
+  /* Gemini 的图生图还没接:原生协议收参考图的方式是在 parts 里再放一段 inlineData。
+     与其静默把用户的参考图丢掉,不如直接说清 */
+  if (isGemini && isImageGen) {
+    return res.status(400).json({
+      error: 'Gemini image-to-image is not available yet',
+      detail: 'Remove the reference image to generate from text only, or switch to another provider.'
+    })
+  }
+
+  /* 两条协议的路径不一样。谁走哪条由前端按 (厂商, 模型) 判定 ——
+     中转站自己也是按模型名分流,我们跟它不一致就会打到它不实现的那条路上
+     (实测 Gemini 系模型打 /images/generations 会回
+     "Images API is not supported for this platform") */
+  const base = baseUrl.replace(/\/+$/, '')
+  const target = isGemini
+    ? `${base}/v1beta/models/${encodeURIComponent(model)}:generateContent`
+    : // OpenAI 的图生图走 /images/edits,其余厂商仍在 /images/generations 上用 multipart 传参考图
+      base + (isImageGen && vendor === 'openai' ? '/images/edits' : '/images/generations')
 
   // 目标校验:协议 + 网段(见 assertSafeTarget)。不通过就没必要再往下走
   let targetUrl
@@ -259,12 +298,16 @@ app.post('/api/generate', rateLimit, async (req, res) => {
     headers['Authorization'] = `Bearer ${apiKey}`
   }
 
-  // quality / background 是 OpenAI 系的扩展参数,不少接口不认,所以只在显式选择时带上
-  const extras = {
-    ...(responseFormat ? { response_format: responseFormat } : {}),
-    ...(quality ? { quality } : {}),
-    ...(background ? { background } : {})
-  }
+  /* quality / background 是 OpenAI 系的扩展参数,不少接口不认,所以只在显式选择时带上。
+     Gemini 那条路一个都不带:原生请求体里没有这些字段,多给一个未知字段会被它拒掉
+     (前端的厂商能力表已经把这两项标成不支持,正常也传不过来) */
+  const extras = isGemini
+    ? {}
+    : {
+        ...(responseFormat ? { response_format: responseFormat } : {}),
+        ...(quality ? { quality } : {}),
+        ...(background ? { background } : {})
+      }
 
   /* size 如实转发,包括字面量 'auto' —— 它是上游的一个真实取值(模型按 prompt
      定比例),跟"不发这个参数"不是一回事:不发时上游用自己的默认尺寸,多数是 1:1。
@@ -276,7 +319,18 @@ app.post('/api/generate', rateLimit, async (req, res) => {
   // 图生图:gpt-image 等模型不接受 JSON 里的 data-url base64,
   // 必须走 multipart 文件上传(或在个别服务下传公网 URL)。
   let payload
-  if (isImageGen) {
+  if (isGemini) {
+    headers['Content-Type'] = 'application/json'
+    const ratio = geminiRatio(size)
+    // 多图靠 candidateCount,只有真要不止一张时才带,不给默认路径添风险
+    const gen = {}
+    if (ratio) gen.imageConfig = { aspectRatio: ratio }
+    if (n > 1) gen.candidateCount = n
+    payload = JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      ...(Object.keys(gen).length ? { generationConfig: gen } : {})
+    })
+  } else if (isImageGen) {
     const [meta, b64] = image.split(',')
     const mime = (meta.match(/data:([^;]+)/) || [])[1] || 'image/jpeg'
     const type = mime.includes('png') ? 'png' : 'jpeg'
@@ -325,8 +379,14 @@ app.post('/api/generate', rateLimit, async (req, res) => {
 
     if (!upstream.ok) {
       let detail = text
-      // 收到 base64_input_not_supported 等错误,给出明确指引
-      if (/base64_input_not_supported|b64传参|multipart/i.test(text)) {
+      /* 中转站按模型名分流:拿 Gemini 系模型(banana / nano-banana 之类)去要
+         OpenAI 的 Images API 就会撞上这一句。判协议的那一步在 src/api.ts
+         (厂商能力表按"厂商 + 模型"解析),这里只负责把话说白 */
+      if (/Images API is not supported for this platform/i.test(text)) {
+        detail =
+          'This endpoint has no OpenAI-compatible Images API — it routes by model name, and Gemini-family image models (banana / nano-banana / gemini-*-image) need the native :generateContent path instead. Original error: ' +
+          text
+      } else if (/base64_input_not_supported|b64传参|multipart/i.test(text)) {
         detail =
           "This endpoint doesn't accept the reference image as a file upload. It may need a public image URL or a specific file field name — check the image input spec of the endpoint behind your Base URL. Original error: " +
           text
