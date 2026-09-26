@@ -1,5 +1,15 @@
 <script setup lang="ts">
 import { ref, computed, nextTick, onMounted, onUnmounted, watch } from 'vue'
+import {
+  PhCaretLeft,
+  PhCaretRight,
+  PhCaretUp,
+  PhCaretDown,
+  PhDotsThreeVertical,
+  PhX,
+  PhCopy,
+  PhHeart
+} from '@phosphor-icons/vue'
 import { BACKGROUND_OPTIONS, QUALITY_OPTIONS, imageSrc, optionLabel, reuseParamsOf } from '../api'
 import type { HistoryEntry, ResultItem, ReuseParams, FavoritePayload } from '../types'
 import { detectMimeFromDataUrl } from '../lib/idb'
@@ -302,14 +312,10 @@ function menuAction(kind: 'favorite' | 'download' | 'remove') {
               <div class="img-wrap" :style="{ aspectRatio: String(boxRatio) }">
                 <img :src="imgs[active]" :alt="`Result ${active + 1}`" @load="onImgLoad" />
                 <button v-if="imgs.length > 1" class="nav prev tip-below" @click="prev" data-tip="Previous (←)" aria-label="Previous">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M15 6l-6 6 6 6" />
-                  </svg>
+                  <PhCaretLeft aria-hidden="true" />
                 </button>
                 <button v-if="imgs.length > 1" class="nav next tip-below" @click="next" data-tip="Next (→)" aria-label="Next">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M9 6l6 6-6 6" />
-                  </svg>
+                  <PhCaretRight aria-hidden="true" />
                 </button>
               </div>
               <!-- 缩略图导航:按出图比例成条,图多时这一列自己滚 -->
@@ -341,9 +347,7 @@ function menuAction(kind: 'favorite' | 'download' | 'remove') {
                     data-tip="Newer (↑)"
                     aria-label="Newer"
                   >
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                      <path d="M6 15l6-6 6 6" />
-                    </svg>
+                    <PhCaretUp aria-hidden="true" />
                   </button>
                   <span class="tpos">{{ entryIndex + 1 }} / {{ items.length }}</span>
                   <button
@@ -353,20 +357,14 @@ function menuAction(kind: 'favorite' | 'download' | 'remove') {
                     data-tip="Older (↓)"
                     aria-label="Older"
                   >
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                      <path d="M6 9l6 6 6-6" />
-                    </svg>
+                    <PhCaretDown aria-hidden="true" />
                   </button>
                 </div>
 
                 <div class="toolbar-main">
                   <span ref="menuEl" class="menu-wrap">
                     <button class="tpill tip-below" @click="menuOpen = !menuOpen" data-tip="More actions" aria-label="More actions">
-                      <svg viewBox="0 0 24 24" fill="currentColor">
-                        <circle cx="12" cy="5.5" r="1.6" />
-                        <circle cx="12" cy="12" r="1.6" />
-                        <circle cx="12" cy="18.5" r="1.6" />
-                      </svg>
+                      <PhDotsThreeVertical weight="bold" aria-hidden="true" />
                     </button>
                     <Transition name="po">
                       <div v-if="menuOpen" class="menu">
@@ -377,9 +375,7 @@ function menuAction(kind: 'favorite' | 'download' | 'remove') {
                     </Transition>
                   </span>
                   <button class="tpill tip-below" @click="close" data-tip="Close (Esc)" aria-label="Close">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
-                      <path d="M6 6l12 12M18 6L6 18" />
-                    </svg>
+                    <PhX aria-hidden="true" />
                   </button>
                 </div>
               </div>
@@ -397,10 +393,7 @@ function menuAction(kind: 'favorite' | 'download' | 'remove') {
                       :data-tip="copyFailed ? 'Copy failed — select the text manually' : 'Copy to clipboard'"
                       :aria-label="copyFailed ? 'Copy failed' : copied ? 'Copied' : 'Copy to clipboard'"
                     >
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                        <rect x="9" y="9" width="11" height="11" rx="2" />
-                        <path d="M5 15V6a1 1 0 0 1 1-1h9" />
-                      </svg>
+                      <PhCopy aria-hidden="true" />
                       <span>{{ copyFailed ? 'Copy failed' : copied ? 'Copied' : 'Copy' }}</span>
                     </button>
                     <button
@@ -410,15 +403,10 @@ function menuAction(kind: 'favorite' | 'download' | 'remove') {
                       :aria-pressed="marked"
                       :aria-label="marked ? 'Unmark image' : 'Mark image'"
                     >
-                      <svg
-                        viewBox="0 0 24 24"
-                        :fill="marked ? 'currentColor' : 'none'"
-                        stroke="currentColor"
-                        stroke-width="1.8"
-                        stroke-linejoin="round"
-                      >
-                        <path d="M12 3.6l2.63 5.33 5.88.86-4.25 4.14 1 5.86L12 17.03l-5.26 2.76 1-5.86-4.25-4.14 5.88-.86z" />
-                      </svg>
+                      <PhHeart
+                        :weight="marked ? 'fill' : 'regular'"
+                        aria-hidden="true"
+                      />
                       <span>{{ marked ? 'Marked' : 'Mark' }}</span>
                     </button>
                   </div>
@@ -521,7 +509,7 @@ function menuAction(kind: 'favorite' | 'download' | 'remove') {
 .tpos {
   min-width: 46px;
   text-align: center;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-3);
   font-variant-numeric: tabular-nums;
 }
@@ -584,7 +572,7 @@ function menuAction(kind: 'favorite' | 'download' | 'remove') {
   width: 100%;
   text-align: left;
   padding: 8px 10px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-2);
   border-radius: var(--r-sm);
   transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
@@ -751,7 +739,7 @@ function menuAction(kind: 'favorite' | 'download' | 'remove') {
   gap: 6px;
 }
 .tag {
-  font-size: 11px;
+  font-size: var(--fs-micro);
   color: var(--text-2);
   background: var(--bg-elev);
   border: 1px solid var(--line);
@@ -777,7 +765,7 @@ function menuAction(kind: 'favorite' | 'download' | 'remove') {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-3);
   font-variant-numeric: tabular-nums;
 }
@@ -808,9 +796,8 @@ function menuAction(kind: 'favorite' | 'download' | 'remove') {
   border-bottom: 1px solid var(--line);
 }
 .blk-title {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   font-weight: 600;
-  letter-spacing: -0.005em;
   color: var(--text-2);
 }
 /* 小节内的图标动作:默认弱化,悬停才浮出,免得和正文抢注意力。
@@ -825,7 +812,7 @@ function menuAction(kind: 'favorite' | 'download' | 'remove') {
   align-items: center;
   gap: 4px;
   padding: 3px 9px;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-3);
   border-radius: 999px;
   cursor: pointer;
@@ -857,7 +844,7 @@ function menuAction(kind: 'favorite' | 'download' | 'remove') {
 /* 提示词是这张卡真正的主角:给正文色、并比按钮再大一档,
    参数标签退到 --text-2 去当注脚 */
 .prompt {
-  font-size: 15px;
+  font-size: var(--fs-md);
   line-height: 1.75;
   color: var(--text);
   white-space: pre-wrap;
@@ -872,9 +859,12 @@ function menuAction(kind: 'favorite' | 'download' | 'remove') {
 }
 .act {
   flex: 1;
+  /* 撑满各自那一半,文案本该居中;全局 button 重置改成 text-align: inherit 后,
+     这里不再有浏览器默认的居中,得就地写回来 */
+  text-align: center;
   padding: 11px 16px;
   border-radius: var(--r-sm);
-  font-size: 14px;
+  font-size: var(--fs-base);
   border: 1px solid var(--line);
   background: var(--surface);
   color: var(--text);

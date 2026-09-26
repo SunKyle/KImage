@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
+import { PhPlus, PhDotsThreeVertical, PhArrowLineUp, PhTrash, PhArchive } from '@phosphor-icons/vue'
 import { BACKGROUND_OPTIONS, QUALITY_OPTIONS, optionLabel } from '../api'
 import type { PromptItem } from '../types'
 
@@ -137,19 +138,13 @@ function fmt(t: number) {
       </div>
       <div class="lib-ops">
         <button class="lib-new" @click="startAdd">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-            <path d="M12 5v14M5 12h14" />
-          </svg>
+          <PhPlus aria-hidden="true" />
           New prompt
         </button>
         <!-- 管理动作低频,收进菜单,不给标题行添按钮 -->
         <span ref="menuEl" class="menu-wrap">
           <button class="icon-ghost" :aria-expanded="menuOpen" aria-label="More" @click="menuOpen = !menuOpen">
-            <svg viewBox="0 0 24 24" fill="currentColor">
-              <circle cx="12" cy="5.5" r="1.6" />
-              <circle cx="12" cy="12" r="1.6" />
-              <circle cx="12" cy="18.5" r="1.6" />
-            </svg>
+            <PhDotsThreeVertical weight="bold" aria-hidden="true" />
           </button>
           <Transition name="po">
             <div v-if="menuOpen" class="menu">
@@ -223,10 +218,7 @@ function fmt(t: number) {
                   :aria-label="`Use: ${item.prompt.slice(0, 20)}`"
                   @click.stop="emit('use', item)"
                 >
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M12 20V8M8 12l4-4 4 4" />
-                    <path d="M4 20h16" />
-                  </svg>
+                  <PhArrowLineUp aria-hidden="true" />
                 </button>
                 <button
                   class="op op-del"
@@ -234,9 +226,7 @@ function fmt(t: number) {
                   :aria-label="`Delete: ${item.prompt.slice(0, 20)}`"
                   @click.stop="emit('remove', item.id)"
                 >
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2M6 7l1 12a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-12" />
-                  </svg>
+                  <PhTrash aria-hidden="true" />
                 </button>
               </div>
             </div>
@@ -253,11 +243,8 @@ function fmt(t: number) {
     <!-- 空态分两种:库里真没有(引到新建) / 筛选没命中(给一键清空) -->
     <div v-else class="lib-none">
       <div class="none-ico" aria-hidden="true">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M5 8a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2" />
-          <path d="M6 8v10a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V8" />
-          <path d="M9 12h6" />
-        </svg>
+        <!-- Phosphor 的 Archive:表达"库还是空的" -->
+        <PhArchive aria-hidden="true" />
       </div>
       <h2 class="none-title">{{ items.length ? 'No matching prompts' : 'No prompts yet' }}</h2>
       <p class="none-sub">
@@ -283,14 +270,14 @@ function fmt(t: number) {
   padding-top: var(--sp-2);
 }
 .lib-title {
-  font-family: var(--font-display);
-  font-size: 28px;
+  font-family: var(--font-sans);
+  font-size: var(--fs-3xl);
   font-weight: 700;
-  letter-spacing: -0.02em;
+  letter-spacing: var(--ls-tight);
 }
 .lib-sub {
   margin-top: 6px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   /* 用 text-2 而不是 text-3:#999 在浅色面上只有 2.85:1,正文级文字要达到 4.5:1 */
   color: var(--text-2);
 }
@@ -310,7 +297,7 @@ function fmt(t: number) {
   border-radius: 999px;
   background: var(--cta);
   color: var(--cta-text);
-  font-size: 13px;
+  font-size: var(--fs-sm);
   font-weight: 500;
   transition: background var(--dur) var(--ease);
 }
@@ -367,7 +354,7 @@ function fmt(t: number) {
 .mitem {
   padding: 8px 10px;
   text-align: left;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-2);
   border-radius: 6px;
   cursor: pointer;
@@ -397,7 +384,7 @@ function fmt(t: number) {
   border: 1px solid var(--line);
   border-radius: var(--r-sm);
   background: var(--surface);
-  font-size: 14px;
+  font-size: var(--fs-base);
   transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
 }
 .search:focus {
@@ -413,7 +400,7 @@ function fmt(t: number) {
 .cat {
   padding: 4px 10px;
   border-radius: 999px;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   border: 1px solid var(--line);
   color: var(--text-2);
   cursor: pointer;
@@ -446,7 +433,7 @@ function fmt(t: number) {
   border: 1px solid var(--line);
   border-radius: var(--r-sm);
   background: var(--surface);
-  font-size: 13px;
+  font-size: var(--fs-sm);
 }
 .add-form input:focus {
   outline: none;
@@ -458,11 +445,14 @@ function fmt(t: number) {
 }
 .add-go {
   flex: 1;
+  /* 撑满剩余宽度,文案本该居中;全局 button 重置改成 text-align: inherit 后,
+     这里不再有浏览器默认的居中,得就地写回来 */
+  text-align: center;
   padding: 8px;
   border-radius: var(--r-sm);
   background: var(--cta);
   color: var(--cta-text);
-  font-size: 13px;
+  font-size: var(--fs-sm);
   cursor: pointer;
   transition: background var(--dur) var(--ease);
 }
@@ -474,7 +464,7 @@ function fmt(t: number) {
   border: 1px solid var(--line);
   border-radius: var(--r-sm);
   color: var(--text-2);
-  font-size: 13px;
+  font-size: var(--fs-sm);
   cursor: pointer;
 }
 .add-cancel:hover {
@@ -599,7 +589,7 @@ function fmt(t: number) {
   padding: var(--sp-4);
 }
 .back-none {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-2);
 }
 
@@ -610,7 +600,7 @@ function fmt(t: number) {
   /* 分类与时间同为 12px,靠字重和位置区分。
      原来分类是个 11px 小胶囊 —— 去掉那个描边盒子之后这一行安静下来,
      提示词才能真正成为卡片里最重的元素 */
-  font-size: 12px;
+  font-size: var(--fs-xs);
   line-height: 1.4;
   color: var(--text-2);
 }
@@ -634,7 +624,7 @@ function fmt(t: number) {
   -webkit-box-orient: vertical;
   -webkit-line-clamp: var(--card-text-lines, 8);
   overflow: hidden;
-  font-size: 15px;
+  font-size: var(--fs-md);
   line-height: 1.62;
   color: var(--text);
 }
@@ -686,7 +676,7 @@ function fmt(t: number) {
    拼成一行之后不再跟提示词抢视线,一行也够放下 */
 .card-params {
   min-width: 0;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   font-variant-numeric: tabular-nums;
   color: var(--text-2);
   overflow: hidden;
@@ -716,15 +706,14 @@ function fmt(t: number) {
 }
 .none-title {
   margin-top: var(--sp-3);
-  font-family: var(--font-display);
-  font-size: 16px;
+  font-size: var(--fs-lg);
   font-weight: 600;
   color: var(--text-2);
 }
 .none-sub {
   margin-top: 8px;
   max-width: 380px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   line-height: 1.7;
   color: var(--text-2);
 }
@@ -735,7 +724,7 @@ function fmt(t: number) {
   border: 1px solid var(--line);
   border-radius: 999px;
   color: var(--text);
-  font-size: 13px;
+  font-size: var(--fs-sm);
   cursor: pointer;
   transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease);
 }
@@ -765,13 +754,13 @@ function fmt(t: number) {
    输入框提到 16px,防止 iOS Safari 聚焦时放大整页 */
 @media (max-width: 640px) {
   .lib-title {
-    font-size: 20px;
+    font-size: var(--fs-xl);
   }
   .search {
-    font-size: 16px;
+    font-size: var(--fs-lg);
   }
   .add-form input {
-    font-size: 16px;
+    font-size: var(--fs-lg);
   }
 }
 </style>

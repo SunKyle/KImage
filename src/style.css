@@ -20,17 +20,46 @@
   --text-2: #6B6B6B;              /* text-secondary */
   --text-3: #727272;              /* text-tertiary(浅色面上 ≥4.6:1,小字也能用) */
   --text-4: #C5C5C5;              /* text-disabled */
-  --accent: #8B7CFF;              /* Brand Accent: AI状态/Highlight/Focus/Gradient */
-  --accent-strong: #7666FA;
-  --accent-soft: rgba(139, 124, 255, 0.1);
+  /* 主题色 = 墨色。与 --cta 同值不是巧合:本站的"强调"就是墨色实心,
+     选中、聚焦、当前项全用它,不再有第二个色相。
+     两者保留各自的变量名 —— 语义不同(一个管按钮底,一个管状态与聚焦环),
+     将来若要重新引入品牌色,只需改这一处 */
+  --accent: #111111;
+  --accent-strong: #000000;       /* 悬停/强调时再压深一档 */
+  --accent-soft: rgba(0, 0, 0, 0.06);   /* 淡底与聚焦晕 */
   --accent-contrast: #FFFFFF;     /* 强调色实心上的文字 */
   --danger: #E5484D;
 
-  /* —— 字体:无衬线,Inter / SF Pro —— */
-  --font-display: "Inter", "SF Pro Display", -apple-system,
-    BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", system-ui, sans-serif;
-  --font-body: "Inter", -apple-system, BlinkMacSystemFont, "SF Pro Text",
-    "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  /* —— 字体 ——
+     正文与标题都用系统无衬线:本站的基调是克制与系统感,而 SF Pro(macOS/iOS)、
+     Segoe UI(Windows)、system-ui(Android/Linux)本来就是各端最合适的界面字体。
+     这里刻意不写 "Inter":之前写了却从未加载,等于让兜底链冒名顶替首选,
+     而开发机若装了 Inter 还会看到与访客不同的字形。 */
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
+    "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+
+  /* —— 字号:按角色命名 ——
+     全站字号只在这里定义,调整时不必去 6 个文件里翻散落的 px。
+     刻意保留密集的几档:11/12/13/14/15/16 各自对应明确的角色,
+     合并它们会改变信息层级,那是改设计而不是收敛。
+     字标的 21px / 24px 不在此列 —— 那是品牌锁形的一部分,与正文字阶无关 */
+  --fs-micro: 11px;   /* 图片浮层、极小注解 */
+  --fs-xs: 12px;      /* 小标签、胶囊、提示 */
+  --fs-sm: 13px;      /* 次级正文、按钮、表单控件 */
+  --fs-base: 14px;    /* 正文 */
+  --fs-md: 15px;      /* 预览卡提示词:刻意比正文大一档 */
+  --fs-lg: 16px;      /* 输入框,以及窄屏下防 iOS 聚焦放大的那一档 */
+  --fs-xl: 20px;      /* 区块标题、窄屏页标题 */
+  --fs-2xl: 22px;     /* 面板标题 */
+  --fs-3xl: 28px;     /* 页标题 */
+
+  /* —— 字距:只三档 ——
+     低于 0.01em 的差异在 15px 上不足 0.15px,肉眼无法分辨,
+     写出来只是噪声,所以不设第四档 */
+  --ls-hero: -0.03em;  /* 首屏超大字 */
+  --ls-tight: -0.02em; /* 标题 */
+  --ls-wide: 0.01em;   /* 全大写小标签 */
+
   /* 字标专用:几何粗体 + 手写体后缀,自托管字体(见 main.ts);
      后面挂系统字体做兜底,网络字体没加载出来也不会退化成衬线 */
   --font-wordmark: "Poppins", "Avenir Next", "Futura", "Century Gothic", sans-serif;
@@ -82,9 +111,10 @@
   --text-2: #A1A1A1;
   --text-3: #8A8A8A;              /* text-tertiary(暗色面上 ≥4.6:1) */
   --text-4: #45454A;
-  --accent: #A89CFF;
-  --accent-strong: #B8ACFF;
-  --accent-soft: rgba(168, 156, 255, 0.14);
+  /* 暗色下主题色反相成纸色,与 --cta 同理 —— 墨色在暗底上会消失 */
+  --accent: #F5F5F5;
+  --accent-strong: #FFFFFF;
+  --accent-soft: rgba(255, 255, 255, 0.1);
   --accent-contrast: #131317;
   --danger: #FF5C5F;
 
@@ -139,10 +169,9 @@ html::-webkit-scrollbar {
   bottom: calc(100% + 8px);
   left: 50%;
   padding: 5px 9px;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   font-weight: 400;
   line-height: 1.4;
-  letter-spacing: 0;
   white-space: nowrap;
   color: var(--cta-text);
   background: var(--cta);
@@ -224,7 +253,7 @@ body {
                     color-mix(in srgb, var(--bg) 62%, transparent)),
     url('/src/assets/bg-light.webp') center / cover no-repeat fixed;
   color: var(--text);
-  font-family: var(--font-body);
+  font-family: var(--font-sans);
   line-height: 1.6;                    /* Body 1.6 */
   min-height: 100vh;
   -webkit-font-smoothing: antialiased;
@@ -233,6 +262,10 @@ body {
 
 button {
   font-family: inherit;
+  /* 浏览器给 button 的默认值是 text-align: center,而 text-align 会被按钮自己的
+     这个值截断,不再从父级继承 —— 于是任何「按钮里放多行文字」的布局都会被静默居中
+     (比如空态里左对齐的入口行)。写进重置里,就不必再逐个按钮补 text-align: left */
+  text-align: inherit;
   cursor: pointer;
   border: none;
   background: none;

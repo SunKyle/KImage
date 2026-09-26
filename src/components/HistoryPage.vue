@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import { PhHeart, PhArrowLineUp, PhTrash, PhClockCounterClockwise } from '@phosphor-icons/vue'
 import { imageSrc, reuseParamsOf, thumbSrc } from '../api'
 import type { HistoryEntry, ResultItem, ReuseParams } from '../types'
 
@@ -124,9 +125,7 @@ function fmt(ts: number) {
         ></button>
         <!-- 标记过的角标常驻:不悬停也要看得出哪些标了 -->
         <span v-if="t.item.marked" class="tile-mark" aria-hidden="true">
-          <svg viewBox="0 0 24 24" fill="currentColor">
-            <path d="M12 3.6l2.63 5.33 5.88.86-4.25 4.14 1 5.86L12 17.03l-5.26 2.76 1-5.86-4.25-4.14 5.88-.86z" />
-          </svg>
+          <PhHeart weight="fill" aria-hidden="true" />
         </span>
         <!-- 悬停/聚焦才浮出:图墙默认只应该是图 -->
         <div class="tile-veil">
@@ -146,34 +145,21 @@ function fmt(ts: number) {
                 :aria-pressed="!!t.item.marked"
                 @click.stop="emit('mark', t.entry, t.index)"
               >
-                <svg
-                  viewBox="0 0 24 24"
-                  :fill="t.item.marked ? 'currentColor' : 'none'"
-                  stroke="currentColor"
-                  stroke-width="1.9"
-                  stroke-linejoin="round"
-                >
-                  <path d="M12 3.6l2.63 5.33 5.88.86-4.25 4.14 1 5.86L12 17.03l-5.26 2.76 1-5.86-4.25-4.14 5.88-.86z" />
-                </svg>
+                <PhHeart :weight="t.item.marked ? 'fill' : 'regular'" aria-hidden="true" />
               </button>
               <button
                 class="top"
                 :aria-label="`Use prompt: ${t.entry.prompt.slice(0, 20)}`"
                 @click.stop="emit('use', reuseParamsOf(t.entry))"
               >
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M12 20V8M8 12l4-4 4 4" />
-                  <path d="M4 20h16" />
-                </svg>
+                <PhArrowLineUp aria-hidden="true" />
               </button>
               <button
                 class="top top-del"
                 :aria-label="`Delete: ${t.entry.prompt.slice(0, 20)}`"
                 @click.stop="emit('remove', t.entry)"
               >
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2M6 7l1 12a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-12" />
-                </svg>
+                <PhTrash aria-hidden="true" />
               </button>
             </div>
           </div>
@@ -183,19 +169,14 @@ function fmt(ts: number) {
 
     <div v-else class="lib-none">
       <div class="none-ico" aria-hidden="true">
-        <svg v-if="onlyMarked" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round">
-          <path d="M12 3.6l2.63 5.33 5.88.86-4.25 4.14 1 5.86L12 17.03l-5.26 2.76 1-5.86-4.25-4.14 5.88-.86z" />
-        </svg>
-        <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="12" cy="12" r="9" />
-          <path d="M12 7.4V12l2.8 1.9" />
-        </svg>
+        <PhHeart v-if="onlyMarked" aria-hidden="true" />
+        <PhClockCounterClockwise v-else aria-hidden="true" />
       </div>
       <h2 class="none-title">{{ onlyMarked ? 'No marked images yet' : 'No generations yet' }}</h2>
       <p class="none-sub">
         {{
           onlyMarked
-            ? 'Hover an image and click the star to mark it. Marks are per image, so images in a record stay independent.'
+            ? 'Hover an image and click the heart to mark it. Marks are per image, so images in a record stay independent.'
             : 'Generate from the home page and your results are saved here automatically, ready to revisit and reuse.'
         }}
       </p>
@@ -215,14 +196,14 @@ function fmt(ts: number) {
   padding-top: var(--sp-2);
 }
 .lib-title {
-  font-family: var(--font-display);
-  font-size: 28px;
+  font-family: var(--font-sans);
+  font-size: var(--fs-3xl);
   font-weight: 700;
-  letter-spacing: -0.02em;
+  letter-spacing: var(--ls-tight);
 }
 .lib-sub {
   margin-top: 6px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-2);
 }
 
@@ -249,7 +230,7 @@ function fmt(ts: number) {
   border: 1px solid var(--line);
   background: none;
   color: var(--text-2);
-  font-size: 12px;
+  font-size: var(--fs-xs);
   cursor: pointer;
   transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease),
     color var(--dur) var(--ease);
@@ -269,7 +250,7 @@ function fmt(ts: number) {
 }
 .lib-note {
   margin-left: auto;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-2);
 }
 
@@ -362,7 +343,7 @@ function fmt(ts: number) {
   pointer-events: auto;
 }
 .tile-text {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   line-height: 1.5;
   display: -webkit-box;
   -webkit-line-clamp: 2;
@@ -376,7 +357,7 @@ function fmt(ts: number) {
 }
 .tile-meta {
   min-width: 0;
-  font-size: 11px;
+  font-size: var(--fs-micro);
   font-variant-numeric: tabular-nums;
   opacity: 0.85;
   overflow: hidden;
@@ -448,15 +429,14 @@ function fmt(ts: number) {
 }
 .none-title {
   margin-top: var(--sp-3);
-  font-family: var(--font-display);
-  font-size: 16px;
+  font-size: var(--fs-lg);
   font-weight: 600;
   color: var(--text-2);
 }
 .none-sub {
   margin-top: 8px;
   max-width: 380px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   line-height: 1.7;
   color: var(--text-2);
 }
@@ -468,7 +448,7 @@ function fmt(ts: number) {
   border-radius: 999px;
   background: none;
   color: var(--text);
-  font-size: 13px;
+  font-size: var(--fs-sm);
   cursor: pointer;
   transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease);
 }
@@ -480,7 +460,7 @@ function fmt(ts: number) {
 /* 窄屏:标题收一档,避免与右上角操作按钮挤压 */
 @media (max-width: 640px) {
   .lib-title {
-    font-size: 20px;
+    font-size: var(--fs-xl);
   }
 }
 </style>

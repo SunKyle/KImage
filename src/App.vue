@@ -1,5 +1,24 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount, watch, toRaw } from 'vue'
+import {
+  PhHouse,
+  PhBooks,
+  PhClockCounterClockwise,
+  PhGear,
+  PhSun,
+  PhMoon,
+  PhSlidersHorizontal,
+  PhSquaresFour,
+  PhDotsNine,
+  PhStop,
+  PhArrowCounterClockwise,
+  PhSparkle,
+  PhArrowsLeftRight,
+  PhX,
+  PhArrowRight,
+  PhCaretRight,
+  PhCaretDown
+} from '@phosphor-icons/vue'
 import PromptLibrary from './components/PromptLibrary.vue'
 import ImagePreview from './components/ImagePreview.vue'
 import HistoryPage from './components/HistoryPage.vue'
@@ -405,9 +424,10 @@ onMounted(() => {
   })
 })
 
-// 新建一份空白配置(进入独立的新增接口表单页)
-function newConfig() {
-  cfgSeed.value = null
+/* 新建一份配置(进入独立的新增接口表单页)。
+   空态的四条入口会带一份预填好的 seed(厂商的地址与模型),不带则是一张空表单 */
+function newConfig(seed?: ApiConfig) {
+  cfgSeed.value = seed ?? null
   cfgView.value = 'form'
 }
 // 复制已有配置:基于它生成一份新编辑(切到表单页)
@@ -980,29 +1000,17 @@ async function toggleMark(entry: HistoryEntry, index: number) {
         aria-label="Main navigation"
       >
         <template #home>
-          <svg class="seg-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M4 10.5 12 4l8 6.5V20a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1z" />
-            <path d="M9.5 21v-6h5v6" />
-          </svg>
+          <PhHouse class="seg-ico" aria-hidden="true" />
         </template>
         <template #lib>
-          <!-- 摊开的书:表达"收藏成册的提示词库" -->
-          <svg class="seg-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M12 7v14" />
-            <path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z" />
-          </svg>
+          <!-- Phosphor 的 Books:表达"收藏成册的提示词库" -->
+          <PhBooks class="seg-ico" aria-hidden="true" />
         </template>
         <template #history>
-          <svg class="seg-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <circle cx="12" cy="12" r="9" />
-            <path d="M12 7.4V12l2.8 1.9" />
-          </svg>
+          <PhClockCounterClockwise class="seg-ico" aria-hidden="true" />
         </template>
         <template #settings>
-          <svg class="seg-ico" :class="{ 'is-warn': !configured() }" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <circle cx="12" cy="12" r="3.4" />
-            <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.03 1.56V21a2 2 0 1 1-4 0v-.09A1.7 1.7 0 0 0 8.96 19.4a1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-1.56-1.03H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.6 8.96 1.7 1.7 0 0 0 4.26 7.09l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 8.96 4.6 1.7 1.7 0 0 0 9.99 3.04V3a2 2 0 1 1 4 0v.09A1.7 1.7 0 0 0 15 4.6 1.7 1.7 0 0 0 16.91 4.26l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 19.4 8.96 1.7 1.7 0 0 0 20.96 9.99H21a2 2 0 1 1 0 4h-.09A1.7 1.7 0 0 0 19.4 15Z" />
-          </svg>
+          <PhGear class="seg-ico" :class="{ 'is-warn': !configured() }" aria-hidden="true" />
         </template>
       </RubberSegment>
 
@@ -1013,13 +1021,8 @@ async function toggleMark(entry: HistoryEntry, index: number) {
           :data-tip="theme === 'dark' ? 'Switch to light' : 'Switch to dark'"
           :aria-label="theme === 'dark' ? 'Switch to light' : 'Switch to dark'"
         >
-          <svg v-if="theme === 'dark'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <circle cx="12" cy="12" r="4" />
-            <path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" />
-          </svg>
-          <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z" />
-          </svg>
+          <PhSun v-if="theme === 'dark'" aria-hidden="true" />
+          <PhMoon v-else aria-hidden="true" />
         </button>
       </nav>
     </header>
@@ -1064,11 +1067,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                 :aria-label="`Image model: ${activeConfigName}. Text model: ${activeTextName}`"
                 @click="togglePanel('config')"
               >
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M4 7h8M17 7h3M4 17h3M12 17h8" />
-                  <circle cx="14.5" cy="7" r="2.3" />
-                  <circle cx="9.5" cy="17" r="2.3" />
-                </svg>
+                <PhSlidersHorizontal aria-hidden="true" />
                 <b class="param-val param-val-name">{{ activeConfigName }}</b>
                 <span class="param-sep" aria-hidden="true"></span>
                 <b class="param-val param-val-name param-val-sub">{{ activeTextName }}</b>
@@ -1080,12 +1079,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                 aria-label="Count"
                 @click="togglePanel('n')"
               >
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <rect x="3.5" y="3.5" width="7" height="7" rx="1.6" />
-                  <rect x="13.5" y="3.5" width="7" height="7" rx="1.6" />
-                  <rect x="3.5" y="13.5" width="7" height="7" rx="1.6" />
-                  <rect x="13.5" y="13.5" width="7" height="7" rx="1.6" />
-                </svg>
+                <PhSquaresFour aria-hidden="true" />
                 <b class="param-val">{{ n }} {{ n === 1 ? 'image' : 'images' }}</b>
               </button>
               <!-- 尺寸/画质/背景/参考图收进这一个入口:参数行默认只留模型与张数,
@@ -1098,13 +1092,8 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                 aria-label="More parameters"
                 @click="togglePanel('more')"
               >
-                <!-- 2×2 点阵:与上面那几个语义明确的图标区分,专表示"还有更多" -->
-                <svg viewBox="0 0 24 24" fill="currentColor">
-                  <circle cx="9" cy="9" r="1.9" />
-                  <circle cx="15" cy="9" r="1.9" />
-                  <circle cx="9" cy="15" r="1.9" />
-                  <circle cx="15" cy="15" r="1.9" />
-                </svg>
+                <!-- Phosphor 的 DotsNine(点阵):与上面那几个语义明确的图标区分,专表示"还有更多" -->
+                <PhDotsNine weight="fill" aria-hidden="true" />
               </button>
 
               <!-- 改写/清除/生成收在参数行末尾。
@@ -1124,16 +1113,9 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                   >
                     <!-- 三态各换符号:运行中 = 方块停止(与生成键同一套语言),
                          可撤销 = 回转箭头,其余 = 四角星 -->
-                    <svg v-if="enhancing" viewBox="0 0 24 24" fill="currentColor">
-                      <rect x="7" y="7" width="10" height="10" rx="1.6" />
-                    </svg>
-                    <svg v-else-if="canUndo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                      <path d="M4 10.5h9.5a4.75 4.75 0 0 1 0 9.5H9" />
-                      <path d="M7.5 6.5 3.5 10.5l4 4" />
-                    </svg>
-                    <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                      <path d="M12 3.5l1.9 6.6 6.6 1.9-6.6 1.9L12 20.5l-1.9-6.6L3.5 12l6.6-1.9L12 3.5z" />
-                    </svg>
+                    <PhStop v-if="enhancing" weight="fill" aria-hidden="true" />
+                    <PhArrowCounterClockwise v-else-if="canUndo" aria-hidden="true" />
+                    <PhSparkle v-else aria-hidden="true" />
                     {{ enhanceText }}
                   </button>
                   <!-- 只两档,点一下来回切,不用下拉。
@@ -1146,9 +1128,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                     :aria-label="`Switch to ${nextModeLabel} mode`"
                     @click="toggleEnhanceMode"
                   >
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                      <path d="M4 8h12l-3-3M20 16H8l3 3" />
-                    </svg>
+                    <PhArrowsLeftRight aria-hidden="true" />
                   </button>
                 </div>
                 <button
@@ -1158,9 +1138,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                   data-tip="Clear"
                   @click="prompt = ''"
                 >
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
-                    <path d="M6 6l12 12M18 6L6 18" />
-                  </svg>
+                  <PhX aria-hidden="true" />
                 </button>
                 <button
                   class="gen-icon"
@@ -1170,13 +1148,8 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                   @click="loading ? stopGenerate() : doGenerate()"
                 >
                   <!-- 生成中变为方块停止键,点击可终止这一批 -->
-                  <svg v-if="loading" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round">
-                    <rect x="7" y="7" width="10" height="10" rx="1.6" />
-                  </svg>
-                  <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M5 12h13" />
-                    <path d="M13 6l6 6-6 6" />
-                  </svg>
+                  <PhStop v-if="loading" aria-hidden="true" />
+                  <PhArrowRight v-else aria-hidden="true" />
                 </button>
               </div>
             </div>
@@ -1337,9 +1310,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
           <div v-if="notice" class="note" role="status">
             <span class="note-msg">{{ notice }}</span>
             <button class="note-close" @click="notice = ''" aria-label="Got it">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-                <path d="M6 6l12 12M18 6L6 18" />
-              </svg>
+              <PhX aria-hidden="true" />
             </button>
           </div>
 
@@ -1372,9 +1343,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
             <div class="sec-tools">
               <button v-if="history.length" class="sec-more" @click="page = 'history'">
                 View all
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M9 6l6 6-6 6" />
-                </svg>
+                <PhCaretRight aria-hidden="true" />
               </button>
               <button
                 class="sec-fold"
@@ -1383,12 +1352,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                 @click="feedOpen = !feedOpen"
               >
                 <span>{{ feedOpen ? 'Collapse' : 'Expand' }}</span>
-                <svg
-                  viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
-                  stroke-linecap="round" stroke-linejoin="round" :class="{ up: feedOpen }"
-                >
-                  <path d="M6 9l6 6 6-6" />
-                </svg>
+                <PhCaretDown :class="{ up: feedOpen }" aria-hidden="true" />
               </button>
             </div>
           </div>
@@ -1545,7 +1509,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
 .title {
   /* 品牌锁形:几何粗体主打 + 手写体后缀,两者按基线对齐 */
   font-family: var(--font-wordmark);
-  font-size: 21px;
+  font-size: 21px; /* 品牌锁形的一部分,随字标字体一起定,不进正文字阶 */
   font-weight: 700;
   letter-spacing: -0.01em;
   line-height: 1.2;
@@ -1557,9 +1521,8 @@ async function toggleMark(entry: HistoryEntry, index: number) {
 .title-script {
   font-family: var(--font-script);
   /* 手写体字面小、上下留白多,要放大一档才和左边的字重们等高 */
-  font-size: 24px;
+  font-size: 24px; /* 同上:手写体后缀,品牌锁形的一部分,不进正文字阶 */
   font-weight: 400;
-  letter-spacing: 0;
 }
 .mast-actions {
   display: flex;
@@ -1642,14 +1605,14 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   box-shadow: var(--sh-md);
 }
 .panel-head h2 {
-  font-family: var(--font-display);
+  font-family: var(--font-sans);
   font-weight: 500;
-  font-size: 22px;
+  font-size: var(--fs-2xl);
 }
 .lede {
   margin-top: 4px;
   color: var(--text-2);
-  font-size: 14px;
+  font-size: var(--fs-base);
 }
 .composer textarea {
   width: 100%;
@@ -1657,7 +1620,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   border: 1px solid var(--line);
   border-radius: var(--r-sm);
   background: var(--surface);
-  font-size: 14px;
+  font-size: var(--fs-base);
   transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
 }
 .composer textarea:focus {
@@ -1682,11 +1645,11 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   overflow: hidden;
 }
 .hero-title {
-  font-family: var(--font-display);
+  font-family: var(--font-sans);
   font-weight: 700;
   /* 英文行更长,字号上限与下限都比中文版收一档,避免窄屏被裁切 */
-  font-size: clamp(28px, 5.2vw, 56px);
-  letter-spacing: -0.03em;
+  font-size: clamp(var(--fs-3xl), 5.2vw, 56px);
+  letter-spacing: var(--ls-hero);
   line-height: 1.08;
   position: relative;
   z-index: 1;
@@ -1694,8 +1657,8 @@ async function toggleMark(entry: HistoryEntry, index: number) {
 .hero-sub {
   margin-top: var(--sp-4);
   color: var(--text-3);
-  font-size: 15px;
-  letter-spacing: 0.01em;
+  font-size: var(--fs-md);
+  letter-spacing: var(--ls-wide);
   position: relative;
   z-index: 1;
 }
@@ -1741,7 +1704,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   resize: none;
   overflow-y: hidden;
   line-height: 1.6;
-  font-size: 16px;
+  font-size: var(--fs-lg);
   /* 一行(16px × 1.6 + 上下内边距 = 39.6)的兜底高度,JS 接管前先撑住;
      同时是 JS 算高度时的下限 */
   min-height: 40px;
@@ -1809,7 +1772,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   padding: 0 12px 0 10px;
 }
 .param-val {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   font-weight: 500;
   font-variant-numeric: tabular-nums;
   color: var(--text);
@@ -1886,7 +1849,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   gap: 8px;
 }
 .pp-label {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-3);
   margin-right: 2px;
 }
@@ -1898,14 +1861,14 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   border: 1px solid var(--line);
 }
 .pp-note {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-2);
 }
 /* 面板里的紧凑数字输入(自定义张数) */
 .num-input {
   width: 76px;
   padding: 6px 10px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   font-variant-numeric: tabular-nums;
   text-align: center;
   color: var(--text);
@@ -1935,7 +1898,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
 /* 面板里的文字动作用中性灰:它是个胶囊形状,和上面那排选项同处一个面板,
    一个紫胶囊夹在灰胶囊中间会显得没做完 */
 .pp-action {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text);
   padding: 5px 10px;
   border: 1px solid var(--line-strong);
@@ -1948,7 +1911,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
 
 .preset {
   padding: 6px 12px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   border: 1px solid var(--line);
   border-radius: 999px;
   color: var(--text-2);
@@ -1982,7 +1945,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
 }
 .preset-hint {
   font-style: normal;
-  font-size: 11px;
+  font-size: var(--fs-micro);
   color: var(--text-3);
   transition: color var(--dur) var(--ease);
 }
@@ -1997,7 +1960,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
 /* 参考图选择 */
 .ref-pick {
   padding: 8px 14px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   border: 1px dashed var(--line-strong);
   border-radius: var(--r-sm);
   color: var(--text-2);
@@ -2012,7 +1975,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
 .err {
   margin-top: var(--sp-2);
   color: var(--danger);
-  font-size: 13px;
+  font-size: var(--fs-sm);
   padding: 8px 12px;
   background: color-mix(in oklch, var(--danger) 10%, transparent);
   border-radius: var(--r-sm);
@@ -2024,7 +1987,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   gap: var(--sp-3);
   margin-top: var(--sp-2);
   padding: 8px 12px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-2);
   background: var(--bg-elev);
   border: 1px solid var(--line);
@@ -2074,7 +2037,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
 }
 .err-btn {
   padding: 3px 10px;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--danger);
   border: 1px solid color-mix(in oklch, var(--danger) 32%, transparent);
   border-radius: 999px;
@@ -2190,7 +2153,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   border: none;
   background: none;
   color: var(--text-2);
-  font-size: 13px;
+  font-size: var(--fs-sm);
   cursor: pointer;
   transition: color var(--dur) var(--ease), background var(--dur) var(--ease);
 }
@@ -2227,10 +2190,10 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   padding: 0 2px;
 }
 .sec-title {
-  font-family: var(--font-display);
-  font-size: 20px;
+  font-family: var(--font-sans);
+  font-size: var(--fs-xl);
   font-weight: 600;
-  letter-spacing: -0.01em;
+  letter-spacing: var(--ls-tight);
   color: var(--text);
 }
 /* 加载态复用 sec-title 的字族与配色,只有动词的字重是组件内写死的 500,
@@ -2248,7 +2211,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-3);
   padding: 6px 10px;
   border-radius: 999px;
@@ -2340,7 +2303,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   opacity: 1;
 }
 .tile-meta {
-  font-size: 11px;
+  font-size: var(--fs-micro);
   opacity: 0.75;
   font-variant-numeric: tabular-nums;
 }
@@ -2422,7 +2385,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   }
   /* iOS Safari 聚焦字号 <16px 的输入框会放大整页,面板内的数字/尺寸输入提到 16px */
   .num-input {
-    font-size: 16px;
+    font-size: var(--fs-lg);
   }
   /* 底部三个动作键跟着参数胶囊一起升到 40px:触控目标要一致,
      只升一半的话它们会比左边那排小一圈,手指点起来也明显更难点中 */
