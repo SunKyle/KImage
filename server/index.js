@@ -130,16 +130,32 @@ function rateLimit(req, res, next) {
 /** 上游多久没响应就中断。Vercel 上另有平台执行上限,两者独立 */
 const UPSTREAM_TIMEOUT_MS = 120_000
 
-/* 提示词改写的系统提示。只输出改写结果、保持原意,并补足画面细节;
-   限 90 词是为了别把输出撑太长,回填到输入框还能一眼读完 */
-const SYSTEM_PROMPT = `You rewrite prompts for an image-generation model.
+/* 提示词改写的系统提示,两档:
+   quick 保守补细节 —— 结构与主体一律不动,只把缺的画面要素补上;
+   creative 允许重构 —— 换构图、光线、色调、风格,但不许换主体,
+   否则改写会变成另一个需求,用户按了反而得重新写一遍。
+   两档都限词数,回填到输入框还得能一眼读完。 */
+const ENHANCE_PROMPTS = {
+  quick: `You polish prompts for an image-generation model.
 
 Rules:
 - Output only the rewritten prompt. No preamble, no explanation, no quotes, no markdown.
-- Keep the subject, intent and any text to be rendered exactly as given.
-- Never introduce new subjects, objects or claims that change the meaning.
-- Add concrete visual detail: composition, lighting, lens and depth of field, material, color, mood, style.
-- Stay under 90 words, one paragraph.`
+- Keep the subject, the intent, any text to be rendered and the overall composition exactly as given.
+- Add only what is missing and concrete: lighting, material, color, lens, mood.
+- Never add new subjects, props or scene changes.
+- Stay under 60 words, one paragraph.`,
+  creative: `You reimagine prompts for an image-generation model.
+
+Rules:
+- Output only the rewritten prompt. No preamble, no explanation, no quotes, no markdown.
+- Keep the subject, the intent and any text to be rendered exactly as given. Never swap the subject or change what the image is about.
+- You may freely rework composition, framing, lighting, palette, materials, style and mood, and place the subject in a coherent setting.
+- Prefer one strong visual direction over a pile of adjectives.
+- Stay under 110 words, one paragraph.`
+}
+
+// 改写强度:保守档给低温度,让它贴着原句走;重构档放开,否则出来的东西没差别
+const ENHANCE_TEMPERATURE = { quick: 0.4, creative: 0.9 }
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const DIST = path.resolve(__dirname, '../dist')
@@ -341,7 +357,10 @@ app.post('/api/generate', rateLimit, async (req, res) => {
  * 与生图的接口配置互不影响 —— 两件事常常不是同一个服务商。
  */
 app.post('/api/enhance', rateLimit, async (req, res) => {
-  const { prompt, textModel, baseUrl, apiKey } = req.body || {}
+  const { prompt, textModel, baseUrl, apiKey, mode } = req.body || {}
+
+  // 只认两档,其余(含老前端不传)一律按保守档处理
+  const enhanceMode = mode === 'creative' ? 'creative' : 'quick'
 
   if (!prompt) {
     return res.status(400).json({ error: 'Enter a prompt first' })
@@ -389,10 +408,10 @@ app.post('/api/enhance', rateLimit, async (req, res) => {
       body: JSON.stringify({
         model: textModel,
         messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
+          { role: 'system', content: ENHANCE_PROMPTS[enhanceMode] },
           { role: 'user', content: prompt }
         ],
-        temperature: 0.7
+        temperature: ENHANCE_TEMPERATURE[enhanceMode]
       }),
       signal: ac.signal,
       dispatcher: dispatcherFor(target)

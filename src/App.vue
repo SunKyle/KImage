@@ -33,7 +33,7 @@ import {
   BACKGROUND_OPTIONS
 } from './api'
 import { blobToDataURL } from './lib/idb'
-import type { Cap, Provider } from './api'
+import type { Cap, EnhanceMode, Provider } from './api'
 import type { ApiConfig, FavoritePayload, HistoryEntry, PromptItem, ResultItem, ReuseParams } from './types'
 
 // —— 状态 ——
@@ -752,10 +752,25 @@ function retry() {
    三态由现有状态推出来,不另存一份 */
 const canUndo = computed(() => !enhancing.value && !!preEnhance.value)
 const enhanceText = computed(() =>
-  enhancing.value ? 'Enhancing…' : canUndo.value ? 'Undo' : 'Enhance'
+  enhancing.value
+    ? 'Enhancing…'
+    : canUndo.value
+      ? 'Undo'
+      : enhanceMode.value === 'creative'
+        ? 'Creative enhance'
+        : 'Quick enhance'
 )
 // 撤销态下即使输入框被清空也照常可点:原稿还在,这正是要撤回来的场景
 const enhanceDisabled = computed(() => enhancing.value || (!canUndo.value && !prompt.value.trim()))
+
+/* 改写档位:只两档,所以切换键直接来回切,不做下拉菜单 ——
+   两种状态用不着菜单那套浮层、外部点击收起和箭头图标。
+   只存在内存里:刷新后回到保守档,重构档是"这次想放开一点"的临时选择 */
+const enhanceMode = ref<EnhanceMode>('quick')
+function toggleEnhanceMode() {
+  enhanceMode.value = enhanceMode.value === 'quick' ? 'creative' : 'quick'
+}
+const nextModeLabel = computed(() => (enhanceMode.value === 'quick' ? 'Creative' : 'Quick'))
 
 /* 提示词改写:用文本模型把当前提示词扩写得更具体,结果填回输入框。
    改写前的原稿另存一份供 Undo 撤销 —— 不做历史记录,只留最近一次。 */
@@ -772,7 +787,7 @@ async function doEnhance() {
   }
   enhancing.value = true
   try {
-    const out = await enhancePrompt(cfg, src)
+    const out = await enhancePrompt(cfg, src, enhanceMode.value)
     // 原稿存的是改写前的完整文本(含可能的首尾空白),Undo 才能一字不差地还原
     preEnhance.value = prompt.value
     prompt.value = out
@@ -1041,23 +1056,38 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                    改写与撤销是同一个按钮(有原稿可撤时它变成 Undo),
                    这样按钮区不会在两种状态间变宽变窄 -->
               <div class="prompt-actions">
-                <button
-                  class="enhance-btn"
-                  :class="{ undo: canUndo }"
-                  :disabled="enhanceDisabled"
-                  :aria-label="canUndo ? 'Undo prompt enhancing' : 'Enhance prompt with a text model'"
-                  @click="canUndo ? undoEnhance() : doEnhance()"
-                >
-                  <!-- 四角星 = 增强,回转箭头 = 撤销:同一处换符号,比只换文案先被看到 -->
-                  <svg v-if="canUndo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M4 10.5h9.5a4.75 4.75 0 0 1 0 9.5H9" />
-                    <path d="M7.5 6.5 3.5 10.5l4 4" />
-                  </svg>
-                  <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M12 3.5l1.9 6.6 6.6 1.9-6.6 1.9L12 20.5l-1.9-6.6L3.5 12l6.6-1.9L12 3.5z" />
-                  </svg>
-                  {{ enhanceText }}
-                </button>
+                <!-- 改写按钮 + 档位切换合成一个控件:两者是同一件事(用哪种方式改写),
+                     拆成两个独立按钮会重新把按钮区撑宽 -->
+                <div class="enhance-split">
+                  <button
+                    class="enhance-btn"
+                    :class="{ undo: canUndo }"
+                    :disabled="enhanceDisabled"
+                    :aria-label="canUndo ? 'Undo prompt enhancing' : `Enhance prompt (${enhanceMode})`"
+                    @click="canUndo ? undoEnhance() : doEnhance()"
+                  >
+                    <!-- 四角星 = 增强,回转箭头 = 撤销:同一处换符号,比只换文案先被看到 -->
+                    <svg v-if="canUndo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M4 10.5h9.5a4.75 4.75 0 0 1 0 9.5H9" />
+                      <path d="M7.5 6.5 3.5 10.5l4 4" />
+                    </svg>
+                    <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M12 3.5l1.9 6.6 6.6 1.9-6.6 1.9L12 20.5l-1.9-6.6L3.5 12l6.6-1.9L12 3.5z" />
+                    </svg>
+                    {{ enhanceText }}
+                  </button>
+                  <!-- 只两档,点一下来回切,不用下拉 -->
+                  <button
+                    class="enhance-mode"
+                    :data-tip="`Switch to ${nextModeLabel} enhance`"
+                    :aria-label="`Switch to ${nextModeLabel} enhance`"
+                    @click="toggleEnhanceMode"
+                  >
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M4 8h12l-3-3M20 16H8l3 3" />
+                    </svg>
+                  </button>
+                </div>
                 <button
                   v-if="prompt.trim() && !loading"
                   class="clear-icon"
@@ -2034,8 +2064,43 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   cursor: not-allowed;
   box-shadow: none;
 }
-/* 提示词改写按钮:与参数按钮同尺寸、同描边语言,带文案所以宽度随内容撑开。
-   改写完成后同一个按钮变成撤销态(见 .undo),不再另起一个按钮 */
+/* 提示词改写:与参数按钮同尺寸、同描边语言,带文案所以宽度随内容撑开。
+   改写完成后同一个按钮变成撤销态(见 .undo),不再另起一个按钮。
+   描边与底色由外层 .enhance-split 提供 —— 按钮和档位切换要读成一个控件 */
+.enhance-split {
+  display: inline-flex;
+  align-items: stretch;
+  flex-shrink: 0;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  overflow: hidden;
+  transition: border-color var(--dur) var(--ease);
+}
+.enhance-split:hover {
+  border-color: var(--line-strong);
+}
+/* 档位切换:竖线把它和改写按钮分开,复用它右边两个图标键的分隔语言 */
+.enhance-mode {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  padding: 0 9px 0 7px;
+  border: none;
+  border-left: 1px solid var(--line);
+  background: none;
+  color: var(--text-3);
+  cursor: pointer;
+  transition: color var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+.enhance-mode:hover {
+  color: var(--text);
+  background: var(--bg-elev);
+}
+.enhance-mode svg {
+  width: 13px;
+  height: 13px;
+}
 .enhance-btn {
   display: inline-flex;
   align-items: center;
@@ -2043,14 +2108,12 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   flex-shrink: 0;
   height: 34px;
   padding: 0 12px;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  background: var(--surface);
+  border: none;
+  background: none;
   color: var(--text-2);
   font-size: 13px;
   cursor: pointer;
-  transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease),
-    background var(--dur) var(--ease);
+  transition: color var(--dur) var(--ease), background var(--dur) var(--ease);
 }
 .enhance-btn svg {
   width: 15px;
@@ -2059,7 +2122,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
 }
 .enhance-btn:hover:not(:disabled) {
   color: var(--text);
-  border-color: var(--line-strong);
+  background: var(--bg-elev);
 }
 .enhance-btn:disabled {
   opacity: 0.45;
@@ -2067,7 +2130,6 @@ async function toggleMark(entry: HistoryEntry, index: number) {
 }
 /* 撤销态:同一个按钮,压轻一档表示"这是往回走"而不是再改写一次 */
 .enhance-btn.undo {
-  background: none;
   color: var(--text-3);
 }
 
