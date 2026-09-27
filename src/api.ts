@@ -354,6 +354,7 @@ export async function generate(
     candidates?: Array<{
       content?: {
         parts?: Array<{
+          text?: string
           inlineData?: { data?: string; mimeType?: string }
           inline_data?: { data?: string; mime_type?: string }
         }>
@@ -361,15 +362,23 @@ export async function generate(
     }>
   }
   const found: Array<{ b64?: string; url?: string }> = []
+  // 模型只回了文字、没出图时,这些句子是唯一能说明原因的线索
+  const said: string[] = []
   for (const item of data.data || []) found.push({ b64: item.b64_json, url: item.url })
   for (const c of data.candidates || []) {
     for (const part of c.content?.parts || []) {
       const inline = part.inlineData || part.inline_data
       if (inline?.data) found.push({ b64: inline.data })
+      else if (typeof part.text === 'string' && part.text.trim()) said.push(part.text.trim())
     }
   }
   if (!found.length) {
-    throw new Error('No images returned by upstream')
+    /* Gemini 系的图像模型本质上是对话模型:它可能不谈出图,只回一句话
+       (最常见的是"请先给参考图",其次是安全拒绝)。那句话是这里唯一有用的信息,
+       丢掉它只会剩下一句"上游没返回图片",等于什么都没说 —— 直接把它当报错抛出来 */
+    throw new Error(
+      said.length ? said.join(' ').slice(0, 400) : 'No images returned by upstream'
+    )
   }
 
   // 结果统一落成 Blob:base64 会膨胀 33% 且整段进 JS 堆,Blob 由浏览器放在堆外。

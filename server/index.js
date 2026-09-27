@@ -422,6 +422,23 @@ app.post('/api/generate', rateLimit, async (req, res) => {
         detail =
           'The upstream doesn\'t recognize a parameter, usually quality or background (OpenAI-only extensions). In "Interface Settings", pick the right vendor, or set quality/background back to "Auto". Original error: ' +
           raw
+      } else {
+        /* 兜底:JSON 里的 message 才是给人看的那句,整个 JSON 塞过去只会让人先看到
+           一堆括号。上游还常常把模型本人说的话放进 message(比如"请先上传参考图"),
+           那更是这里唯一有用的信息,所以优先把它摆出来,错误码跟在后面当注脚 */
+        try {
+          const j = JSON.parse(text)
+          const m = j?.error?.message ?? j?.message
+          if (typeof m === 'string' && m.trim()) {
+            // 数值型的 code(如 Google 的 400)是冗余的 —— HTTP 状态里已经有了
+            const code = [j?.error?.code, j?.error?.type, j?.error?.status, j?.code].find(
+              (c) => typeof c === 'string' && c
+            )
+            detail = code ? `${m.trim()} (${code})` : m.trim()
+          }
+        } catch {
+          /* 不是 JSON 就保持原样 */
+        }
       }
       return res.status(upstream.status).json({
         error: `Upstream returned an error (${upstream.status})`,
