@@ -20,14 +20,10 @@ import type { PromptItem } from '../types'
 
 const props = defineProps<{
   items: PromptItem[]
-  /* 还在历史里的记录 id。封面点开的是"那张图"的预览,而图存在历史里 ——
-     记录被清理之后只剩封面这张静态图,那种情况退回编辑 */
-  historyIds: Set<string>
 }>()
 
 const emit = defineEmits<{
   (e: 'use', item: PromptItem): void
-  (e: 'open', item: PromptItem): void
   (e: 'remove', id: string): void
   (e: 'save', item: PromptItem): void
   (e: 'import', items: PromptItem[]): void
@@ -102,7 +98,8 @@ function titleOf(item: PromptItem): string {
   return item.title?.trim() || titleFromPrompt(item.prompt)
 }
 
-// 封面角标显示的标签:第一个,加上"还有几个"。多个标签全铺在封面上会盖掉图
+/* 封面左上角那枚是模型名(见模板),分类改到下沿显示:
+   第一个标签,加上"还有几个" —— 多个标签全铺开会把下沿挤到贴住按钮 */
 function leadTag(item: PromptItem): string {
   return (item.tags || [])[0] || ''
 }
@@ -129,13 +126,6 @@ const filtered = computed(() => {
   else out.sort((a, b) => b.createdAt - a.createdAt)
   return out
 })
-
-/* 卡片下沿那行:模型名;没有模型的手动条目就写存下来的时间。
-   不写尺寸 —— 挑提示词的人不看尺寸,而它会把这一行撑到截断(实测
-   "banana2-4k · 1024x1024" 在一张卡里放不下,只能显示成 "102…") */
-function metaLine(item: PromptItem): string {
-  return item.model || fmtDate(item.createdAt)
-}
 
 /* 表单右栏那份只读的参数摘要。它们是收藏时自动记下的,改参数去生成页那边改。
    尺寸写成 × 而不是 x:界面上其他地方都是这么写的 */
@@ -227,17 +217,6 @@ function saveForm() {
 }
 
 // —— 卡片动作 ——
-
-/* 封面点开的是那张图,不是编辑器:封面是为了"认出这条提示词出过什么"而留的,
-   想看大图/下载/复现,都得回到它原本那条记录。原图不在了(历史被清理,
-   或这条本来就是手写的)就退回编辑 —— 至少封面这张图还看得见 */
-function hasOriginal(item: PromptItem): boolean {
-  return !!item.historyId && props.historyIds.has(item.historyId)
-}
-function openCover(item: PromptItem) {
-  if (hasOriginal(item)) emit('open', item)
-  else startEdit(item)
-}
 
 async function copyPrompt(item: PromptItem) {
   openMenu.value = ''
@@ -391,30 +370,25 @@ function onImportFile(e: Event) {
       </div>
 
       <ul v-if="filtered.length" class="lib-grid">
-        <!-- 封面与正文是两个入口:封面点开是那张图(还在历史里时),正文点开是编辑。
+        <!-- 封面与正文是一整块可点区域:点开就是这条的详情兼编辑。
              取用/删除留在下沿 —— 它们是"动作",不该和"打开"抢同一次点击 -->
         <li v-for="item in filtered" :key="item.id" class="card" :class="{ 'menu-open': openMenu === item.id }">
           <button
-            class="cover"
-            :aria-label="hasOriginal(item) ? `Open the image for ${titleOf(item)}` : `Edit ${titleOf(item)}`"
-            @click="openCover(item)"
-          >
-            <img v-if="item.cover" :src="coverSrc(item.cover)" alt="" />
-            <!-- 手动新建的提示词没有配图。做成一块安静的底,不画"缺图"的警示 ——
-                 它只是没存过封面,不是出错 -->
-            <span v-else class="cover-none" aria-hidden="true"><PhImage /></span>
-            <span v-if="leadTag(item)" class="cover-tag">
-              {{ leadTag(item) }}
-              <template v-if="extraTags(item)">+{{ extraTags(item) }}</template>
-            </span>
-            <!-- 次数摆在封面上:它回答"这条我到底用过没有",而不占正文的行 -->
-            <span v-if="item.uses" class="cover-uses">{{ item.uses }}×</span>
-          </button>
-          <button
             class="card-open"
-            :aria-label="`Edit ${titleOf(item)}`"
+            :aria-label="`Open ${titleOf(item)}`"
             @click="startEdit(item)"
           >
+            <span class="cover">
+              <img v-if="item.cover" :src="coverSrc(item.cover)" alt="" />
+              <!-- 手动新建的提示词没有配图。做成一块安静的底,不画"缺图"的警示 ——
+                   它只是没存过封面,不是出错 -->
+              <span v-else class="cover-none" aria-hidden="true"><PhImage /></span>
+              <!-- 封面上这枚是模型名:一张图"是谁出的"是看图时最想知道的事,
+                   它跟着图走,所以贴在图角上。分类挪到下沿(见 .card-tag) -->
+              <span v-if="item.model" class="cover-tag">{{ item.model }}</span>
+              <!-- 次数摆在封面上:它回答"这条我到底用过没有",而不占正文的行 -->
+              <span v-if="item.uses" class="cover-uses">{{ item.uses }}×</span>
+            </span>
             <span class="card-body">
               <b class="card-title">{{ titleOf(item) }}</b>
               <span class="card-text">{{ item.prompt }}</span>
@@ -422,8 +396,14 @@ function onImportFile(e: Event) {
           </button>
           <div class="card-foot">
             <span v-if="copiedId === item.id" class="card-meta copied">Copied</span>
+            <!-- 分类从封面挪到下沿:有分类就显示分类(第一个 + 其余几个),
+                 手写的、没分类的条目退回显示时间 -->
+            <span v-else-if="leadTag(item)" class="card-tag" :title="fmtDate(item.createdAt)">
+              {{ leadTag(item) }}
+              <template v-if="extraTags(item)">+{{ extraTags(item) }}</template>
+            </span>
             <span v-else class="card-meta" :title="fmtDate(item.createdAt)">{{
-              metaLine(item)
+              fmtDate(item.createdAt)
             }}</span>
             <div class="ops">
               <button
@@ -787,13 +767,6 @@ function onImportFile(e: Event) {
   aspect-ratio: 1;
   overflow: hidden;
   background: var(--image-bg);
-  /* 它是个按钮(点开原图预览),把浏览器给按钮的默认外观清掉 */
-  width: 100%;
-  padding: 0;
-  border: 0;
-  font: inherit;
-  color: inherit;
-  cursor: pointer;
   /* 顶部两个角自己圆掉:卡片不再裁子元素了,这里要跟卡片内沿对齐(减去 1px 边框) */
   border-top-left-radius: calc(var(--r) - 1px);
   border-top-right-radius: calc(var(--r) - 1px);
@@ -818,7 +791,7 @@ function onImportFile(e: Event) {
   width: 26px;
   height: 26px;
 }
-/* 封面上的两个角标:标签在左上,取用次数在右下。
+/* 封面上的两个角标:模型名在左上,取用次数在右下。
    都压在图上,所以都要自带底衬,不然浅色图上读不出来 */
 .cover-tag,
 .cover-uses {
@@ -838,6 +811,10 @@ function onImportFile(e: Event) {
 .cover-tag {
   top: 8px;
   left: 8px;
+  /* block 而不是沿用上面的 inline-flex:模型名比分类长得多
+     (gemini-2.5-flash-image-preview 这类),得真截断 ——
+     flex 容器里文字是 flex item,text-overflow 不生效 */
+  display: block;
   max-width: calc(100% - 16px);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -889,6 +866,21 @@ function onImportFile(e: Event) {
   white-space: nowrap;
   font-size: var(--fs-micro);
   color: var(--text-3);
+}
+/* 卡片下沿的分类。用 --accent-soft 底 + accent 字:标签在这个页面一直是这套语言
+   (见表单里的 .tag-chip),换个底色会让"分类"看着像另一种东西。
+   min-width:0 是必须的 —— 没有它,flex 子项不会收缩,长标签会把右边的按钮顶出去 */
+.card-tag {
+  min-width: 0;
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: var(--fs-micro);
+  background: var(--accent-soft);
+  color: var(--accent);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .card-meta.copied {
   color: var(--accent);

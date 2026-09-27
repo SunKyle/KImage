@@ -19,9 +19,6 @@ const props = defineProps<{
   entry: HistoryEntry | null
   // 全部历史,用于上下翻页在记录之间切换
   items: HistoryEntry[]
-  /* 打开时先显示第几张。库页点封面进来时用:那条记录可能有好几张图,
-     要点开的正是当初收藏的那一张,而不是默认的第一张 */
-  startAt?: number
 }>()
 const emit = defineEmits<{
   (e: 'close'): void
@@ -77,9 +74,7 @@ function onImgLoad(e: Event) {
 
 // 每次打开、或上下翻到另一条记录,都回到初始视图
 function resetView() {
-  // 记录里可能不止一张图:进来看的是 startAt 指定的那张,翻到别的记录则退回第一张
-  const count = props.entry?.results.length || 1
-  active.value = Math.min(Math.max(0, props.startAt || 0), count - 1)
+  active.value = 0
   menuOpen.value = false
   copied.value = false
   copyFailed.value = false
@@ -295,10 +290,7 @@ function menuAction(kind: 'favorite' | 'download' | 'remove') {
       size: props.entry.size,
       quality: props.entry.quality,
       background: props.entry.background,
-      image: item,
-      // 记下出处:以后在库里点封面,才回得到这张图的预览
-      historyId: props.entry.id,
-      index: active.value
+      image: item
     })
   } else if (kind === 'download') {
     download()
