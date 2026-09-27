@@ -20,10 +20,14 @@ import type { PromptItem } from '../types'
 
 const props = defineProps<{
   items: PromptItem[]
+  /* 还在历史里的记录 id。封面点开的是"那张图"的预览,而图存在历史里 ——
+     记录被清理之后只剩封面这张静态图,那种情况退回编辑 */
+  historyIds: Set<string>
 }>()
 
 const emit = defineEmits<{
   (e: 'use', item: PromptItem): void
+  (e: 'open', item: PromptItem): void
   (e: 'remove', id: string): void
   (e: 'save', item: PromptItem): void
   (e: 'import', items: PromptItem[]): void
@@ -224,6 +228,17 @@ function saveForm() {
 
 // —— 卡片动作 ——
 
+/* 封面点开的是那张图,不是编辑器:封面是为了"认出这条提示词出过什么"而留的,
+   想看大图/下载/复现,都得回到它原本那条记录。原图不在了(历史被清理,
+   或这条本来就是手写的)就退回编辑 —— 至少封面这张图还看得见 */
+function hasOriginal(item: PromptItem): boolean {
+  return !!item.historyId && props.historyIds.has(item.historyId)
+}
+function openCover(item: PromptItem) {
+  if (hasOriginal(item)) emit('open', item)
+  else startEdit(item)
+}
+
 async function copyPrompt(item: PromptItem) {
   openMenu.value = ''
   try {
@@ -376,26 +391,30 @@ function onImportFile(e: Event) {
       </div>
 
       <ul v-if="filtered.length" class="lib-grid">
-        <!-- 封面与正文是一整块可点区域:点开就是这条的详情兼编辑。
+        <!-- 封面与正文是两个入口:封面点开是那张图(还在历史里时),正文点开是编辑。
              取用/删除留在下沿 —— 它们是"动作",不该和"打开"抢同一次点击 -->
         <li v-for="item in filtered" :key="item.id" class="card" :class="{ 'menu-open': openMenu === item.id }">
           <button
+            class="cover"
+            :aria-label="hasOriginal(item) ? `Open the image for ${titleOf(item)}` : `Edit ${titleOf(item)}`"
+            @click="openCover(item)"
+          >
+            <img v-if="item.cover" :src="coverSrc(item.cover)" alt="" />
+            <!-- 手动新建的提示词没有配图。做成一块安静的底,不画"缺图"的警示 ——
+                 它只是没存过封面,不是出错 -->
+            <span v-else class="cover-none" aria-hidden="true"><PhImage /></span>
+            <span v-if="leadTag(item)" class="cover-tag">
+              {{ leadTag(item) }}
+              <template v-if="extraTags(item)">+{{ extraTags(item) }}</template>
+            </span>
+            <!-- 次数摆在封面上:它回答"这条我到底用过没有",而不占正文的行 -->
+            <span v-if="item.uses" class="cover-uses">{{ item.uses }}×</span>
+          </button>
+          <button
             class="card-open"
-            :aria-label="`Open ${titleOf(item)}`"
+            :aria-label="`Edit ${titleOf(item)}`"
             @click="startEdit(item)"
           >
-            <span class="cover">
-              <img v-if="item.cover" :src="coverSrc(item.cover)" alt="" />
-              <!-- 手动新建的提示词没有配图。做成一块安静的底,不画"缺图"的警示 ——
-                   它只是没存过封面,不是出错 -->
-              <span v-else class="cover-none" aria-hidden="true"><PhImage /></span>
-              <span v-if="leadTag(item)" class="cover-tag">
-                {{ leadTag(item) }}
-                <template v-if="extraTags(item)">+{{ extraTags(item) }}</template>
-              </span>
-              <!-- 次数摆在封面上:它回答"这条我到底用过没有",而不占正文的行 -->
-              <span v-if="item.uses" class="cover-uses">{{ item.uses }}×</span>
-            </span>
             <span class="card-body">
               <b class="card-title">{{ titleOf(item) }}</b>
               <span class="card-text">{{ item.prompt }}</span>
@@ -768,6 +787,13 @@ function onImportFile(e: Event) {
   aspect-ratio: 1;
   overflow: hidden;
   background: var(--image-bg);
+  /* 它是个按钮(点开原图预览),把浏览器给按钮的默认外观清掉 */
+  width: 100%;
+  padding: 0;
+  border: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
   /* 顶部两个角自己圆掉:卡片不再裁子元素了,这里要跟卡片内沿对齐(减去 1px 边框) */
   border-top-left-radius: calc(var(--r) - 1px);
   border-top-right-radius: calc(var(--r) - 1px);

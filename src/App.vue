@@ -102,6 +102,11 @@ const refImage = ref('') // 图生图参考图 (data URL)
 type Page = 'home' | 'lib' | 'history' | 'settings'
 const page = ref<Page>('home')
 const previewEntry = ref<HistoryEntry | null>(null)
+// 打开预览时先显示这条记录里的第几张(库页点封面进来时用,其余情况是 0)
+const previewStart = ref(0)
+/* 还在历史里的记录 id。提示词库要据此判断"点封面该开原图预览还是开编辑器" ——
+   图在历史里,历史会被清理,清掉之后封面就只剩一张静态图了 */
+const historyIds = computed(() => new Set(history.value.map((h) => h.id)))
 // 参数 icon 展开的面板:同一时间只开一个,再次点击收起。
 // 只有三项 —— 尺寸/画质/背景/参考图合并成 'more' 一块,参数行默认只露模型与张数
 type PanelKey = '' | 'n' | 'more' | 'config'
@@ -1248,11 +1253,22 @@ function fmtDate(ts: number) {
 /* 短标题的派生逻辑在 lib/text.ts:图砖角标与提示词库卡片共用同一个口径。
    完整提示词仍然只挂在 img 的 alt 上(读屏能拿到),角标里不出现,免得挡图 */
 
-function openPreview(entry: HistoryEntry) {
+/* startAt:这条记录里的第几张。只有从库页点封面进来才有值 ——
+   收藏的是那张图,点开时就该看到那张,而不是默认的第一张 */
+function openPreview(entry: HistoryEntry, startAt = 0) {
   previewEntry.value = entry
+  previewStart.value = startAt
 }
 function closePreview() {
   previewEntry.value = null
+}
+
+/* 库页点封面:回到那张图的预览。
+   库页已经确认过记录还在(否则它点开的是编辑器,见 PromptLibrary 的 openCover),
+   这里再查一遍是因为记录可能刚被清理 —— 查不到就当无事发生 */
+function openLibCover(item: PromptItem) {
+  const entry = item.historyId ? history.value.find((h) => h.id === item.historyId) : undefined
+  if (entry) openPreview(entry, item.imageIndex || 0)
 }
 // 复现一条记录:提示词连同当时的参数一起带回,但只套用当前厂商认得的项
 /* 从历史取用一条记录的完整配方。顺序要紧:先切配置,后面几项的能力校验
@@ -1327,6 +1343,9 @@ async function favoriteFromPreview(p: FavoritePayload) {
     quality: p.quality,
     background: p.background,
     cover: await coverOf(p.image),
+    // 记下出处:以后在库里点封面才回得到这张图的预览
+    historyId: p.historyId,
+    imageIndex: p.index,
     createdAt: Date.now()
   }
   libItems.value = [item, ...libItems.value]
@@ -1896,7 +1915,9 @@ async function toggleMark(entry: HistoryEntry, index: number) {
         v-else-if="page === 'lib'"
         class="page-in"
         :items="libItems"
+        :history-ids="historyIds"
         @use="useLibItem"
+        @open="openLibCover"
         @remove="removeLibItem"
         @save="saveLibItem"
         @import="importLibItems"
@@ -1940,6 +1961,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
       :visible="!!previewEntry"
       :entry="previewEntry"
       :items="history"
+      :start-at="previewStart"
       @close="closePreview"
       @navigate="openPreview"
       @use-prompt="usePreviewPrompt"

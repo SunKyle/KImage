@@ -57,6 +57,11 @@ export interface PromptItem {
   cover?: Blob
   // 旧字段:封面曾经是 data URL 字符串(还是压到 320px 的缩略图)。读入时并进 cover
   thumb?: string
+  /* 这条提示词是从哪张图收藏来的:历史记录 id,以及它是那条记录里的第几张。
+     有了它,点封面才回得去那张图的预览 —— 否则封面只是一张孤立的图,点开只能进编辑器。
+     可选:手动新建的条目没有,历史被清理后也对不上,两种情况都退回编辑 */
+  historyId?: string
+  imageIndex?: number
   createdAt: number
   // 旧字段:加 tags 之前只有一个分类字符串。读入时并进 tags,不再写回
   category?: string
@@ -74,6 +79,9 @@ export interface FavoritePayload {
   /* 出这张图的原始载荷。封面要的是原图,而预览那边拿得出手的只有渲染地址 ——
      交出载荷让主界面自己决定怎么取回字节(新记录是 Blob,老记录是 data URL) */
   image?: ResultItem
+  /* 这张图来自哪条记录的第几张。库里存下来,以后点封面才能回到原图预览 */
+  historyId?: string
+  index?: number
 }
 
 // 一条图片结果。
