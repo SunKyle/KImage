@@ -2,6 +2,7 @@
 import { computed, ref } from 'vue'
 import { PhHeart, PhArrowLineUp, PhTrash, PhClockCounterClockwise } from '@phosphor-icons/vue'
 import { imageSrc, reuseParamsOf, thumbSrc } from '../api'
+import { blobToDataURL } from '../lib/idb'
 import type { HistoryEntry, ResultItem, ReuseParams } from '../types'
 
 /* 历史记录:独立页面。
@@ -21,6 +22,14 @@ const emit = defineEmits<{
   (e: 'remove', entry: HistoryEntry): void
   (e: 'mark', entry: HistoryEntry, index: number): void
 }>()
+
+/* 交回整条配方(提示词、参数、种子、当时的模型配置、参考图)。
+   参考图存的是 Blob,要转成 data URL 才交得出去 —— 所以这里是异步的,
+   与预览卡那边的 Reuse 是同一套做法,两个入口不该给出不同的配方 */
+async function reuse(entry: HistoryEntry) {
+  const ref = entry.ref ? await blobToDataURL(entry.ref) : undefined
+  emit('use', { ...reuseParamsOf(entry), ref })
+}
 
 // 摊平:一条记录三张图就是三块,每块都能点开预览,标记也各标各的
 const tiles = computed<Tile[]>(() =>
@@ -150,7 +159,7 @@ function fmt(ts: number) {
               <button
                 class="top"
                 :aria-label="`Use prompt: ${t.entry.prompt.slice(0, 20)}`"
-                @click.stop="emit('use', reuseParamsOf(t.entry))"
+                @click.stop="reuse(t.entry)"
               >
                 <PhArrowLineUp aria-hidden="true" />
               </button>

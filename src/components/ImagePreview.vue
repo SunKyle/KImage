@@ -12,7 +12,7 @@ import {
 } from '@phosphor-icons/vue'
 import { BACKGROUND_OPTIONS, QUALITY_OPTIONS, imageSrc, optionLabel, reuseParamsOf } from '../api'
 import type { HistoryEntry, ResultItem, ReuseParams, FavoritePayload } from '../types'
-import { detectMimeFromDataUrl } from '../lib/idb'
+import { detectMimeFromDataUrl, blobToDataURL } from '../lib/idb'
 
 const props = defineProps<{
   visible: boolean
@@ -186,9 +186,16 @@ async function copyPrompt() {
   }, 1600)
 }
 
-function useThisPrompt() {
-  if (!props.entry) return
-  emit('usePrompt', reuseParamsOf(props.entry))
+/* 把整条配方交回输入区:提示词、尺寸、张数、画质、背景、种子、当时的模型配置、
+   以及参考图。"改一个变量重跑"要成立,这些一样都不能少 ——
+   少哪一样,重跑出来的就不是同一次实验,而用户看不出来 */
+async function useThisPrompt() {
+  const e = props.entry
+  if (!e) return
+  /* 参考图存的是 Blob,得转成 data URL 才交得出去。转不出来就当作"没有参考图":
+     主界面那边会据此清掉参考图槽,总好过留着上一张还让人以为是同一次 */
+  const ref = e.ref ? await blobToDataURL(e.ref) : undefined
+  emit('usePrompt', { ...reuseParamsOf(e), ref })
   close()
 }
 
@@ -430,16 +437,24 @@ function menuAction(kind: 'favorite' | 'download' | 'remove') {
                     Background · {{ optionLabel(BACKGROUND_OPTIONS, entry.background) }}
                   </span>
                   <span v-if="entry.hasRef" class="tag">Reference</span>
+                  <span v-if="entry.seed !== undefined" class="tag">Seed · {{ entry.seed }}</span>
                   <span v-if="entry.elapsedMs" class="tag tag-dim">{{ fmtElapsed(entry.elapsedMs) }}</span>
                 </div>
                 <span class="meta">{{ fmtTime(entry.createdAt) }}</span>
               </div>
 
               <!-- 底部操作:主次并排,占满侧栏宽度。
-                   文案取 "As reference" 而非 "Use as reference":
-                   侧栏 320px 放两个等宽按钮,长一档就会换行折成两行 -->
+                   主操作叫 "Reuse" 是因为它交回去的是整条配方(提示词、尺寸、张数、
+                   画质、背景、种子、当时那个模型配置、参考图),不只是提示词 ——
+                   叫 "Use prompt" 会让人以为只是拷了段文字回去 -->
               <div class="side-actions">
-                <button class="act primary" @click="useThisPrompt">Use prompt</button>
+                <button
+                  class="act primary"
+                  title="Reuse this recipe: prompt, size, model, seed and reference"
+                  @click="useThisPrompt"
+                >
+                  Reuse
+                </button>
                 <button class="act" @click="useAsReference">As reference</button>
               </div>
             </aside>

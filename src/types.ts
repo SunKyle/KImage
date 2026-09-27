@@ -25,6 +25,11 @@ export interface GenParams {
   quality?: string
   // 背景:auto / transparent / opaque(部分接口不支持)
   background?: string
+  /* 随机种子。留空表示交给上游随机 —— 我们不存"上游实际用的那个数":
+     响应里从来没有这个字段,谁也拿不回来。所以它只在用户自己填了之后
+     才有意义:同样的 seed + 同样的参数,才有机会拿到同一张图
+     (部分接口根本不认这个参数,见厂商能力表的 seed) */
+  seed?: number
 }
 
 // 提示词库收藏项
@@ -73,6 +78,15 @@ export interface HistoryEntry {
   hasRef?: boolean
   // 这一批从发起到返回的耗时(毫秒)
   elapsedMs?: number
+  /* 当时用的那条接口配置的 id。有了它,"沿用这条记录的配方"才能连配置一起还原 ——
+     否则改一个变量重跑时,用的其实是当前生效的那个模型,对比就失真了。
+     可选:老记录没有,配置被删后也对不上,两种情况都退回当前配置 */
+  configId?: string
+  // 当时指定的随机种子(没填就没有这个字段)。上游不告诉我们它实际用了哪个数
+  seed?: number
+  /* 参考图的存档副本(压到最长边 512)。配方要能完整复现,就得连参考图一起留下 ——
+     hasRef 只能说明"用过参考图",给不出是哪张。可选:老记录与纯文生图都没有 */
+  ref?: Blob
   /* 对比出图(Model Race)的分组 id:同一次对比里各模型的结果共用一个值。
      派生关系(版本树)也将挂在同一个字段上,所以它是"这一批从哪来"的标识,
      不限于对比。可选:普通生成与加这个字段之前的记录都没有 */
@@ -99,4 +113,10 @@ export interface ReuseParams {
   n?: number
   quality?: string
   background?: string
+  /* 以下三项是"完整配方"的其余部分:有了它们,从历史重跑才真的等于当时那一次,
+     而不是"提示词一样、其他都不一样"。缺任何一项都按当前界面上的值处理 */
+  configId?: string
+  seed?: number
+  // 参考图(data URL)。记录里存的是 Blob,取用时才转成 data URL
+  ref?: string
 }

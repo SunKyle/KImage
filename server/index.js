@@ -262,6 +262,7 @@ app.post('/api/generate', rateLimit, async (req, res) => {
     image,
     quality,
     background,
+    seed,
     vendor,
     protocol
   } = req.body || {}
@@ -306,13 +307,16 @@ app.post('/api/generate', rateLimit, async (req, res) => {
 
   /* quality / background 是 OpenAI 系的扩展参数,不少接口不认,所以只在显式选择时带上。
      Gemini 那条路一个都不带:原生请求体里没有这些字段,多给一个未知字段会被它拒掉
-     (前端的厂商能力表已经把这两项标成不支持,正常也传不过来) */
+     (前端的厂商能力表已经把这两项标成不支持,正常也传不过来)
+     seed 不同:它是用户自己填的"复现键",两条协议各有它的位置 ——
+     OpenAI 系放请求体顶层(所以归在这批里),Gemini 放 generationConfig(见下面) */
   const extras = isGemini
     ? {}
     : {
         ...(responseFormat ? { response_format: responseFormat } : {}),
         ...(quality ? { quality } : {}),
-        ...(background ? { background } : {})
+        ...(background ? { background } : {}),
+        ...(Number.isFinite(seed) ? { seed } : {})
       }
 
   /* size 如实转发(OpenAI 那条路),包括字面量 'auto' —— 它是上游的一个真实取值
@@ -332,6 +336,8 @@ app.post('/api/generate', rateLimit, async (req, res) => {
     const gen = {}
     if (ratio) gen.imageConfig = { aspectRatio: ratio }
     if (n > 1) gen.candidateCount = n
+    // 原生协议里 seed 在 generationConfig 下;图像模型认不认由上游决定(见厂商能力表)
+    if (Number.isFinite(seed)) gen.seed = seed
     /* 图生图在原生协议里不是另一个端点,而是同一个端点多给一段 parts:
        文字在前、参考图在后。mime 必须从 data URL 里读,不能写死 ——
        参考图可能是历史里的 PNG/WebP(原样带过来),也可能是

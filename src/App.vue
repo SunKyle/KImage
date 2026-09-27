@@ -51,7 +51,7 @@ import {
   QUALITY_OPTIONS,
   BACKGROUND_OPTIONS
 } from './api'
-import { blobToDataURL } from './lib/idb'
+import { blobToDataURL, urlToBlob } from './lib/idb'
 import type { Cap, EnhanceMode, Provider } from './api'
 import type { ApiConfig, FavoritePayload, HistoryEntry, PromptItem, ResultItem, ReuseParams } from './types'
 
@@ -69,6 +69,11 @@ const n = ref(1)
 // 'auto' 表示交给上游自己决定,请求时不带这个参数
 const quality = ref('auto')
 const background = ref('auto')
+/* 随机种子。留空表示"不发这个参数",交给上游随机。
+   注意它和 quality/background 的 auto 不是一回事:那两个的 'auto' 是"不传"的哨兵值,
+   这里空着才是"不传"。上游从不告诉我们它实际用了哪个数,所以这里只能由用户自己填,
+   填了才有"同一张图再微调"可言 */
+const seed = ref('')
 const loading = ref(false)
 const error = ref('')
 // 错误区默认收成一行:上游原文动辄上百字,整段铺开会把输入区顶得很高
@@ -276,8 +281,30 @@ const moreCustom = computed(
     size.value !== defaultSize.value ||
     quality.value !== 'auto' ||
     background.value !== 'auto' ||
+    (provider.value.seed !== 'no' && !!seed.value.trim()) ||
     !!refImage.value
 )
+
+/* 种子的实际取值:空着、或厂商明确不支持就不发。范围按 32 位有符号整数收 ——
+   各家都在这条线以内,再大的值上游只当非法 */
+const seedValue = computed(() => {
+  const raw = seed.value.trim()
+  if (!raw) return undefined
+  const v = Math.round(Number(raw))
+  return Number.isFinite(v) && Math.abs(v) <= 2147483647 ? v : undefined
+})
+function seedFor(cfg: ApiConfig = config.value): number | undefined {
+  const caps = getProvider(cfg.vendor || inferVendor(cfg.baseUrl), cfg.model)
+  return caps.seed === 'no' ? undefined : seedValue.value
+}
+// 手填种子:失焦/回车时收敛成整数并回写输入框;认不出来就清空(= 交给上游随机)
+function commitSeed(e: Event) {
+  const el = e.target as HTMLInputElement
+  const v = Math.round(Number(el.value))
+  seed.value =
+    el.value.trim() !== '' && Number.isFinite(v) && Math.abs(v) <= 2147483647 ? String(v) : ''
+  el.value = seed.value
+}
 
 // 张数上限:多数生图接口一次最多 10 张
 const N_MAX = 10
@@ -407,16 +434,17 @@ const cfgSeed = ref<ApiConfig | null>(null)
 
 /* —— 对比出图(Model Race) ——
    把同一句提示词一次发给多个出图配置,并排看结果。这是"自带多家模型"才有的事:
-   官方 app 只能跑自家模型。代价是花费按模型数翻倍,所以它必须是一个显式开关,
-   而不是默认行为 —— 参数行上的胶囊会写明这一下要跑几个模型 */
-const compareOn = ref(false)
-// 参与对比的配置 id。存 id 不存配置对象:设置页改了名字或地址,这里自动跟着走
-const compareIds = ref<string[]>([])
+   官方 app 只能跑自家模型。代价是花费按模型数翻倍。
+   没有单独的"对比"开关:芯片本来就是多选,选一个 = 平时那样,选两个以上 = 对比 */
+const selectedIds = ref<string[]>([])
 // 一次最多几个:花费线性增长,四个已经排满一屏
 const RACE_MAX = 4
-const compareConfigs = computed(() =>
-  imageConfigs.value.filter((c) => compareIds.value.includes(c.id))
+// 参与这次生成的配置。存 id 不存配置对象:设置页改了名字或地址,这里自动跟着走
+const selectedConfigs = computed(() =>
+  imageConfigs.value.filter((c) => selectedIds.value.includes(c.id))
 )
+// 多选即对比
+const compareMode = computed(() => selectedConfigs.value.length > 1)
 // 一个槽位 = 一个模型 × 这一次请求。results 为空表示还没回来
 type RaceSlot = {
   configId: string
@@ -425,6 +453,8 @@ type RaceSlot = {
   size: string
   // 发起时锁定的扩展参数:各模型不一样(OpenAI 有 quality,豆包没有)
   extras: Record<string, string>
+  // 发起时锁定的种子(该模型认 seed 且用户填了才有)
+  seed?: number
   state: 'running' | 'done' | 'stopped' | 'error'
   results: ResultItem[]
   error?: string
@@ -438,21 +468,23 @@ const racePrompt = ref('')
 // 同一次对比的各条记录共用一个分组 id
 const raceGroupId = ref('')
 const raceRunning = computed(() => raceSlots.value.some((s) => s.state === 'running'))
-// 至少两个模型才谈得上对比
-const raceReady = computed(() => !compareOn.value || compareConfigs.value.length >= 2)
-/* 参数行上的出图胶囊:对比开启时改说"要跑几个模型" ——
-   否则点生成之前没法知道这一下会花掉 N 倍的额度 */
+/* 参数行上的出图胶囊:多选时写成"主模型 +N"。这里必须说清楚 ——
+   点一下芯片就从单模型变成多模型,生成键又只是个图标,
+   不在胶囊上写明"这次要跑几个",加选一个模型就会变成一次双倍花费的意外 */
 const imagePillName = computed(() =>
-  compareOn.value ? `Compare · ${compareConfigs.value.length}` : activeConfigName.value
+  compareMode.value
+    ? `${activeConfigName.value} +${selectedConfigs.value.length - 1}`
+    : activeConfigName.value
 )
-const imagePillTip = computed(() =>
-  compareOn.value
-    ? `Comparing ${compareConfigs.value.length} image models · Text model · ${activeTextName.value}`
+const selectionTip = computed(() => {
+  const names = selectedConfigs.value.map((c) => c.name || c.model || 'Untitled config')
+  return compareMode.value
+    ? `Running ${names.length} models: ${names.join(', ')} · Text model · ${activeTextName.value}`
     : `Image model · ${activeConfigName.value} / Text model · ${activeTextName.value}`
-)
-const imagePillAria = computed(() =>
-  compareOn.value
-    ? `Comparing ${compareConfigs.value.length} image models. Text model: ${activeTextName.value}`
+})
+const selectionAria = computed(() =>
+  compareMode.value
+    ? `Running ${selectedConfigs.value.length} image models. Text model: ${activeTextName.value}`
     : `Image model: ${activeConfigName.value}. Text model: ${activeTextName.value}`
 )
 
@@ -482,6 +514,8 @@ onMounted(() => {
       activeId.value = active.id
       saveActiveId(active.id)
     }
+    // 选择集合起手就是"当前这一条":单选是常态,多选是用户一个个点出来的
+    selectedIds.value = [active.id]
   }
   // 文本配置:按 activeTextId 在列表里找用途为 text 的那条;
   // 没命中(存着的 id 已被删/被改用途)就退而取第一条文本配置并回填 ——
@@ -541,6 +575,13 @@ function saveSettings(draft: ApiConfig) {
     config.value = { ...cfg }
     activeId.value = cfg.id
     saveActiveId(cfg.id)
+    /* 选择集合里必须有"当前"这条,否则参数行胶囊写着它、生成用的却是别的。
+       新建一条时直接收敛成只选它(刚建好就是要用它);改一条已有的,
+       缺了才补上,不能把正在做的多模型对比打散。已经选满则同样收敛 */
+    if (!selectedIds.value.includes(cfg.id)) {
+      selectedIds.value =
+        idx < 0 || selectedIds.value.length >= RACE_MAX ? [cfg.id] : [...selectedIds.value, cfg.id]
+    }
   }
   // 留在设置页看列表:刚存下的那条会带「当前」标记,比直接跳走更容易确认
   cfgView.value = 'list'
@@ -604,6 +645,10 @@ function removeConfig(c: ApiConfig) {
       saveActiveId('')
     }
   }
+  /* 选择集合里也要摘掉它:被删的那条不再参与生成,但它留在集合里会让
+     长度算错 —— 剩两条其实只剩一条,却仍被当成对比模式。摘完一个不剩就退回当前这条 */
+  selectedIds.value = selectedIds.value.filter((id) => id !== c.id)
+  if (!selectedIds.value.length && config.value.id) selectedIds.value = [config.value.id]
 }
 
 function configured() {
@@ -707,6 +752,20 @@ function onPickRef(e: Event) {
   reader.readAsDataURL(file)
   ;(e.target as HTMLInputElement).value = ''
 }
+/* 参考图的存档副本:配方要能完整复现,就得连参考图一起留下 ——
+   hasRef 只说得出"用过参考图",说不出是哪一张,重跑时就会悄悄退化成文生图。
+   压到最长边 512(它只当参考用,不需要原分辨率),存 Blob 不存 data URL,
+   与结果图同一套。压不出来就返回 undefined,按"没存档"处理,不阻断生成 */
+async function refThumbOf(src: string): Promise<Blob | undefined> {
+  if (!src) return undefined
+  try {
+    const out = await compressImage(src, 512, 0.72)
+    return /^data:image\//.test(out) ? await urlToBlob(out) : undefined
+  } catch {
+    return undefined
+  }
+}
+
 // 用 canvas 压缩图片:超过 maxEdge 的最长边等比缩放,透明图铺白底,输出 JPEG
 function compressImage(dataUrl: string, maxEdge = 1024, quality = 0.85): Promise<string> {
   return new Promise((resolve) => {
@@ -763,8 +822,8 @@ async function doGenerate() {
     openConfigManager()
     return
   }
-  // 对比开启时走另一条链路:一次发给多个模型,结果并排
-  if (compareOn.value) {
+  // 选了多个模型时走另一条链路:一次发给每个模型,结果并排
+  if (compareMode.value) {
     await doRace()
     return
   }
@@ -773,6 +832,8 @@ async function doGenerate() {
   running.value = { prompt: prompt.value, size: size.value, n: n.value }
   // 扩展参数与参考图同样要快照:它们在 await 期间可能被改动
   const extras = extraParams()
+  // 种子也是快照的一部分:中途改它不该影响已经发出的这一批
+  const seedNum = seedFor()
   const refSrc = refImage.value
   const startedAt = Date.now()
   controller.value = new AbortController()
@@ -788,6 +849,7 @@ async function doGenerate() {
         size: running.value.size,
         n: running.value.n,
         ...(refSrc ? { image: refSrc } : {}),
+        ...(seedNum !== undefined ? { seed: seedNum } : {}),
         // 由厂商能力表决定带哪些扩展参数:auto 与已知不支持的都不发
         ...extras
       },
@@ -802,6 +864,9 @@ async function doGenerate() {
       quality: extras.quality,
       background: extras.background,
       hasRef: !!refSrc,
+      configId: config.value.id,
+      seed: seedNum,
+      refSrc: refSrc || undefined,
       elapsedMs: Date.now() - startedAt
     })
     await persist(record)
@@ -831,6 +896,11 @@ async function recordFor(
     hasRef?: boolean
     groupId?: string
     elapsedMs: number
+    // 完整配方里其余的三项:重跑时要用它们还原当时的条件
+    configId?: string
+    seed?: number
+    // 参考图本体(data URL)。存一份压过的小图,不然"当时用了哪张参考图"就丢了
+    refSrc?: string
   }
 ): Promise<HistoryEntry> {
   const record: HistoryEntry = {
@@ -842,6 +912,8 @@ async function recordFor(
     background: meta.background,
     hasRef: meta.hasRef,
     groupId: meta.groupId,
+    configId: meta.configId,
+    seed: meta.seed,
     elapsedMs: meta.elapsedMs,
     createdAt: Date.now(),
     results: res
@@ -852,6 +924,7 @@ async function recordFor(
     record.w = t.w
     record.h = t.h
   }
+  if (meta.refSrc) record.ref = await refThumbOf(meta.refSrc)
   return record
 }
 
@@ -884,8 +957,8 @@ async function persist(record: HistoryEntry) {
    同一提示词并发发给每个选中的模型。单个槽位自己吞掉异常,一个失败不影响其他 ——
    这正是这个功能最值钱的地方:并排就能看出是"提示词不行"还是"某个模型不行" */
 async function doRace() {
-  // 没地址或没密钥的配置发不出去,先摘掉:参与对比的必须是能真跑的
-  const targets = compareConfigs.value.filter((c) => c.baseUrl && c.apiKey)
+  // 没地址或没密钥的配置发不出去,先摘掉:参与生成的必须是能真跑的
+  const targets = selectedConfigs.value.filter((c) => c.baseUrl && c.apiKey)
   if (targets.length < 2) {
     fail('Pick at least 2 image models with a base URL and an API key to compare')
     openPanel.value = 'config'
@@ -903,6 +976,7 @@ async function doRace() {
     model: c.model || '',
     size: sizeFor(c),
     extras: extraParams(c),
+    seed: seedFor(c),
     state: 'running',
     results: []
   }))
@@ -927,6 +1001,7 @@ async function doRace() {
               size: slot.size,
               n: 1,
               ...(refSrc ? { image: refSrc } : {}),
+              ...(slot.seed !== undefined ? { seed: slot.seed } : {}),
               ...slot.extras
             },
             cfg,
@@ -961,6 +1036,9 @@ async function doRace() {
         background: slot.extras.background,
         hasRef: !!refSrc,
         groupId: raceGroupId.value,
+        configId: slot.configId,
+        seed: slot.seed,
+        refSrc: refSrc || undefined,
         elapsedMs: slot.elapsedMs || 0
       })
       slot.entryId = record.id
@@ -1001,26 +1079,22 @@ function raceMeta(s: RaceSlot) {
   return parts.join(' · ')
 }
 
-// 开对比时先替用户选好:当前模型优先,再按顺序补到三个 —— 从零个开始点太重
-function toggleCompare() {
-  compareOn.value = !compareOn.value
-  if (compareOn.value && compareConfigs.value.length < 2) {
-    const pool = imageConfigs.value.map((c) => c.id)
-    const picked = [config.value.id, ...pool].filter((id, i, arr) => !!id && arr.indexOf(id) === i)
-    compareIds.value = picked.slice(0, Math.min(3, pool.length))
-  }
-  openPanel.value = ''
-  focusPrompt()
-}
-
-// 对比模式下点芯片是"加入/移出对比",不再是"设为当前"
-function toggleCompareId(id: string) {
-  if (compareIds.value.includes(id)) {
-    compareIds.value = compareIds.value.filter((x) => x !== id)
+/* 点芯片 = 加入/移出这次生成。这就是全部的开关:选一个跟平时一样,选两个以上就是对比 */
+function toggleSelectedId(id: string) {
+  if (selectedIds.value.includes(id)) {
+    // 至少要留一个:一个都不选,生成键就无事可做了
+    if (selectedIds.value.length <= 1) return
+    selectedIds.value = selectedIds.value.filter((x) => x !== id)
+    /* 卸掉的正好是主模型时要顺位给剩下的第一个:尺寸候选、画质门控、
+       改写风格都照主模型来,不能让"当前"指向一个已经不在选择里的配置 */
+    if (config.value.id === id) {
+      const next = imageConfigs.value.find((c) => selectedIds.value.includes(c.id))
+      if (next) activateConfig(next)
+    }
     return
   }
-  if (compareIds.value.length >= RACE_MAX) return
-  compareIds.value = [...compareIds.value, id]
+  if (selectedIds.value.length >= RACE_MAX) return
+  selectedIds.value = [...selectedIds.value, id]
 }
 
 // 终止当前批次(单模型与对比共用同一个 controller)
@@ -1179,17 +1253,33 @@ function closePreview() {
   previewEntry.value = null
 }
 // 复现一条记录:提示词连同当时的参数一起带回,但只套用当前厂商认得的项
+/* 从历史取用一条记录的完整配方。顺序要紧:先切配置,后面几项的能力校验
+   才会按"当时那个模型"来判,而不是按切换前那个 */
 function usePreviewPrompt(p: ReuseParams) {
   prompt.value = p.prompt
+  /* 配置先还原 —— 配方里最容易漏、又最影响结果的就是"当时用的哪个模型"。
+     不还原它,重跑用的其实是当前生效的那个:换了模型却以为是在同一张图上微调。
+     配置已被删掉时保持当前这条,但要说一声,别让人以为还原成了 */
+  if (p.configId && p.configId !== config.value.id) {
+    const c = configs.value.find((x) => x.id === p.configId && x.kind !== 'text')
+    if (c) activateConfig(c)
+    else notice.value = 'The model this image used is no longer in your configs — using the current one.'
+  }
   applySize(p.size)
   if (p.n) n.value = Math.min(N_MAX, Math.max(1, p.n))
   // 已知不支持的厂商直接跳过,免得把界面上根本不存在的档位偷偷塞进去
   if (p.quality && provider.value.quality !== 'no') quality.value = p.quality
   if (p.background && provider.value.background !== 'no') background.value = p.background
+  seed.value = p.seed !== undefined ? String(p.seed) : ''
+  /* 参考图整项覆盖,而不是"有才设":这条记录当初没用参考图,却留着上一张的
+     参考图,下一次生成就会悄悄变成图生图 —— 那是最不该发生的意外 */
+  refImage.value = p.ref || ''
   // 从历史页取用要先回到首页,否则参数填进去了却看不见输入框
   page.value = 'home'
   // 已经在首页时上面这次赋值不会触发滚动(navView 没变),所以这里补一次
   window.scrollTo({ top: 0, behavior: 'smooth' })
+  // 这个动作的目的就是"改一个变量再跑",所以把光标直接放回输入框
+  focusPrompt()
 }
 
 /**
@@ -1352,8 +1442,8 @@ async function toggleMark(entry: HistoryEntry, index: number) {
               <button
                 class="param-btn has-val"
                 :class="{ on: openPanel === 'config', filled: !!configured() }"
-                :data-tip="imagePillTip"
-                :aria-label="imagePillAria"
+                :data-tip="selectionTip"
+                :aria-label="selectionAria"
                 @click="togglePanel('config')"
               >
                 <PhSlidersHorizontal aria-hidden="true" />
@@ -1431,17 +1521,15 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                 </button>
                 <button
                   class="gen-icon"
-                  :disabled="!loading && (enhancing || !prompt.trim() || !raceReady)"
-                  :aria-label="loading ? 'Stop' : compareOn ? 'Compare models' : 'Generate'"
+                  :disabled="!loading && (enhancing || !prompt.trim())"
+                  :aria-label="loading ? 'Stop' : compareMode ? 'Compare models' : 'Generate'"
                   :data-tip="
                     loading
                       ? 'Stop'
                       : enhancing
                         ? 'Rewriting the prompt…'
-                        : compareOn
-                          ? raceReady
-                            ? `Generate with ${compareConfigs.length} models`
-                            : 'Pick at least 2 models to compare'
+                        : compareMode
+                          ? `Generate with ${selectedConfigs.length} models`
                           : 'Generate with Enter'
                   "
                   @click="loading ? stopGenerate() : doGenerate()"
@@ -1462,38 +1550,28 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                     <!-- 出图与改写分两组,各自标各自的"当前";空组不渲染 -->
                     <div v-if="imageConfigs.length" class="pp-group">
                       <span class="pp-label">Image model</span>
+                      <!-- 芯片就是多选:点一下加入/移出这次生成。
+                           选一个 = 平时那样,选两个以上 = 对比模式 ——
+                           不再有单独的"对比"开关,多选本身就是那个开关。
+                           一键切换单个模型仍然是一次点击:先选上新的,再卸掉旧的 -->
                       <button
                         v-for="c in imageConfigs"
                         :key="c.id"
                         class="preset"
-                        :class="{ on: compareOn ? compareIds.includes(c.id) : config.id === c.id }"
+                        :class="{ on: selectedIds.includes(c.id) }"
                         :disabled="
-                          compareOn && !compareIds.includes(c.id) && compareIds.length >= RACE_MAX
+                          !selectedIds.includes(c.id) && selectedIds.length >= RACE_MAX
                         "
                         :title="
-                          compareOn && !compareIds.includes(c.id) && compareIds.length >= RACE_MAX
-                            ? `Compare runs at most ${RACE_MAX} models`
-                            : `${c.baseUrl}${c.model ? ' · ' + c.model : ''}`
+                          !selectedIds.includes(c.id) && selectedIds.length >= RACE_MAX
+                            ? `At most ${RACE_MAX} models can run at once`
+                            : selectedIds.length === 1 && selectedIds.includes(c.id)
+                              ? 'At least one model has to stay selected'
+                              : `${c.baseUrl}${c.model ? ' · ' + c.model : ''}`
                         "
-                        @click="compareOn ? toggleCompareId(c.id) : activateConfig(c)"
+                        @click="toggleSelectedId(c.id)"
                       >
                         {{ c.name || 'Untitled config' }}
-                      </button>
-                      <!-- 对比开关:同一句提示词一次发给多个模型,结果并排。
-                           一个模型没法对比,所以只在有两个以上出图配置时出现。
-                           开着时上面的芯片变成多选(不再是"设为当前") -->
-                      <button
-                        v-if="imageConfigs.length >= 2"
-                        class="pp-action"
-                        :class="{ on: compareOn }"
-                        :title="
-                          compareOn
-                            ? 'Turn off compare'
-                            : `Run the same prompt on up to ${RACE_MAX} models`
-                        "
-                        @click="toggleCompare"
-                      >
-                        {{ compareOn ? `Comparing ${compareIds.length}` : 'Compare models' }}
                       </button>
                     </div>
                     <div v-if="textConfigs.length" class="pp-group">
@@ -1541,6 +1619,24 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                         aria-label="Custom size"
                         @change="commitSize"
                       />
+                    </div>
+
+                    <!-- 种子:它只对"复现同一张图"有意义,所以自成一格,并把话说全 ——
+                         上游从不回传它实际用的那个数,所以这里空着就是"每次都不同" -->
+                    <div v-if="provider.seed !== 'no'" class="pp-group">
+                      <span class="pp-label">Seed</span>
+                      <input
+                        class="num-input seed-input"
+                        :value="seed"
+                        placeholder="Random"
+                        inputmode="numeric"
+                        spellcheck="false"
+                        aria-label="Random seed"
+                        @change="commitSeed"
+                      />
+                      <span class="pp-note">
+                        Same seed with the same settings may reproduce the same image
+                      </span>
                     </div>
                   </div>
 
@@ -2290,6 +2386,10 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   text-align: left;
   padding-left: 12px;
 }
+/* 种子:比默认的 76px 宽,容得下 2147483647 这种十位数 */
+.seed-input {
+  width: 118px;
+}
 /* 面板里的文字动作用中性灰:它是个胶囊形状,和上面那排选项同处一个面板,
    一个紫胶囊夹在灰胶囊中间会显得没做完 */
 .pp-action {
@@ -2302,17 +2402,6 @@ async function toggleMark(entry: HistoryEntry, index: number) {
 }
 .pp-action:hover {
   background: var(--surface-hover);
-}
-/* 开着的时候它和其他胶囊的选中态同一套墨色:它是这个面板里的一个开关,
-   不是一句说明文字 */
-.pp-action.on {
-  background: var(--cta);
-  border-color: var(--cta);
-  color: var(--cta-text);
-}
-.pp-action.on:hover {
-  background: var(--cta-hover);
-  border-color: var(--cta-hover);
 }
 
 .preset {

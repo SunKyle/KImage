@@ -48,6 +48,10 @@ export interface Provider {
   /** 图生图打哪个端点 */
   edit: 'generations' | 'edits'
   protocol: Protocol
+  /* 接口认不认 seed。OpenAI 的 Images API 没有这个参数,标 'no' ——
+     界面就不会给出一个填了也白发、甚至被 400 拒掉的输入框。
+     未知的按 'unknown' 处理:填了就照发,由上游自己决定收不收 */
+  seed: Cap
 }
 
 // 兜底项:baseUrl 认不出来时的归宿
@@ -59,6 +63,7 @@ const CUSTOM: Provider = {
   // 未知厂商一律按"不确定"处理:照常展示参数,但不静默丢弃
   quality: 'unknown',
   background: 'unknown',
+  seed: 'unknown',
   sizes: 'free',
   /* 未知厂商按"认 auto"处理:这里的兜底对象就是 OpenAI 兼容代理,
      如实转发比静默降级好 —— 真发错了会报错提示,而静默丢掉参数只会让人
@@ -87,6 +92,9 @@ const GEMINI: Provider = {
      会被 Google 拒掉。标成不支持,界面就不会给出按不动的开关 */
   quality: 'no',
   background: 'no',
+  /* 原生的 generationConfig 里有 seed 字段,但图像模型认不认没有实测过,
+     所以标 unknown(填了就发),不假装支持也不假装不支持 */
+  seed: 'unknown',
   /* 给的都是能干净约分成 Gemini 认的宽高比的档位:
      1024x1024→1:1、1536x1024→3:2、1024x1536→2:3、1792x1024→16:9、1024x1792→9:16。
      约不出来的值不发这个参数(见 server 的 geminiRatio),不做隐式近似 */
@@ -108,6 +116,8 @@ export const PROVIDERS: Provider[] = [
     model: 'gpt-image-1',
     quality: 'yes',
     background: 'yes',
+    // Images API 没有 seed 参数(那是 ChatGPT 界面里的东西),发了只会被拒
+    seed: 'no',
     sizes: ['auto', '1024x1024', '1536x1024', '1024x1536'],
     autoSize: true,
     edit: 'edits',
@@ -120,6 +130,8 @@ export const PROVIDERS: Provider[] = [
     model: 'doubao-seedream-3-0-t2i',
     quality: 'no',
     background: 'no',
+    // Ark 认不认 seed 没有实测过:按"填了就发"处理,真被拒了上游会报错
+    seed: 'unknown',
     sizes: 'free',
     // Ark 的 size 是枚举,收到 "auto" 会直接报错;它也没有"模型自定比例"这一档
     autoSize: false,
@@ -133,6 +145,8 @@ export const PROVIDERS: Provider[] = [
     model: 'wanx2.1-t2i-turbo',
     quality: 'no',
     background: 'no',
+    // 同 Ark:没有实测过,按"填了就发"处理
+    seed: 'unknown',
     sizes: 'free',
     // 万相的 size 同样是枚举,没有 auto 档
     autoSize: false,
@@ -590,7 +604,8 @@ export async function backfillThumbs(list: HistoryEntry[]): Promise<void> {
 }
 
 /* ===== 历史记录(IndexedDB,容量不受限、真正持久) ===== */
-/** 把一条历史摊成可复现的参数,交给主界面按当前厂商的能力逐项套用 */
+/** 把一条历史摊成可复现的完整配方,交给主界面按当前厂商的能力逐项套用。
+ *  参考图不在返回值里 —— 记录里存的是 Blob,转 data URL 要异步,由调用方补上 */
 export function reuseParamsOf(e: HistoryEntry): ReuseParams {
   return {
     prompt: e.prompt,
@@ -598,7 +613,11 @@ export function reuseParamsOf(e: HistoryEntry): ReuseParams {
     // 实际拿到的张数,而不是当初请求的数值:上游少给了就以实际为准
     n: e.results.length,
     quality: e.quality,
-    background: e.background
+    background: e.background,
+    /* 配方里最容易漏掉的两项。不还原配置,重跑用的其实是"当前生效的那个模型",
+       换了模型却以为是同一张图在微调,对比就失真了 */
+    configId: e.configId,
+    seed: e.seed
   }
 }
 export async function loadHistory() {
