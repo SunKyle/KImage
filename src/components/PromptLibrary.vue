@@ -42,6 +42,21 @@ const openMenu = ref<string>('')
 // 复制成功的短暂回执:库里没有通知系统,就地在这张卡的元信息位置显示一下
 const copiedId = ref('')
 let copiedTimer: number | undefined
+/* 卡片菜单默认朝下开。最后一行离视口底部不够高时改朝上 —— 否则菜单会伸到屏幕外,
+   "删除"那一项根本够不着(实测末行卡片就是这样) */
+const menuUp = ref(false)
+// 菜单大致高度(三项 + 内边距 + 与按钮的间距),留一点余量
+const MENU_ROOM = 130
+
+function toggleMenu(key: string, e: MouseEvent) {
+  if (openMenu.value === key) {
+    openMenu.value = ''
+    return
+  }
+  const r = (e.currentTarget as HTMLElement | null)?.getBoundingClientRect()
+  menuUp.value = !!r && r.bottom + MENU_ROOM > window.innerHeight
+  openMenu.value = key
+}
 
 /* 菜单展开后点别处收起:管理动作低频,不该逼用户再点一次 ⋮ 才能走。
    用 closest 判断"点的是不是某个菜单内部",而不是记住某一个容器 ——
@@ -276,12 +291,12 @@ function onImportFile(e: Event) {
             class="icon-ghost"
             :aria-expanded="openMenu === MENU_MORE"
             aria-label="More actions"
-            @click="openMenu = openMenu === MENU_MORE ? '' : MENU_MORE"
+            @click="toggleMenu(MENU_MORE, $event)"
           >
             <PhDotsThreeVertical weight="bold" aria-hidden="true" />
           </button>
           <Transition name="po">
-            <div v-if="openMenu === MENU_MORE" class="menu">
+            <div v-if="openMenu === MENU_MORE" class="menu" :class="{ up: menuUp }">
               <button class="mitem" @click="exportJson">Export JSON</button>
               <label class="mitem file">
                 Import JSON
@@ -330,13 +345,13 @@ function onImportFile(e: Event) {
             class="sort-btn"
             :aria-expanded="openMenu === MENU_SORT"
             aria-label="Sort prompts"
-            @click="openMenu = openMenu === MENU_SORT ? '' : MENU_SORT"
+            @click="toggleMenu(MENU_SORT, $event)"
           >
             {{ sortLabel }}
             <PhCaretDown aria-hidden="true" />
           </button>
           <Transition name="po">
-            <div v-if="openMenu === MENU_SORT" class="menu">
+            <div v-if="openMenu === MENU_SORT" class="menu" :class="{ up: menuUp }">
               <button
                 v-for="s in SORTS"
                 :key="s.key"
@@ -354,7 +369,7 @@ function onImportFile(e: Event) {
       <ul v-if="filtered.length" class="lib-grid">
         <!-- 封面与正文是一整块可点区域:点开就是这条的详情兼编辑。
              取用/删除留在下沿 —— 它们是"动作",不该和"打开"抢同一次点击 -->
-        <li v-for="item in filtered" :key="item.id" class="card">
+        <li v-for="item in filtered" :key="item.id" class="card" :class="{ 'menu-open': openMenu === item.id }">
           <button
             class="card-open"
             :aria-label="`Open ${titleOf(item)}`"
@@ -395,12 +410,12 @@ function onImportFile(e: Event) {
                   class="icon-ghost sm"
                   :aria-expanded="openMenu === item.id"
                   :aria-label="`Actions for ${titleOf(item)}`"
-                  @click="openMenu = openMenu === item.id ? '' : item.id"
+                  @click="toggleMenu(item.id, $event)"
                 >
                   <PhDotsThreeVertical weight="bold" aria-hidden="true" />
                 </button>
                 <Transition name="po">
-                  <div v-if="openMenu === item.id" class="menu">
+                  <div v-if="openMenu === item.id" class="menu" :class="{ up: menuUp }">
                     <button class="mitem" @click="copyPrompt(item)">Copy prompt</button>
                     <button class="mitem" @click="startEdit(item)">
                       <PhPencilSimple aria-hidden="true" />
@@ -708,7 +723,9 @@ function onImportFile(e: Event) {
 .card {
   display: flex;
   flex-direction: column;
-  overflow: hidden;
+  /* 不设 overflow:hidden —— 卡片菜单是它的绝对定位子元素,会被一起裁掉。
+     封面圆角改由 .cover 自己带(见下),底部的圆角由卡片的背景与边框负责 */
+  position: relative;
   border: 1px solid var(--line);
   border-radius: var(--r);
   background: var(--surface);
@@ -722,6 +739,11 @@ function onImportFile(e: Event) {
   transform: translateY(-2px);
   box-shadow: var(--sh-md);
   border-color: var(--line-strong);
+}
+/* transform 会让这张卡自己形成一个层叠上下文,于是排在它后面的兄弟卡会盖住菜单。
+   菜单开着的那张必须显式抬到它们之上 */
+.card.menu-open {
+  z-index: 2;
 }
 .card-open {
   display: block;
@@ -737,6 +759,9 @@ function onImportFile(e: Event) {
   aspect-ratio: 1;
   overflow: hidden;
   background: var(--image-bg);
+  /* 顶部两个角自己圆掉:卡片不再裁子元素了,这里要跟卡片内沿对齐(减去 1px 边框) */
+  border-top-left-radius: calc(var(--r) - 1px);
+  border-top-right-radius: calc(var(--r) - 1px);
 }
 .cover img {
   width: 100%;
@@ -906,6 +931,11 @@ function onImportFile(e: Event) {
   border: 1px solid var(--line);
   border-radius: var(--r-sm);
   box-shadow: var(--sh-md);
+}
+/* 下方放不下时朝上开:末行的卡片用它,不然菜单会伸到视口外 */
+.menu.up {
+  top: auto;
+  bottom: calc(100% + 6px);
 }
 .mitem {
   display: flex;
