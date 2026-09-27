@@ -3,17 +3,20 @@ import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import {
   PhPlus,
   PhDotsThreeVertical,
-  PhArrowLineUp,
   PhTrash,
-  PhArchive,
-  PhImage
+  PhImage,
+  PhCaretLeft,
+  PhPencilSimple,
+  PhCaretDown,
+  PhX
 } from '@phosphor-icons/vue'
 import { BACKGROUND_OPTIONS, QUALITY_OPTIONS, optionLabel } from '../api'
+import { titleFromPrompt } from '../lib/text'
 import type { PromptItem } from '../types'
 
-/* 提示词库:独立页面,不再是抽屉。
-   整页宽度替代了原来的 410px 窄栏,卡片因此能排成网格、正文能给到两行。
-   挂载由 App.vue 用 v-if 控制,所以切走再回来时搜索词和展开状态会自然重置。 */
+/* 提示词库:独立页面,分两屏 —— 网格(browse)与表单(新建/编辑)。
+   两屏合一而不是各占一个导航项:表单只从库里进出,给它一个平级入口没有意义。
+   这与接口设置页是同一套做法(草稿由表单自己持有,所以"返回"就是真正的放弃)。 */
 
 const props = defineProps<{
   items: PromptItem[]
@@ -22,80 +25,213 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: 'use', item: PromptItem): void
   (e: 'remove', id: string): void
-  (e: 'add', item: PromptItem): void
+  (e: 'save', item: PromptItem): void
   (e: 'import', items: PromptItem[]): void
 }>()
 
+const MENU_MORE = 'more'
+const MENU_SORT = 'sort'
+const view = ref<'grid' | 'form'>('grid')
 const query = ref('')
-const filter = ref('All')
-const menuOpen = ref(false)
-// 菜单展开后点别处收起:低频动作,不该逼用户再点一次 ⋮ 才能走
-const menuEl = ref<HTMLElement | null>(null)
+// 标签筛选。'All' 是"不筛",与标签同处一排,所以单独用一个哨兵值而不是空串
+const tagFilter = ref('All')
+type SortKey = 'recent' | 'title' | 'uses'
+const sort = ref<SortKey>('recent')
+// 哪个菜单开着(卡片菜单用 id,顶部两个用固定键)。同时只开一个
+const openMenu = ref<string>('')
+// 复制成功的短暂回执:库里没有通知系统,就地在这张卡的元信息位置显示一下
+const copiedId = ref('')
+let copiedTimer: number | undefined
+
+/* 菜单展开后点别处收起:管理动作低频,不该逼用户再点一次 ⋮ 才能走。
+   用 closest 判断"点的是不是某个菜单内部",而不是记住某一个容器 ——
+   这一页有三个菜单(顶部管理、排序、每张卡各一个),一个 ref 挂多处只会拿到最后一个 */
 function onDocPointerDown(e: PointerEvent) {
-  if (!menuOpen.value) return
-  const t = e.target as Node | null
-  if (t && menuEl.value?.contains(t)) return
-  menuOpen.value = false
+  if (!openMenu.value) return
+  const t = e.target as Element | null
+  if (t && typeof t.closest === 'function' && t.closest('.menu-wrap')) return
+  openMenu.value = ''
 }
 onMounted(() => document.addEventListener('pointerdown', onDocPointerDown))
-onBeforeUnmount(() => document.removeEventListener('pointerdown', onDocPointerDown))
-const showAdd = ref(false)
-const draftPrompt = ref('')
-const draftCategory = ref('')
-
-const categories = computed(() => {
-  const set = new Set(props.items.map((i) => i.category || 'Uncategorized'))
-  return ['All', ...set]
+onBeforeUnmount(() => {
+  document.removeEventListener('pointerdown', onDocPointerDown)
+  window.clearTimeout(copiedTimer)
 })
+
+// —— 筛选与排序 ——
+
+/* 标签及其条数。按条数从多到少:用得多的排前面,一条的沉在后面。
+   条数直接摆在标签上,不用点进去才知道里面有几条 */
+const tagCounts = computed(() => {
+  const map = new Map<string, number>()
+  for (const it of props.items) for (const t of it.tags || []) map.set(t, (map.get(t) || 0) + 1)
+  return [...map.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+})
+
+const SORTS: Array<{ key: SortKey; label: string }> = [
+  { key: 'recent', label: 'Most recent' },
+  { key: 'uses', label: 'Most used' },
+  { key: 'title', label: 'Title A–Z' }
+]
+const sortLabel = computed(() => SORTS.find((s) => s.key === sort.value)?.label || 'Most recent')
+function pickSort(key: SortKey) {
+  sort.value = key
+  openMenu.value = ''
+}
+
+function titleOf(item: PromptItem): string {
+  return item.title?.trim() || titleFromPrompt(item.prompt)
+}
+
+// 封面角标显示的标签:第一个,加上"还有几个"。多个标签全铺在封面上会盖掉图
+function leadTag(item: PromptItem): string {
+  return (item.tags || [])[0] || ''
+}
+function extraTags(item: PromptItem): number {
+  return Math.max(0, (item.tags || []).length - 1)
+}
 
 const filtered = computed(() => {
   let list = props.items
-  if (filter.value !== 'All') list = list.filter((i) => (i.category || 'Uncategorized') === filter.value)
+  if (tagFilter.value !== 'All') {
+    list = list.filter((i) => (i.tags || []).includes(tagFilter.value))
+  }
   const q = query.value.trim().toLowerCase()
-  if (q) list = list.filter((i) => i.prompt.toLowerCase().includes(q))
-  return list
+  if (q) {
+    /* 标题与标签一起参与搜索:只看正文的话,记得住标题或标签的人反而搜不到 */
+    list = list.filter((i) =>
+      `${i.title || ''} ${i.prompt} ${(i.tags || []).join(' ')}`.toLowerCase().includes(q)
+    )
+  }
+  const out = [...list]
+  if (sort.value === 'title') out.sort((a, b) => titleOf(a).localeCompare(titleOf(b)))
+  else if (sort.value === 'uses') out.sort((a, b) => (b.uses || 0) - (a.uses || 0) || b.createdAt - a.createdAt)
+  // 默认:最近存的在最前(props.items 本身已是这个顺序,这里显式写出来免得依赖上游)
+  else out.sort((a, b) => b.createdAt - a.createdAt)
+  return out
 })
 
-/* 参数拼成一行用 · 连接。原来三个描边小胶囊在 322px 的卡里是三个小盒子,
-   跟提示词抢视线;拼成一行之后它退成背景信息,提示词才立得住 */
+/* 卡片下沿那行:模型名;没有模型的手动条目就写存下来的时间。
+   不写尺寸 —— 挑提示词的人不看尺寸,而它会把这一行撑到截断(实测
+   "banana2-4k · 1024x1024" 在一张卡里放不下,只能显示成 "102…") */
+function metaLine(item: PromptItem): string {
+  return item.model || fmtDate(item.createdAt)
+}
+
+/* 表单右栏那份只读的参数摘要。它们是收藏时自动记下的,改参数去生成页那边改。
+   尺寸写成 × 而不是 x:界面上其他地方都是这么写的 */
 function paramLine(item: PromptItem): string {
   const out: string[] = []
-  if (item.size) out.push(item.size === 'auto' ? 'Auto' : item.size)
   if (item.quality) out.push(optionLabel(QUALITY_OPTIONS, item.quality))
   if (item.background) out.push(optionLabel(BACKGROUND_OPTIONS, item.background))
   return out.join(' · ')
 }
+function savedParams(item: PromptItem): string {
+  const size = item.size === 'auto' ? 'Auto' : item.size?.replace('x', '×')
+  return [size, paramLine(item)].filter(Boolean).join(' · ')
+}
 
-// 搜索和分类是两套筛选,空态里要能一键把两个都清掉
+function fmtDate(t: number) {
+  const d = new Date(t)
+  const p = (x: number) => String(x).padStart(2, '0')
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
+// 搜索与标签是两套筛选,空态里要能一键把两个都清掉
 function resetFilter() {
   query.value = ''
-  filter.value = 'All'
+  tagFilter.value = 'All'
 }
 
-function startAdd() {
-  menuOpen.value = false
-  showAdd.value = true
+// —— 表单 ——
+
+const draft = ref<PromptItem>(blank())
+const draftTag = ref('')
+// 已经有别的条目在用的标签:点一下就加,免得到处是拼写只差一点点的重名标签
+const suggestedTags = computed(() =>
+  tagCounts.value.map(([t]) => t).filter((t) => !(draft.value.tags || []).includes(t))
+)
+const draftTitle = computed(() => titleOf(draft.value))
+
+function blank(): PromptItem {
+  return { id: '', prompt: '', tags: [], title: '', createdAt: Date.now() }
 }
 
-function addCurrent() {
-  const text = draftPrompt.value.trim()
-  if (!text) return
-  emit('add', {
-    id: Date.now() + Math.random().toString(16).slice(2),
-    prompt: text,
-    category: draftCategory.value.trim() || 'Uncategorized',
-    createdAt: Date.now()
-  })
-  draftPrompt.value = ''
-  draftCategory.value = ''
-  showAdd.value = false
+function startNew() {
+  draft.value = blank()
+  draftTag.value = ''
+  openMenu.value = ''
+  view.value = 'form'
 }
+
+function startEdit(item: PromptItem) {
+  // 复制一份:表单改的是草稿,取消就等于没发生过
+  draft.value = { ...item, tags: [...(item.tags || [])] }
+  draftTag.value = ''
+  openMenu.value = ''
+  view.value = 'form'
+}
+
+function cancelForm() {
+  view.value = 'grid'
+}
+
+function addDraftTag(raw?: string) {
+  const t = (raw ?? draftTag.value).trim()
+  if (!t) return
+  const tags = draft.value.tags || []
+  // 大小写不同的同一个词不该并存,但保留用户第一次写下的那种拼法
+  if (!tags.some((x) => x.toLowerCase() === t.toLowerCase())) tags.push(t)
+  draft.value.tags = tags
+  draftTag.value = ''
+}
+
+function dropDraftTag(t: string) {
+  draft.value.tags = (draft.value.tags || []).filter((x) => x !== t)
+}
+
+/* 草稿里只留用户真正填过的东西:空标签数组、空标题、空参数的字段
+   存下来只会让 JSON 变长,读取时还要多一层判断 */
+function saveForm() {
+  const prompt = draft.value.prompt.trim()
+  if (!prompt) return
+  const item: PromptItem = {
+    ...draft.value,
+    prompt,
+    title: draft.value.title?.trim() || undefined,
+    model: draft.value.model?.trim() || undefined,
+    tags: (draft.value.tags || []).map((t) => t.trim()).filter(Boolean),
+    id: draft.value.id || Date.now() + Math.random().toString(16).slice(2)
+  }
+  emit('save', item)
+  view.value = 'grid'
+}
+
+// —— 卡片动作 ——
+
+async function copyPrompt(item: PromptItem) {
+  openMenu.value = ''
+  try {
+    await navigator.clipboard.writeText(item.prompt)
+    copiedId.value = item.id
+    window.clearTimeout(copiedTimer)
+    copiedTimer = window.setTimeout(() => (copiedId.value = ''), 1600)
+  } catch {
+    /* 剪贴板写不进去时什么都不做:回执说"已复制"而实际没写,
+       比没有回执更糟 —— 用户会关掉页面才发现粘贴出来是旧的 */
+  }
+}
+
+function removeItem(item: PromptItem) {
+  openMenu.value = ''
+  emit('remove', item.id)
+}
+
+// —— 导入导出 ——
 
 function exportJson() {
-  menuOpen.value = false
-  const blob = new Blob([JSON.stringify(props.items, null, 2)], {
-    type: 'application/json'
-  })
+  openMenu.value = ''
+  const blob = new Blob([JSON.stringify(props.items, null, 2)], { type: 'application/json' })
   const a = document.createElement('a')
   a.href = URL.createObjectURL(blob)
   a.download = `kimage-prompts-${Date.now()}.json`
@@ -105,7 +241,7 @@ function exportJson() {
 }
 
 function onImportFile(e: Event) {
-  menuOpen.value = false
+  openMenu.value = ''
   const file = (e.target as HTMLInputElement).files?.[0]
   if (!file) return
   const reader = new FileReader()
@@ -120,35 +256,32 @@ function onImportFile(e: Event) {
   reader.readAsText(file)
   ;(e.target as HTMLInputElement).value = ''
 }
-
-function fmt(t: number) {
-  const d = new Date(t)
-  const p = (x: number) => String(x).padStart(2, '0')
-  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
-}
 </script>
 
 <template>
   <section class="lib" aria-label="Prompt library">
-    <header class="lib-head">
-      <div class="lib-title-wrap">
-        <h1 class="lib-title">Prompt Library</h1>
-        <p class="lib-sub">
-          {{ items.length }} {{ items.length === 1 ? 'prompt' : 'prompts' }}<template v-if="filter !== 'All'"> · Current category "{{ filter }}"</template>
-        </p>
-      </div>
-      <div class="lib-ops">
-        <button class="lib-new" @click="startAdd">
-          <PhPlus aria-hidden="true" />
-          New prompt
-        </button>
-        <!-- 管理动作低频,收进菜单,不给标题行添按钮 -->
-        <span ref="menuEl" class="menu-wrap">
-          <button class="icon-ghost" :aria-expanded="menuOpen" aria-label="More" @click="menuOpen = !menuOpen">
+    <!-- ===== 浏览 ===== -->
+    <template v-if="view === 'grid'">
+      <header class="lib-head">
+        <div>
+          <h1 class="lib-title">Prompt Library</h1>
+          <p class="lib-sub">
+            {{ items.length }} {{ items.length === 1 ? 'prompt' : 'prompts' }} · saved in this
+            browser
+          </p>
+        </div>
+        <!-- 导入导出是低频管理动作,收进菜单,不给标题行添按钮 -->
+        <span class="menu-wrap">
+          <button
+            class="icon-ghost"
+            :aria-expanded="openMenu === MENU_MORE"
+            aria-label="More actions"
+            @click="openMenu = openMenu === MENU_MORE ? '' : MENU_MORE"
+          >
             <PhDotsThreeVertical weight="bold" aria-hidden="true" />
           </button>
           <Transition name="po">
-            <div v-if="menuOpen" class="menu">
+            <div v-if="openMenu === MENU_MORE" class="menu">
               <button class="mitem" @click="exportJson">Export JSON</button>
               <label class="mitem file">
                 Import JSON
@@ -157,99 +290,272 @@ function fmt(t: number) {
             </div>
           </Transition>
         </span>
-      </div>
-    </header>
+      </header>
 
-    <!-- 工具栏:整页宽度下分类直接换行,不再像窄抽屉那样横向滚动藏起来 -->
-    <div class="lib-tools">
-      <input v-model="query" class="search" placeholder="Search prompts…" spellcheck="false" />
-      <div v-if="categories.length > 1" class="cat-row">
-        <button
-          v-for="c in categories"
-          :key="c"
-          class="cat"
-          :class="{ on: filter === c }"
-          @click="filter = c"
-        >
-          {{ c }}
+      <!-- 一行:搜索 + 新建。标题独占上排之后,这两个最常用的动作在同一行里相遇 -->
+      <div class="lib-tools">
+        <input
+          v-model="query"
+          class="search"
+          type="search"
+          placeholder="Search prompts, titles or tags…"
+          spellcheck="false"
+          aria-label="Search prompts"
+        />
+        <button class="lib-new" @click="startNew">
+          <PhPlus aria-hidden="true" />
+          New prompt
         </button>
       </div>
-    </div>
 
-    <div v-if="showAdd" class="add-form">
-      <input v-model="draftPrompt" placeholder="Enter a prompt" @keydown.enter="addCurrent" />
-      <input v-model="draftCategory" placeholder="Category (default: Uncategorized)" @keydown.enter="addCurrent" />
-      <div class="add-ops">
-        <button class="add-go" @click="addCurrent">Save to library</button>
-        <button class="add-cancel" @click="showAdd = false">Cancel</button>
+      <div v-if="items.length" class="lib-filter">
+        <div class="cat-row">
+          <button class="cat" :class="{ on: tagFilter === 'All' }" @click="tagFilter = 'All'">
+            All
+            <span class="cat-n">{{ items.length }}</span>
+          </button>
+          <button
+            v-for="[t, n] in tagCounts"
+            :key="t"
+            class="cat"
+            :class="{ on: tagFilter === t }"
+            @click="tagFilter = t"
+          >
+            {{ t }}
+            <span class="cat-n">{{ n }}</span>
+          </button>
+        </div>
+        <span class="menu-wrap">
+          <button
+            class="sort-btn"
+            :aria-expanded="openMenu === MENU_SORT"
+            aria-label="Sort prompts"
+            @click="openMenu = openMenu === MENU_SORT ? '' : MENU_SORT"
+          >
+            {{ sortLabel }}
+            <PhCaretDown aria-hidden="true" />
+          </button>
+          <Transition name="po">
+            <div v-if="openMenu === MENU_SORT" class="menu">
+              <button
+                v-for="s in SORTS"
+                :key="s.key"
+                class="mitem"
+                :class="{ on: sort === s.key }"
+                @click="pickSort(s.key)"
+              >
+                {{ s.label }}
+              </button>
+            </div>
+          </Transition>
+        </span>
       </div>
-    </div>
 
-    <ul v-if="filtered.length" class="lib-grid">
-      <!-- 卡片不再整块可点:以前点一下是翻面看封面,而那一面是唯一有图的地方,
-           既没有视觉提示、也只是把 320px 的图放大到卡宽。现在封面直接铺在正面,
-           点击这个动作就没有必要了 —— 留在卡上的只有两个真动作(取用 / 删除) -->
-      <li v-for="item in filtered" :key="item.id" class="card">
-        <div class="cover">
-          <img v-if="item.thumb" :src="item.thumb" alt="" />
-          <!-- 手动新建的提示词没有配图。做成一块安静的底,不画"缺图"的警示 ——
-               它只是没存过封面,不是出错 -->
-          <span v-else class="cover-none" aria-hidden="true">
-            <PhImage />
-          </span>
-        </div>
-        <div class="card-body">
-          <div class="card-meta">
-            <span class="card-cat">{{ item.category || 'Uncategorized' }}</span>
-            <span class="card-time">{{ fmt(item.createdAt) }}</span>
+      <ul v-if="filtered.length" class="lib-grid">
+        <!-- 封面与正文是一整块可点区域:点开就是这条的详情兼编辑。
+             取用/删除留在下沿 —— 它们是"动作",不该和"打开"抢同一次点击 -->
+        <li v-for="item in filtered" :key="item.id" class="card">
+          <button
+            class="card-open"
+            :aria-label="`Open ${titleOf(item)}`"
+            @click="startEdit(item)"
+          >
+            <span class="cover">
+              <img v-if="item.thumb" :src="item.thumb" alt="" />
+              <!-- 手动新建的提示词没有配图。做成一块安静的底,不画"缺图"的警示 ——
+                   它只是没存过封面,不是出错 -->
+              <span v-else class="cover-none" aria-hidden="true"><PhImage /></span>
+              <span v-if="leadTag(item)" class="cover-tag">
+                {{ leadTag(item) }}
+                <template v-if="extraTags(item)">+{{ extraTags(item) }}</template>
+              </span>
+              <!-- 次数摆在封面上:它回答"这条我到底用过没有",而不占正文的行 -->
+              <span v-if="item.uses" class="cover-uses">{{ item.uses }}×</span>
+            </span>
+            <span class="card-body">
+              <b class="card-title">{{ titleOf(item) }}</b>
+              <span class="card-text">{{ item.prompt }}</span>
+            </span>
+          </button>
+          <div class="card-foot">
+            <span v-if="copiedId === item.id" class="card-meta copied">Copied</span>
+            <span v-else class="card-meta" :title="fmtDate(item.createdAt)">{{
+              metaLine(item)
+            }}</span>
+            <div class="ops">
+              <button
+                class="use-btn"
+                :aria-label="`Use: ${titleOf(item)}`"
+                @click="emit('use', item)"
+              >
+                Use
+              </button>
+              <span class="menu-wrap">
+                <button
+                  class="icon-ghost sm"
+                  :aria-expanded="openMenu === item.id"
+                  :aria-label="`Actions for ${titleOf(item)}`"
+                  @click="openMenu = openMenu === item.id ? '' : item.id"
+                >
+                  <PhDotsThreeVertical weight="bold" aria-hidden="true" />
+                </button>
+                <Transition name="po">
+                  <div v-if="openMenu === item.id" class="menu">
+                    <button class="mitem" @click="copyPrompt(item)">Copy prompt</button>
+                    <button class="mitem" @click="startEdit(item)">
+                      <PhPencilSimple aria-hidden="true" />
+                      Edit
+                    </button>
+                    <button class="mitem danger" @click="removeItem(item)">
+                      <PhTrash aria-hidden="true" />
+                      Delete
+                    </button>
+                  </div>
+                </Transition>
+              </span>
+            </div>
           </div>
-          <div class="card-text">{{ item.prompt }}</div>
-        </div>
-        <div class="card-foot">
-          <span class="card-params">{{ paramLine(item) }}</span>
-          <div class="ops">
-            <button
-              class="op"
-              data-tip="Use prompt"
-              :aria-label="`Use: ${item.prompt.slice(0, 20)}`"
-              @click="emit('use', item)"
-            >
-              <PhArrowLineUp aria-hidden="true" />
-            </button>
-            <button
-              class="op op-del"
-              data-tip="Delete"
-              :aria-label="`Delete: ${item.prompt.slice(0, 20)}`"
-              @click="emit('remove', item.id)"
-            >
-              <PhTrash aria-hidden="true" />
-            </button>
-          </div>
-        </div>
-      </li>
-    </ul>
+        </li>
+      </ul>
 
-    <!-- 空态分两种:库里真没有(引到新建) / 筛选没命中(给一键清空) -->
-    <div v-else class="lib-none">
-      <div class="none-ico" aria-hidden="true">
-        <!-- Phosphor 的 Archive:表达"库还是空的" -->
-        <PhArchive aria-hidden="true" />
+      <!-- 空态分两种:库里真没有(引到新建) / 筛选没命中(给一键清空) -->
+      <div v-else class="lib-none">
+        <h2 class="none-title">{{ items.length ? 'No matching prompts' : 'No prompts yet' }}</h2>
+        <p class="none-sub">
+          {{
+            items.length
+              ? 'Try another keyword, or switch the tag back to "All".'
+              : 'Generate an image, then open the preview and choose "More actions → Save to library". You can also write one here.'
+          }}
+        </p>
+        <button v-if="items.length" class="none-action" @click="resetFilter">Clear filters</button>
+        <button v-else class="none-action" @click="startNew">New prompt</button>
       </div>
-      <h2 class="none-title">{{ items.length ? 'No matching prompts' : 'No prompts yet' }}</h2>
-      <p class="none-sub">
-        {{
-          items.length
-            ? 'Try another keyword, or switch the category back to "All".'
-            : 'Generate an image, then open the preview and choose "More actions → Save to library". You can also add one here.'
-        }}
-      </p>
-      <button v-if="items.length" class="none-action" @click="resetFilter">Clear filters</button>
-      <button v-else class="none-action" @click="startAdd">New prompt</button>
-    </div>
+    </template>
+
+    <!-- ===== 新建 / 编辑 ===== -->
+    <template v-else>
+      <header class="form-head">
+        <button class="back" @click="cancelForm">
+          <PhCaretLeft aria-hidden="true" />
+          Library
+        </button>
+        <h1 class="lib-title">{{ draft.id ? 'Edit prompt' : 'New prompt' }}</h1>
+        <p class="lib-sub">
+          {{
+            draft.id
+              ? 'Change anything here. The saved parameters stay as they were.'
+              : 'Write a prompt you want to keep. Tags are yours — a prompt can carry several.'
+          }}
+        </p>
+      </header>
+
+      <div class="form-grid">
+        <div class="form-main">
+          <label class="field">
+            <span class="field-label">Title</span>
+            <input
+              v-model="draft.title"
+              class="field-input"
+              :placeholder="draft.prompt ? draftTitle : 'Optional — taken from the prompt'"
+              spellcheck="false"
+            />
+          </label>
+
+          <label class="field">
+            <span class="field-label">Prompt</span>
+            <textarea
+              v-model="draft.prompt"
+              class="field-area"
+              rows="9"
+              placeholder="Describe the image…"
+              spellcheck="false"
+            ></textarea>
+          </label>
+
+          <div class="field">
+            <span class="field-label">Tags</span>
+            <div class="tag-edit">
+              <span v-for="t in draft.tags || []" :key="t" class="tag-chip">
+                {{ t }}
+                <button :aria-label="`Remove tag ${t}`" @click="dropDraftTag(t)">
+                  <PhX aria-hidden="true" />
+                </button>
+              </span>
+              <input
+                v-model="draftTag"
+                class="tag-input"
+                placeholder="Add a tag and press Enter"
+                spellcheck="false"
+                aria-label="Add tag"
+                @keydown.enter.prevent="addDraftTag()"
+              />
+            </div>
+            <!-- 已经在别处用过的标签:点一下就加。不给这一步的话,
+                 同一个词会以几种拼法各存一份,标签就失去了分类的意义 -->
+            <div v-if="suggestedTags.length" class="tag-suggest">
+              <span class="tag-suggest-label">Used before</span>
+              <button
+                v-for="t in suggestedTags.slice(0, 8)"
+                :key="t"
+                class="tag-suggest-item"
+                @click="addDraftTag(t)"
+              >
+                {{ t }}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <aside class="form-side">
+          <div class="field">
+            <span class="field-label">Cover</span>
+            <span class="side-cover">
+              <img v-if="draft.thumb" :src="draft.thumb" alt="" />
+              <span v-else class="cover-none" aria-hidden="true"><PhImage /></span>
+            </span>
+            <span class="side-hint">
+              {{
+                draft.thumb
+                  ? 'Kept from the image this prompt came from.'
+                  : 'No cover — this prompt was written by hand.'
+              }}
+            </span>
+          </div>
+
+          <label class="field">
+            <span class="field-label">Model</span>
+            <input v-model="draft.model" class="field-input" placeholder="Not recorded" spellcheck="false" />
+          </label>
+
+          <div v-if="savedParams(draft)" class="field">
+            <span class="field-label">Saved parameters</span>
+            <span class="side-hint">{{ savedParams(draft) }}</span>
+            <span class="side-hint dim">Changing these happens on the generate page.</span>
+          </div>
+
+          <div v-if="draft.id" class="field">
+            <span class="field-label">Saved</span>
+            <span class="side-hint">
+              {{ fmtDate(draft.createdAt) }}
+              <template v-if="draft.uses"> · used {{ draft.uses }}×</template>
+            </span>
+          </div>
+        </aside>
+      </div>
+
+      <div class="form-ops">
+        <button class="ops-cancel" @click="cancelForm">Cancel</button>
+        <button class="ops-save" :disabled="!draft.prompt.trim()" @click="saveForm">
+          {{ draft.id ? 'Save changes' : 'Save to library' }}
+        </button>
+      </div>
+    </template>
   </section>
 </template>
 
 <style scoped>
+/* ===== 浏览 ===== */
 .lib-head {
   display: flex;
   flex-wrap: wrap;
@@ -270,19 +576,39 @@ function fmt(t: number) {
   /* 用 text-2 而不是 text-3:#999 在浅色面上只有 2.85:1,正文级文字要达到 4.5:1 */
   color: var(--text-2);
 }
-.lib-ops {
+/* 搜索与新建同处一行:两者都是"从这里开始"的动作,分到两行就散了 */
+.lib-tools {
   display: flex;
   align-items: center;
-  gap: 8px;
-  /* 与标题基线对齐时略微抬起,避免贴着页面下沿 */
-  padding-bottom: 2px;
+  gap: var(--sp-3);
+  margin-top: var(--sp-5);
+}
+.search {
+  flex: 1;
+  min-width: 0;
+  height: 40px;
+  padding: 0 14px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  font-size: var(--fs-base);
+  transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+}
+.search:focus {
+  outline: none;
+  border-color: color-mix(in oklch, var(--accent) 45%, var(--line));
+  box-shadow: 0 6px 22px -10px color-mix(in oklch, var(--accent) 40%, transparent);
+}
+.search::-webkit-search-cancel-button {
+  -webkit-appearance: none;
 }
 .lib-new {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  height: 34px;
-  padding: 0 14px;
+  flex: none;
+  height: 40px;
+  padding: 0 16px;
   border-radius: 999px;
   background: var(--cta);
   color: var(--cta-text);
@@ -297,89 +623,17 @@ function fmt(t: number) {
 .lib-new:hover {
   background: var(--cta-hover);
 }
-.icon-ghost {
-  width: 34px;
-  height: 34px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  color: var(--text-2);
-  background: var(--surface);
-  cursor: pointer;
-  transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease),
-    background var(--dur) var(--ease);
-}
-.icon-ghost svg {
-  width: 15px;
-  height: 15px;
-}
-.icon-ghost:hover {
-  color: var(--text);
-  border-color: var(--line-strong);
-  background: var(--bg-elev);
-}
 
-/* 右上角菜单:管理动作低频,收进来给列表让出空间 */
-.menu-wrap {
-  position: relative;
-  display: inline-flex;
-}
-.menu {
-  position: absolute;
-  top: calc(100% + 6px);
-  right: 0;
-  z-index: 6;
-  min-width: 148px;
-  padding: 4px;
-  display: flex;
-  flex-direction: column;
-  background: var(--surface);
-  border: 1px solid var(--line);
-  border-radius: var(--r-sm);
-  box-shadow: var(--sh-md);
-}
-.mitem {
-  padding: 8px 10px;
-  text-align: left;
-  font-size: var(--fs-sm);
-  color: var(--text-2);
-  border-radius: 6px;
-  cursor: pointer;
-  transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
-}
-.mitem:hover {
-  background: var(--bg-elev);
-  color: var(--text);
-}
-.file {
-  display: block;
-}
-
-.lib-tools {
+/* 标签与排序同处一行:一个筛、一个排,是同一层级的"看哪几条、按什么顺序" */
+.lib-filter {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
+  justify-content: space-between;
   gap: var(--sp-3);
-  margin-top: var(--sp-5);
+  margin-top: var(--sp-4);
   padding-bottom: var(--sp-4);
   border-bottom: 1px solid var(--line);
-}
-.search {
-  flex: 1 1 220px;
-  max-width: 420px;
-  padding: 9px 12px;
-  border: 1px solid var(--line);
-  border-radius: var(--r-sm);
-  background: var(--surface);
-  font-size: var(--fs-base);
-  transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
-}
-.search:focus {
-  outline: none;
-  border-color: color-mix(in oklch, var(--accent) 45%, var(--line));
-  box-shadow: 0 6px 22px -10px color-mix(in oklch, var(--accent) 40%, transparent);
 }
 .cat-row {
   display: flex;
@@ -387,7 +641,10 @@ function fmt(t: number) {
   gap: 6px;
 }
 .cat {
-  padding: 4px 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 11px;
   border-radius: 999px;
   font-size: var(--fs-xs);
   border: 1px solid var(--line);
@@ -403,82 +660,54 @@ function fmt(t: number) {
 /* 选中态用 accent-soft 而不是实心填充,与参数面板的 .param-btn.on 同一档 */
 .cat.on {
   background: var(--accent-soft);
-  border-color: color-mix(in oklch, var(--accent) 45%, transparent);
-  color: var(--accent-strong);
+  border-color: color-mix(in oklch, var(--accent) 35%, var(--line));
+  color: var(--accent);
+  font-weight: 500;
 }
-
-.add-form {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin-top: var(--sp-4);
-  padding: var(--sp-3);
-  border: 1px solid var(--line-strong);
-  border-radius: var(--r-sm);
-  background: var(--surface);
+/* 条数:小一号且更淡,它是注解不是标签名的一部分 */
+.cat-n {
+  font-size: var(--fs-micro);
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
 }
-.add-form input {
-  padding: 8px 10px;
+.cat.on .cat-n {
+  color: color-mix(in oklch, var(--accent) 70%, transparent);
+}
+.sort-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  height: 32px;
+  padding: 0 12px;
   border: 1px solid var(--line);
-  border-radius: var(--r-sm);
-  background: var(--surface);
-  font-size: var(--fs-sm);
-}
-.add-form input:focus {
-  outline: none;
-  border-color: color-mix(in oklch, var(--accent) 45%, var(--line));
-}
-.add-ops {
-  display: flex;
-  gap: 8px;
-}
-.add-go {
-  flex: 1;
-  /* 撑满剩余宽度,文案本该居中;全局 button 重置改成 text-align: inherit 后,
-     这里不再有浏览器默认的居中,得就地写回来 */
-  text-align: center;
-  padding: 8px;
-  border-radius: var(--r-sm);
-  background: var(--cta);
-  color: var(--cta-text);
-  font-size: var(--fs-sm);
-  cursor: pointer;
-  transition: background var(--dur) var(--ease);
-}
-.add-go:hover {
-  background: var(--cta-hover);
-}
-.add-cancel {
-  padding: 8px 14px;
-  border: 1px solid var(--line);
-  border-radius: var(--r-sm);
+  border-radius: 999px;
+  font-size: var(--fs-xs);
   color: var(--text-2);
-  font-size: var(--fs-sm);
-  cursor: pointer;
+  transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease);
 }
-.add-cancel:hover {
-  border-color: var(--line-strong);
+.sort-btn svg {
+  width: 12px;
+  height: 12px;
+}
+.sort-btn:hover {
   color: var(--text);
+  border-color: var(--line-strong);
 }
 
-/* 网格:定宽多列,与首页图墙、历史图墙同一套排法 ——
-   卡片高矮不一,定宽多列比 auto-fill 网格更能把空格子吃掉,排得紧凑 */
+/* ===== 卡片 ===== */
+/* 用 grid 而不是多列瀑布流:封面固定 1:1、正文固定两行,卡片本来就等高,
+   多列反而会让行与行错开 */
 .lib-grid {
   list-style: none;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(228px, 1fr));
+  gap: var(--sp-4);
   margin-top: var(--sp-5);
-  column-width: 240px;
-  column-gap: var(--sp-3);
-  /* 提示词的显示上限(行数)。封面已经占了上半张卡,正文再给满会让卡片长成
-     一条 1:2 的白条,整墙扫不动 —— 完整提示词去预览卡读。
-     要调卡片的最大高度只改这一个值,.card-text 那边不用动 */
-  --card-text-lines: 4;
 }
 .card {
-  /* 多列布局下纵向间距要靠 margin:column-gap 只管列与列之间,管不了上下;
-     break-inside 防止一张卡被拆到两列去 */
-  margin: 0 0 var(--sp-3);
-  break-inside: avoid;
-  /* 圆角靠 overflow 裁封面:图要铺到卡片边缘,不能留白边 */
+  display: flex;
+  flex-direction: column;
   overflow: hidden;
   border: 1px solid var(--line);
   border-radius: var(--r);
@@ -490,225 +719,489 @@ function fmt(t: number) {
    这里要的只是"这张被指到了";阴影升到 --sh-md,与首页图砖取齐 */
 .card:hover,
 .card:focus-within {
-  border-color: var(--line-strong);
-  box-shadow: var(--sh-md);
   transform: translateY(-2px);
+  box-shadow: var(--sh-md);
+  border-color: var(--line-strong);
 }
-
-/* —— 封面 ——
-   库页原先把封面藏在翻面背后,那是全站唯一一处"图不在正面"的地方,而翻面这件事
-   没有任何视觉提示 —— 于是整墙读起来是一叠白纸。库里存的是提示词,但提示词是
-   写给图看的,封面放正面之后这一页才和首页图墙、历史图墙是同一套语言 */
+.card-open {
+  display: block;
+  width: 100%;
+  padding: 0;
+  text-align: left;
+  cursor: pointer;
+}
 .cover {
   position: relative;
-  /* 固定正方形并裁切,不跟每张图的真实比例走 ——
-     提示词长短本来就不一,封面高度再浮动的话,每张卡的正文起点都不一样,整墙扫不动。
-     选 1:1 是因为它对混合比例是最不亏的那一档:本站最常见的输出就是 1024×1024,
-     那它是零裁切;横图(3:2)保留 2/3 宽度,竖图(2:3)保留 2/3 高度。
-     换成 4:3 看着更"照片",但竖图只剩一半高度,封面就认不出是哪张了 */
-  aspect-ratio: 1 / 1;
+  display: grid;
+  place-items: center;
+  aspect-ratio: 1;
   overflow: hidden;
   background: var(--image-bg);
 }
 .cover img {
-  display: block;
   width: 100%;
   height: 100%;
   object-fit: cover;
   transition: transform 600ms var(--ease);
 }
-/* 与首页图砖同一档反馈:悬停时封面极缓推近 */
 .card:hover .cover img {
   transform: scale(1.04);
 }
-/* 手动新建的提示词没有配图,做成一块安静的底。
-   不画"缺图"的警示 —— 它只是没存过封面,不是出错 */
 .cover-none {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
   color: var(--text-4);
 }
 .cover-none svg {
-  width: 24px;
-  height: 24px;
+  width: 26px;
+  height: 26px;
 }
-/* 脚注与正文之间靠留白分开,不画横线 */
-.card-body {
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-2);
-  padding: var(--sp-4) var(--sp-4) var(--sp-3);
-}
-
-/* 分类是全大写微标签,和首屏标题上方那行是同一档读音 ——
-   全站只有这两处用这种"拉开字距的小字",于是它们自动成了一组:
-   一处说这是什么站,一处说这条属于哪一类。
-   字号压到 11px 是为了让它安静下来:提示词才是这张卡最重的元素 */
-.card-meta {
-  display: flex;
-  align-items: baseline;
-  gap: var(--sp-2);
+/* 封面上的两个角标:标签在左上,取用次数在右下。
+   都压在图上,所以都要自带底衬,不然浅色图上读不出来 */
+.cover-tag,
+.cover-uses {
+  position: absolute;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 3px 8px;
+  border-radius: 999px;
   font-size: var(--fs-micro);
-  line-height: 1.4;
-  color: var(--text-3);
+  font-weight: 500;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.55);
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
 }
-.card-cat {
-  /* 分类是用户自己填的,可能很长;列变窄后要能自己截断,不能把右边的时间挤掉 */
-  min-width: 0;
+.cover-tag {
+  top: 8px;
+  left: 8px;
+  max-width: calc(100% - 16px);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-weight: 500;
-  letter-spacing: var(--ls-eyebrow);
-  text-transform: uppercase;
 }
-.card-time {
-  /* 时间不能被压:分类已经会自己截断,这里再跟着缩就两边都读不全 */
-  flex: none;
-  margin-left: auto;
+.cover-uses {
+  right: 8px;
+  bottom: 8px;
   font-variant-numeric: tabular-nums;
 }
+.card-body {
+  display: block;
+  padding: 12px 14px 10px;
+}
+.card-title {
+  display: block;
+  font-size: var(--fs-base);
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 正文固定两行:封面已经占了整张卡的上半,正文再放开会让卡片长成一条竖条,
+   整页扫不动 —— 完整提示词点开卡片就能看到 */
 .card-text {
-  /* 提示词是这张卡的主角:字号最大、颜色最深。
-     line-clamp 就是这张卡的最大高度:几行就显示几行,行数由
-     .lib-grid 上的 --card-text-lines 统一控制 */
   display: -webkit-box;
   -webkit-box-orient: vertical;
-  -webkit-line-clamp: var(--card-text-lines, 4);
+  -webkit-line-clamp: 2;
   overflow: hidden;
-  font-size: var(--fs-md);
-  line-height: 1.58;
-  color: var(--text);
-}
-.ops {
-  display: flex;
-  flex-shrink: 0;
-  gap: 2px;
-  margin-left: auto;
-}
-/* 图标用 --text-2:比 --text-3 重一档,悬停前的分量和正文里的动作图标一致 */
-.op {
-  width: 28px;
-  height: 28px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border: 1px solid transparent;
-  border-radius: var(--r-sm);
+  margin-top: 4px;
+  font-size: var(--fs-xs);
+  line-height: 1.5;
   color: var(--text-2);
-  background: none;
-  cursor: pointer;
-  transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease),
-    background var(--dur) var(--ease), transform 120ms var(--ease);
-}
-.op svg {
-  width: 15px;
-  height: 15px;
-}
-.op:hover {
-  color: var(--accent-strong);
-  border-color: color-mix(in oklch, var(--accent) 45%, transparent);
-  background: var(--accent-soft);
-}
-.op:active {
-  transform: scale(0.94);
-}
-.op-del:hover {
-  color: var(--danger);
-  border-color: color-mix(in oklch, var(--danger) 45%, var(--line));
-  background: color-mix(in oklch, var(--danger) 8%, transparent);
 }
 .card-foot {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: var(--sp-2);
-  padding: 0 var(--sp-4) var(--sp-4);
+  margin-top: auto;
+  padding: 10px 12px 10px 14px;
+  border-top: 1px solid var(--line);
 }
-/* 参数是一行文字,不是三个小胶囊:它只是背景信息,
-   拼成一行之后不再跟提示词抢视线,一行也够放下 */
-.card-params {
+.card-meta {
   min-width: 0;
-  font-size: var(--fs-xs);
-  font-variant-numeric: tabular-nums;
-  color: var(--text-2);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-size: var(--fs-micro);
+  color: var(--text-3);
+}
+.card-meta.copied {
+  color: var(--accent);
+  font-weight: 500;
+}
+.ops {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+.use-btn {
+  display: inline-flex;
+  align-items: center;
+  height: 30px;
+  padding: 0 12px;
+  border-radius: 999px;
+  font-size: var(--fs-xs);
+  color: var(--text-2);
+  /* 有描边才读得出这是个按钮,而不是一行文字 */
+  border: 1px solid var(--line);
+  transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease),
+    background var(--dur) var(--ease);
+}
+.use-btn:hover {
+  color: var(--text);
+  border-color: var(--line-strong);
+  background: var(--bg-elev);
 }
 
+/* ===== 菜单(顶部管理与卡片菜单共用一个外观) ===== */
+.menu-wrap {
+  position: relative;
+  display: inline-flex;
+}
+.icon-ghost {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--text-2);
+  background: var(--surface);
+  cursor: pointer;
+  transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease),
+    background var(--dur) var(--ease);
+}
+.icon-ghost svg {
+  width: 15px;
+  height: 15px;
+}
+/* 卡片里的那个小一号:它和 Use 并排,占满 40px 会把那一行顶高 */
+.icon-ghost.sm {
+  width: 30px;
+  height: 30px;
+  border-color: transparent;
+}
+.icon-ghost:hover {
+  color: var(--text);
+  border-color: var(--line-strong);
+  background: var(--bg-elev);
+}
+.menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 6;
+  min-width: 152px;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  box-shadow: var(--sh-md);
+}
+.mitem {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  text-align: left;
+  font-size: var(--fs-sm);
+  color: var(--text-2);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+.mitem svg {
+  width: 14px;
+  height: 14px;
+}
+.mitem:hover {
+  background: var(--bg-elev);
+  color: var(--text);
+}
+.mitem.on {
+  color: var(--accent);
+  font-weight: 500;
+}
+.mitem.danger:hover {
+  color: var(--danger, #b4232a);
+}
+.file {
+  display: block;
+}
+
+/* ===== 空态 ===== */
 .lib-none {
   display: flex;
   flex-direction: column;
   align-items: center;
   text-align: center;
-  padding: var(--sp-8) var(--sp-4);
-}
-.none-ico {
-  width: 44px;
-  height: 44px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--text-3);
-  opacity: 0.7;
-}
-.none-ico svg {
-  width: 28px;
-  height: 28px;
+  padding: clamp(48px, 12vh, 110px) var(--sp-4);
 }
 .none-title {
-  margin-top: var(--sp-3);
-  font-size: var(--fs-lg);
+  font-size: var(--fs-xl);
   font-weight: 600;
-  color: var(--text-2);
 }
 .none-sub {
   margin-top: 8px;
-  max-width: 380px;
+  max-width: 46ch;
   font-size: var(--fs-sm);
-  line-height: 1.7;
+  line-height: 1.6;
   color: var(--text-2);
 }
 .none-action {
   margin-top: var(--sp-5);
-  height: 34px;
+  height: 36px;
   padding: 0 16px;
-  border: 1px solid var(--line);
   border-radius: 999px;
-  color: var(--text);
+  border: 1px solid var(--line-strong);
   font-size: var(--fs-sm);
-  cursor: pointer;
-  transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease);
+  color: var(--text);
+  transition: background var(--dur) var(--ease);
 }
 .none-action:hover {
-  border-color: var(--line-strong);
-  background: var(--bg-elev);
+  background: var(--surface-hover);
 }
 
-.po-enter-active,
-.po-leave-active {
-  transition: opacity 140ms var(--ease), transform 140ms var(--ease);
+/* ===== 表单 ===== */
+.form-head {
+  padding-top: var(--sp-2);
 }
-.po-enter-from,
-.po-leave-to {
-  opacity: 0;
-  transform: translateY(-4px);
+.back {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: var(--sp-4);
+  font-size: var(--fs-sm);
+  color: var(--text-2);
+  transition: color var(--dur) var(--ease);
+}
+.back svg {
+  width: 13px;
+  height: 13px;
+}
+.back:hover {
+  color: var(--text);
+}
+/* 左编辑右信息:右栏不是"设置",而是这条记录本身的样子(封面、模型、参数)。
+   两栏都只在 860px 以上并排,窄屏一律单列 */
+.form-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  gap: var(--sp-6, 32px);
+  margin-top: var(--sp-5);
+}
+.form-main,
+.form-side {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-5);
+  min-width: 0;
+}
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.field-label {
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  color: var(--text-2);
+}
+.field-input,
+.field-area {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  font-size: var(--fs-base);
+  transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+}
+.field-area {
+  line-height: 1.6;
+  resize: vertical;
+  min-height: 180px;
+}
+.field-input:focus,
+.field-area:focus {
+  outline: none;
+  border-color: color-mix(in oklch, var(--accent) 45%, var(--line));
+  box-shadow: 0 6px 22px -10px color-mix(in oklch, var(--accent) 40%, transparent);
 }
 
-/* 窄屏:标题收一档避免与右上角操作按钮挤压;
-   输入框提到 16px,防止 iOS Safari 聚焦时放大整页 */
-@media (max-width: 640px) {
-  .lib-title {
-    font-size: var(--fs-xl);
+.tag-edit {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+}
+.tag-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 6px 4px 10px;
+  border-radius: 999px;
+  font-size: var(--fs-xs);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.tag-chip button {
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  color: inherit;
+  opacity: 0.7;
+  transition: opacity var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+.tag-chip button:hover {
+  opacity: 1;
+  background: color-mix(in oklch, var(--accent) 15%, transparent);
+}
+.tag-chip svg {
+  width: 11px;
+  height: 11px;
+}
+.tag-input {
+  flex: 1;
+  min-width: 150px;
+  padding: 4px 2px;
+  font-size: var(--fs-base);
+}
+.tag-suggest {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.tag-suggest-label {
+  font-size: var(--fs-micro);
+  color: var(--text-3);
+}
+.tag-suggest-item {
+  padding: 3px 9px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 999px;
+  font-size: var(--fs-micro);
+  color: var(--text-2);
+  transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease);
+}
+.tag-suggest-item:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+.side-cover {
+  display: grid;
+  place-items: center;
+  aspect-ratio: 1;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  background: var(--image-bg);
+}
+.side-cover img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.side-hint {
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+  color: var(--text-2);
+}
+.side-hint.dim {
+  color: var(--text-3);
+}
+.form-ops {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--sp-3);
+  margin-top: var(--sp-6, 32px);
+  padding-top: var(--sp-5);
+  border-top: 1px solid var(--line);
+}
+.ops-cancel,
+.ops-save {
+  height: 40px;
+  padding: 0 20px;
+  border-radius: 999px;
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease),
+    border-color var(--dur) var(--ease);
+}
+.ops-cancel {
+  border: 1px solid var(--line-strong);
+  color: var(--text-2);
+}
+.ops-cancel:hover {
+  color: var(--text);
+  background: var(--surface-hover);
+}
+.ops-save {
+  background: var(--cta);
+  color: var(--cta-text);
+}
+.ops-save:hover:not(:disabled) {
+  background: var(--cta-hover);
+}
+.ops-save:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* 窄屏:两栏并排要先有宽度,不够就单列;顺带把触控目标提到 40px */
+@media (max-width: 860px) {
+  .form-grid {
+    grid-template-columns: minmax(0, 1fr);
   }
+  /* 侧栏挪到正文之后:窄屏上先写内容,再看它长什么样 */
+  .form-side {
+    order: 2;
+  }
+}
+@media (max-width: 720px) {
+  .lib-tools {
+    flex-wrap: wrap;
+  }
+  .lib-new {
+    width: 100%;
+    justify-content: center;
+  }
+  .icon-ghost.sm,
+  .use-btn {
+    min-width: 40px;
+    height: 40px;
+  }
+  /* 标签上的 × 跟着放大一档。它嵌在胶囊里,做到 40px 会让标签本身变成一个大方块,
+     所以取一个能稳稳点到的中间值 —— 它是个次要动作,主路径是输入框回车 */
+  .tag-chip {
+    padding: 6px 8px 6px 12px;
+  }
+  .tag-chip button {
+    width: 24px;
+    height: 24px;
+  }
+  .field-input,
+  .field-area,
+  .tag-input,
   .search {
-    font-size: var(--fs-lg);
-  }
-  .add-form input {
-    font-size: var(--fs-lg);
+    /* 16px 以下 iOS Safari 聚焦时会放大整页 */
+    font-size: 16px;
   }
 }
 </style>

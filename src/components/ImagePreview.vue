@@ -285,6 +285,8 @@ function menuAction(kind: 'favorite' | 'download' | 'remove') {
     const item = props.entry.results[active.value]
     emit('favorite', {
       prompt: props.entry.prompt,
+      // 模型也带上:库里没有它,卡片就只能显示参数,看不出这张是谁出的
+      model: props.entry.model,
       size: props.entry.size,
       quality: props.entry.quality,
       background: props.entry.background,

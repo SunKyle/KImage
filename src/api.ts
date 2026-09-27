@@ -647,6 +647,20 @@ export async function saveHistoryRecord(entry: HistoryEntry) {
 
 /* ===== 提示词库(收藏) ===== */
 const LIB_KEY = 'kimage.prompts'
+/* 提示词库的读入规范化。老记录只有一个 category 字符串,新的是 tags 数组;
+   两套字段的判断收口在这里,别散到各个组件里去分辨"这条是新的还是旧的"。
+   'Uncategorized' 是当初的默认值,不是用户填的,转成标签只会多出一个噪声分类 */
+export function normalizePrompt(p: PromptItem): PromptItem {
+  const out: PromptItem = { ...p }
+  if (!Array.isArray(out.tags)) {
+    const legacy = (out.category || '').trim()
+    out.tags = legacy && legacy !== 'Uncategorized' ? [legacy] : []
+  }
+  out.tags = [...new Set(out.tags.map((t) => String(t).trim()).filter(Boolean))]
+  delete out.category
+  return out
+}
+
 export function loadPrompts(): PromptItem[] {
   try {
     const raw = localStorage.getItem(LIB_KEY)
@@ -655,10 +669,12 @@ export function loadPrompts(): PromptItem[] {
     // 存的是本地数据,但别信它一定是好的:被写坏(同步工具截断、手改)时
     // 直接当数组用会让整个库页崩掉,这里滤一遍,坏项丢掉即可
     if (!Array.isArray(list)) return []
-    return list.filter(
-      (p): p is PromptItem =>
-        !!p && typeof p === 'object' && typeof (p as PromptItem).prompt === 'string'
-    )
+    return list
+      .filter(
+        (p): p is PromptItem =>
+          !!p && typeof p === 'object' && typeof (p as PromptItem).prompt === 'string'
+      )
+      .map(normalizePrompt)
   } catch {
     return []
   }

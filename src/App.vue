@@ -41,6 +41,7 @@ import {
   saveHistoryRecord,
   loadPrompts,
   savePrompts,
+  normalizePrompt,
   getProvider,
   inferVendor,
   allowedSizes,
@@ -52,6 +53,7 @@ import {
   BACKGROUND_OPTIONS
 } from './api'
 import { blobToDataURL, urlToBlob } from './lib/idb'
+import { titleFromPrompt } from './lib/text'
 import type { Cap, EnhanceMode, Provider } from './api'
 import type { ApiConfig, FavoritePayload, HistoryEntry, PromptItem, ResultItem, ReuseParams } from './types'
 
@@ -675,6 +677,10 @@ function useLibItem(item: PromptItem) {
   // 画质/背景同样过一遍能力表:库里存的可能是别家厂商支持的档位
   if (item.quality && provider.value.quality !== 'no') quality.value = item.quality
   if (item.background && provider.value.background !== 'no') background.value = item.background
+  /* 记一次取用。这是库里唯一一个"随时间变化"的数字,它回答的是
+     "我到底在用哪些提示词" —— 不记的话,一年后翻库只能靠感觉 */
+  item.uses = (item.uses || 0) + 1
+  persistLib()
   // 关掉库页就等于切回首页;回顶部由 navView 的 watch 统一负责,这里不必再来一次
   page.value = 'home'
 }
@@ -682,8 +688,12 @@ function removeLibItem(id: string) {
   libItems.value = libItems.value.filter((i) => i.id !== id)
   persistLib()
 }
-function addLibItem(item: PromptItem) {
-  libItems.value = [item, ...libItems.value]
+/* 新建与编辑走同一个出口:按 id 判断是插入还是覆盖。
+   分成两个 emit 会让"编辑"这件事在库页多一次分支判断,而它本来就只是"存一条" */
+function saveLibItem(item: PromptItem) {
+  const idx = libItems.value.findIndex((i) => i.id === item.id)
+  if (idx >= 0) libItems.value[idx] = item
+  else libItems.value = [item, ...libItems.value]
   persistLib()
 }
 function importLibItems(items: PromptItem[]) {
@@ -691,16 +701,16 @@ function importLibItems(items: PromptItem[]) {
   // 超大的 thumb 会顶爆 localStorage 配额,两者都必须在入口拦掉
   const clean: PromptItem[] = items
     .filter((i) => i && typeof i.prompt === 'string' && i.prompt.trim())
-    .map((i) => ({
-      id: i.id || uid(),
-      prompt: i.prompt,
-      category: i.category || 'Uncategorized',
-      size: i.size,
-      quality: i.quality,
-      background: i.background,
-      thumb: typeof i.thumb === 'string' && i.thumb.startsWith('data:image/') ? i.thumb : undefined,
-      createdAt: typeof i.createdAt === 'number' ? i.createdAt : Date.now()
-    }))
+    .map((i) =>
+      normalizePrompt({
+        ...i,
+        id: i.id || uid(),
+        prompt: i.prompt,
+        thumb:
+          typeof i.thumb === 'string' && i.thumb.startsWith('data:image/') ? i.thumb : undefined,
+        createdAt: typeof i.createdAt === 'number' ? i.createdAt : Date.now()
+      })
+    )
   libItems.value = [...clean, ...libItems.value]
   persistLib()
 }
@@ -1219,32 +1229,8 @@ function fmtDate(ts: number) {
   return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
 }
 
-/* 短标题结尾要摘掉的虚词。放模块级是为了不每次调用都重建正则 */
-const TAIL_STOP =
-  /\s+(of|in|on|at|with|and|or|for|to|from|by|the|a|an|as|into|over|under|that|is|are)$/i
-
-/* 图砖上的短标题:从提示词开头取几个词,让每块砖有名字可认。
-   不新增字段存它 —— 提示词本来就在历史记录里,派生得出来的东西不必再落一份盘,
-   这样已有记录也立刻有标题,不用迁移。
+/* 短标题的派生逻辑在 lib/text.ts:图砖角标与提示词库卡片共用同一个口径。
    完整提示词仍然只挂在 img 的 alt 上(读屏能拿到),角标里不出现,免得挡图 */
-function tileTitle(prompt: string) {
-  const s = (prompt || '').replace(/\s+/g, ' ').trim()
-  if (!s) return 'Untitled'
-  const cap = (t: string) => t.charAt(0).toUpperCase() + t.slice(1)
-  /* 拉丁文按词切,顺便去掉开头的冠词:
-     "A cinematic portrait of a girl" 里的 A 只是语法,做了标题就是噪声 */
-  if (!/[\u3400-\u9fff]/.test(s)) {
-    const cut = s.replace(/^(a|an|the)\s+/i, '').split(' ').slice(0, 4).join(' ')
-    /* 切在虚词上收不住尾:"cinematic portrait of a" 读起来像被截断,
-       所以把结尾的 of / in / the 这类非实词摘掉,直到落在一个实词上 */
-    let out = cut
-    while (TAIL_STOP.test(out)) out = out.replace(TAIL_STOP, '')
-    // 整句都是虚词的极端情况:别返回空串,退回没修过的结果
-    return cap(out || cut)
-  }
-  // 中日韩没有空格,按词切会把整句糊上来,所以按字截
-  return s.slice(0, 12)
-}
 
 function openPreview(entry: HistoryEntry) {
   previewEntry.value = entry
@@ -1302,7 +1288,9 @@ async function favoriteFromPreview(p: FavoritePayload) {
   const item: PromptItem = {
     id: uid(),
     prompt: p.prompt,
-    category: 'Uncategorized',
+    // 新条目起手没有标签:标签是用户自己的分类法,替他猜一个只会多出噪声
+    tags: [],
+    model: p.model,
     size: p.size,
     quality: p.quality,
     background: p.background,
@@ -1861,7 +1849,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                   <!-- 悬停浮出短标题与元信息:提示词动辄两三行,压在缩略图上把图挡掉大半,
                        而这块砖是用来扫图的;要读完整提示词点开预览即可 -->
                   <span class="tile-veil">
-                    <span class="tile-name">{{ tileTitle(t.entry.prompt) }}</span>
+                    <span class="tile-name">{{ titleFromPrompt(t.entry.prompt) }}</span>
                     <span class="tile-meta">{{ fmtDate(t.entry.createdAt) }} · {{ sizeLabel(t.entry.size) }}</span>
                   </span>
                 </button>
@@ -1878,7 +1866,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
         :items="libItems"
         @use="useLibItem"
         @remove="removeLibItem"
-        @add="addLibItem"
+        @save="saveLibItem"
         @import="importLibItems"
       />
 

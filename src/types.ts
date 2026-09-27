@@ -36,7 +36,16 @@ export interface GenParams {
 export interface PromptItem {
   id: string
   prompt: string
-  category: string // 分类/标签
+  /* 标签。一条提示词可以挂多个 —— 原先只有一个 category 字符串,
+     加这个字段时把它并了进来(见 api.ts 的 normalizePrompt) */
+  tags?: string[]
+  // 自定义标题。空着就按提示词开头派生一个(见 lib/text.ts)
+  title?: string
+  // 存进库时用的是哪个模型。手动新建的没有
+  model?: string
+  /* 取用次数。它回答的是"我到底在用哪些提示词",不是社交意义上的热度 ——
+     数据全在本机,也没有别人可以比较 */
+  uses?: number
   // 收藏时一并记下这几个参数,从库里取用时才能完整复现,而不是只填回提示词
   size?: string
   quality?: string
@@ -45,12 +54,16 @@ export interface PromptItem {
   // 库存在 localStorage(配额约 5MB),所以压得很紧:160px / webp 0.6,通常 5~9KB
   thumb?: string
   createdAt: number
+  // 旧字段:加 tags 之前只有一个分类字符串。读入时并进 tags,不再写回
+  category?: string
 }
 
 // 预览里「收藏到提示词库」时一起交出来的内容:
 // 提示词 + 当时真正发出去的参数 + 当前这张图的渲染地址(用来生成封面缩略图)
 export interface FavoritePayload {
   prompt: string
+  // 出这张图用的模型。库里存下来,以后翻卡才看得出"这张是谁出的"
+  model?: string
   size: string
   quality?: string
   background?: string
