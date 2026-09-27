@@ -517,6 +517,16 @@ const racePrompt = ref('')
 // 同一次对比的各条记录共用一个分组 id
 const raceGroupId = ref('')
 const raceRunning = computed(() => raceSlots.value.some((s) => s.state === 'running'))
+/* 图墙的占位格子:单模型看张数,对比看模型数 —— 数量不同,形式一样。
+   对比进行中刻意不走"一排对比槽位"那套骨架:还没有图可比,那种布局把页面
+   切成另一副样子,出图后又得切回来 */
+const skeletonCount = computed(() =>
+  raceRunning.value ? raceSlots.value.length : running.value.n > 0 ? running.value.n : 1
+)
+// 占位按发起时锁定的尺寸取比例;对比时各家尺寸可能不同,取第一个就够
+const skeletonSize = computed(() =>
+  raceRunning.value ? raceSlots.value[0]?.size || size.value : running.value.size
+)
 /* 参数行上的出图胶囊:多选时写成"主模型 +N"。这里必须说清楚 ——
    点一下芯片就从单模型变成多模型,生成键又只是个图标,
    不在胶囊上写明"这次要跑几个",加选一个模型就会变成一次双倍花费的意外 */
@@ -1877,22 +1887,13 @@ async function toggleMark(entry: HistoryEntry, index: number) {
           </div>
         </div>
 
-        <!-- 对比面板:同一句提示词的各家结果并排。生成中与生成后都留在这里 ——
-             它取代图墙,免得刚出的几张在上面板与下图墙里各出现一次 -->
-        <div v-if="raceSlots.length" class="feed-zone" aria-live="polite">
+        <!-- 对比结果:同一句提示词的各家结果并排。只在出图后出现 ——
+             生成中不摆一排空槽位:那时还没有图可比,那种骨架既说明不了什么,
+             又把页面切成另一副布局,出图后还得再切回来。生成中的占位交给下面的图墙 -->
+        <div v-if="raceSlots.length && !raceRunning" class="feed-zone" aria-live="polite">
           <div class="section-head">
-            <LatticeLoader
-              v-if="raceRunning"
-              class="sec-title"
-              label="Comparing"
-              :font-size="20"
-              :cell-size="6"
-              :gap="2"
-            />
-            <span v-else class="sec-title">Compare · {{ raceSlots.length }} models</span>
-            <!-- 跑动中不给关:已经回来的槽位还没走到落盘那一步,关掉等于把它们扔了。
-                 要提前结束就用输入框右边那个停止键(和单模型同一条路) -->
-            <div v-if="!raceRunning" class="sec-tools">
+            <span class="sec-title">Compare · {{ raceSlots.length }} models</span>
+            <div class="sec-tools">
               <button class="sec-more" @click="dismissRace">
                 Close
                 <PhX aria-hidden="true" />
@@ -1935,16 +1936,22 @@ async function toggleMark(entry: HistoryEntry, index: number) {
           </div>
         </div>
 
-        <!-- 历史图墙:输入框下方展示最近生成的图,可收起 -->
-        <div v-else-if="loading || feedItems.length" class="feed-zone" aria-live="polite">
+        <!-- 历史图墙:输入框下方展示最近生成的图,可收起。
+             对比出图进行中也走这一支:占位与单模型一样是图墙式的格子,
+             只是格子数等于参与对比的模型数 -->
+        <div
+          v-else-if="loading || raceRunning || feedItems.length"
+          class="feed-zone"
+          aria-live="polite"
+        >
           <div class="section-head">
-            <span v-if="!loading" class="sec-title">Recent creations</span>
+            <span v-if="!loading && !raceRunning" class="sec-title">Recent creations</span>
             <!-- 生成中换成格子波 + 秒表:尺寸与字重都对齐 sec-title,
                  生成结束时从加载态切回标题不会跳一下 -->
             <LatticeLoader
               v-else
               class="sec-title"
-              label="Generating"
+              :label="raceRunning ? 'Comparing' : 'Generating'"
               :font-size="20"
               :cell-size="6"
               :gap="2"
@@ -1970,10 +1977,10 @@ async function toggleMark(entry: HistoryEntry, index: number) {
             <div class="fold-inner">
               <div class="feed-grid">
                 <div
-                  v-for="k in loading ? (running.n > 0 ? running.n : 1) : 0"
+                  v-for="k in loading || raceRunning ? skeletonCount : 0"
                   :key="`sk-${k}`"
                   class="tile tile-skel"
-                  :style="{ aspectRatio: String(tileRatio(running.size)) }"
+                  :style="{ aspectRatio: String(tileRatio(skeletonSize)) }"
                 >
                   <div class="skel-shimmer"></div>
                 </div>
