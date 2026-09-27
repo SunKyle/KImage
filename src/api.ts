@@ -275,11 +275,20 @@ export function loadConfigs(): ApiConfig[] {
   }
   // 兼容旧的单份配置格式
   try {
-    const raw = localStorage.getItem('kimage.apiConfig')
+    const LEGACY_KEY = 'kimage.apiConfig'
+    const raw = localStorage.getItem(LEGACY_KEY)
     if (raw) {
       const c = JSON.parse(raw)
       const list: ApiConfig[] = [normalizeConfig({ id: uid(), name: 'Default config', ...c })]
       saveConfigs(list)
+      /* 搬完就把旧键删掉:新键已经写好,它留着没有用,而里面带着 API Key ——
+         "一份密钥在这个站点上存了两处"不该是长期状态。
+         删除单独兜一层:它失败不该把这次迁移一起判死,否则好不容易读出来的配置会丢 */
+      try {
+        localStorage.removeItem(LEGACY_KEY)
+      } catch {
+        /* 读得到就删得掉,这里只是不把删除失败升级成"配置也读不出来" */
+      }
       return list
     }
   } catch {
