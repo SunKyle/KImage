@@ -494,7 +494,9 @@ const shownN = computed(() => (compareMode.value ? 1 : n.value))
 watch(compareMode, (on) => {
   if (on && openPanel.value === 'n') openPanel.value = ''
 })
-// 一个槽位 = 一个模型 × 这一次请求。results 为空表示还没回来
+/* 一个槽位 = 一个模型 × 这一次请求。它只用来盯这一批的进展
+   (占位格子数、失败统计、生成键的忙闲),结果出来后各条走普通的历史记录 ——
+   没有单独的"对比面板":同一批图不该有两套呈现方式 */
 type RaceSlot = {
   configId: string
   label: string
@@ -508,18 +510,12 @@ type RaceSlot = {
   results: ResultItem[]
   error?: string
   elapsedMs?: number
-  // 落盘后指向历史记录,点开预览要用
-  entryId?: string
 }
 const raceSlots = ref<RaceSlot[]>([])
-// 这一批用的提示词:槽位里不各存一份,它们本来就是同一句
-const racePrompt = ref('')
 // 同一次对比的各条记录共用一个分组 id
 const raceGroupId = ref('')
 const raceRunning = computed(() => raceSlots.value.some((s) => s.state === 'running'))
-/* 图墙的占位格子:单模型看张数,对比看模型数 —— 数量不同,形式一样。
-   对比进行中刻意不走"一排对比槽位"那套骨架:还没有图可比,那种布局把页面
-   切成另一副样子,出图后又得切回来 */
+/* 图墙的占位格子:单模型看张数,对比看模型数 —— 数量不同,形式一样 */
 const skeletonCount = computed(() =>
   raceRunning.value ? raceSlots.value.length : running.value.n > 0 ? running.value.n : 1
 )
@@ -1098,7 +1094,6 @@ async function doRace() {
   }
   const runPrompt = prompt.value
   const refSrc = refImage.value
-  racePrompt.value = runPrompt
   raceGroupId.value = `race-${Date.now().toString(36)}`
   /* 尺寸与扩展参数在发起前逐配置定下来:中途改参数不该影响已经发出的这一批,
      而且各模型的合法尺寸/参数本来就不一样,不能拿一家的能力套所有家 */
@@ -1152,8 +1147,8 @@ async function doRace() {
         }
       })
     )
-    /* 跑完的槽位落进历史:它们已经是用户看得见的图,不存就等于关掉面板就没了。
-       (单模型那条路中断后不入历史 —— 那时根本没有图可言,这里不一样) */
+    /* 跑完的槽位落进历史:它们已经是用户看得见的图,和平时生成的图一视同仁,
+       在图墙里等着。 */
     for (const slot of raceSlots.value) {
       if (slot.state !== 'done' || !slot.results.length) continue
       /* 必须取原始数组:槽位上的 results 是响应式代理,而 indexedDB 用结构化克隆
@@ -1173,42 +1168,24 @@ async function doRace() {
         refSrc: refSrc || undefined,
         elapsedMs: slot.elapsedMs || 0
       })
-      slot.entryId = record.id
       await persist(record)
     }
-    // 全盘皆输才占用错误区;部分成功不报错 —— 成败各自写在槽位里
-    if (raceSlots.value.every((s) => s.state === 'error')) {
-      fail('Every model failed. See the compare panel for each error.', true)
+    /* 成败都从提示通道说一声。没有并排面板了,哪几家没出来只能在这里交代 ——
+       全盘皆输占用错误区(有原文和重试),部分失败走中性的 notice,不打断 */
+    const failed = raceSlots.value.filter((s) => s.state === 'error')
+    const names = failed.map((s) => s.model || s.label).join(', ')
+    if (failed.length === raceSlots.value.length) {
+      fail(
+        raceSlots.value.map((s) => `${s.model || s.label}: ${s.error || 'failed'}`).join('\n'),
+        true
+      )
+    } else if (failed.length) {
+      notice.value = `${names} failed — the rest are in your recent creations`
     }
   } finally {
     loading.value = false
     controller.value = null
   }
-}
-
-/* 关掉对比面板:图已经落进历史了,关掉只是回到图墙。
-   跑动中不给关(那时头部只写"Comparing…")—— 否则已经回来的那几个槽位
-   还没走到落盘那一步,关掉就等于把它们扔了 */
-function dismissRace() {
-  raceSlots.value = []
-  racePrompt.value = ''
-}
-
-// 点开某个槽的大图:它在历史里已经是一条普通记录,复用同一个预览卡
-function openRaceSlot(s: RaceSlot) {
-  const entry = history.value.find((h) => h.id === s.entryId)
-  if (entry) openPreview(entry)
-}
-
-// 槽位第二行:配置名(与模型名重复时省掉)、尺寸、耗时或状态
-function raceMeta(s: RaceSlot) {
-  const parts: string[] = []
-  if (s.label && s.label !== s.model) parts.push(s.label)
-  parts.push(sizeLabel(s.size))
-  if (s.state === 'error') parts.push('failed')
-  else if (s.state === 'stopped') parts.push('stopped')
-  else if (s.state === 'done') parts.push(`${((s.elapsedMs || 0) / 1000).toFixed(1)}s`)
-  return parts.join(' · ')
 }
 
 /* 点芯片 = 加入/移出这次生成。这就是全部的开关:选一个跟平时一样,选两个以上就是对比 */
@@ -1887,60 +1864,12 @@ async function toggleMark(entry: HistoryEntry, index: number) {
           </div>
         </div>
 
-        <!-- 对比结果:同一句提示词的各家结果并排。只在出图后出现 ——
-             生成中不摆一排空槽位:那时还没有图可比,那种骨架既说明不了什么,
-             又把页面切成另一副布局,出图后还得再切回来。生成中的占位交给下面的图墙 -->
-        <div v-if="raceSlots.length && !raceRunning" class="feed-zone" aria-live="polite">
-          <div class="section-head">
-            <span class="sec-title">Compare · {{ raceSlots.length }} models</span>
-            <div class="sec-tools">
-              <button class="sec-more" @click="dismissRace">
-                Close
-                <PhX aria-hidden="true" />
-              </button>
-            </div>
-          </div>
-          <div class="race-board" :style="{ '--race-cols': String(raceSlots.length) }">
-            <article v-for="s in raceSlots" :key="s.configId" class="race-slot">
-              <!-- 标签在图上:各列的名字与耗时因此天然对齐在同一行,
-                   底下的图可以各自不同的比例,不会把脚注拉得高低不齐 -->
-              <div class="race-foot">
-                <b class="race-name" :title="s.model || s.label">{{ s.model || s.label }}</b>
-                <span class="race-meta">{{ raceMeta(s) }}</span>
-              </div>
-              <!-- 只有占位与失败态需要给个形状(占位按所选尺寸,失败态按同一尺寸),
-                   出图后不再约束比例:auto 档下各家输出的比例并不相同,
-                   裁掉两侧就看不出构图差异了 —— 而看构图正是对比的目的 -->
-              <div
-                class="race-media"
-                :style="
-                  s.state === 'done' ? undefined : { aspectRatio: String(tileRatio(s.size)) }
-                "
-              >
-                <div v-if="s.state === 'running'" class="skel-shimmer"></div>
-                <button
-                  v-else-if="s.state === 'done'"
-                  class="race-open"
-                  :aria-label="`Open ${s.model || s.label}`"
-                  @click="openRaceSlot(s)"
-                >
-                  <img :src="imageSrc(s.results[0])" :alt="racePrompt" />
-                </button>
-                <!-- 失败与中断分开写:分不清"是你停的"还是"模型坏了",
-                     并排看结果这件事就失去意义了 -->
-                <p v-else class="race-note" :title="s.error || ''">
-                  {{ s.state === 'stopped' ? 'Stopped' : s.error || 'Failed' }}
-                </p>
-              </div>
-            </article>
-          </div>
-        </div>
-
         <!-- 历史图墙:输入框下方展示最近生成的图,可收起。
-             对比出图进行中也走这一支:占位与单模型一样是图墙式的格子,
-             只是格子数等于参与对比的模型数 -->
+             对比出图的各家结果也落进这里,和平时生成的图一视同仁 ——
+             单独摆一排"对比面板"等于给同一批图两套呈现方式,关掉面板图就"消失"了,
+             而它们本来就已经是历史记录 -->
         <div
-          v-else-if="loading || raceRunning || feedItems.length"
+          v-if="loading || raceRunning || feedItems.length"
           class="feed-zone"
           aria-live="polite"
         >
@@ -2719,6 +2648,9 @@ async function toggleMark(entry: HistoryEntry, index: number) {
 .err-msg {
   line-height: 1.6;
   overflow-wrap: anywhere;
+  /* 上游原文里的换行是它自己的格式,留着;对比出图全军覆没时,
+     这里也是一行一家的错误 */
+  white-space: pre-wrap;
 }
 .err-msg.clipped {
   display: -webkit-box;
@@ -2931,91 +2863,6 @@ async function toggleMark(entry: HistoryEntry, index: number) {
 /* 展开时箭头翻上去,收起时朝下 */
 .sec-fold svg.up {
   transform: rotate(180deg);
-}
-
-/* —— 对比出图:同题并排 ——
-   等宽格子,信息放在图下面。列数只由参与对比的模型数决定 */
-.race-board {
-  display: grid;
-  grid-template-columns: repeat(var(--race-cols, 2), minmax(0, 1fr));
-  gap: var(--sp-4);
-}
-.race-slot {
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-2);
-  min-width: 0;
-}
-/* 占位与成图共用同一个框。出图后不给比例,由图片自身决定高度 ——
-   各模型按 auto 档输出的比例可能不同,强行装进同一个形状只能二选一:
-   裁掉两侧(看不出构图差异)或留黑边(白占地方) */
-.race-media {
-  position: relative;
-  display: grid;
-  place-items: center;
-  width: 100%;
-  overflow: hidden;
-  border: 1px solid var(--line);
-  border-radius: var(--r);
-  background: var(--image-bg);
-}
-.race-open {
-  display: block;
-  width: 100%;
-  padding: 0;
-  border: none;
-  cursor: zoom-in;
-}
-.race-open img {
-  width: 100%;
-  height: auto;
-  display: block;
-  transition: transform 600ms var(--ease);
-}
-.race-open:hover img {
-  transform: scale(1.04);
-}
-/* 失败与中断写在这个框里。上游原文可能很长,框内滚动,全文挂在 title 上 */
-.race-note {
-  max-width: 100%;
-  max-height: 100%;
-  margin: 0;
-  padding: var(--sp-4) var(--sp-3);
-  overflow: auto;
-  font-size: var(--fs-xs);
-  line-height: 1.5;
-  color: var(--text-3);
-  text-align: center;
-  word-break: break-word;
-}
-.race-foot {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-}
-.race-name {
-  font-size: var(--fs-sm);
-  font-weight: 500;
-  color: var(--text);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.race-meta {
-  font-size: var(--fs-micro);
-  color: var(--text-3);
-}
-/* 四个模型在窄屏上仍要能并排比较,所以先折成两列,很窄才单列 */
-@media (max-width: 900px) {
-  .race-board {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-}
-@media (max-width: 560px) {
-  .race-board {
-    grid-template-columns: minmax(0, 1fr);
-  }
 }
 
 /* 图墙:多列瀑布流,图片按原始比例高低错落 */
