@@ -227,6 +227,20 @@ function geminiRatio(size) {
   return GEMINI_RATIOS.has(r) ? r : ''
 }
 
+/* 上游回来的是一整页网页而不是 API 响应。两种场景都会撞上:
+   - 上游挂了:Cloudflare / nginx 的 5xx 模板(十几 KB);
+   - 路径打错:网站把 404 页面配成 200 回给你。
+   两种都不该原样塞进错误框,也不该让前端在 JSON.parse 上炸出一句
+   "Unexpected token '<'"。 */
+function looksLikeHtml(body) {
+  return /^\s*<(!doctype|html|\?xml)/i.test(body)
+}
+/** 抓 <title>:这类页面的标题通常正好是关键信息,比如 "域名 | 502: Bad gateway" */
+function htmlTitle(html) {
+  const t = (html.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1]
+  return t ? t.trim().replace(/\s+/g, ' ').slice(0, 160) : ''
+}
+
 /**
  * 通用图像生成代理。
  * 前端把配置(prompt / size / n / model / baseUrl / apiKey)POST 过来,
@@ -382,27 +396,51 @@ app.post('/api/generate', rateLimit, async (req, res) => {
     const text = await upstream.text()
 
     if (!upstream.ok) {
-      let detail = text
-      /* 中转站按模型名分流:拿 Gemini 系模型(banana / nano-banana 之类)去要
-         OpenAI 的 Images API 就会撞上这一句。判协议的那一步在 src/api.ts
-         (厂商能力表按"厂商 + 模型"解析),这里只负责把话说白 */
-      if (/Images API is not supported for this platform/i.test(text)) {
+      /* 上游报错可能很长(整页 HTML,或回显了整段提示词的 JSON),先截断再回显 ——
+         与 /api/enhance 那条同一套规矩 */
+      const raw = text.slice(0, 600)
+      let detail = raw
+      /* 上游挂掉时回的多是 Cloudflare / nginx 的整页 HTML。塞进错误框既读不了也刷屏,
+         所以只留标题那句,再补一句这是谁的问题。
+         这条必须排在最前:HTML 里可能同时命中下面那些关键词 */
+      if (looksLikeHtml(text)) {
+        const title = htmlTitle(text)
+        detail =
+          `The upstream host returned an error page (HTTP ${upstream.status})` +
+          (title ? `: ${title}` : '.') +
+          ' This is on their side — retry in a few minutes.'
+      } else if (/Images API is not supported for this platform/i.test(text)) {
         detail =
           'This endpoint has no OpenAI-compatible Images API — it routes by model name, and Gemini-family image models (banana / nano-banana / gemini-*-image) need the native :generateContent path instead. Original error: ' +
-          text
+          raw
       } else if (/base64_input_not_supported|b64传参|multipart/i.test(text)) {
         detail =
           "This endpoint doesn't accept the reference image as a file upload. It may need a public image URL or a specific file field name — check the image input spec of the endpoint behind your Base URL. Original error: " +
-          text
+          raw
       } else if (/unknown (parameter|argument)|unrecognized|unexpected.*parameter|invalid.*(parameter|param)/i.test(text)) {
         // 大多是不支持 quality / background 这类扩展参数
         detail =
           'The upstream doesn\'t recognize a parameter, usually quality or background (OpenAI-only extensions). In "Interface Settings", pick the right vendor, or set quality/background back to "Auto". Original error: ' +
-          text
+          raw
       }
       return res.status(upstream.status).json({
         error: `Upstream returned an error (${upstream.status})`,
         detail
+      })
+    }
+
+    /* 上游回了 200,给的却是一整页 HTML —— 多半是 Base URL 里的路径写错了,
+       网站把它的 404 页面配成 200 返回。照原样透传的话前端会炸出一句
+       "Unexpected token '<'",对用户没有任何意义,所以这里就判成网关错误。
+       两条协议都要求响应是 JSON,所以这个判断不会误伤正常结果 */
+    if (looksLikeHtml(text)) {
+      const title = htmlTitle(text)
+      return res.status(502).json({
+        error: 'Upstream returned a web page instead of an API response',
+        detail:
+          `HTTP ${upstream.status} from ${PROD_LIKE ? targetUrl.host : target}` +
+          (title ? ` (page title: ${title})` : '') +
+          '. The path is probably wrong — check the Base URL in API settings.'
       })
     }
 
