@@ -293,13 +293,28 @@ function sizeLabel(s: string) {
    排在 512x512 前面,免得摘掉 auto 之后默认掉到 512 去 */
 const FREE_SIZES = ['auto', '1024x1024', '1024x1792', '1792x1024', '512x512', '2560x1440']
 
-// 按厂商能力决定携带哪些扩展参数:已知不支持的一律不发
-function extraParams(): Record<string, string> {
-  const caps = provider.value
+/* 按厂商能力决定携带哪些扩展参数:已知不支持的一律不发。
+   默认按当前生效配置算;对比出图时逐个传入 —— 同一次对比里各模型的
+   可用参数并不一样(OpenAI 认 quality,豆包不认),不能拿一家的能力套所有家 */
+function extraParams(cfg: ApiConfig = config.value): Record<string, string> {
+  const caps = getProvider(cfg.vendor || inferVendor(cfg.baseUrl), cfg.model)
   const out: Record<string, string> = {}
   if (caps.quality !== 'no' && quality.value !== 'auto') out.quality = quality.value
   if (caps.background !== 'no' && background.value !== 'auto') out.background = background.value
   return out
+}
+
+/* 对比出图时按每个模型各自校验尺寸:候选是固定列表的厂商(OpenAI 只认那几档),
+   当前尺寸不在它的列表里就退回它自己的第一档,而不是硬发一个它不认的值。
+   退回是必要的妥协 —— 各模型支持的尺寸本来就不完全重合,
+   并排面板里会把每张实际用的尺寸写出来,所以这个差异是看得见的 */
+function sizeFor(cfg: ApiConfig): string {
+  const allowed = allowedSizes(
+    getProvider(cfg.vendor || inferVendor(cfg.baseUrl), cfg.model).id,
+    cfg.model
+  )
+  if (allowed === 'free') return size.value
+  return allowed.includes(size.value) ? size.value : allowed[0] || 'auto'
 }
 
 // 自定义张数:允许手输,失焦/回车时收敛到 1..N_MAX 的整数并回写输入框
@@ -389,6 +404,57 @@ const cfgView = ref<'list' | 'form'>('list')
 // 表单页要编辑/复制的来源;null 表示新增空白。
 // 草稿本身由页面组件持有,这里只给种子 —— 于是「返回列表」是真正的放弃修改
 const cfgSeed = ref<ApiConfig | null>(null)
+
+/* —— 对比出图(Model Race) ——
+   把同一句提示词一次发给多个出图配置,并排看结果。这是"自带多家模型"才有的事:
+   官方 app 只能跑自家模型。代价是花费按模型数翻倍,所以它必须是一个显式开关,
+   而不是默认行为 —— 参数行上的胶囊会写明这一下要跑几个模型 */
+const compareOn = ref(false)
+// 参与对比的配置 id。存 id 不存配置对象:设置页改了名字或地址,这里自动跟着走
+const compareIds = ref<string[]>([])
+// 一次最多几个:花费线性增长,四个已经排满一屏
+const RACE_MAX = 4
+const compareConfigs = computed(() =>
+  imageConfigs.value.filter((c) => compareIds.value.includes(c.id))
+)
+// 一个槽位 = 一个模型 × 这一次请求。results 为空表示还没回来
+type RaceSlot = {
+  configId: string
+  label: string
+  model: string
+  size: string
+  // 发起时锁定的扩展参数:各模型不一样(OpenAI 有 quality,豆包没有)
+  extras: Record<string, string>
+  state: 'running' | 'done' | 'stopped' | 'error'
+  results: ResultItem[]
+  error?: string
+  elapsedMs?: number
+  // 落盘后指向历史记录,点开预览要用
+  entryId?: string
+}
+const raceSlots = ref<RaceSlot[]>([])
+// 这一批用的提示词:槽位里不各存一份,它们本来就是同一句
+const racePrompt = ref('')
+// 同一次对比的各条记录共用一个分组 id
+const raceGroupId = ref('')
+const raceRunning = computed(() => raceSlots.value.some((s) => s.state === 'running'))
+// 至少两个模型才谈得上对比
+const raceReady = computed(() => !compareOn.value || compareConfigs.value.length >= 2)
+/* 参数行上的出图胶囊:对比开启时改说"要跑几个模型" ——
+   否则点生成之前没法知道这一下会花掉 N 倍的额度 */
+const imagePillName = computed(() =>
+  compareOn.value ? `Compare · ${compareConfigs.value.length}` : activeConfigName.value
+)
+const imagePillTip = computed(() =>
+  compareOn.value
+    ? `Comparing ${compareConfigs.value.length} image models · Text model · ${activeTextName.value}`
+    : `Image model · ${activeConfigName.value} / Text model · ${activeTextName.value}`
+)
+const imagePillAria = computed(() =>
+  compareOn.value
+    ? `Comparing ${compareConfigs.value.length} image models. Text model: ${activeTextName.value}`
+    : `Image model: ${activeConfigName.value}. Text model: ${activeTextName.value}`
+)
 
 // 换厂商/换模型后,原来的尺寸可能已不在候选里,自动回退到第一个,免得发出上游不认的值。
 // immediate 让它立刻跑一次,覆盖初始值:默认是 'auto',但 dall-e-3 这类不开放 auto 的
@@ -697,6 +763,11 @@ async function doGenerate() {
     openConfigManager()
     return
   }
+  // 对比开启时走另一条链路:一次发给多个模型,结果并排
+  if (compareOn.value) {
+    await doRace()
+    return
+  }
 
   // 发起前锁定这一批的参数,后面一律读快照,避免中途改参数串味
   running.value = { prompt: prompt.value, size: size.value, n: n.value }
@@ -723,8 +794,7 @@ async function doGenerate() {
       config.value,
       controller.value.signal
     )
-    const record: HistoryEntry = {
-      id: Date.now() + Math.random().toString(16).slice(2),
+    const record = await recordFor(res, {
       prompt: running.value.prompt,
       size: running.value.size,
       model: config.value.model || undefined,
@@ -732,39 +802,9 @@ async function doGenerate() {
       quality: extras.quality,
       background: extras.background,
       hasRef: !!refSrc,
-      elapsedMs: Date.now() - startedAt,
-      createdAt: Date.now(),
-      results: res
-    }
-    // 缩略图要在入列表和落盘之前补上:入列表后拿到的是响应式代理,
-    // 在代理上改动不会回写到这里的原始对象,而 idb 又只接受原始对象。
-    // 同时把量到的真实像素写进记录,图墙就能按真实比例排,而不是按所选尺寸
-    const t = await makeThumb(res[0])
-    if (t) {
-      record.thumb = t.blob
-      record.w = t.w
-      record.h = t.h
-    }
-    history.value = [record, ...history.value]
-    try {
-      const pruned = await addHistoryRecord(record)
-      if (pruned) {
-        // 磁盘上已经删掉了,内存里也要同步,否则界面还留着早已不存在的记录
-        const goneIds = new Set(pruned.removedIds)
-        const gone = history.value.filter((h) => goneIds.has(h.id))
-        history.value = history.value.filter((h) => !goneIds.has(h.id))
-        // 这些图不会再展示了,顺带把 object URL 撤掉,让 Blob 能被回收
-        gone.forEach(releaseEntryMedia)
-        const pct = Math.round(pruned.usageRatio * 100)
-        notice.value = pct
-          ? `Local storage is about ${pct}% full. Removed the oldest ${pruned.removed} history ${pruned.removed === 1 ? 'item' : 'items'} to free space.`
-          : `Removed the oldest ${pruned.removed} history ${pruned.removed === 1 ? 'item' : 'items'} to limit local usage.`
-      }
-    } catch {
-      // 生成是成功的,失败的只是"存进本地":记录先留在内存里(本次会话仍可见),
-      // 但必须如实告知刷新会丢 —— 不能混进下面"生成失败"的提示里
-      notice.value = 'Image generated, but not saved locally. It will be lost on refresh — download it first.'
-    }
+      elapsedMs: Date.now() - startedAt
+    })
+    await persist(record)
   } catch (e: any) {
     // 主动终止不是失败,不报错也不入历史
     if (e?.name === 'AbortError') return
@@ -776,7 +816,214 @@ async function doGenerate() {
   }
 }
 
-// 终止当前批次
+/* 把一组结果包成一条历史记录,并补上缩略图与真实像素。
+   缩略图要在入列表和落盘之前补上:入列表后拿到的是响应式代理,
+   在代理上改动不会回写到这里的原始对象,而 idb 又只接受原始对象。
+   同时把量到的真实像素写进记录,图墙就能按真实比例排,而不是按所选尺寸 */
+async function recordFor(
+  res: ResultItem[],
+  meta: {
+    prompt: string
+    size: string
+    model?: string
+    quality?: string
+    background?: string
+    hasRef?: boolean
+    groupId?: string
+    elapsedMs: number
+  }
+): Promise<HistoryEntry> {
+  const record: HistoryEntry = {
+    id: Date.now() + Math.random().toString(16).slice(2),
+    prompt: meta.prompt,
+    size: meta.size,
+    model: meta.model,
+    quality: meta.quality,
+    background: meta.background,
+    hasRef: meta.hasRef,
+    groupId: meta.groupId,
+    elapsedMs: meta.elapsedMs,
+    createdAt: Date.now(),
+    results: res
+  }
+  const t = await makeThumb(res[0])
+  if (t) {
+    record.thumb = t.blob
+    record.w = t.w
+    record.h = t.h
+  }
+  return record
+}
+
+/* 一条记录:入内存 + 落盘。裁剪与落盘失败的处置只有这一处,
+   生成与对比出图的每条结果都走它 */
+async function persist(record: HistoryEntry) {
+  history.value = [record, ...history.value]
+  try {
+    const pruned = await addHistoryRecord(record)
+    if (pruned) {
+      // 磁盘上已经删掉了,内存里也要同步,否则界面还留着早已不存在的记录
+      const goneIds = new Set(pruned.removedIds)
+      const gone = history.value.filter((h) => goneIds.has(h.id))
+      history.value = history.value.filter((h) => !goneIds.has(h.id))
+      // 这些图不会再展示了,顺带把 object URL 撤掉,让 Blob 能被回收
+      gone.forEach(releaseEntryMedia)
+      const pct = Math.round(pruned.usageRatio * 100)
+      notice.value = pct
+        ? `Local storage is about ${pct}% full. Removed the oldest ${pruned.removed} history ${pruned.removed === 1 ? 'item' : 'items'} to free space.`
+        : `Removed the oldest ${pruned.removed} history ${pruned.removed === 1 ? 'item' : 'items'} to limit local usage.`
+    }
+  } catch {
+    // 生成是成功的,失败的只是"存进本地":记录先留在内存里(本次会话仍可见),
+    // 但必须如实告知刷新会丢 —— 不能混进"生成失败"的提示里
+    notice.value = 'Image generated, but not saved locally. It will be lost on refresh — download it first.'
+  }
+}
+
+/* —— 对比出图 ——
+   同一提示词并发发给每个选中的模型。单个槽位自己吞掉异常,一个失败不影响其他 ——
+   这正是这个功能最值钱的地方:并排就能看出是"提示词不行"还是"某个模型不行" */
+async function doRace() {
+  // 没地址或没密钥的配置发不出去,先摘掉:参与对比的必须是能真跑的
+  const targets = compareConfigs.value.filter((c) => c.baseUrl && c.apiKey)
+  if (targets.length < 2) {
+    fail('Pick at least 2 image models with a base URL and an API key to compare')
+    openPanel.value = 'config'
+    return
+  }
+  const runPrompt = prompt.value
+  const refSrc = refImage.value
+  racePrompt.value = runPrompt
+  raceGroupId.value = `race-${Date.now().toString(36)}`
+  /* 尺寸与扩展参数在发起前逐配置定下来:中途改参数不该影响已经发出的这一批,
+     而且各模型的合法尺寸/参数本来就不一样,不能拿一家的能力套所有家 */
+  raceSlots.value = targets.map((c) => ({
+    configId: c.id,
+    label: c.name || c.model || c.baseUrl,
+    model: c.model || '',
+    size: sizeFor(c),
+    extras: extraParams(c),
+    state: 'running',
+    results: []
+  }))
+  controller.value = new AbortController()
+  const signal = controller.value.signal
+
+  loading.value = true
+  error.value = ''
+  notice.value = ''
+  canRetry.value = false
+  try {
+    /* 张数固定 1:对比要看的是"哪个模型更好",不是每个模型各来三张。
+       并发发出 —— 串行的话总耗时是各家之和,等起来没法用 */
+    await Promise.all(
+      targets.map(async (cfg, i) => {
+        const slot = raceSlots.value[i]
+        const slotStart = Date.now()
+        try {
+          const res = await generate(
+            {
+              prompt: runPrompt,
+              size: slot.size,
+              n: 1,
+              ...(refSrc ? { image: refSrc } : {}),
+              ...slot.extras
+            },
+            cfg,
+            signal
+          )
+          slot.results = res
+          slot.elapsedMs = Date.now() - slotStart
+          slot.state = 'done'
+        } catch (e: any) {
+          // 主动终止不是失败,但要说清是"你停的",不是模型坏了
+          slot.state = e?.name === 'AbortError' ? 'stopped' : 'error'
+          // 上游原文可能很长,槽位里放不下;完整内容挂在节点的 title 上
+          if (slot.state === 'error') {
+            slot.error = String(e?.message || 'Generation failed').slice(0, 300)
+          }
+        }
+      })
+    )
+    /* 跑完的槽位落进历史:它们已经是用户看得见的图,不存就等于关掉面板就没了。
+       (单模型那条路中断后不入历史 —— 那时根本没有图可言,这里不一样) */
+    for (const slot of raceSlots.value) {
+      if (slot.state !== 'done' || !slot.results.length) continue
+      /* 必须取原始数组:槽位上的 results 是响应式代理,而 indexedDB 用结构化克隆
+         写盘,代理克隆不了(DataCloneError),记录会写不进去 —— 界面看着图还在
+         (内存里有),刷新就没了,还会误报"没能保存到本地" */
+      const results = toRaw(slot.results)
+      const record = await recordFor(results, {
+        prompt: runPrompt,
+        size: slot.size,
+        model: slot.model || undefined,
+        quality: slot.extras.quality,
+        background: slot.extras.background,
+        hasRef: !!refSrc,
+        groupId: raceGroupId.value,
+        elapsedMs: slot.elapsedMs || 0
+      })
+      slot.entryId = record.id
+      await persist(record)
+    }
+    // 全盘皆输才占用错误区;部分成功不报错 —— 成败各自写在槽位里
+    if (raceSlots.value.every((s) => s.state === 'error')) {
+      fail('Every model failed. See the compare panel for each error.', true)
+    }
+  } finally {
+    loading.value = false
+    controller.value = null
+  }
+}
+
+/* 关掉对比面板:图已经落进历史了,关掉只是回到图墙。
+   跑动中不给关(那时头部只写"Comparing…")—— 否则已经回来的那几个槽位
+   还没走到落盘那一步,关掉就等于把它们扔了 */
+function dismissRace() {
+  raceSlots.value = []
+  racePrompt.value = ''
+}
+
+// 点开某个槽的大图:它在历史里已经是一条普通记录,复用同一个预览卡
+function openRaceSlot(s: RaceSlot) {
+  const entry = history.value.find((h) => h.id === s.entryId)
+  if (entry) openPreview(entry)
+}
+
+// 槽位第二行:配置名(与模型名重复时省掉)、尺寸、耗时或状态
+function raceMeta(s: RaceSlot) {
+  const parts: string[] = []
+  if (s.label && s.label !== s.model) parts.push(s.label)
+  parts.push(sizeLabel(s.size))
+  if (s.state === 'error') parts.push('failed')
+  else if (s.state === 'stopped') parts.push('stopped')
+  else if (s.state === 'done') parts.push(`${((s.elapsedMs || 0) / 1000).toFixed(1)}s`)
+  return parts.join(' · ')
+}
+
+// 开对比时先替用户选好:当前模型优先,再按顺序补到三个 —— 从零个开始点太重
+function toggleCompare() {
+  compareOn.value = !compareOn.value
+  if (compareOn.value && compareConfigs.value.length < 2) {
+    const pool = imageConfigs.value.map((c) => c.id)
+    const picked = [config.value.id, ...pool].filter((id, i, arr) => !!id && arr.indexOf(id) === i)
+    compareIds.value = picked.slice(0, Math.min(3, pool.length))
+  }
+  openPanel.value = ''
+  focusPrompt()
+}
+
+// 对比模式下点芯片是"加入/移出对比",不再是"设为当前"
+function toggleCompareId(id: string) {
+  if (compareIds.value.includes(id)) {
+    compareIds.value = compareIds.value.filter((x) => x !== id)
+    return
+  }
+  if (compareIds.value.length >= RACE_MAX) return
+  compareIds.value = [...compareIds.value, id]
+}
+
+// 终止当前批次(单模型与对比共用同一个 controller)
 function stopGenerate() {
   controller.value?.abort()
 }
@@ -1105,12 +1352,12 @@ async function toggleMark(entry: HistoryEntry, index: number) {
               <button
                 class="param-btn has-val"
                 :class="{ on: openPanel === 'config', filled: !!configured() }"
-                :data-tip="`Image model · ${activeConfigName} / Text model · ${activeTextName}`"
-                :aria-label="`Image model: ${activeConfigName}. Text model: ${activeTextName}`"
+                :data-tip="imagePillTip"
+                :aria-label="imagePillAria"
                 @click="togglePanel('config')"
               >
                 <PhSlidersHorizontal aria-hidden="true" />
-                <b class="param-val param-val-name">{{ activeConfigName }}</b>
+                <b class="param-val param-val-name">{{ imagePillName }}</b>
                 <span class="param-sep" aria-hidden="true"></span>
                 <b class="param-val param-val-name param-val-sub">{{ activeTextName }}</b>
               </button>
@@ -1184,9 +1431,19 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                 </button>
                 <button
                   class="gen-icon"
-                  :disabled="!loading && (enhancing || !prompt.trim())"
-                  :aria-label="loading ? 'Stop' : 'Generate'"
-                  :data-tip="loading ? 'Stop' : enhancing ? 'Rewriting the prompt…' : 'Generate with Enter'"
+                  :disabled="!loading && (enhancing || !prompt.trim() || !raceReady)"
+                  :aria-label="loading ? 'Stop' : compareOn ? 'Compare models' : 'Generate'"
+                  :data-tip="
+                    loading
+                      ? 'Stop'
+                      : enhancing
+                        ? 'Rewriting the prompt…'
+                        : compareOn
+                          ? raceReady
+                            ? `Generate with ${compareConfigs.length} models`
+                            : 'Pick at least 2 models to compare'
+                          : 'Generate with Enter'
+                  "
                   @click="loading ? stopGenerate() : doGenerate()"
                 >
                   <!-- 生成中变为方块停止键,点击可终止这一批 -->
@@ -1209,11 +1466,34 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                         v-for="c in imageConfigs"
                         :key="c.id"
                         class="preset"
-                        :class="{ on: config.id === c.id }"
-                        :title="`${c.baseUrl}${c.model ? ' · ' + c.model : ''}`"
-                        @click="activateConfig(c)"
+                        :class="{ on: compareOn ? compareIds.includes(c.id) : config.id === c.id }"
+                        :disabled="
+                          compareOn && !compareIds.includes(c.id) && compareIds.length >= RACE_MAX
+                        "
+                        :title="
+                          compareOn && !compareIds.includes(c.id) && compareIds.length >= RACE_MAX
+                            ? `Compare runs at most ${RACE_MAX} models`
+                            : `${c.baseUrl}${c.model ? ' · ' + c.model : ''}`
+                        "
+                        @click="compareOn ? toggleCompareId(c.id) : activateConfig(c)"
                       >
                         {{ c.name || 'Untitled config' }}
+                      </button>
+                      <!-- 对比开关:同一句提示词一次发给多个模型,结果并排。
+                           一个模型没法对比,所以只在有两个以上出图配置时出现。
+                           开着时上面的芯片变成多选(不再是"设为当前") -->
+                      <button
+                        v-if="imageConfigs.length >= 2"
+                        class="pp-action"
+                        :class="{ on: compareOn }"
+                        :title="
+                          compareOn
+                            ? 'Turn off compare'
+                            : `Run the same prompt on up to ${RACE_MAX} models`
+                        "
+                        @click="toggleCompare"
+                      >
+                        {{ compareOn ? `Comparing ${compareIds.length}` : 'Compare models' }}
                       </button>
                     </div>
                     <div v-if="textConfigs.length" class="pp-group">
@@ -1368,8 +1648,66 @@ async function toggleMark(entry: HistoryEntry, index: number) {
           </div>
         </div>
 
+        <!-- 对比面板:同一句提示词的各家结果并排。生成中与生成后都留在这里 ——
+             它取代图墙,免得刚出的几张在上面板与下图墙里各出现一次 -->
+        <div v-if="raceSlots.length" class="feed-zone" aria-live="polite">
+          <div class="section-head">
+            <LatticeLoader
+              v-if="raceRunning"
+              class="sec-title"
+              label="Comparing"
+              :font-size="20"
+              :cell-size="6"
+              :gap="2"
+            />
+            <span v-else class="sec-title">Compare · {{ raceSlots.length }} models</span>
+            <!-- 跑动中不给关:已经回来的槽位还没走到落盘那一步,关掉等于把它们扔了。
+                 要提前结束就用输入框右边那个停止键(和单模型同一条路) -->
+            <div v-if="!raceRunning" class="sec-tools">
+              <button class="sec-more" @click="dismissRace">
+                Close
+                <PhX aria-hidden="true" />
+              </button>
+            </div>
+          </div>
+          <div class="race-board" :style="{ '--race-cols': String(raceSlots.length) }">
+            <article v-for="s in raceSlots" :key="s.configId" class="race-slot">
+              <!-- 标签在图上:各列的名字与耗时因此天然对齐在同一行,
+                   底下的图可以各自不同的比例,不会把脚注拉得高低不齐 -->
+              <div class="race-foot">
+                <b class="race-name" :title="s.model || s.label">{{ s.model || s.label }}</b>
+                <span class="race-meta">{{ raceMeta(s) }}</span>
+              </div>
+              <!-- 只有占位与失败态需要给个形状(占位按所选尺寸,失败态按同一尺寸),
+                   出图后不再约束比例:auto 档下各家输出的比例并不相同,
+                   裁掉两侧就看不出构图差异了 —— 而看构图正是对比的目的 -->
+              <div
+                class="race-media"
+                :style="
+                  s.state === 'done' ? undefined : { aspectRatio: String(tileRatio(s.size)) }
+                "
+              >
+                <div v-if="s.state === 'running'" class="skel-shimmer"></div>
+                <button
+                  v-else-if="s.state === 'done'"
+                  class="race-open"
+                  :aria-label="`Open ${s.model || s.label}`"
+                  @click="openRaceSlot(s)"
+                >
+                  <img :src="imageSrc(s.results[0])" :alt="racePrompt" />
+                </button>
+                <!-- 失败与中断分开写:分不清"是你停的"还是"模型坏了",
+                     并排看结果这件事就失去意义了 -->
+                <p v-else class="race-note" :title="s.error || ''">
+                  {{ s.state === 'stopped' ? 'Stopped' : s.error || 'Failed' }}
+                </p>
+              </div>
+            </article>
+          </div>
+        </div>
+
         <!-- 历史图墙:输入框下方展示最近生成的图,可收起 -->
-        <div v-if="loading || feedItems.length" class="feed-zone" aria-live="polite">
+        <div v-else-if="loading || feedItems.length" class="feed-zone" aria-live="polite">
           <div class="section-head">
             <span v-if="!loading" class="sec-title">Recent creations</span>
             <!-- 生成中换成格子波 + 秒表:尺寸与字重都对齐 sec-title,
@@ -1965,6 +2303,17 @@ async function toggleMark(entry: HistoryEntry, index: number) {
 .pp-action:hover {
   background: var(--surface-hover);
 }
+/* 开着的时候它和其他胶囊的选中态同一套墨色:它是这个面板里的一个开关,
+   不是一句说明文字 */
+.pp-action.on {
+  background: var(--cta);
+  border-color: var(--cta);
+  color: var(--cta-text);
+}
+.pp-action.on:hover {
+  background: var(--cta-hover);
+  border-color: var(--cta-hover);
+}
 
 .preset {
   padding: 6px 12px;
@@ -1993,6 +2342,17 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   background: var(--cta-hover);
   border-color: var(--cta-hover);
   color: var(--cta-text);
+}
+/* 对比选满之后,没入选的芯片不能再加进来。置灰而不是静默忽略:
+   点了没反应会被当成坏了 */
+.preset:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.preset:disabled:hover {
+  border-color: var(--line);
+  color: var(--text-2);
+  background: var(--surface);
 }
 /* 带注解的胶囊(画质档位):主标签 + 一句代价说明,同一行排布 */
 .preset-rich {
@@ -2291,6 +2651,91 @@ async function toggleMark(entry: HistoryEntry, index: number) {
 /* 展开时箭头翻上去,收起时朝下 */
 .sec-fold svg.up {
   transform: rotate(180deg);
+}
+
+/* —— 对比出图:同题并排 ——
+   等宽格子,信息放在图下面。列数只由参与对比的模型数决定 */
+.race-board {
+  display: grid;
+  grid-template-columns: repeat(var(--race-cols, 2), minmax(0, 1fr));
+  gap: var(--sp-4);
+}
+.race-slot {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+/* 占位与成图共用同一个框。出图后不给比例,由图片自身决定高度 ——
+   各模型按 auto 档输出的比例可能不同,强行装进同一个形状只能二选一:
+   裁掉两侧(看不出构图差异)或留黑边(白占地方) */
+.race-media {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 100%;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  background: var(--image-bg);
+}
+.race-open {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: none;
+  cursor: zoom-in;
+}
+.race-open img {
+  width: 100%;
+  height: auto;
+  display: block;
+  transition: transform 600ms var(--ease);
+}
+.race-open:hover img {
+  transform: scale(1.04);
+}
+/* 失败与中断写在这个框里。上游原文可能很长,框内滚动,全文挂在 title 上 */
+.race-note {
+  max-width: 100%;
+  max-height: 100%;
+  margin: 0;
+  padding: var(--sp-4) var(--sp-3);
+  overflow: auto;
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+  color: var(--text-3);
+  text-align: center;
+  word-break: break-word;
+}
+.race-foot {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.race-name {
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.race-meta {
+  font-size: var(--fs-micro);
+  color: var(--text-3);
+}
+/* 四个模型在窄屏上仍要能并排比较,所以先折成两列,很窄才单列 */
+@media (max-width: 900px) {
+  .race-board {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (max-width: 560px) {
+  .race-board {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 /* 图墙:多列瀑布流,图片按原始比例高低错落 */

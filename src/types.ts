@@ -73,6 +73,10 @@ export interface HistoryEntry {
   hasRef?: boolean
   // 这一批从发起到返回的耗时(毫秒)
   elapsedMs?: number
+  /* 对比出图(Model Race)的分组 id:同一次对比里各模型的结果共用一个值。
+     派生关系(版本树)也将挂在同一个字段上,所以它是"这一批从哪来"的标识,
+     不限于对比。可选:普通生成与加这个字段之前的记录都没有 */
+  groupId?: string
   createdAt: number
   // 上游可能返回一张或多张图
   results: ResultItem[]
