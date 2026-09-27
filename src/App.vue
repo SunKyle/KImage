@@ -25,6 +25,7 @@ import HistoryPage from './components/HistoryPage.vue'
 import SettingsPage from './components/SettingsPage.vue'
 import RubberSegment from './components/RubberSegment.vue'
 import LatticeLoader from './components/LatticeLoader.vue'
+import UndoToast from './components/UndoToast.vue'
 import {
   generate,
   enhancePrompt,
@@ -93,6 +94,42 @@ function fail(msg: string, retryable = false) {
 const errorLong = computed(() => error.value.length > 90)
 // 存储清理的事后告知。它不是错误,所以单独一条通道,中性配色
 const notice = ref('')
+
+/* ===== 删除的撤销窗口 ================================================
+   删除不再弹确认框,而是立刻生效、几秒内可撤销(见 components/UndoToast.vue)。
+   关键在于:真正落盘的删除发生在窗口结束时(见 purge),窗口里数据一直还在 ——
+   所以"撤销"只是把它放回列表,不需要从磁盘上把东西搬回来。
+   同一时刻只保留一次待撤销:再来一次删除就把上一次落盘,否则两枚按钮会各烧各的。
+   ------------------------------------------------------------------ */
+interface PendingUndo {
+  /** 换一次删除就换一个 token,撤销条据此重新点燃 */
+  token: string
+  /** 说明删掉了什么 */
+  label: string
+  /** 把东西放回列表,并把恢复后的状态落盘 */
+  undo: () => void
+  /** 窗口结束:真正落盘删除,释放图片地址 */
+  purge: () => void
+}
+const pendingUndo = ref<PendingUndo | null>(null)
+/** 4.5 秒:够看清删了什么、也够反悔,又不至于让这条一直挂在屏幕上 */
+const UNDO_MS = 4500
+
+function scheduleUndo(item: Omit<PendingUndo, 'token'>) {
+  pendingUndo.value?.purge()
+  pendingUndo.value = { ...item, token: uid() }
+}
+// 保险丝烧完 = 用户接受了这次删除
+function commitUndo() {
+  const p = pendingUndo.value
+  pendingUndo.value = null
+  p?.purge()
+}
+function runUndo() {
+  const p = pendingUndo.value
+  pendingUndo.value = null
+  p?.undo()
+}
 // 发起生成时锁定的参数快照:生成中途改尺寸/张数/提示词,不会影响已发出的这一批
 const running = ref({ prompt: '', size: '1024x1024', n: 1 })
 const history = ref<HistoryEntry[]>([])
@@ -623,12 +660,23 @@ function activateTextConfig(c: ApiConfig) {
   activeTextId.value = c.id
   saveActiveTextId(c.id)
 }
-// 删除一条配置;若删的是激活项,自动激活剩余第一条
+/* 删除一条配置;若删的是激活项,自动激活剩余第一条。
+   删除本身立刻改列表,但落盘推迟到撤销窗口结束 —— 于是"撤销"只要把这一条
+   放回去、并把「当前生效」的指向恢复即可,不必从磁盘上搬回来。
+   恢复时用的是"当前列表 + 插回这一条",不是整份旧快照:
+   窗口里万一正好改了别的配置,不该被这次撤销一起回滚 */
 function removeConfig(c: ApiConfig) {
+  const at = configs.value.findIndex((x) => x.id === c.id)
+  if (at < 0) return
+  const wasActive = activeId.value === c.id
+  const wasActiveText = activeTextId.value === c.id
+  const wasSelected = selectedIds.value.includes(c.id)
+
+  /* 选择集合里也要摘掉它:被删的那条不再参与生成,但它留在集合里会让
+     长度算错 —— 剩两条其实只剩一条,却仍被当成对比模式。摘完一个不剩就退回当前这条 */
   configs.value = configs.value.filter((x) => x.id !== c.id)
-  saveConfigs(configs.value)
   // 占着各自「当前生效」的那条被删掉时,同样要按用途重新挑一条,免得生效值悬空
-  if (activeTextId.value === c.id) {
+  if (wasActiveText) {
     const nextText = configs.value.find((x) => x.kind === 'text')
     if (nextText) {
       activateTextConfig(nextText)
@@ -638,7 +686,7 @@ function removeConfig(c: ApiConfig) {
       saveActiveTextId('')
     }
   }
-  if (activeId.value === c.id) {
+  if (wasActive) {
     const next = configs.value.find((x) => x.kind !== 'text')
     if (next) {
       config.value = { ...next }
@@ -650,10 +698,35 @@ function removeConfig(c: ApiConfig) {
       saveActiveId('')
     }
   }
-  /* 选择集合里也要摘掉它:被删的那条不再参与生成,但它留在集合里会让
-     长度算错 —— 剩两条其实只剩一条,却仍被当成对比模式。摘完一个不剩就退回当前这条 */
   selectedIds.value = selectedIds.value.filter((id) => id !== c.id)
   if (!selectedIds.value.length && config.value.id) selectedIds.value = [config.value.id]
+
+  scheduleUndo({
+    label: 'Config deleted',
+    undo: () => {
+      configs.value = [
+        ...configs.value.slice(0, Math.min(at, configs.value.length)),
+        c,
+        ...configs.value.slice(Math.min(at, configs.value.length))
+      ]
+      if (wasSelected && !selectedIds.value.includes(c.id)) {
+        selectedIds.value = [...selectedIds.value, c.id]
+      }
+      // 恢复「当前生效」的指向。它当初是被这次删除夺走的,现在物归原主
+      if (wasActive) {
+        config.value = { ...c }
+        activeId.value = c.id
+        saveActiveId(c.id)
+      }
+      if (wasActiveText) {
+        textConfig.value = { ...c }
+        activeTextId.value = c.id
+        saveActiveTextId(c.id)
+      }
+      saveConfigs(configs.value)
+    },
+    purge: () => saveConfigs(configs.value)
+  })
 }
 
 function configured() {
@@ -687,12 +760,26 @@ async function useLibItem(item: PromptItem) {
   // 关掉库页就等于切回首页;回顶部由 navView 的 watch 统一负责,这里不必再来一次
   page.value = 'home'
 }
-async function removeLibItem(id: string) {
-  const gone = libItems.value.find((i) => i.id === id)
+function removeLibItem(id: string) {
+  const at = libItems.value.findIndex((i) => i.id === id)
+  if (at < 0) return
+  const gone = libItems.value[at]
   libItems.value = libItems.value.filter((i) => i.id !== id)
-  // 封面用过的 object URL 要撤掉:blob URL 会强引用住 Blob,不撤就回收不了
-  releaseSrc(gone?.cover)
-  await persistLib()
+  scheduleUndo({
+    label: 'Prompt deleted',
+    undo: () => {
+      // 放回原来的位置:列表顺序是有意义的(最近存的在最前)
+      libItems.value.splice(Math.min(at, libItems.value.length), 0, gone)
+      // 撤销要立刻落盘:窗口里别的操作可能已经把"它不在"写进去了
+      persistLib()
+    },
+    purge: () => {
+      /* 封面用过的 object URL 到这时才撤:blob URL 会强引用住 Blob,
+         不撤就回收不了 —— 但窗口里撤销回来还要用它渲染,提前撤就是裂图 */
+      releaseSrc(gone.cover)
+      persistLib()
+    }
+  })
 }
 /* 新建与编辑走同一个出口:按 id 判断是插入还是覆盖。
    分成两个 emit 会让"编辑"这件事在库页多一次分支判断,而它本来就只是"存一条" */
@@ -1347,21 +1434,32 @@ async function setAsReference(item: ResultItem) {
   window.scrollTo({ top: 0, behavior: 'smooth' })
 }
 
-// 预览菜单:删除该条历史
-async function removeHistoryItem() {
+// 预览菜单:删除该条历史。与历史页那条走同一个出口,撤销窗口也共用
+function removeHistoryItem() {
   const cur = previewEntry.value
   if (!cur) return
-  history.value = history.value.filter((h) => h.id !== cur.id)
-  await removeHistoryRecord(cur.id)
+  removeHistoryEntry(cur)
   closePreview()
-  // 关闭预览之后再释放:预览还开着时撤地址会让图裂掉
-  releaseEntryMedia(cur)
 }
 // 历史页:不进预览,直接删掉某条记录
-async function removeHistoryEntry(entry: HistoryEntry) {
+function removeHistoryEntry(entry: HistoryEntry) {
+  const at = history.value.findIndex((h) => h.id === entry.id)
+  if (at < 0) return
   history.value = history.value.filter((h) => h.id !== entry.id)
-  await removeHistoryRecord(entry.id)
-  releaseEntryMedia(entry)
+  scheduleUndo({
+    label: 'Removed from history',
+    undo: () => {
+      history.value.splice(Math.min(at, history.value.length), 0, entry)
+      // 窗口里可能正好生成了新图并触发淘汰,把这条按最旧的清掉了,所以补写一次
+      saveHistoryRecord(entry)
+    },
+    purge: () => {
+      removeHistoryRecord(entry.id)
+      /* 地址到这时才释放:窗口里撤销回来还要渲染它。
+         也只在这里释放 —— 预览开着时撤地址会让图裂掉 */
+      releaseEntryMedia(entry)
+    }
+  })
 }
 /* 标记逐张标:图墙里一块图块就是一张图,所以标在结果项上而不是整条记录上。
    改完必须落盘,否则刷新就丢;界面靠响应式代理更新,而 idb 只吃原始对象,故 toRaw */
@@ -1948,6 +2046,18 @@ async function toggleMark(entry: HistoryEntry, index: number) {
       @remove="removeHistoryItem"
       @mark="toggleMark"
     />
+
+    <!-- 删除的撤销条:固定在底部居中,四个页面里删了东西都从这儿撤销 -->
+    <Transition name="undo-in">
+      <UndoToast
+        v-if="pendingUndo"
+        :key="pendingUndo.token"
+        :label="pendingUndo.label"
+        :duration="UNDO_MS"
+        @undo="runUndo"
+        @expire="commitUndo"
+      />
+    </Transition>
   </div>
 </template>
 
@@ -2074,6 +2184,17 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   display: flex;
   flex-direction: column;
   gap: var(--sp-7);
+}
+
+/* 撤销条从底部升起来。它比页面切换更"贴身",所以更快一点 */
+.undo-in-enter-active,
+.undo-in-leave-active {
+  transition: opacity 180ms var(--ease), transform 180ms var(--ease);
+}
+.undo-in-enter-from,
+.undo-in-leave-to {
+  opacity: 0;
+  transform: translateY(10px);
 }
 
 /* 页面切换:新页挂载时自己淡入上浮一下,不再整块硬切。

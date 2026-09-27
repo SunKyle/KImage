@@ -55,10 +55,6 @@ const menuEl = ref<HTMLElement | null>(null)
    列表里有很多行,一个布尔表达不了「这个菜单是给谁的」。
    同一时刻只开一个,切换行时旧的自动让位 */
 const openRow = ref<string | null>(null)
-/* 删除的二次确认:记着哪一行已经点过第一次。
-   删除不可撤销,而菜单里手滑点一下的概率并不低,所以进危险态再问一次。
-   不用弹窗:这个项目的语言里没有 modal */
-const confirmId = ref<string | null>(null)
 
 // 密钥显隐:默认遮住。声明在灌草稿的 watch 之前 —— 那个 watch 是 immediate,会立刻用到它
 const showKey = ref(false)
@@ -71,26 +67,19 @@ function onDocPointerDown(e: PointerEvent) {
      一个 ref 装不住多行,而类名判断天然只看当前这一棵子树 */
   if (openRow.value && !(t instanceof Element && t.closest('.row-menu, .row-more'))) {
     openRow.value = null
-    confirmId.value = null
   }
 }
 onMounted(() => document.addEventListener('pointerdown', onDocPointerDown))
 onBeforeUnmount(() => document.removeEventListener('pointerdown', onDocPointerDown))
 
-// 开/收某一行的菜单。顺手清掉删除确认态 —— 换了行就不该还停在上一次的「再点一次」上
+// 开/收某一行的菜单
 function toggleRow(id: string) {
-  confirmId.value = null
   openRow.value = openRow.value === id ? null : id
 }
 
-/* 删除:第一次只是把这一项变成危险态,第二次才真的删。
-   菜单本身不收起,用户能看到那一行字变了,才知道「第一次点生效了」 */
-function askRemove(c: ApiConfig) {
-  if (confirmId.value !== c.id) {
-    confirmId.value = c.id
-    return
-  }
-  confirmId.value = null
+/* 删除:一次点击就删。原先要点两次是因为"删掉就没了",而现在删完有一条
+   燃烧的撤销窗口兜着(见 UndoToast)—— 让它兜,比多一步确认更省事,也更可逆 */
+function remove(c: ApiConfig) {
   openRow.value = null
   emit('remove', c)
 }
@@ -100,7 +89,6 @@ watch(
   () => props.mode,
   () => {
     openRow.value = null
-    confirmId.value = null
   }
 )
 
@@ -379,14 +367,7 @@ function onImportFile(e: Event) {
                     <button class="mitem" @click="openRow = null; emit('duplicate', c)">
                       Duplicate
                     </button>
-                    <!-- 第一次点只是进危险态,第二次才真的删:删除不可撤销 -->
-                    <button
-                      class="mitem danger"
-                      :class="{ confirm: confirmId === c.id }"
-                      @click="askRemove(c)"
-                    >
-                      {{ confirmId === c.id ? 'Click again to delete' : 'Delete' }}
-                    </button>
+                    <button class="mitem danger" @click="remove(c)">Delete</button>
                   </div>
                 </Transition>
               </div>
@@ -684,11 +665,6 @@ function onImportFile(e: Event) {
 /* 行菜单里的删除:中性色里唯一的红,和编辑/复制区分开 */
 .mitem.danger {
   color: var(--danger);
-}
-/* 已点过一次的删除:底色也铺上红,否则用户以为第一次点没生效 */
-.mitem.danger.confirm {
-  background: color-mix(in oklch, var(--danger) 12%, transparent);
-  font-weight: 500;
 }
 .file {
   display: block;
