@@ -8,6 +8,8 @@ import {
   PhCaretLeft,
   PhPencilSimple,
   PhCaretDown,
+  PhCopy,
+  PhArrowUpRight,
   PhX
 } from '@phosphor-icons/vue'
 import { BACKGROUND_OPTIONS, QUALITY_OPTIONS, optionLabel, coverSrc } from '../api'
@@ -406,16 +408,21 @@ function onImportFile(e: Event) {
               fmtDate(item.createdAt)
             }}</span>
             <div class="ops">
+              <!-- 取用是卡片上最高频的动作,所以留在卡面上,不进菜单。
+                   用图标而不是"Use"两个字:下沿这一行还要挤分类与 ⋮,
+                   文字按钮占的宽度是图标的近三倍,而它的名字靠 tooltip 补 -->
               <button
-                class="use-btn"
+                class="icon-ghost sm"
+                data-tip="Use this prompt"
                 :aria-label="`Use: ${titleOf(item)}`"
                 @click="emit('use', item)"
               >
-                Use
+                <PhArrowUpRight aria-hidden="true" />
               </button>
               <span class="menu-wrap">
                 <button
                   class="icon-ghost sm"
+                  data-tip="More actions"
                   :aria-expanded="openMenu === item.id"
                   :aria-label="`Actions for ${titleOf(item)}`"
                   @click="toggleMenu(item.id, $event)"
@@ -424,7 +431,10 @@ function onImportFile(e: Event) {
                 </button>
                 <Transition name="po">
                   <div v-if="openMenu === item.id" class="menu" :class="{ up: menuUp }">
-                    <button class="mitem" @click="copyPrompt(item)">Copy prompt</button>
+                    <button class="mitem" @click="copyPrompt(item)">
+                      <PhCopy aria-hidden="true" />
+                      Copy prompt
+                    </button>
                     <button class="mitem" @click="startEdit(item)">
                       <PhPencilSimple aria-hidden="true" />
                       Edit
@@ -892,25 +902,6 @@ function onImportFile(e: Event) {
   gap: 4px;
   flex: none;
 }
-.use-btn {
-  display: inline-flex;
-  align-items: center;
-  height: 30px;
-  padding: 0 12px;
-  border-radius: 999px;
-  font-size: var(--fs-xs);
-  color: var(--text-2);
-  /* 有描边才读得出这是个按钮,而不是一行文字 */
-  border: 1px solid var(--line);
-  transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease),
-    background var(--dur) var(--ease);
-}
-.use-btn:hover {
-  color: var(--text);
-  border-color: var(--line-strong);
-  background: var(--bg-elev);
-}
-
 /* ===== 菜单(顶部管理与卡片菜单共用一个外观) ===== */
 .menu-wrap {
   position: relative;
@@ -934,7 +925,8 @@ function onImportFile(e: Event) {
   width: 15px;
   height: 15px;
 }
-/* 卡片里的那个小一号:它和 Use 并排,占满 40px 会把那一行顶高 */
+/* 卡片下沿那两个小一号(取用与更多):40px 会把这一行顶高。
+   它们都没有文字,靠 data-tip 说明用途 —— 图标按钮不给提示就只剩猜 */
 .icon-ghost.sm {
   width: 30px;
   height: 30px;
@@ -1239,8 +1231,7 @@ function onImportFile(e: Event) {
     width: 100%;
     justify-content: center;
   }
-  .icon-ghost.sm,
-  .use-btn {
+  .icon-ghost.sm {
     min-width: 40px;
     height: 40px;
   }
