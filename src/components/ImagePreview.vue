@@ -6,6 +6,8 @@ import {
   PhCaretUp,
   PhCaretDown,
   PhDotsThreeVertical,
+  PhArrowBendUpLeft,
+  PhImageSquare,
   PhX,
   PhCopy,
   PhHeart
@@ -455,9 +457,15 @@ function menuAction(kind: 'favorite' | 'download' | 'remove') {
                   title="Reuse this recipe: prompt, size, model, seed and reference"
                   @click="useThisPrompt"
                 >
+                  <!-- 折返箭头:把这条配方原路带回去。Phosphor 没有 ImagePlus,
+                       参考图那枚用图框(ImageSquare)表意"一张图" -->
+                  <PhArrowBendUpLeft aria-hidden="true" />
                   Reuse
                 </button>
-                <button class="act" @click="useAsReference">As reference</button>
+                <button class="act" @click="useAsReference">
+                  <PhImageSquare aria-hidden="true" />
+                  As reference
+                </button>
               </div>
             </aside>
           </div>
@@ -876,10 +884,14 @@ function menuAction(kind: 'favorite' | 'download' | 'remove') {
 }
 .act {
   flex: 1;
-  /* 撑满各自那一半,文案本该居中;全局 button 重置改成 text-align: inherit 后,
-     这里不再有浏览器默认的居中,得就地写回来 */
-  text-align: center;
-  padding: 11px 16px;
+  /* 图标 + 文案,所以用 flex 居中并给个间距:原来靠 text-align 居中,
+     那一套对 flex 子项不再生效(全局 button 重置把 text-align 改成了 inherit) */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  /* 侧栏只有 320px,两个按钮各占一半 —— 左右各 16px 会让「As reference」挤到换行 */
+  padding: 11px 12px;
   border-radius: var(--r-sm);
   font-size: var(--fs-base);
   border: 1px solid var(--line);
@@ -905,6 +917,11 @@ function menuAction(kind: 'favorite' | 'download' | 'remove') {
   background: var(--cta-hover);
   border-color: var(--cta-hover);
   box-shadow: 0 8px 22px -12px color-mix(in oklch, var(--cta) 55%, transparent);
+}
+.act svg {
+  width: 16px;
+  height: 16px;
+  flex: none;
 }
 
 .modal-enter-active,
