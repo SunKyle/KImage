@@ -1,6 +1,11 @@
-// 极简 IndexedDB 封装:用来持久化历史记录(比 localStorage 容量大得多)
+// 极简 IndexedDB 封装:用来持久化历史记录与提示词封面(比 localStorage 容量大得多)
 const DB_NAME = 'kimage.db'
 const STORE = 'history'
+/* 提示词封面单独一个 store。它们原来是 base64 塞在 localStorage 条目里的,
+   而 localStorage 一共只有约 5MB —— 五六十张封面就顶到天花板,写不下时
+   只能把所有封面整批丢掉(见 git 历史的 savePrompts)。挪到这里之后,
+   封面与历史图共用浏览器级配额,那个"整批丢封面"的降级路径也就不需要了 */
+const COVER_STORE = 'covers'
 /* ===== 历史容量 =====================================================
    不按固定条数淘汰,而是看浏览器给的配额:只有占用接近上限时才清理最旧的一批。
    固定条数会在空间还很宽裕时就静默删记录,而每条记录的体积差很多,
@@ -27,7 +32,7 @@ export interface PruneResult {
 
 function openDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, 2)
+    const req = indexedDB.open(DB_NAME, 3)
     req.onupgradeneeded = () => {
       const db = req.result
       const tx = req.transaction
@@ -38,9 +43,71 @@ function openDB(): Promise<IDBDatabase> {
         : db.createObjectStore(STORE, { keyPath: 'id' })
       // createdAt 索引让"淘汰最旧"只需读主键,不必把整表记录读出来
       if (!store.indexNames.contains('createdAt')) store.createIndex('createdAt', 'createdAt')
+      // v3 新增:提示词封面
+      if (!db.objectStoreNames.contains(COVER_STORE)) {
+        db.createObjectStore(COVER_STORE, { keyPath: 'id' })
+      }
     }
     req.onsuccess = () => resolve(req.result)
     req.onerror = () => reject(req.error)
+  })
+}
+
+/* 申请持久化存储。不申请的话,浏览器在磁盘吃紧时可以把整个 origin 的数据清掉,
+   而这里存的正是用户唯一的作品与提示词库。浏览器多半要求"这个站点正在被使用"
+   才给,所以在第一次真正写入时申请,不在启动时空喊。
+   结果不往上抛:它只影响"磁盘满时会不会被回收",而这件事在正常使用中不该打断用户 */
+let askedPersist = false
+export async function ensurePersisted(): Promise<boolean> {
+  if (askedPersist) return true
+  askedPersist = true
+  try {
+    if (await navigator.storage?.persisted?.()) return true
+    return (await navigator.storage?.persist?.()) ?? false
+  } catch {
+    return false
+  }
+}
+
+/* ===== 提示词封面 =====
+   存的是 data URL 字符串而不是 Blob:提示词库里 item.thumb 一直是字符串,
+   保持形状不变,那个页面就一行都不用改(Blob 得引入 object URL 的创建与回收,
+   为省几 KB 换一堆生命周期管理不值得) */
+export interface CoverRecord {
+  id: string
+  data: string
+}
+
+/** 读出全部封面。库不大,一次读完最简单,调用方按 id 贴回条目 */
+export async function getAllCovers(): Promise<Map<string, string>> {
+  try {
+    const db = await openDB()
+    const rows = await new Promise<CoverRecord[]>((resolve, reject) => {
+      const req = db.transaction(COVER_STORE, 'readonly').objectStore(COVER_STORE).getAll()
+      req.onsuccess = () => resolve(req.result as CoverRecord[])
+      req.onerror = () => reject(req.error)
+    })
+    return new Map(rows.map((r) => [r.id, r.data]))
+  } catch {
+    // 拿不到就当没有封面:库还能用,不该因为封面读不出来而整页打不开
+    return new Map()
+  }
+}
+
+/** 覆盖写回全部封面,并删掉已经不在库里的那些 —— 删掉一条提示词,它的封面不该留下 */
+export async function putCovers(covers: CoverRecord[]): Promise<void> {
+  const db = await openDB()
+  const keep = new Set(covers.map((c) => c.id))
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(COVER_STORE, 'readwrite')
+    const store = tx.objectStore(COVER_STORE)
+    const keysReq = store.getAllKeys()
+    keysReq.onsuccess = () => {
+      for (const k of keysReq.result) if (!keep.has(String(k))) store.delete(k)
+    }
+    for (const c of covers) store.put(c)
+    tx.oncomplete = () => resolve()
+    tx.onerror = () => reject(tx.error)
   })
 }
 

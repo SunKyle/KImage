@@ -1,5 +1,5 @@
 import type { ApiConfig, GenParams, HistoryEntry, PromptItem, ResultItem, ReuseParams } from './types'
-import type { PruneResult } from './lib/idb'
+import type { PruneResult, CoverRecord } from './lib/idb'
 import {
   getAll,
   pruneHistory,
@@ -7,7 +7,10 @@ import {
   deleteOne,
   urlToBlob,
   base64ToBlob,
-  detectMimeFromDataUrl
+  detectMimeFromDataUrl,
+  getAllCovers,
+  putCovers,
+  ensurePersisted
 } from './lib/idb'
 
 const CONFIG_KEY = 'kimage.apiConfigs'
@@ -633,6 +636,8 @@ export async function loadHistory() {
  * 返回 PruneResult 表示"确实清了",交由界面告知用户;空间宽裕时返回 null。
  */
 export async function addHistoryRecord(record: HistoryEntry): Promise<PruneResult | null> {
+  // 第一次真正写入时顺带申请持久化存储(见 idb.ts 的 ensurePersisted)
+  await ensurePersisted()
   await putOne(record)
   return await pruneHistory()
 }
@@ -661,15 +666,20 @@ export function normalizePrompt(p: PromptItem): PromptItem {
   return out
 }
 
-export function loadPrompts(): PromptItem[] {
+/* 读入库。封面不在 localStorage 里(那里只有约 5MB),而是按 id 存在 IndexedDB;
+   所以这里要异步,并把封面贴回条目上。
+   老数据(以及从 JSON 导入的)把封面直接写在条目里,这里顺手搬进 IDB ——
+   搬完把 localStorage 里那一份去掉,否则它一直占着那 5MB 不撒手 */
+export async function loadPrompts(): Promise<PromptItem[]> {
+  let list: PromptItem[] = []
   try {
     const raw = localStorage.getItem(LIB_KEY)
     if (!raw) return []
-    const list = JSON.parse(raw)
+    const parsed = JSON.parse(raw)
     // 存的是本地数据,但别信它一定是好的:被写坏(同步工具截断、手改)时
     // 直接当数组用会让整个库页崩掉,这里滤一遍,坏项丢掉即可
-    if (!Array.isArray(list)) return []
-    return list
+    if (!Array.isArray(parsed)) return []
+    list = parsed
       .filter(
         (p): p is PromptItem =>
           !!p && typeof p === 'object' && typeof (p as PromptItem).prompt === 'string'
@@ -678,28 +688,66 @@ export function loadPrompts(): PromptItem[] {
   } catch {
     return []
   }
-}
-export function savePrompts(list: PromptItem[]): boolean {
-  try {
-    localStorage.setItem(LIB_KEY, JSON.stringify(list))
-    return true
-  } catch {
-    /* 配额不够时逐级丢封面:提示词本身比封面重要得多,宁可丢图也不能让整次保存失败
-       (那样用户会以为存进去了)。列表是从新到旧排的,所以丢的是最旧那批的封面。
 
-       降级按二分来:一条一条地试,每轮都要把整个列表重新序列化一遍,
-       库稍大一点就会把主线程卡住;二分最多试 log2(n) 轮,几十条和几百条都没差别。 */
-    for (let keep = Math.floor(list.length / 2); keep >= 0; keep = Math.floor(keep / 2)) {
-      const next = list.map((p, i) => (i < keep ? { ...p } : { ...p, thumb: undefined }))
-      try {
-        localStorage.setItem(LIB_KEY, JSON.stringify(next))
-        return false
-      } catch {
-        /* 还装不下,保留封面的大半再砍一半 */
-      }
-      if (keep === 0) break
+  const covers = await getAllCovers()
+  let moved = 0
+  for (const item of list) {
+    if (typeof item.thumb === 'string' && item.thumb.startsWith('data:image/')) {
+      covers.set(item.id, item.thumb)
+      moved++
+    } else if (covers.has(item.id)) {
+      item.thumb = covers.get(item.id)
     }
-    return false
   }
+  if (moved) {
+    try {
+      await putCovers([...covers].map(([id, data]) => ({ id, data })))
+      /* 目录单独写,不走 savePrompts:那条路会按"条目里现存的封面"反向裁剪 IDB,
+         而这里条目的封面还没摘(内存里要留着给界面用),一裁就把刚搬进去的全删了 */
+      localStorage.setItem(LIB_KEY, JSON.stringify(slimList(list)))
+    } catch {
+      /* 搬不过去就先算了:下次加载会再试一遍,条目里那份还在,数据不会丢 */
+    }
+  }
+  return list
+}
+
+/** 目录:localStorage 只存这个(没有封面,每条几百字节) */
+function slimList(list: PromptItem[]): PromptItem[] {
+  return list.map((item) => {
+    const copy = { ...item }
+    delete copy.thumb
+    return copy
+  })
+}
+
+/** 封面:按 id 进 IndexedDB */
+function coversOf(list: PromptItem[]): CoverRecord[] {
+  return list
+    .filter((i) => typeof i.thumb === 'string' && i.thumb.startsWith('data:image/'))
+    .map((i) => ({ id: i.id, data: i.thumb as string }))
+}
+
+/* 存回库。封面与目录分开写:localStorage 只留目录(小),封面按 id 进 IndexedDB。
+   以前两者都在 localStorage 里,装不下时只能整批丢封面 —— 去掉封面之后
+   每条只剩几百字节,那一整套"逐级丢封面"的降级路径也就不需要了。
+   返回 false 表示有东西没落盘,界面据此提示 */
+export async function savePrompts(list: PromptItem[]): Promise<boolean> {
+  const covers = coversOf(list)
+  let ok = true
+  try {
+    await ensurePersisted()
+    // 顺带清掉已经不在库里的封面:删掉一条提示词,它的封面不该永远留在这儿
+    await putCovers(covers)
+  } catch {
+    ok = false
+  }
+  try {
+    localStorage.setItem(LIB_KEY, JSON.stringify(slimList(list)))
+  } catch {
+    // 连目录都写不下(现实里到不了:去掉封面后每条只有几百字节),如实返回失败
+    ok = false
+  }
+  return ok
 }
 

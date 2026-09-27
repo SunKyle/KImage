@@ -532,7 +532,9 @@ onMounted(() => {
       saveActiveTextId(activeText.id)
     }
   }
-  libItems.value = loadPrompts()
+  /* 库封面存在 IndexedDB 里,读取因此是异步的(见 api.ts 的 loadPrompts)。
+     不 await —— 首页不必等它,提示词库页挂载时数据早到了 */
+  loadPrompts().then((list) => (libItems.value = list))
   loadHistory().then((h) => {
     history.value = h
     // 老记录没有列表缩略图,后台慢慢补;不 await,免得拖慢首屏
@@ -664,14 +666,14 @@ function applySize(s?: string) {
   if (list === 'free' || list.includes(s)) size.value = s
 }
 
-// 保存提示词库。配额不足时 savePrompts 会退化成不带缩略图的版本,
-// 这时必须说一声 —— 否则封面会莫名消失,而用户以为存好了
-function persistLib() {
-  if (!savePrompts(libItems.value)) {
-    notice.value = 'Not enough local storage. Prompts saved, but cover images were not.'
+/* 保存提示词库。封面现在写在 IndexedDB(见 api.ts 的 savePrompts),
+   失败的概率比从前低得多,但一旦失败仍然要说一声 —— 否则用户以为存好了 */
+async function persistLib() {
+  if (!(await savePrompts(libItems.value))) {
+    notice.value = 'Not enough local storage. Prompts saved, but their covers were not.'
   }
 }
-function useLibItem(item: PromptItem) {
+async function useLibItem(item: PromptItem) {
   prompt.value = item.prompt
   applySize(item.size)
   // 画质/背景同样过一遍能力表:库里存的可能是别家厂商支持的档位
@@ -680,23 +682,23 @@ function useLibItem(item: PromptItem) {
   /* 记一次取用。这是库里唯一一个"随时间变化"的数字,它回答的是
      "我到底在用哪些提示词" —— 不记的话,一年后翻库只能靠感觉 */
   item.uses = (item.uses || 0) + 1
-  persistLib()
+  await persistLib()
   // 关掉库页就等于切回首页;回顶部由 navView 的 watch 统一负责,这里不必再来一次
   page.value = 'home'
 }
-function removeLibItem(id: string) {
+async function removeLibItem(id: string) {
   libItems.value = libItems.value.filter((i) => i.id !== id)
-  persistLib()
+  await persistLib()
 }
 /* 新建与编辑走同一个出口:按 id 判断是插入还是覆盖。
    分成两个 emit 会让"编辑"这件事在库页多一次分支判断,而它本来就只是"存一条" */
-function saveLibItem(item: PromptItem) {
+async function saveLibItem(item: PromptItem) {
   const idx = libItems.value.findIndex((i) => i.id === item.id)
   if (idx >= 0) libItems.value[idx] = item
   else libItems.value = [item, ...libItems.value]
-  persistLib()
+  await persistLib()
 }
-function importLibItems(items: PromptItem[]) {
+async function importLibItems(items: PromptItem[]) {
   // 内容是外部文件,逐条规整:缺 prompt 的记录会让列表渲染崩掉,
   // 超大的 thumb 会顶爆 localStorage 配额,两者都必须在入口拦掉
   const clean: PromptItem[] = items
@@ -712,7 +714,7 @@ function importLibItems(items: PromptItem[]) {
       })
     )
   libItems.value = [...clean, ...libItems.value]
-  persistLib()
+  await persistLib()
 }
 
 /* 导入的配置来自外部文件,逐条规整:没有 baseUrl 的存下来也发不出请求;
@@ -1298,7 +1300,7 @@ async function favoriteFromPreview(p: FavoritePayload) {
     createdAt: Date.now()
   }
   libItems.value = [item, ...libItems.value]
-  persistLib()
+  await persistLib()
   closePreview()
   page.value = 'lib'
 }
