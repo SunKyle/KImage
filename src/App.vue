@@ -1523,10 +1523,13 @@ async function toggleMark(entry: HistoryEntry, index: number) {
       </nav>
     </header>
 
-    <!-- 视图切换:首页工作台与提示词库是两个平级页面,同时只挂载一个 -->
+    <!-- 视图切换:四个页面是平级视图,同时只挂载一个 -->
     <main class="frame">
-      <!-- 生图工作台 -->
-      <section v-if="page === 'home'" class="workbench page-in" aria-label="Studio">
+      <!-- 外面这层 Transition 让新旧两页交叉过渡 ——
+           原来只做了"新页淡入",旧页瞬间消失,那一下硬切就是生硬的来源 -->
+      <Transition name="page">
+        <!-- 生图工作台 -->
+        <section v-if="page === 'home'" class="workbench" aria-label="Studio">
         <header class="hero">
           <p class="hero-eyebrow">AI Image Studio</p>
           <h1 class="hero-title">Turn your ideas<br />into beautiful images</h1>
@@ -1992,7 +1995,6 @@ async function toggleMark(entry: HistoryEntry, index: number) {
       <!-- 提示词库 -->
       <PromptLibrary
         v-else-if="page === 'lib'"
-        class="page-in"
         :items="libItems"
         @use="useLibItem"
         @remove="removeLibItem"
@@ -2003,7 +2005,6 @@ async function toggleMark(entry: HistoryEntry, index: number) {
       <!-- 历史记录 -->
       <HistoryPage
         v-else-if="page === 'history'"
-        class="page-in"
         :items="history"
         @open="openPreview"
         @use="usePreviewPrompt"
@@ -2014,7 +2015,6 @@ async function toggleMark(entry: HistoryEntry, index: number) {
       <!-- 接口设置 -->
       <SettingsPage
         v-else
-        class="page-in"
         :configs="configs"
         :active-id="activeId"
         :active-text-id="activeTextId"
@@ -2031,6 +2031,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
         @save="saveSettings"
         @import="importConfigs"
       />
+      </Transition>
     </main>
 
     <!-- 历史图片预览 -->
@@ -2184,6 +2185,8 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   display: flex;
   flex-direction: column;
   gap: var(--sp-7);
+  /* 离场的那一页会脱离文档流(见 .page-leave-active),这里得是它的定位基准 */
+  position: relative;
 }
 
 /* 撤销条从底部升起来。它比页面切换更"贴身",所以更快一点 */
@@ -2197,20 +2200,38 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   transform: translateY(10px);
 }
 
-/* 页面切换:新页挂载时自己淡入上浮一下,不再整块硬切。
-   只做入场不做离场 —— 分支链是 v-if 直接替换,要离场就得整条链再包一层 <Transition>,
-   那 380 行的首页模板要整体多缩进一级;而入+出会让一次点击等上 360ms,工具类反而显拖。
-   让新页接住这一下就够,读起来是"落位"而不是"换页" */
-.page-in {
-  animation: pageIn 240ms var(--ease) both;
+/* ===== 页面切换 =====
+   旧页原地淡出并微微上移,新页从下方浮起来接住它 —— 两页在同一段时间里交叉,
+   不是"旧页消失、新页另起一段"。离场期间旧页脱离文档流,高度交给新页,
+   所以滚动条不会在中途缩一下又弹回来 */
+.page-leave-active {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  /* 离场只是让位,所以比入场短:两段叠起来刚好是一次呼吸的长度 */
+  transition: opacity 150ms ease-out, transform 150ms ease-out;
 }
-@keyframes pageIn {
-  from {
-    opacity: 0;
-    transform: translateY(8px);
+.page-leave-to {
+  opacity: 0;
+  /* 往上走一点,与入场的方向对上:读起来像两页纸交错滑过 */
+  transform: translateY(-6px);
+}
+.page-enter-active {
+  transition: opacity 320ms var(--ease), transform 320ms var(--ease);
+}
+.page-enter-from {
+  opacity: 0;
+  transform: translateY(14px);
+}
+/* 位移对前庭敏感的人不友好,那种情况下只留淡入淡出 */
+@media (prefers-reduced-motion: reduce) {
+  .page-enter-active,
+  .page-leave-active {
+    transition-duration: 160ms;
   }
-  to {
-    opacity: 1;
+  .page-enter-from,
+  .page-leave-to {
     transform: none;
   }
 }
