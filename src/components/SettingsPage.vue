@@ -134,11 +134,12 @@ function setPurpose(kind: 'image' | 'text') {
   draft.value.model = ''
 }
 
-/* 预设只补地址与推荐模型,密钥一律不动 —— 换一家预设不该把已填的 key 冲掉。
-   与下面的 applyProvider 同一套规矩。 */
+/* 文本表单没有 vendor 字段:高亮与选择都靠地址本身(textPresetOn 比的就是地址),
+   所以地址必须照写下去 —— 它在这里就是"身份",不属于"其他参数"。
+   模型则只补空:已填的模型名常常是对着某家中转写的别名,不该被预设冲掉。 */
 function applyTextProvider(p: TextProvider) {
   draft.value.baseUrl = p.baseUrl
-  if (p.model) draft.value.model = p.model
+  if (!draft.value.model.trim() && p.model) draft.value.model = p.model
 }
 
 /* 高亮当前地址命中哪个预设:草稿里没有 vendor 字段,直接比地址,
@@ -148,11 +149,16 @@ function textPresetOn(p: TextProvider) {
   return norm(draft.value.baseUrl) === norm(p.baseUrl)
 }
 
-// 选厂商:已知厂商顺带填入它的默认地址与模型;自定义只记身份,不动用户已填的内容
+/* 选厂商:只写身份字段(vendor),已填的地址与模型一律不动 ——
+   换厂商常常只是想换个能力表或协议,而地址多半是自己粘的中转或自建接口,
+   被预设顺手覆盖掉就得重新找一遍。
+   空着的字段才用预设补上("只补空,不覆盖"),这样新开一张空白表单仍然少填两格。
+   注意与"新增配置"空态那四条入口区分:那条路走 seedFor,直接给一张填好的表,
+   是"从零开始"的语义,不受这里约束。 */
 function applyProvider(p: Provider) {
   draft.value.vendor = p.id
-  if (p.baseUrl) draft.value.baseUrl = p.baseUrl
-  if (p.model) draft.value.model = p.model
+  if (!draft.value.baseUrl.trim() && p.baseUrl) draft.value.baseUrl = p.baseUrl
+  if (!draft.value.model.trim() && p.model) draft.value.model = p.model
 }
 
 // 表单校验:接口地址填错就完全发不出请求,所以提交前拦一下并说清原因
