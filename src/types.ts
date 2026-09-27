@@ -50,8 +50,12 @@ export interface PromptItem {
   size?: string
   quality?: string
   background?: string
-  // 列表里做视觉锚点的小缩略图(data URL)。
-  // 库存在 localStorage(配额约 5MB),所以压得很紧:160px / webp 0.6,通常 5~9KB
+  /* 卡片封面。存的是原图,不是缩略图 —— 它同时铺在库页卡片和详情左栏上,
+     320px 的缩略图在那个尺寸下一眼就糊。存在 IndexedDB 里(浏览器级配额),
+     所以不必再为几 KB 牺牲清晰度。用 Blob 而不是 data URL:base64 会膨胀 33%,
+     而且整段进 JS 堆。仅当长边超过 1600 时才等比缩一次(见 App.vue 的 coverOf) */
+  cover?: Blob
+  // 旧字段:封面曾经是 data URL 字符串(还是压到 320px 的缩略图)。读入时并进 cover
   thumb?: string
   createdAt: number
   // 旧字段:加 tags 之前只有一个分类字符串。读入时并进 tags,不再写回
@@ -59,7 +63,7 @@ export interface PromptItem {
 }
 
 // 预览里「收藏到提示词库」时一起交出来的内容:
-// 提示词 + 当时真正发出去的参数 + 当前这张图的渲染地址(用来生成封面缩略图)
+// 提示词 + 当时真正发出去的参数 + 出这张图的原始载荷(用来生成封面)
 export interface FavoritePayload {
   prompt: string
   // 出这张图用的模型。库里存下来,以后翻卡才看得出"这张是谁出的"
@@ -67,7 +71,9 @@ export interface FavoritePayload {
   size: string
   quality?: string
   background?: string
-  src: string
+  /* 出这张图的原始载荷。封面要的是原图,而预览那边拿得出手的只有渲染地址 ——
+     交出载荷让主界面自己决定怎么取回字节(新记录是 Blob,老记录是 data URL) */
+  image?: ResultItem
 }
 
 // 一条图片结果。

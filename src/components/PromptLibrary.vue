@@ -10,7 +10,7 @@ import {
   PhCaretDown,
   PhX
 } from '@phosphor-icons/vue'
-import { BACKGROUND_OPTIONS, QUALITY_OPTIONS, optionLabel } from '../api'
+import { BACKGROUND_OPTIONS, QUALITY_OPTIONS, optionLabel, coverSrc } from '../api'
 import { titleFromPrompt } from '../lib/text'
 import type { PromptItem } from '../types'
 
@@ -246,7 +246,16 @@ function removeItem(item: PromptItem) {
 
 function exportJson() {
   openMenu.value = ''
-  const blob = new Blob([JSON.stringify(props.items, null, 2)], { type: 'application/json' })
+  /* 封面不进备份:它是原图,几十条能凑出几百 MB 的 JSON,而这份文件的用处是
+     "把提示词与参数搬到别处" —— 图本来就在别处。以前封面是张 6KB 的缩略图,
+     顺带打包无所谓;现在得显式摘掉,否则 JSON.stringify 会把 Blob 写成 {} */
+  const slim = props.items.map((i) => {
+    const copy = { ...i }
+    delete copy.cover
+    delete copy.thumb
+    return copy
+  })
+  const blob = new Blob([JSON.stringify(slim, null, 2)], { type: 'application/json' })
   const a = document.createElement('a')
   a.href = URL.createObjectURL(blob)
   a.download = `kimage-prompts-${Date.now()}.json`
@@ -376,7 +385,7 @@ function onImportFile(e: Event) {
             @click="startEdit(item)"
           >
             <span class="cover">
-              <img v-if="item.thumb" :src="item.thumb" alt="" />
+              <img v-if="item.cover" :src="coverSrc(item.cover)" alt="" />
               <!-- 手动新建的提示词没有配图。做成一块安静的底,不画"缺图"的警示 ——
                    它只是没存过封面,不是出错 -->
               <span v-else class="cover-none" aria-hidden="true"><PhImage /></span>
@@ -526,12 +535,12 @@ function onImportFile(e: Event) {
           <div class="field">
             <span class="field-label">Cover</span>
             <span class="side-cover">
-              <img v-if="draft.thumb" :src="draft.thumb" alt="" />
+              <img v-if="draft.cover" :src="coverSrc(draft.cover)" alt="" />
               <span v-else class="cover-none" aria-hidden="true"><PhImage /></span>
             </span>
             <span class="side-hint">
               {{
-                draft.thumb
+                draft.cover
                   ? 'Kept from the image this prompt came from.'
                   : 'No cover — this prompt was written by hand.'
               }}

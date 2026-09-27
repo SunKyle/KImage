@@ -49,6 +49,7 @@ import {
   makeThumb,
   backfillThumbs,
   releaseEntryMedia,
+  releaseSrc,
   QUALITY_OPTIONS,
   BACKGROUND_OPTIONS
 } from './api'
@@ -687,7 +688,10 @@ async function useLibItem(item: PromptItem) {
   page.value = 'home'
 }
 async function removeLibItem(id: string) {
+  const gone = libItems.value.find((i) => i.id === id)
   libItems.value = libItems.value.filter((i) => i.id !== id)
+  // 封面用过的 object URL 要撤掉:blob URL 会强引用住 Blob,不撤就回收不了
+  releaseSrc(gone?.cover)
   await persistLib()
 }
 /* 新建与编辑走同一个出口:按 id 判断是插入还是覆盖。
@@ -699,20 +703,30 @@ async function saveLibItem(item: PromptItem) {
   await persistLib()
 }
 async function importLibItems(items: PromptItem[]) {
-  // 内容是外部文件,逐条规整:缺 prompt 的记录会让列表渲染崩掉,
-  // 超大的 thumb 会顶爆 localStorage 配额,两者都必须在入口拦掉
-  const clean: PromptItem[] = items
-    .filter((i) => i && typeof i.prompt === 'string' && i.prompt.trim())
-    .map((i) =>
-      normalizePrompt({
-        ...i,
-        id: i.id || uid(),
-        prompt: i.prompt,
-        thumb:
-          typeof i.thumb === 'string' && i.thumb.startsWith('data:image/') ? i.thumb : undefined,
-        createdAt: typeof i.createdAt === 'number' ? i.createdAt : Date.now()
-      })
-    )
+  /* 内容是外部文件,逐条规整:缺 prompt 的记录会让列表渲染崩掉,必须在入口拦掉。
+     封面只在旧版备份里才有,而且是 320px 的 data URL 缩略图 —— 转成 Blob 收下,
+     比没有强;尺寸够不够清楚不是导入这一步该管的事 */
+  const clean: PromptItem[] = []
+  for (const i of items) {
+    if (!i || typeof i.prompt !== 'string' || !i.prompt.trim()) continue
+    const thumb = typeof i.thumb === 'string' && i.thumb.startsWith('data:image/') ? i.thumb : ''
+    const item = normalizePrompt({
+      ...i,
+      id: i.id || uid(),
+      prompt: i.prompt,
+      cover: i.cover instanceof Blob ? i.cover : undefined,
+      thumb: undefined,
+      createdAt: typeof i.createdAt === 'number' ? i.createdAt : Date.now()
+    })
+    if (!item.cover && thumb) {
+      try {
+        item.cover = await urlToBlob(thumb)
+      } catch {
+        /* 坏封面丢掉,不影响这条提示词 */
+      }
+    }
+    clean.push(item)
+  }
   libItems.value = [...clean, ...libItems.value]
   await persistLib()
 }
@@ -1271,20 +1285,36 @@ function usePreviewPrompt(p: ReuseParams) {
 }
 
 /**
- * 生成封面缩略图。compressImage 在最长边已经小于目标时会把输入原样返回,
- * 那种情况可能是个 blob: URL(刷新即失效),所以只收 data: 开头的;
- * 同时限长,避免把原始大图当成封面塞进 localStorage。
+ * 生成提示词封面。
  *
- * 320px / 0.78:库页卡片的背面会把这张图铺开显示,原来 160px 在那个尺寸下会糊。
- * 画质压得比参考图低,是因为它按条数存进 localStorage,省下的都是配额。
+ * 存的是原图,不是缩略图:封面同时铺在库页卡片和详情左栏上,原来那张
+ * 320px 的缩略图在那个尺寸下一眼就糊(它当年压那么小,只是因为封面挤在
+ * localStorage 的 5MB 里;现在封面在 IndexedDB,没有这个约束了)。
+ *
+ * 之所以还留一个上限:4000px 的图光解码就占几十 MB 内存,库里几十张一起
+ * 铺开会把页面拖死;1600 已经够卡片和详情在 2× 屏上显示得干干净净。
+ * 没超过上限时一次编码都不做 —— compressImage 在那种情况会把输入原样返回,
+ * 于是这里直接把原始载荷存下来,画质一点不丢。
  */
-async function thumbOf(src: string): Promise<string | undefined> {
+const COVER_MAX = 1600
+async function coverOf(item: ResultItem | undefined): Promise<Blob | undefined> {
+  if (!item) return undefined
+  const src = imageSrc(item)
   if (!src) return undefined
-  const out = await compressImage(src, 320, 0.78)
-  return /^data:image\//.test(out) && out.length < 80000 ? out : undefined
+  try {
+    const out = await compressImage(src, COVER_MAX, 0.9)
+    const blob =
+      out === src && item.data instanceof Blob
+        ? item.data
+        : // 超限走了 canvas(或旧记录是 data URL):取回字节
+          await urlToBlob(out)
+    return blob.type.startsWith('image/') ? blob : undefined
+  } catch {
+    return undefined
+  }
 }
 
-// 预览菜单:收藏当前预览的提示词到库(连带参数与一张封面缩略图)
+// 预览菜单:收藏当前预览的提示词到库(连带参数与一张封面)
 async function favoriteFromPreview(p: FavoritePayload) {
   if (!p.prompt.trim()) return
   const item: PromptItem = {
@@ -1296,7 +1326,7 @@ async function favoriteFromPreview(p: FavoritePayload) {
     size: p.size,
     quality: p.quality,
     background: p.background,
-    thumb: await thumbOf(p.src),
+    cover: await coverOf(p.image),
     createdAt: Date.now()
   }
   libItems.value = [item, ...libItems.value]

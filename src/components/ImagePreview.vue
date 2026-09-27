@@ -281,7 +281,7 @@ onUnmounted(() => {
 function menuAction(kind: 'favorite' | 'download' | 'remove') {
   if (!props.entry) return
   if (kind === 'favorite') {
-    // 连参数和当前这张图一起交出去,库里才能既复现参数、又留下封面
+    // 连参数和这张图的原始载荷一起交出去:库里既复现参数,又留一张清晰的封面
     const item = props.entry.results[active.value]
     emit('favorite', {
       prompt: props.entry.prompt,
@@ -290,7 +290,7 @@ function menuAction(kind: 'favorite' | 'download' | 'remove') {
       size: props.entry.size,
       quality: props.entry.quality,
       background: props.entry.background,
-      src: item ? imageSrc(item) : ''
+      image: item
     })
   } else if (kind === 'download') {
     download()

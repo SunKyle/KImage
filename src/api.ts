@@ -490,6 +490,14 @@ export async function enhancePrompt(
    调用 releaseEntryMedia 显式释放。
    ------------------------------------------------------------------ */
 const srcCache = new WeakMap<Blob, string>()
+function objectUrlOf(blob: Blob): string {
+  let url = srcCache.get(blob)
+  if (!url) {
+    url = URL.createObjectURL(blob)
+    srcCache.set(blob, url)
+  }
+  return url
+}
 export function imageSrc(item: ResultItem): string {
   if (typeof item.data === 'string') {
     // 旧数据若是纯 base64,补一个 png 前缀(尽力兼容)
@@ -497,12 +505,13 @@ export function imageSrc(item: ResultItem): string {
     if (!s || s.startsWith('data:') || s.startsWith('blob:')) return s
     return item.type === 'b64' ? `data:image/png;base64,${s}` : s
   }
-  let url = srcCache.get(item.data)
-  if (!url) {
-    url = URL.createObjectURL(item.data)
-    srcCache.set(item.data, url)
-  }
-  return url
+  return objectUrlOf(item.data)
+}
+
+/* 提示词封面 → 可渲染的 src。与历史图共用同一份缓存(Object URL 由 Blob 键控),
+   所以从库里删掉一条时,要连它的封面一起 releaseSrc 掉 */
+export function coverSrc(cover: Blob | undefined): string {
+  return cover ? objectUrlOf(cover) : ''
 }
 
 /** 释放一个载荷用过的 object URL:不撤销的话,blob URL 会一直强引用住 Blob */
@@ -668,8 +677,9 @@ export function normalizePrompt(p: PromptItem): PromptItem {
 
 /* 读入库。封面不在 localStorage 里(那里只有约 5MB),而是按 id 存在 IndexedDB;
    所以这里要异步,并把封面贴回条目上。
-   老数据(以及从 JSON 导入的)把封面直接写在条目里,这里顺手搬进 IDB ——
-   搬完把 localStorage 里那一份去掉,否则它一直占着那 5MB 不撒手 */
+   老数据(以及旧版导出文件)把封面写成条目里的 thumb —— data URL,而且是当年
+   为了挤进 5MB 压到 320px 的缩略图。读到这里顺手转成 Blob 搬进 IDB,
+   并从条目里摘掉,否则它一直占着那 5MB 不撒手。旧封面糊就糊了,没法凭空变清楚 */
 export async function loadPrompts(): Promise<PromptItem[]> {
   let list: PromptItem[] = []
   try {
@@ -690,16 +700,25 @@ export async function loadPrompts(): Promise<PromptItem[]> {
   }
 
   const covers = await getAllCovers()
-  let moved = 0
+  let legacy = false
   for (const item of list) {
-    if (typeof item.thumb === 'string' && item.thumb.startsWith('data:image/')) {
-      covers.set(item.id, item.thumb)
-      moved++
-    } else if (covers.has(item.id)) {
-      item.thumb = covers.get(item.id)
+    const thumb = typeof item.thumb === 'string' ? item.thumb : ''
+    if (thumb.startsWith('data:image/')) {
+      legacy = true
+      // 库里已经有这条封面(上次搬运成功过)就以库里那份为准
+      if (!covers.has(item.id)) {
+        try {
+          covers.set(item.id, await urlToBlob(thumb))
+        } catch {
+          /* 转不出来:这条没封面,不影响其余 */
+        }
+      }
     }
+    delete item.thumb
+    const cover = covers.get(item.id)
+    if (cover) item.cover = cover
   }
-  if (moved) {
+  if (legacy) {
     try {
       await putCovers([...covers].map(([id, data]) => ({ id, data })))
       /* 目录单独写,不走 savePrompts:那条路会按"条目里现存的封面"反向裁剪 IDB,
@@ -716,6 +735,7 @@ export async function loadPrompts(): Promise<PromptItem[]> {
 function slimList(list: PromptItem[]): PromptItem[] {
   return list.map((item) => {
     const copy = { ...item }
+    delete copy.cover
     delete copy.thumb
     return copy
   })
@@ -724,8 +744,8 @@ function slimList(list: PromptItem[]): PromptItem[] {
 /** 封面:按 id 进 IndexedDB */
 function coversOf(list: PromptItem[]): CoverRecord[] {
   return list
-    .filter((i) => typeof i.thumb === 'string' && i.thumb.startsWith('data:image/'))
-    .map((i) => ({ id: i.id, data: i.thumb as string }))
+    .filter((i): i is PromptItem & { cover: Blob } => i.cover instanceof Blob)
+    .map((i) => ({ id: i.id, data: i.cover }))
 }
 
 /* 存回库。封面与目录分开写:localStorage 只留目录(小),封面按 id 进 IndexedDB。

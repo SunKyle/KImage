@@ -70,31 +70,52 @@ export async function ensurePersisted(): Promise<boolean> {
 }
 
 /* ===== 提示词封面 =====
-   存的是 data URL 字符串而不是 Blob:提示词库里 item.thumb 一直是字符串,
-   保持形状不变,那个页面就一行都不用改(Blob 得引入 object URL 的创建与回收,
-   为省几 KB 换一堆生命周期管理不值得) */
+   存的是原图(仅长边超 1600 时缩一次),不是缩略图。用 Blob 不用 data URL:
+   base64 会膨胀 33%,而且整段字符串要进 JS 堆;Blob 由浏览器放在堆外。
+   封面按 id 存,与提示词目录(localStorage)分开 —— 目录每条只有几百字节 */
 export interface CoverRecord {
   id: string
-  data: string
+  data: Blob
 }
 
 /** 读出全部封面。库不大,一次读完最简单,调用方按 id 贴回条目 */
-export async function getAllCovers(): Promise<Map<string, string>> {
+export async function getAllCovers(): Promise<Map<string, Blob>> {
+  // 库里存着的形状不一定等于 CoverRecord:封面刚挪进 IDB 那版存的是 data URL 字符串
+  type CoverRow = { id: string; data: Blob | string }
   try {
     const db = await openDB()
-    const rows = await new Promise<CoverRecord[]>((resolve, reject) => {
+    const rows = await new Promise<CoverRow[]>((resolve, reject) => {
       const req = db.transaction(COVER_STORE, 'readonly').objectStore(COVER_STORE).getAll()
-      req.onsuccess = () => resolve(req.result as CoverRecord[])
+      req.onsuccess = () => resolve(req.result as CoverRow[])
       req.onerror = () => reject(req.error)
     })
-    return new Map(rows.map((r) => [r.id, r.data]))
+    const out = new Map<string, Blob>()
+    for (const row of rows) {
+      if (row.data instanceof Blob) {
+        out.set(row.id, row.data)
+      } else if (typeof row.data === 'string' && row.data.startsWith('data:image/')) {
+        // 封面刚一挪进 IDB 那版存的是 data URL 字符串,这里统一转成 Blob,
+        // 让上层只需要认一种形状;转不出来的坏数据跳过
+        try {
+          out.set(row.id, await urlToBlob(row.data))
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    return out
   } catch {
     // 拿不到就当没有封面:库还能用,不该因为封面读不出来而整页打不开
     return new Map()
   }
 }
 
-/** 覆盖写回全部封面,并删掉已经不在库里的那些 —— 删掉一条提示词,它的封面不该留下 */
+/**
+ * 写回封面:只补库里还没有的那几张,并删掉已经不在库里的那些
+ * (删掉一条提示词,它的封面不该留下)。
+ * 不做全量重写是有意的 —— 封面是原图,而每次保存提示词(取用一次也算)都会
+ * 走到这里,全量重写就是几十上百 MB 的写入。封面只会新增,不会改。
+ */
 export async function putCovers(covers: CoverRecord[]): Promise<void> {
   const db = await openDB()
   const keep = new Set(covers.map((c) => c.id))
@@ -103,9 +124,10 @@ export async function putCovers(covers: CoverRecord[]): Promise<void> {
     const store = tx.objectStore(COVER_STORE)
     const keysReq = store.getAllKeys()
     keysReq.onsuccess = () => {
+      const existing = new Set(keysReq.result.map(String))
       for (const k of keysReq.result) if (!keep.has(String(k))) store.delete(k)
+      for (const c of covers) if (!existing.has(c.id)) store.put(c)
     }
-    for (const c of covers) store.put(c)
     tx.oncomplete = () => resolve()
     tx.onerror = () => reject(tx.error)
   })
