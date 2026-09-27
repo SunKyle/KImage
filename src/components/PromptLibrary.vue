@@ -10,6 +10,8 @@ import {
   PhCaretDown,
   PhCopy,
   PhArrowUpRight,
+  PhDownloadSimple,
+  PhUploadSimple,
   PhX
 } from '@phosphor-icons/vue'
 import { BACKGROUND_OPTIONS, QUALITY_OPTIONS, optionLabel, coverSrc } from '../api'
@@ -302,8 +304,12 @@ function onImportFile(e: Event) {
           </button>
           <Transition name="po">
             <div v-if="openMenu === MENU_MORE" class="menu" :class="{ up: menuUp }">
-              <button class="mitem" @click="exportJson">Export JSON</button>
+              <button class="mitem" @click="exportJson">
+                <PhDownloadSimple aria-hidden="true" />
+                Export JSON
+              </button>
               <label class="mitem file">
+                <PhUploadSimple aria-hidden="true" />
                 Import JSON
                 <input type="file" accept=".json" hidden @change="onImportFile" />
               </label>
@@ -962,6 +968,10 @@ function onImportFile(e: Event) {
   gap: 8px;
   padding: 8px 10px;
   text-align: left;
+  /* 菜单里既有 button 也有 label(Import 那一项):button 的 line-height 是 UA 的
+     normal,而 label 会继承正文的 1.6,两个并排就一高一矮(实测 32px vs 37px)。
+     这里统一成 normal,让它们回到同一个高度 */
+  line-height: normal;
   font-size: var(--fs-sm);
   color: var(--text-2);
   border-radius: 6px;
@@ -983,9 +993,9 @@ function onImportFile(e: Event) {
 .mitem.danger:hover {
   color: var(--danger, #b4232a);
 }
-.file {
-  display: block;
-}
+/* Import 那一项是 label(里面藏着 file input)。这里不再覆盖 display:
+   .mitem 的 flex + gap 才让图标与文字对齐 —— 覆盖成 block 时,
+   SVG 只能跟文字靠基线对齐,会往下一截 */
 
 /* ===== 空态 ===== */
 .lib-none {
