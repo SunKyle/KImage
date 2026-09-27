@@ -36,7 +36,17 @@ const emit = defineEmits<{
 
 const MENU_MORE = 'more'
 const MENU_SORT = 'sort'
-const view = ref<'grid' | 'form'>('grid')
+// 详情页右上角那个菜单(复制/编辑/删除):一页只有一条,用一个固定键即可
+const MENU_DETAIL = 'detail'
+/* 三屏:列表 → 详情 → 表单。详情不是第四屏而是"列表与表单之间"那一步 ——
+   卡片是入口,点开先看清这条是什么(大图、正文、标签、参数),要改再进表单 */
+const view = ref<'grid' | 'detail' | 'form'>('grid')
+/* 详情页在看哪一条:存 id 不存对象 —— 编辑保存后父组件会换一份新的 items,
+   存对象就会停在旧数据上,详情页显示的还是改之前的 */
+const detailId = ref('')
+const detail = computed(() => props.items.find((i) => i.id === detailId.value) || null)
+// 表单是从哪进来的:决定"返回/保存"回列表还是回详情
+const formFrom = ref<'grid' | 'detail'>('grid')
 const query = ref('')
 // 标签筛选。'All' 是"不筛",与标签同处一排,所以单独用一个哨兵值而不是空串
 const tagFilter = ref('All')
@@ -175,19 +185,35 @@ function startNew() {
   draft.value = blank()
   draftTag.value = ''
   openMenu.value = ''
+  formFrom.value = 'grid'
   view.value = 'form'
 }
 
-function startEdit(item: PromptItem) {
+/* 打开详情。列表里的卡片点开的是它,而不是直接进编辑 ——
+   先看清这条是什么,改不改是下一步的事 */
+function openDetail(item: PromptItem) {
+  detailId.value = item.id
+  openMenu.value = ''
+  view.value = 'detail'
+}
+
+function closeDetail() {
+  openMenu.value = ''
+  view.value = 'grid'
+}
+
+function startEdit(item: PromptItem, from: 'grid' | 'detail' = 'detail') {
   // 复制一份:表单改的是草稿,取消就等于没发生过
   draft.value = { ...item, tags: [...(item.tags || [])] }
   draftTag.value = ''
   openMenu.value = ''
+  formFrom.value = from
   view.value = 'form'
 }
 
+// 从哪进来的就回哪去:从详情点编辑,取消后该回到那条的详情,而不是被弹回列表
 function cancelForm() {
-  view.value = 'grid'
+  view.value = formFrom.value
 }
 
 function addDraftTag(raw?: string) {
@@ -218,7 +244,8 @@ function saveForm() {
     id: draft.value.id || Date.now() + Math.random().toString(16).slice(2)
   }
   emit('save', item)
-  view.value = 'grid'
+  // 从详情进来编辑的,存完回详情 —— 那里能看到改动生效,也方便接着取用
+  view.value = formFrom.value
 }
 
 // —— 卡片动作 ——
@@ -238,6 +265,8 @@ async function copyPrompt(item: PromptItem) {
 
 function removeItem(item: PromptItem) {
   openMenu.value = ''
+  // 删掉的正是详情页在看的这条:先退回列表,否则 detail 变空、页面会落到表单分支
+  if (view.value === 'detail') closeDetail()
   emit('remove', item.id)
 }
 
@@ -293,7 +322,23 @@ function onImportFile(e: Event) {
             browser
           </p>
         </div>
-        <!-- 导入导出是低频管理动作,收进菜单,不给标题行添按钮 -->
+      </header>
+
+      <!-- 一行:搜索 + 新建 + 更多。三者都是"从这里开始"的动作,分到两行就散了;
+           导入导出是低频管理,收进最右那个菜单,不单独占位 -->
+      <div class="lib-tools">
+        <input
+          v-model="query"
+          class="search"
+          type="search"
+          placeholder="Search prompts, titles or tags…"
+          spellcheck="false"
+          aria-label="Search prompts"
+        />
+        <button class="lib-new" @click="startNew">
+          <PhPlus aria-hidden="true" />
+          New prompt
+        </button>
         <span class="menu-wrap">
           <button
             class="icon-ghost"
@@ -317,22 +362,6 @@ function onImportFile(e: Event) {
             </div>
           </Transition>
         </span>
-      </header>
-
-      <!-- 一行:搜索 + 新建。标题独占上排之后,这两个最常用的动作在同一行里相遇 -->
-      <div class="lib-tools">
-        <input
-          v-model="query"
-          class="search"
-          type="search"
-          placeholder="Search prompts, titles or tags…"
-          spellcheck="false"
-          aria-label="Search prompts"
-        />
-        <button class="lib-new" @click="startNew">
-          <PhPlus aria-hidden="true" />
-          New prompt
-        </button>
       </div>
 
       <div v-if="items.length" class="lib-filter">
@@ -382,13 +411,13 @@ function onImportFile(e: Event) {
       </div>
 
       <ul v-if="filtered.length" class="lib-grid">
-        <!-- 封面与正文是一整块可点区域:点开就是这条的详情兼编辑。
-             取用/删除留在下沿 —— 它们是"动作",不该和"打开"抢同一次点击 -->
+        <!-- 封面与正文是一整块可点区域:点开是这条的详情(大图 + 正文 + 标签 + 参数),
+             要改再进编辑。取用/删除留在下沿 —— 它们是"动作",不该和"打开"抢同一次点击 -->
         <li v-for="item in filtered" :key="item.id" class="card" :class="{ 'menu-open': openMenu === item.id }">
           <button
             class="card-open"
             :aria-label="`Open ${titleOf(item)}`"
-            @click="startEdit(item)"
+            @click="openDetail(item)"
           >
             <span class="cover">
               <img v-if="item.cover" :src="coverSrc(item.cover)" alt="" />
@@ -445,7 +474,7 @@ function onImportFile(e: Event) {
                       <PhCopy aria-hidden="true" />
                       Copy prompt
                     </button>
-                    <button class="mitem" @click="startEdit(item)">
+                    <button class="mitem" @click="startEdit(item, 'grid')">
                       <PhPencilSimple aria-hidden="true" />
                       Edit
                     </button>
@@ -476,8 +505,88 @@ function onImportFile(e: Event) {
       </div>
     </template>
 
+    <!-- ===== 详情 ===== -->
+    <!-- 卡片点开的落点:先看清这条是什么(大图、正文、标签、参数),
+         要改再进编辑 —— 底部那个 Edit 就是入口 -->
+    <template v-else-if="view === 'detail' && detail">
+      <div class="detail">
+        <header class="detail-head">
+          <button class="back" @click="closeDetail">
+            <PhCaretLeft aria-hidden="true" />
+            Library
+          </button>
+          <span class="menu-wrap">
+            <button
+              class="icon-ghost"
+              :aria-expanded="openMenu === MENU_DETAIL"
+              aria-label="More actions"
+              @click="toggleMenu(MENU_DETAIL, $event)"
+            >
+              <PhDotsThreeVertical weight="bold" aria-hidden="true" />
+            </button>
+            <Transition name="po">
+              <div v-if="openMenu === MENU_DETAIL" class="menu" :class="{ up: menuUp }">
+                <button class="mitem" @click="copyPrompt(detail)">
+                  <PhCopy aria-hidden="true" />
+                  Copy prompt
+                </button>
+                <button class="mitem" @click="startEdit(detail)">
+                  <PhPencilSimple aria-hidden="true" />
+                  Edit
+                </button>
+                <button class="mitem danger" @click="removeItem(detail)">
+                  <PhTrash aria-hidden="true" />
+                  Delete
+                </button>
+              </div>
+            </Transition>
+          </span>
+        </header>
+
+        <!-- 封面按真实比例铺开:列表里那枚是正方形裁切,这里要看得见整张图 -->
+        <figure class="detail-cover" :class="{ 'is-empty': !detail.cover }">
+          <img v-if="detail.cover" :src="coverSrc(detail.cover)" alt="" />
+          <span v-else class="cover-none" aria-hidden="true"><PhImage /></span>
+          <!-- 模型名贴在图上,与列表卡片同一枚语言:一张图"是谁出的"跟着图走 -->
+          <figcaption v-if="detail.model" class="cover-tag">{{ detail.model }}</figcaption>
+        </figure>
+
+        <h2 class="detail-title">{{ titleOf(detail) }}</h2>
+        <p class="detail-prompt">{{ detail.prompt }}</p>
+
+        <div v-if="(detail.tags || []).length" class="detail-tags">
+          <span v-for="t in detail.tags" :key="t" class="detail-tag">{{ t }}</span>
+        </div>
+
+        <!-- 一行交代这条的来处:何时存的、用过几次、当时是什么参数 -->
+        <p class="detail-meta">
+          <span>Saved {{ fmtDate(detail.createdAt) }}</span>
+          <template v-if="detail.uses">
+            <span class="sep">·</span>
+            <span>Used {{ detail.uses }}×</span>
+          </template>
+          <template v-if="savedParams(detail)">
+            <span class="sep">·</span>
+            <span>{{ savedParams(detail) }}</span>
+          </template>
+          <span v-if="copiedId === detail.id" class="copied">Copied</span>
+        </p>
+
+        <div class="detail-ops">
+          <button class="btn-solid grow" @click="emit('use', detail)">
+            <PhArrowUpRight aria-hidden="true" />
+            Use prompt
+          </button>
+          <button class="btn-line" @click="startEdit(detail)">
+            <PhPencilSimple aria-hidden="true" />
+            Edit
+          </button>
+        </div>
+      </div>
+    </template>
+
     <!-- ===== 新建 / 编辑 ===== -->
-    <template v-else>
+    <template v-else-if="view === 'form'">
       <header class="form-head">
         <button class="back" @click="cancelForm">
           <PhCaretLeft aria-hidden="true" />
@@ -588,8 +697,8 @@ function onImportFile(e: Event) {
       </div>
 
       <div class="form-ops">
-        <button class="ops-cancel" @click="cancelForm">Cancel</button>
-        <button class="ops-save" :disabled="!draft.prompt.trim()" @click="saveForm">
+        <button class="btn-line" @click="cancelForm">Cancel</button>
+        <button class="btn-solid" :disabled="!draft.prompt.trim()" @click="saveForm">
           {{ draft.id ? 'Save changes' : 'Save to library' }}
         </button>
       </div>
@@ -1039,6 +1148,104 @@ function onImportFile(e: Event) {
   background: var(--surface-hover);
 }
 
+/* ===== 详情 ===== */
+/* 列表是 1080 宽的多列,详情是单栏:限宽居中 —— 一行文字太长不好读,
+   大图也不该占满整屏 */
+.detail {
+  max-width: 720px;
+  margin: 0 auto;
+  padding-top: var(--sp-2);
+}
+.detail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--sp-5);
+}
+/* .back 在表单那边自带下外边距(它是块级流里的第一个元素),这里由容器管间距 */
+.detail-head .back {
+  margin-bottom: 0;
+}
+/* 封面按真实比例铺开:列表里那枚是正方形裁切,这里要看整张图。
+   限高 62vh 是因为竖版图(848×1264 这类)铺到 720 宽会有近千像素高 */
+.detail-cover {
+  position: relative;
+  display: grid;
+  place-items: center;
+  margin: 0;
+  min-height: 200px;
+  max-height: 62vh;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  background: var(--image-bg);
+  overflow: hidden;
+}
+.detail-cover img {
+  display: block;
+  width: auto;
+  height: auto;
+  max-width: 100%;
+  max-height: 62vh;
+}
+/* 手写的、没存过封面的条目:留一块安静的底,不画"缺图"的警示 */
+.detail-cover.is-empty {
+  min-height: 150px;
+}
+.detail-title {
+  margin-top: var(--sp-5);
+  font-size: var(--fs-2xl);
+  font-weight: 700;
+  letter-spacing: var(--ls-tight);
+}
+.detail-prompt {
+  margin-top: var(--sp-3);
+  font-size: var(--fs-base);
+  line-height: 1.7;
+  /* 提示词里的换行是用户自己敲的,要留着;长串(URL 之类)也得能折行 */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.detail-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: var(--sp-4);
+}
+.detail-tag {
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: var(--fs-xs);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.detail-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  margin-top: var(--sp-4);
+  font-size: var(--fs-xs);
+  color: var(--text-2);
+}
+.detail-meta .sep {
+  color: var(--text-4);
+}
+.detail-meta .copied {
+  color: var(--accent);
+  font-weight: 500;
+}
+.detail-ops {
+  display: flex;
+  gap: var(--sp-3);
+  margin-top: var(--sp-6, 32px);
+  padding-top: var(--sp-5);
+  border-top: 1px solid var(--line);
+}
+/* 主操作占满剩余宽度:这一屏只有这一件事值得强调 */
+.detail-ops .grow {
+  flex: 1;
+}
+
 /* ===== 表单 ===== */
 .form-head {
   padding-top: var(--sp-2);
@@ -1202,8 +1409,14 @@ function onImportFile(e: Event) {
   padding-top: var(--sp-5);
   border-top: 1px solid var(--line);
 }
-.ops-cancel,
-.ops-save {
+/* 表单底部与详情页底部共用这两个按钮(实心主操作 / 描边次操作):
+   同一套尺寸与配色,不各写一份 —— 将来调圆角或高度只改一处 */
+.btn-line,
+.btn-solid {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
   height: 40px;
   padding: 0 20px;
   border-radius: 999px;
@@ -1212,22 +1425,27 @@ function onImportFile(e: Event) {
   transition: background var(--dur) var(--ease), color var(--dur) var(--ease),
     border-color var(--dur) var(--ease);
 }
-.ops-cancel {
+.btn-line svg,
+.btn-solid svg {
+  width: 15px;
+  height: 15px;
+}
+.btn-line {
   border: 1px solid var(--line-strong);
   color: var(--text-2);
 }
-.ops-cancel:hover {
+.btn-line:hover {
   color: var(--text);
   background: var(--surface-hover);
 }
-.ops-save {
+.btn-solid {
   background: var(--cta);
   color: var(--cta-text);
 }
-.ops-save:hover:not(:disabled) {
+.btn-solid:hover:not(:disabled) {
   background: var(--cta-hover);
 }
-.ops-save:disabled {
+.btn-solid:disabled {
   opacity: 0.4;
   cursor: not-allowed;
 }
@@ -1246,8 +1464,13 @@ function onImportFile(e: Event) {
   .lib-tools {
     flex-wrap: wrap;
   }
+  /* 搜索自己占一行,下面 New prompt 与「更多」并排:
+     三个挤一行会把搜索压到只剩几十像素 */
+  .search {
+    flex: 1 1 100%;
+  }
   .lib-new {
-    width: 100%;
+    flex: 1;
     justify-content: center;
   }
   .icon-ghost.sm {
