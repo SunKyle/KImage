@@ -12,6 +12,7 @@ import {
   PhArrowUpRight,
   PhDownloadSimple,
   PhUploadSimple,
+  PhCheck,
   PhX
 } from '@phosphor-icons/vue'
 import { BACKGROUND_OPTIONS, QUALITY_OPTIONS, optionLabel, coverSrc } from '../api'
@@ -371,6 +372,9 @@ function onImportFile(e: Event) {
                 @click="pickSort(s.key)"
               >
                 {{ s.label }}
+                <!-- 勾号推在最右,不给未选中的两项留占位槽 ——
+                     留了的话它们前面会空一块,看着像图标没加载出来 -->
+                <PhCheck v-if="sort === s.key" class="menu-check" aria-hidden="true" />
               </button>
             </div>
           </Transition>
@@ -989,6 +993,11 @@ function onImportFile(e: Event) {
 .mitem.on {
   color: var(--accent);
   font-weight: 500;
+}
+/* 排序菜单的当前项。margin-left: auto 把它顶到菜单最右:
+   占位槽会让三项里未选中的两项前面空一块,而推到右端不占文字的位置 */
+.menu-check {
+  margin-left: auto;
 }
 .mitem.danger:hover {
   color: var(--danger, #b4232a);
