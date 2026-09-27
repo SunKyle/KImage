@@ -485,6 +485,15 @@ const selectedConfigs = computed(() =>
 )
 // 多选即对比
 const compareMode = computed(() => selectedConfigs.value.length > 1)
+/* 对比模式下每个模型只出一张(见 doRace):张数入口停用,并且如实显示 1 ——
+   否则行上还写着"3 images",用户会以为三家各出三张。
+   n 本身不动:退出对比模式后,之前设的张数原样回来 */
+const shownN = computed(() => (compareMode.value ? 1 : n.value))
+/* 加选到第二个模型时,张数面板已经没意义了(下一刻入口就会被停用),顺手收起 ——
+   留着它只会让人以为还能改 */
+watch(compareMode, (on) => {
+  if (on && openPanel.value === 'n') openPanel.value = ''
+})
 // 一个槽位 = 一个模型 × 这一次请求。results 为空表示还没回来
 type RaceSlot = {
   configId: string
@@ -1575,12 +1584,15 @@ async function toggleMark(entry: HistoryEntry, index: number) {
               <button
                 class="param-btn has-val"
                 :class="{ on: openPanel === 'n' }"
-                :data-tip="`Images · ${n}`"
+                :disabled="compareMode"
+                :data-tip="
+                  compareMode ? 'One image per model in compare mode' : `Images · ${n}`
+                "
                 aria-label="Count"
                 @click="togglePanel('n')"
               >
                 <PhSquaresFour aria-hidden="true" />
-                <b class="param-val">{{ n }} {{ n === 1 ? 'image' : 'images' }}</b>
+                <b class="param-val">{{ shownN }} {{ shownN === 1 ? 'image' : 'images' }}</b>
               </button>
               <!-- 尺寸/画质/背景/参考图收进这一个入口:参数行默认只留模型与张数,
                    最常改的两个直接可达,其余点开就是完整面板,不必挤成一长排。
@@ -2413,6 +2425,16 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   color: var(--text);
   border-color: var(--line-strong);
   background: var(--bg-elev);
+}
+/* 多模型对比时张数入口被停用(每个模型只出一张)。停用不是"出错",
+   所以压暗但保留可读,悬停仍能拿到 tooltip 说明为什么不能改 */
+.param-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.param-btn:disabled:hover {
+  color: var(--text-2);
+  border-color: var(--line);
 }
 .param-btn.filled {
   border-color: var(--line-strong);
