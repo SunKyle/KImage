@@ -123,10 +123,12 @@ function setPurpose(kind: 'image' | 'text') {
   draft.value.model = ''
 }
 
-/* 文本表单没有 vendor 字段:高亮与选择都靠地址本身(textPresetOn 比的就是地址),
-   所以地址必须照写下去 —— 它在这里就是"身份",不属于"其他参数"。
-   模型则只补空:已填的模型名常常是对着某家中转写的别名,不该被预设冲掉。 */
+/* 文本预设:地址照写(高亮比的就是地址,它在这里是身份),模型只补空 ——
+   已填的模型名常常是对着某家中转写的别名,不该被预设冲掉。
+   vendor 也要写下去:它本来只在出图那条路上被写,于是文本配置的 vendor 一直
+   是 add() 给的 'custom',从 DeepSeek 换成 OpenAI 也照样顶着「接线」图标 */
 function applyTextProvider(p: TextProvider) {
+  draft.value.vendor = p.id
   draft.value.baseUrl = p.baseUrl
   if (!draft.value.model.trim() && p.model) draft.value.model = p.model
 }
@@ -174,8 +176,15 @@ function submit() {
   emit('save', { ...draft.value, baseUrl: url })
 }
 
-// 配置的厂商:老配置没写 vendor 就按域名猜,和主页面用的是同一套推断
+/* 配置的厂商:老配置没写 vendor 就按域名猜,和主页面用的是同一套推断。
+   文本配置多一步:那条路以前不写 vendor(字段是后加的),旧数据里它是 'custom',
+   直接信它的话,DeepSeek 那类配置会一直顶着「接线」图标 —— 所以这种值不可信,
+   按域名认一次。出图配置不动:那里的 custom 是用户明确选的 */
 function vendorId(c: ApiConfig) {
+  if (c.kind === 'text' && (!c.vendor || c.vendor === 'custom')) {
+    const guess = inferVendor(c.baseUrl)
+    if (guess !== 'custom') return guess
+  }
   return c.vendor || inferVendor(c.baseUrl)
 }
 
