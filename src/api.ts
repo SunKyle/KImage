@@ -188,6 +188,7 @@ export function inferVendor(baseUrl: string): string {
      模型名还带 google/ 前缀,和这里不是一套,硬认出来只会误导 */
   if (h.includes('generativelanguage')) return 'gemini'
   if (h.includes('openai')) return 'openai'
+  if (h.includes('deepseek')) return 'deepseek'
   if (h.includes('volces') || h.includes('ark.cn')) return 'ark'
   if (h.includes('dashscope') || h.includes('aliyun')) return 'dashscope'
   return 'custom'
@@ -225,6 +226,15 @@ export const TEXT_PROVIDERS: TextProvider[] = [
     label: 'OpenAI',
     baseUrl: 'https://api.openai.com/v1',
     model: 'gpt-4o-mini'
+  },
+  {
+    /* DeepSeek 只有对话模型(deepseek-chat / deepseek-reasoner),没有出图,
+       所以它只在这一份预设里,不进 PROVIDERS —— 出图那行给出一个画不了图的
+       选项等于骗人 */
+    id: 'deepseek',
+    label: 'DeepSeek',
+    baseUrl: 'https://api.deepseek.com/v1',
+    model: 'deepseek-chat'
   },
   {
     id: 'dashscope-compat',

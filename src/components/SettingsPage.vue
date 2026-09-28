@@ -1,19 +1,14 @@
 <script setup lang="ts">
 import { computed, ref, watch, onMounted, onBeforeUnmount } from 'vue'
-import type { Component } from 'vue'
 import {
   PhPlus,
   PhDotsThreeVertical,
   PhCaretRight,
   PhCheck,
   PhEye,
-  PhEyeSlash,
-  PhOpenAiLogo,
-  PhGoogleLogo,
-  PhLightning,
-  PhCloud,
-  PhPlugsConnected
+  PhEyeSlash
 } from '@phosphor-icons/vue'
+import BrandIcon from './BrandIcon.vue'
 import { PROVIDERS, TEXT_PROVIDERS, getProvider, inferVendor } from '../api'
 import type { Provider, TextProvider } from '../api'
 import type { ApiConfig } from '../types'
@@ -179,31 +174,19 @@ function submit() {
   emit('save', { ...draft.value, baseUrl: url })
 }
 
-// 配置行上的厂商名:老配置没写 vendor 就按域名猜,和主页面用的是同一套推断
-function vendorLabel(c: ApiConfig) {
-  return getProvider(c.vendor || inferVendor(c.baseUrl)).label
+// 配置的厂商:老配置没写 vendor 就按域名猜,和主页面用的是同一套推断
+function vendorId(c: ApiConfig) {
+  return c.vendor || inferVendor(c.baseUrl)
 }
 
-/* 厂商图标。Phosphor 里只有 OpenAI 与 Google 两家的品牌标,所以:
-   - openai / gemini 用真标
-   - ark(火山方舟)、dashscope(百炼) 用它俩的语义图标兜底 —— 拿一个不是它家的
-     标来充数比没有更糟
-   - custom 用「接线」而不是 OpenAI 标:它跑的是那套协议,但它不是 OpenAI,
-     两行摆在一起时得能一眼分开
-   认不出的 id 一律回到这个接线图标,所以每行都有图标,名字左缘对得齐 */
-const VENDOR_ICONS: Record<string, Component> = {
-  openai: PhOpenAiLogo,
-  gemini: PhGoogleLogo,
-  ark: PhLightning,
-  dashscope: PhCloud,
-  'dashscope-compat': PhCloud,
-  custom: PhPlugsConnected
+/* 厂商名。预设是两份表 —— 出图的 PROVIDERS 与文本的 TEXT_PROVIDERS,
+   DeepSeek 只做对话所以只在后一份里。两边都查一遍,再退回能力表兜底 */
+function providerLabel(id: string) {
+  const p = PROVIDERS.find((x) => x.id === id) || TEXT_PROVIDERS.find((x) => x.id === id)
+  return (p || getProvider(id)).label
 }
-function vendorIcon(c: ApiConfig) {
-  return vendorIconOf(c.vendor || inferVendor(c.baseUrl))
-}
-function vendorIconOf(vendorId: string | undefined): Component {
-  return VENDOR_ICONS[vendorId || 'custom'] || PhPlugsConnected
+function vendorLabel(c: ApiConfig) {
+  return providerLabel(vendorId(c))
 }
 
 /* 模型在前、厂商在后合成一句。
@@ -367,7 +350,7 @@ function onImportFile(e: Event) {
                   </span>
                   <span class="row-main">
                     <span class="row-name">
-                      <component :is="vendorIcon(c)" class="v-ic" aria-hidden="true" />
+                      <BrandIcon :brand="vendorId(c)" />
                       <span class="nm">{{ c.name || 'Untitled config' }}</span>
                     </span>
                     <!-- 地址不再出现在列表里:编辑表单里本来就有完整地址 -->
@@ -425,7 +408,7 @@ function onImportFile(e: Event) {
               >
                 <span class="qm">
                   <b>
-                    <component :is="vendorIconOf(p.id)" class="v-ic" aria-hidden="true" />
+                    <BrandIcon :brand="p.id" :size="15" />
                     {{ p.label }}
                   </b>
                   <span>{{ quickHint(p) }}</span>
@@ -435,7 +418,7 @@ function onImportFile(e: Event) {
               <button class="quick-item" @click="emit('create')">
                 <span class="qm">
                   <b>
-                    <PhPlugsConnected class="v-ic" aria-hidden="true" />
+                    <BrandIcon brand="custom" :size="15" />
                     My own endpoint
                   </b>
                   <span>Any OpenAI-compatible base URL</span>
@@ -494,7 +477,7 @@ function onImportFile(e: Event) {
                   :class="{ on: (draft.vendor || 'custom') === p.id }"
                   @click="applyProvider(p)"
                 >
-                  <component :is="vendorIconOf(p.id)" class="v-ic" aria-hidden="true" />
+                  <BrandIcon :brand="p.id" :size="14" />
                   {{ p.label }}
                 </button>
               </template>
@@ -507,7 +490,7 @@ function onImportFile(e: Event) {
                   :class="{ on: textPresetOn(p) }"
                   @click="applyTextProvider(p)"
                 >
-                  <component :is="vendorIconOf(p.id)" class="v-ic" aria-hidden="true" />
+                  <BrandIcon :brand="p.id" :size="14" />
                   {{ p.label }}
                 </button>
               </template>
@@ -846,13 +829,6 @@ function onImportFile(e: Event) {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* 厂商图标。颜色跟着行名走(名字变深时它一起变),尺寸按文字大小定 */
-.v-ic {
-  flex: none;
-  width: 16px;
-  height: 16px;
-  opacity: 0.85;
-}
 /* 当前那条用正文色,其余退一档:靠字色而不是整行铺色块表达「最实」 */
 .row.is-current .row-name {
   color: var(--text);
@@ -968,9 +944,8 @@ function onImportFile(e: Event) {
   font-size: var(--fs-base);
   font-weight: 600;
 }
-.qm b .v-ic {
-  width: 15px;
-  height: 15px;
+/* 品牌标比标题浅一档,不跟文字抢 */
+.qm b :deep(.v-ic) {
   color: var(--text-3);
 }
 .qm span {
@@ -1118,10 +1093,6 @@ function onImportFile(e: Event) {
   cursor: pointer;
   transition: border-color var(--dur) var(--ease), color var(--dur) var(--ease),
     background var(--dur) var(--ease);
-}
-.preset .v-ic {
-  width: 14px;
-  height: 14px;
 }
 .preset:hover {
   border-color: var(--line-strong);
