@@ -12,9 +12,9 @@ import {
   PhCopy,
   PhHeart
 } from '@phosphor-icons/vue'
-import { BACKGROUND_OPTIONS, QUALITY_OPTIONS, imageSrc, optionLabel, reuseParamsOf } from '../api'
+import { BACKGROUND_OPTIONS, QUALITY_OPTIONS, extOf, imageSrc, optionLabel, reuseParamsOf } from '../api'
 import type { HistoryEntry, ResultItem, ReuseParams, FavoritePayload } from '../types'
-import { detectMimeFromDataUrl, blobToDataURL } from '../lib/idb'
+import { blobToDataURL } from '../lib/idb'
 
 const props = defineProps<{
   visible: boolean
@@ -139,23 +139,8 @@ function next() {
   active.value = (active.value + 1) % imgs.value.length
 }
 
-/** 按载荷真实类型推下载扩展名:结果可能是 jpeg / webp,写死 png 名不对 */
-function extOf(item: ResultItem | undefined): string {
-  const data = item?.data
-  if (data instanceof Blob) {
-    const t = data.type
-    if (t.includes('jpeg')) return 'jpg'
-    if (t.includes('webp')) return 'webp'
-    if (t.includes('gif')) return 'gif'
-    return 'png'
-  }
-  if (typeof data === 'string') {
-    const mime = detectMimeFromDataUrl(data)
-    return mime === 'image/jpeg' ? 'jpg' : mime.split('/')[1] || 'png'
-  }
-  return 'png'
-}
-
+/** 按载荷真实类型推下载扩展名:结果可能是 jpeg / webp,写死 png 名不对。
+ *  实现与批量导出共用一份(见 api.ts 的 extOf) */
 function download() {
   const url = imgs.value[active.value]
   if (!url) return

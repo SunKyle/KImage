@@ -139,6 +139,10 @@ const refImage = ref('') // 图生图参考图 (data URL)
 type Page = 'home' | 'lib' | 'history' | 'settings'
 const page = ref<Page>('home')
 const previewEntry = ref<HistoryEntry | null>(null)
+/* 「拉自某条记录改一个变量重跑」时,这一批的父记录 id。
+   use-prompt 会把 fromEntryId 放进来,doGenerate 落盘时写进新记录做 parentId;
+   用户手动改输入框后清空 —— 改完就不再是"同一个实验的延续",而是一张新图 */
+const pendingParentId = ref<string | undefined>()
 // 参数 icon 展开的面板:同一时间只开一个,再次点击收起。
 // 只有三项 —— 尺寸/画质/背景/参考图合并成 'more' 一块,参数行默认只露模型与张数
 type PanelKey = '' | 'n' | 'more' | 'config'
@@ -935,6 +939,12 @@ function onEnter(e: KeyboardEvent) {
   doGenerate()
 }
 
+/* 用户手动改动提示词 = 开启一个新的实验分支,和"从某条记录拉下来再改"不再是同一件事。
+   所以来源要清掉:这一批落盘时就不会再挂父记录,链在这里断开 */
+function onPromptEdit() {
+  pendingParentId.value = undefined
+}
+
 async function doGenerate() {
   if (loading.value) return
   /* 改写回来时会整体覆盖提示词。此刻发出去的图,用的是改写到一半的内容,
@@ -958,6 +968,9 @@ async function doGenerate() {
 
   // 发起前锁定这一批的参数,后面一律读快照,避免中途改参数串味
   running.value = { prompt: prompt.value, size: size.value, n: n.value }
+  /* 普通生成也纳入分组:同一次点生成就是一批。group 让生成的结果在图墙上
+     可归拢,和对比出图共用同一个字段语义(见 groupId 注释) */
+  const genGroupId = `gen-${Date.now().toString(36)}`
   // 扩展参数与参考图同样要快照:它们在 await 期间可能被改动
   const extras = extraParams()
   // 种子也是快照的一部分:中途改它不该影响已经发出的这一批
@@ -992,9 +1005,12 @@ async function doGenerate() {
       quality: extras.quality,
       background: extras.background,
       hasRef: !!refSrc,
+      groupId: genGroupId,
       configId: config.value.id,
       seed: seedNum,
       refSrc: refSrc || undefined,
+      /* 「拉自某条记录改一个变量重跑」的出处。普通手写提示词这里是空,不入链 */
+      parentId: pendingParentId.value,
       elapsedMs: Date.now() - startedAt
     })
     await persist(record)
@@ -1023,6 +1039,8 @@ async function recordFor(
     background?: string
     hasRef?: boolean
     groupId?: string
+    /* 这一批是「从某条记录拉下来改的」时的父记录 id。见 pendingParentId */
+    parentId?: string
     elapsedMs: number
     // 完整配方里其余的三项:重跑时要用它们还原当时的条件
     configId?: string
@@ -1040,6 +1058,7 @@ async function recordFor(
     background: meta.background,
     hasRef: meta.hasRef,
     groupId: meta.groupId,
+    parentId: meta.parentId,
     configId: meta.configId,
     seed: meta.seed,
     elapsedMs: meta.elapsedMs,
@@ -1342,6 +1361,9 @@ function closePreview() {
    才会按"当时那个模型"来判,而不是按切换前那个 */
 function usePreviewPrompt(p: ReuseParams) {
   prompt.value = p.prompt
+  /* 这一批的出处:只有当它确实是"从某条记录拉下来的"才记。
+     普通手写提示词的生成没有 fromEntryId,来源就保持为空 */
+  pendingParentId.value = p.fromEntryId
   /* 配置先还原 —— 配方里最容易漏、又最影响结果的就是"当时用的哪个模型"。
      不还原它,重跑用的其实是当前生效的那个:换了模型却以为是在同一张图上微调。
      配置已被删掉时保持当前这条,但要说一声,别让人以为还原成了 */
@@ -1547,6 +1569,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
                 :readonly="enhancing"
                 aria-label="Prompt"
                 placeholder="Describe your image: an orange cat dozing in the sun…"
+                @input="onPromptEdit"
                 @keydown.enter.exact="onEnter"
               />
 

@@ -110,6 +110,10 @@ export interface HistoryEntry {
      派生关系(版本树)也将挂在同一个字段上,所以它是"这一批从哪来"的标识,
      不限于对比。可选:普通生成与加这个字段之前的记录都没有 */
   groupId?: string
+  /* 「拉自某条记录改一个变量重跑」时的出处:被复现的那条记录的 id。
+     只有走 Reuse(预览卡 / 历史页的 use)才记,用户手动敲新提示词没有。
+     一条链,不是树:父可以没有,也不能有多个。可选:老记录与普通手写生成都没有 */
+  parentId?: string
   createdAt: number
   // 上游可能返回一张或多张图
   results: ResultItem[]
@@ -138,4 +142,7 @@ export interface ReuseParams {
   seed?: number
   // 参考图(data URL)。记录里存的是 Blob,取用时才转成 data URL
   ref?: string
+  /* 「拉自某条记录」时的出处记录 id。带上来,主界面才知道这次生成
+     把谁当父记录(parentId)。可选:手动手写提示词开始的生成没有 */
+  fromEntryId?: string
 }

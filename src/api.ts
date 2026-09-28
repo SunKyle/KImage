@@ -1,5 +1,6 @@
 import type { ApiConfig, GenParams, HistoryEntry, PromptItem, ResultItem, ReuseParams } from './types'
 import type { PruneResult, CoverRecord } from './lib/idb'
+import { titleFromPrompt } from './lib/text'
 import {
   getAll,
   pruneHistory,
@@ -687,6 +688,130 @@ export async function backfillThumbs(list: HistoryEntry[]): Promise<void> {
   }
 }
 
+/* ===== 批量导出选中的图 =============================================
+   把挑好的图打包带走 —— "做一套素材"这个任务的最后一步。
+   粒度是"图"而不是"记录":一条记录里只挑了一张,就只导出那一张,
+   与历史图墙把记录摊平成图块的口径一致(见 HistoryPage 的 tiles)。
+
+   这里刻意不认识"标记":标记是一份长期收藏,而"这次要带走哪几张"往往
+   只是一次性的挑选。所以由调用方给出清单,这一层只负责取字节与打包。
+   -------------------------------------------------------------------- */
+export interface ExportPick {
+  /** 属于哪条提示词 —— 只用来起文件名 */
+  prompt: string
+  item: ResultItem
+}
+
+export interface ExportOutcome {
+  /** 真正打进包里的张数 */
+  exported: number
+  /** 取不回字节因而被跳过的张数(远端图被 CORS 拦、载荷损坏) */
+  skipped: number
+}
+
+/** 按载荷真实类型推扩展名:结果可能是 jpeg / webp,写死 png 名不对。
+ *  单张下载与批量导出共用同一份,两处各写一套迟早改歪一边 */
+export function extOf(item: ResultItem | undefined): string {
+  const data = item?.data
+  if (data instanceof Blob) {
+    const t = data.type
+    if (t.includes('jpeg')) return 'jpg'
+    if (t.includes('webp')) return 'webp'
+    if (t.includes('gif')) return 'gif'
+    return 'png'
+  }
+  if (typeof data === 'string') {
+    const mime = detectMimeFromDataUrl(data)
+    return mime === 'image/jpeg' ? 'jpg' : mime.split('/')[1] || 'png'
+  }
+  return 'png'
+}
+
+/* 读出一张图的字节。统一借 imageSrc 把三种载荷(Blob / data URL / 远端 URL)
+   变成可 fetch 的地址,不必在调用点各判一次。
+   远端图可能被跨域拦下 —— 返回 undefined 让调用方跳过:导出不该因为一张
+   取不回来的老图而整批失败 */
+async function itemBlob(item: ResultItem): Promise<Blob | undefined> {
+  const src = imageSrc(item)
+  if (!src) return undefined
+  try {
+    return await urlToBlob(src)
+  } catch {
+    return undefined
+  }
+}
+
+/** 文件名里不能出现的字符去掉;标题派生不出来时退回一个通用名 */
+function safeBase(prompt: string): string {
+  const cleaned = titleFromPrompt(prompt)
+    .replace(/[\\/:*?"<>|]/g, '')
+    .replace(/\.+$/, '')
+    .trim()
+  return cleaned || 'image'
+}
+
+/** 触发一次下载。object URL 用完即撤,否则这份 zip 会被一直强引用住 */
+function downloadBlob(blob: Blob, filename: string) {
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(blob)
+  a.download = filename
+  a.click()
+  setTimeout(() => URL.revokeObjectURL(a.href), 1500)
+}
+
+/** 包名带时间戳:同一天导两次不会互相覆盖 */
+function zipName(): string {
+  const d = new Date()
+  const p = (x: number) => String(x).padStart(2, '0')
+  return `kimage-${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}.zip`
+}
+
+/**
+ * 把给出的一批图打包成一个 zip 下载。
+ *
+ * 逐张串行读字节:并发读会一次性解码多张大图、把整批请求同时压在主线程上,
+ * 而这是一次手动动作,慢一点无妨。
+ * 图片本身已是压缩格式,所以用 level 0(只打包不再压),省掉白烧的 CPU。
+ * zip 库用动态引入:导出是低频动作,不该让它进首屏那份包。
+ */
+export async function exportImages(
+  picks: ExportPick[],
+  onProgress?: (done: number, total: number) => void
+): Promise<ExportOutcome> {
+  const files: Record<string, Uint8Array> = {}
+  // 同一句提示词出的多张图会撞名,所以按标题分别计数编号
+  const counters = new Map<string, number>()
+  let skipped = 0
+
+  for (let i = 0; i < picks.length; i++) {
+    onProgress?.(i, picks.length)
+    const { prompt, item } = picks[i]
+    const blob = await itemBlob(item)
+    if (!blob) {
+      skipped++
+      continue
+    }
+    const base = safeBase(prompt)
+    const n = (counters.get(base) || 0) + 1
+    counters.set(base, n)
+    files[`kimage-${base}-${n}.${extOf(item)}`] = new Uint8Array(await blob.arrayBuffer())
+  }
+  onProgress?.(picks.length, picks.length)
+
+  const exported = Object.keys(files).length
+  if (!exported) return { exported: 0, skipped }
+
+  const { zip } = await import('fflate')
+  const bytes = await new Promise<Uint8Array>((resolve, reject) => {
+    zip(files, { level: 0 }, (err, out) => (err ? reject(err) : resolve(out)))
+  })
+  /* fflate 的返回类型挂在 ArrayBufferLike 上(理论上可能是 SharedArrayBuffer),
+     而 BlobPart 只收 ArrayBuffer 支撑的视图 —— 这里拿到的一定是普通 Uint8Array,
+     转一下类型即可,不必白拷一份字节 */
+  downloadBlob(new Blob([bytes as BlobPart], { type: 'application/zip' }), zipName())
+  return { exported, skipped }
+}
+
 /* ===== 历史记录(IndexedDB,容量不受限、真正持久) ===== */
 /** 把一条历史摊成可复现的完整配方,交给主界面按当前厂商的能力逐项套用。
  *  参考图不在返回值里 —— 记录里存的是 Blob,转 data URL 要异步,由调用方补上 */
@@ -701,7 +826,9 @@ export function reuseParamsOf(e: HistoryEntry): ReuseParams {
     /* 配方里最容易漏掉的两项。不还原配置,重跑用的其实是"当前生效的那个模型",
        换了模型却以为是同一张图在微调,对比就失真了 */
     configId: e.configId,
-    seed: e.seed
+    seed: e.seed,
+    // 出处:主界面在落盘时把这条记录设为新生成的 parent,链就挂上了
+    fromEntryId: e.id
   }
 }
 export async function loadHistory() {
