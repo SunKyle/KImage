@@ -1867,14 +1867,6 @@ async function toggleMark(entry: HistoryEntry, index: number) {
             <input id="ref-file" type="file" accept="image/*" hidden @change="onPickRef" />
           </div>
 
-          <!-- 存储清理提示:是提醒不是错误,中性配色 + 可手动关掉 -->
-          <div v-if="notice" class="note" role="status">
-            <span class="note-msg">{{ notice }}</span>
-            <button class="note-close" @click="notice = ''" aria-label="Got it">
-              <PhX aria-hidden="true" />
-            </button>
-          </div>
-
           <!-- 报错:默认收成一行,过长才给「详情」;真失败过才给「重试」 -->
           <div v-if="error" class="err" role="alert">
             <p class="err-msg" :class="{ clipped: !errorOpen }">{{ error }}</p>
@@ -2019,7 +2011,16 @@ async function toggleMark(entry: HistoryEntry, index: number) {
       @mark="toggleMark"
     />
 
-    <!-- 删除的撤销条:固定在底部居中,四个页面里删了东西都从这儿撤销 -->
+    <!-- 存储清理等中性提示:以前只在生图工作台里铺一块,切到别的页面就看不见了。
+         这类提示(空间快满、覆盖未保存)跟"当前在哪个页面"无关,提到全局浮层,
+         哪个页面触发都在视野内,仍可手动关掉 -->
+    <div v-if="notice" class="note" role="status">
+      <span class="note-msg">{{ notice }}</span>
+      <button class="note-close" @click="notice = ''" aria-label="Got it">
+        <PhX aria-hidden="true" />
+      </button>
+    </div>
+
     <Transition name="undo-in">
       <UndoToast
         v-if="pendingUndo"
@@ -2629,17 +2630,26 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   background: color-mix(in oklch, var(--danger) 10%, transparent);
   border-radius: var(--r-sm);
 }
-/* 存储清理提示:提醒而非错误,用中性色,不与报错抢注意力 */
+/* 存储清理提示:提醒而非错误,用中性色,不与报错抢注意力。
+   现在挂在全局层(所有页面共用),所以做成居中浮条而非流内一方块:
+   触发点和当前页面无关,固定在最底部才保证任何页面都能看见 */
 .note {
+  position: fixed;
+  left: 50%;
+  /* 抬高到撤销浮条(底部 28px)之上,两者几乎不会同屏,但一旦撞上不至于盖住操作 */
+  bottom: 76px;
+  transform: translateX(-50%);
+  z-index: 40;
   display: flex;
   align-items: flex-start;
   gap: var(--sp-3);
-  margin-top: var(--sp-2);
+  max-width: min(520px, calc(100vw - 32px));
   padding: 8px 12px;
   font-size: var(--fs-sm);
   color: var(--text-2);
   background: var(--bg-elev);
   border: 1px solid var(--line);
+  box-shadow: var(--shadow-sm);
   border-radius: var(--r-sm);
 }
 .note-msg {
