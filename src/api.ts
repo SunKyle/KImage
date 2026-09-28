@@ -345,6 +345,10 @@ export interface TestResult {
   ok: boolean
   /** auth=密钥被拒 endpoint=没有这个端点 server=上游自己出错 network/timeout=没连上 */
   code?: 'auth' | 'endpoint' | 'server' | 'network' | 'timeout'
+  /** models=走的是 GET /models(顺带查了模型在不在)，probe=那家没有 /models，退回探测 */
+  via?: 'models' | 'probe'
+  /** 只在 via='models' 且有模型清单时有值：目标模型在不在清单里 */
+  modelListed?: boolean | null
   status: number | null
   ms: number
   detail?: string

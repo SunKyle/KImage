@@ -192,15 +192,40 @@ watch(
 
 /* 判决翻成人话。服务端只回 ok / code / status 这些机器可读的东西,
    怎么说由这里定 —— 与生图那条路同一套分工 */
-function testMessage(r: TestResult): { text: string; detail?: string } {
+function testMessage(r: TestResult, model: string): { text: string; detail?: string } {
   // 局域网或本地中转常常几十毫秒就回来了,写成 "0.0s" 会显得没测一样
   const took = r.ms < 1000 ? `${r.ms} ms` : `${(r.ms / 1000).toFixed(1)}s`
-  if (r.ok) return { text: `Connected in ${took}` }
+  if (r.ok) {
+    /* 走 /models 那次能多说一句:模型在不在它的清单里。
+       不在也不算失败 —— 清单常常是列不全的,所以只在中性色里提一句,
+       并写明生成仍然可能可用,免得用户跑去改一个本来没问题的配置 */
+    if (r.via === 'models' && r.modelListed === true) {
+      return { text: `Connected in ${took} · ${model} is available` }
+    }
+    if (r.via === 'models' && r.modelListed === false) {
+      return {
+        text: `Connected in ${took} · the key works, but the list has no ${model}`,
+        detail:
+          'Some endpoints publish only part of their catalog. Generation can still work — this is just what /models reported.'
+      }
+    }
+    return { text: `Connected in ${took}` }
+  }
   if (r.code === 'auth') return { text: `The endpoint rejected the key (${r.status})`, detail: r.detail }
   if (r.code === 'endpoint')
     return { text: `No such endpoint at this address (${r.status})`, detail: r.detail }
   if (r.code === 'timeout') return { text: 'No response within 15s', detail: r.detail }
-  if (r.code === 'server') return { text: `Reachable, but it answered ${r.status}`, detail: r.detail }
+  if (r.code === 'server') {
+    /* 200 也走到这里:地址少了 /v1 这类前缀时,网站会把首页当作 200 回给你。
+       那时说 "answered 200" 只会让人困惑 */
+    return {
+      text:
+        r.status && r.status < 400
+          ? 'Answered with a web page instead of an API response'
+          : `Reachable, but it answered ${r.status}`,
+      detail: r.detail
+    }
+  }
   return { text: 'Could not reach the endpoint', detail: r.detail }
 }
 
@@ -218,7 +243,7 @@ async function runTest() {
   testResult.value = null
   try {
     const r = await testConnection({ ...draft.value, baseUrl: url })
-    testResult.value = { ok: r.ok, ...testMessage(r) }
+    testResult.value = { ok: r.ok, ...testMessage(r, (draft.value.model || '').trim()) }
   } finally {
     testing.value = false
   }
@@ -1296,7 +1321,11 @@ function onImportFile(e: Event) {
   height: 14px;
 }
 .form-foot .test-line b {
+  /* 带上模型名后这句会变长,让它也能被挤掉而不是把按钮顶出去 */
+  min-width: 0;
   font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 .form-foot .test-line i {
