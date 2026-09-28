@@ -19,8 +19,10 @@ export interface GenParams {
   prompt: string
   size: string
   n: number
-  // 图生图:参考图(data URL / base64),可选
-  image?: string
+  /* 图生图:参考图(data URL / base64),可选。
+     可以有多个 —— 角色的设定图就是"几张视图一起当参考",比单张锁得住脸。
+     上游收不收多张由它定,收不了会把错误透回来 */
+  images?: string[]
   // 画质档位:auto / low / medium / high(部分接口不支持)
   quality?: string
   // 背景:auto / transparent / opaque(部分接口不支持)
@@ -117,6 +119,9 @@ export interface HistoryEntry {
   /* 归属的作品集 id(见 Collection)。把一组生成归拢时挂到某个作品集下,
      挂了的记录不会被存储清理自动淘汰。可选:老记录与未归类的都没有 */
   collectionId?: string
+  /* 这次生成套用的角色预设 id(见 Character)。与 collectionId 同理,
+     只在这条记录确实用了角色时才有;取消角色或手动换参考图都不会留下它 */
+  characterId?: string
   createdAt: number
   // 上游可能返回一张或多张图
   results: ResultItem[]
@@ -139,6 +144,49 @@ export interface Collection {
   // 作品集的标题(如"人物练习"/"参赛稿")。空内容允许为空串,但创建时尽量给一个
   title: string
   createdAt: number
+}
+
+// 角色的结构化设定。生成时按固定顺序拼成一段描述,前置到提示词最前面。
+// 拆成字段而不是一整段自由文本,是为了让「AI 创建」能逐项填、用户也能逐项校对
+export interface CharacterFields {
+  // 身份 / 职业 / 风格,如 "cyberpunk female warrior"
+  identity: string
+  hair: string
+  eyes: string
+  outfit: string
+  marks: string
+}
+
+/* 设定图里的一张视图。detail 是"细节图":服装、配件、身上特征的特写 ——
+   全身图里这些只有几个像素,模型抓不住,单独来一张特写才说得清 */
+export type CharacterViewKind = 'front' | 'threeQuarter' | 'full' | 'expression' | 'detail'
+
+export interface CharacterView {
+  kind: CharacterViewKind
+  data: Blob
+}
+
+// 一个角色:可复用的出图预设 —— 一张主参考图 + 一段固定设定 + 名字。
+// 参考图管"形状"、设定管"语义",两者一起注入才谈得上跨图的一致性。
+// 名字与设定是轻量目录,放 localStorage;图是 Blob,按 id 存在 IndexedDB
+export interface Character {
+  id: string
+  name: string
+  createdAt: number
+  /* 结构化设定。可选是为了兼容加它之前存下来的角色 —— 那些只有 desc */
+  fields?: CharacterFields
+  /* 自由描述。加结构化字段之前,角色的全部设定就写在这里;
+     读入时原样保留,合成时排在结构化设定之后当补充 —— 老角色不该因为改了模型就变样 */
+  desc?: string
+  /* 主参考图。生成时送上上游的就是它 —— 单图,受现有接口限制。
+     默认取设定图里的正脸,用户也可以改指另一张 */
+  ref?: Blob
+  /* 主参考图取自哪张视图。存它是因为刷新后 ref 与视图是两次独立的 IDB 读取,
+     Blob 不是同一个实例,靠身份比较认不出"这张正在用";从外部上传的图没有这个值 */
+  refKind?: CharacterViewKind
+  /* 设定图里正脸以外的视图(3/4、全身、表情、动作)。
+     只用于查看与挑选主图、不参与生成,所以不在启动时加载 */
+  views?: CharacterView[]
 }
 
 // 「使用提示词」时带回的一组参数,用于一键复现当时的出图条件

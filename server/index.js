@@ -130,11 +130,12 @@ function rateLimit(req, res, next) {
 /** 上游多久没响应就中断。Vercel 上另有平台执行上限,两者独立 */
 const UPSTREAM_TIMEOUT_MS = 120_000
 
-/* 提示词改写的系统提示,两档:
+/* 提示词改写的系统提示,三档:
    quick 保守补细节 —— 结构与主体一律不动,只把缺的画面要素补上;
    creative 允许重构 —— 换构图、光线、色调、风格,但不许换主体,
-   否则改写会变成另一个需求,用户按了反而得重新写一遍。
-   两档都限词数,回填到输入框还得能一眼读完。 */
+   否则改写会变成另一个需求,用户按了反而得重新写一遍;
+   character 与上面两档不是一回事:它把一句话拆成可复用的角色设定。
+   两档改写都限词数,回填到输入框还得能一眼读完。 */
 const ENHANCE_PROMPTS = {
   quick: `You polish prompts for an image-generation model.
 
@@ -151,11 +152,27 @@ Rules:
 - Keep the subject, the intent and any text to be rendered exactly as given. Never swap the subject or change what the image is about.
 - You may freely rework composition, framing, lighting, palette, materials, style and mood, and place the subject in a coherent setting.
 - Prefer one strong visual direction over a pile of adjectives.
-- Stay under 110 words, one paragraph.`
+- Stay under 110 words, one paragraph.`,
+  /* 拆角色设定用固定前缀而不是 JSON:少一整类"围栏/多余解释"的解析坑,
+     而且人可以直接读懂回的是什么。五个字段必须都给,缺项由它自己补一致的内容。 */
+  character: `You turn a one-line idea into a reusable character spec for an image-generation model.
+
+Rules:
+- Output exactly five lines, in this order, and nothing else:
+Identity: <who this character is, plus the overall style>
+Hair: <hairstyle and hair color>
+Eyes: <eye color and any eye feature>
+Outfit: <clothing, armor, gear>
+Marks: <scars, tattoos, implants, signature accessories>
+- Every one of the five lines must be present. If the idea says nothing about a field, invent something specific that fits the rest.
+- Each value is a short comma-separated phrase in English, under 12 words.
+- Describe only the character itself. Never mention background, lighting, camera, lens or composition — the user supplies the scene separately.
+- No preamble, no explanation, no markdown, no quotes.`
 }
 
-// 改写强度:保守档给低温度,让它贴着原句走;重构档放开,否则出来的东西没差别
-const ENHANCE_TEMPERATURE = { quick: 0.4, creative: 0.9 }
+// 改写强度:保守档给低温度,让它贴着原句走;重构档放开,否则出来的东西没差别。
+// 拆角色要具体又不重复,取中间偏放开
+const ENHANCE_TEMPERATURE = { quick: 0.4, creative: 0.9, character: 0.7 }
 
 /* 目标出图模型对提示词结构的偏好。改写是写给下游那个模型看的,
    同一段文字喂给 gpt-image 和喂给 SD 系模型,该有的样子完全不同:
@@ -260,6 +277,7 @@ app.post('/api/generate', rateLimit, async (req, res) => {
     apiKey,
     responseFormat,
     image,
+    images,
     quality,
     background,
     seed,
@@ -275,7 +293,13 @@ app.post('/api/generate', rateLimit, async (req, res) => {
     return res.status(400).json({ error: 'Configure your Base URL first' })
   }
 
-  const isImageGen = image && typeof image === 'string' && image.startsWith('data:image')
+  /* 参考图:新前端发 images(数组)—— 角色的设定图就是"多张视图一起当参考";
+     老前端仍发 image(单张)。两边都收,免得缓存里的旧包打过来时参考图被静默丢掉。
+     上游收不收多张由它自己决定,我们只如实转发 */
+  const refs = (Array.isArray(images) ? images : image ? [image] : []).filter(
+    (s) => typeof s === 'string' && s.startsWith('data:image')
+  )
+  const isImageGen = refs.length > 0
   const isGemini = protocol === 'gemini'
 
   if (isGemini && !model) {
@@ -343,8 +367,10 @@ app.post('/api/generate', rateLimit, async (req, res) => {
        参考图可能是历史里的 PNG/WebP(原样带过来),也可能是
        compressImage 压过的 JPEG */
     const parts = [{ text: prompt }]
-    if (isImageGen) {
-      const [meta, b64] = image.split(',')
+    /* 原生协议天然能收多张:每张参考图各占一段 inlineData,
+       所以角色的"正脸 + 3/4 + 全身"可以一起送上去 */
+    for (const ref of refs) {
+      const [meta, b64] = ref.split(',')
       const mime = (meta.match(/data:([^;]+)/) || [])[1] || 'image/jpeg'
       parts.push({ inlineData: { mimeType: mime, data: b64 } })
     }
@@ -355,16 +381,26 @@ app.post('/api/generate', rateLimit, async (req, res) => {
   } else if (isImageGen) {
     // OpenAI 系图生图:gpt-image 等模型不接受 JSON 里的 data-url base64,
     // 必须走 multipart 文件上传(或在个别服务下传公网 URL)
-    const [meta, b64] = image.split(',')
-    const mime = (meta.match(/data:([^;]+)/) || [])[1] || 'image/jpeg'
-    const type = mime.includes('png') ? 'png' : 'jpeg'
     const fd = new FormData()
     if (model) fd.append('model', model)
     fd.append('prompt', prompt)
     fd.append('n', String(n))
     if (size) fd.append('size', size)
     for (const [k, v] of Object.entries(extras)) fd.append(k, String(v))
-    fd.append('image', new Blob([Buffer.from(b64, 'base64')], { type: mime }), `image.${type}`)
+    /* 单张仍用 image —— 与一直以来的行为完全一致,不给最常见的那条路添风险;
+       多张才改用 image[],那是 OpenAI 的 /images/edits 收多图时的字段名。
+       字段名各家未必相同,上游拒绝时会原样透出来,照提示改即可 */
+    const field = refs.length > 1 ? 'image[]' : 'image'
+    refs.forEach((ref, i) => {
+      const [meta, b64] = ref.split(',')
+      const mime = (meta.match(/data:([^;]+)/) || [])[1] || 'image/jpeg'
+      const type = mime.includes('png') ? 'png' : 'jpeg'
+      fd.append(
+        field,
+        new Blob([Buffer.from(b64, 'base64')], { type: mime }),
+        `image-${i + 1}.${type}`
+      )
+    })
     payload = fd // fetch 自动设置 multipart boundary
   } else {
     headers['Content-Type'] = 'application/json'
@@ -511,8 +547,19 @@ app.post('/api/generate', rateLimit, async (req, res) => {
 app.post('/api/enhance', rateLimit, async (req, res) => {
   const { prompt, textModel, baseUrl, apiKey, mode, targetVendor, targetModel, hasRef } = req.body || {}
 
-  // 只认两档,其余(含老前端不传)一律按保守档处理
-  const enhanceMode = mode === 'creative' ? 'creative' : 'quick'
+  /* 只认这三档,其余(含老前端不传)一律按保守档处理。
+     character 是"把一句话拆成角色设定",不是改写出图提示词 */
+  const enhanceMode =
+    mode === 'creative' ? 'creative' : mode === 'character' ? 'character' : 'quick'
+
+  /* 角色那一档不加图生图说明与目标模型偏好:那两条都是给"改写出图提示词"用的,
+     跟拆字段无关,加上只会让它顺手把画面信息也写进去 */
+  const systemPrompt =
+    enhanceMode === 'character'
+      ? ENHANCE_PROMPTS.character
+      : ENHANCE_PROMPTS[enhanceMode] +
+        (hasRef ? REF_NOTE : '') +
+        targetNote(targetVendor, targetModel)
 
   if (!prompt) {
     return res.status(400).json({ error: 'Enter a prompt first' })
@@ -561,7 +608,7 @@ app.post('/api/enhance', rateLimit, async (req, res) => {
         model: textModel,
         messages: [
           // 顺序有讲究:先两档的基本规则,再图生图的变更导向,最后目标模型的结构偏好
-          { role: 'system', content: ENHANCE_PROMPTS[enhanceMode] + (hasRef ? REF_NOTE : '') + targetNote(targetVendor, targetModel) },
+          { role: 'system', content: systemPrompt },
           { role: 'user', content: prompt }
         ],
         temperature: ENHANCE_TEMPERATURE[enhanceMode]

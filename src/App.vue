@@ -8,7 +8,6 @@ import {
   PhSun,
   PhMoon,
   PhSlidersHorizontal,
-  PhSquaresFour,
   PhDotsNine,
   PhStop,
   PhArrowCounterClockwise,
@@ -17,11 +16,20 @@ import {
   PhX,
   PhArrowRight,
   PhCaretRight,
-  PhCaretDown
+  PhCaretDown,
+  PhMaskHappy,
+  PhRuler,
+  PhHash,
+  PhStack,
+  PhGauge,
+  PhPaintBucket,
+  PhImageSquare,
+  PhTextT
 } from '@phosphor-icons/vue'
 import PromptLibrary from './components/PromptLibrary.vue'
 import ImagePreview from './components/ImagePreview.vue'
 import HistoryPage from './components/HistoryPage.vue'
+import CharacterPage from './components/CharacterPage.vue'
 import SettingsPage from './components/SettingsPage.vue'
 import RubberSegment from './components/RubberSegment.vue'
 import LatticeLoader from './components/LatticeLoader.vue'
@@ -45,21 +53,27 @@ import {
   normalizePrompt,
   loadCollections,
   saveCollections,
+  characterDesc,
+  characterFaceDesc,
+  loadCharacters,
+  saveCharacters,
   getProvider,
   inferVendor,
   allowedSizes,
   imageSrc,
+  coverSrc,
   makeThumb,
   backfillThumbs,
   releaseEntryMedia,
   releaseSrc,
   QUALITY_OPTIONS,
-  BACKGROUND_OPTIONS
+  BACKGROUND_OPTIONS,
+  CHARACTER_VIEWS
 } from './api'
-import { blobToDataURL, urlToBlob } from './lib/idb'
+import { blobToDataURL, urlToBlob, getCharViews, putCharView } from './lib/idb'
 import { titleFromPrompt } from './lib/text'
 import type { Cap, EnhanceMode, Provider } from './api'
-import type { ApiConfig, Collection, FavoritePayload, HistoryEntry, PromptItem, ResultItem, ReuseParams } from './types'
+import type { ApiConfig, Collection, FavoritePayload, HistoryEntry, PromptItem, ResultItem, ReuseParams, Character, CharacterFields, CharacterView, CharacterViewKind } from './types'
 
 // —— 状态 ——
 const prompt = ref('')
@@ -139,8 +153,21 @@ const history = ref<HistoryEntry[]>([])
 const collections = ref<Collection[]>([])
 const libItems = ref<PromptItem[]>([])
 const refImage = ref('') // 图生图参考图 (data URL)
-// 四个平级页面:首页 / 提示词库 / 历史记录 / 接口设置,同时只挂载一个
-type Page = 'home' | 'lib' | 'history' | 'settings'
+/* —— 角色 ——
+   一个角色 = 一组设定图 + 一段固定描述。目录(名字/描述)放 localStorage,
+   图是 Blob,按 id 存在 IndexedDB(见 api.ts 的 loadCharacters)。
+   角色是独立的输入:它不占表单里的参考图槽,只在发请求那一刻并进参考图一起送
+   (见 charRefSrcs)。表单上看到的是什么,发出去的参考图就由这里决定 */
+const characters = ref<Character[]>([])
+/* 这次创作套用的角色 id。空 = 不用角色 */
+const activeCharId = ref('')
+/* 设定图:按角色 id 缓存已取出的视图。只在这个角色被选中时才读 IndexedDB ——
+   启动时不碰,5 张图 × N 个角色全读进来太重 */
+const charViews = ref<Record<string, CharacterView[]>>({})
+/* 正在生成哪一张视图(空 = 空闲)。一次只跑一张,免得几个请求互相排队 */
+const charViewBusy = ref('')
+// 五个平级页面:首页 / 角色 / 提示词库 / 历史记录 / 接口设置,同时只挂载一个
+type Page = 'home' | 'chars' | 'lib' | 'history' | 'settings'
 const page = ref<Page>('home')
 const previewEntry = ref<HistoryEntry | null>(null)
 /* 「拉自某条记录改一个变量重跑」时,这一批的父记录 id。
@@ -148,8 +175,8 @@ const previewEntry = ref<HistoryEntry | null>(null)
    用户手动改输入框后清空 —— 改完就不再是"同一个实验的延续",而是一张新图 */
 const pendingParentId = ref<string | undefined>()
 // 参数 icon 展开的面板:同一时间只开一个,再次点击收起。
-// 只有三项 —— 尺寸/画质/背景/参考图合并成 'more' 一块,参数行默认只露模型与张数
-type PanelKey = '' | 'n' | 'more' | 'config'
+// 参数行只露模型与角色两个"身份"入口 —— 其余参数合并成 'more' 一块
+type PanelKey = '' | 'chars' | 'more' | 'config'
 const openPanel = ref<PanelKey>('')
 // 收起动画播放期间保留上一次的面板内容,避免"内容先消失、容器再合拢"的两段跳变
 const shownPanel = ref<PanelKey>('')
@@ -326,6 +353,7 @@ const defaultSize = computed(() =>
 )
 const moreCustom = computed(
   () =>
+    n.value !== 1 ||
     size.value !== defaultSize.value ||
     quality.value !== 'auto' ||
     background.value !== 'auto' ||
@@ -450,6 +478,7 @@ onBeforeUnmount(() => window.removeEventListener('scroll', onScroll))
 // 必须放在 page 声明之后:getter 引用了它
 const navItems = [
   { value: 'home', label: 'Studio' },
+  { value: 'chars', label: 'Characters' },
   { value: 'lib', label: 'Prompt Library' },
   { value: 'history', label: 'History' },
   { value: 'settings', label: 'Settings' }
@@ -493,15 +522,6 @@ const selectedConfigs = computed(() =>
 )
 // 多选即对比
 const compareMode = computed(() => selectedConfigs.value.length > 1)
-/* 对比模式下每个模型只出一张(见 doRace):张数入口停用,并且如实显示 1 ——
-   否则行上还写着"3 images",用户会以为三家各出三张。
-   n 本身不动:退出对比模式后,之前设的张数原样回来 */
-const shownN = computed(() => (compareMode.value ? 1 : n.value))
-/* 加选到第二个模型时,张数面板已经没意义了(下一刻入口就会被停用),顺手收起 ——
-   留着它只会让人以为还能改 */
-watch(compareMode, (on) => {
-  if (on && openPanel.value === 'n') openPanel.value = ''
-})
 /* 一个槽位 = 一个模型 × 这一次请求。它只用来盯这一批的进展
    (占位格子数、失败统计、生成键的忙闲),结果出来后各条走普通的历史记录 ——
    没有单独的"对比面板":同一批图不该有两套呈现方式 */
@@ -603,6 +623,8 @@ onMounted(() => {
   })
   // 作品集目录是同步读的 localStorage,直接落一次
   collections.value = loadCollections()
+  // 角色要连 IndexedDB 里的参考图一起取,所以是异步的
+  loadCharacters().then((list) => (characters.value = list))
 })
 
 /* 新建一份配置(进入独立的新增接口表单页)。
@@ -882,6 +904,7 @@ function importConfigs(list: ApiConfig[]) {
 function onPickRef(e: Event) {
   const file = (e.target as HTMLInputElement).files?.[0]
   if (!file) return
+  // 角色与参考图是两个独立输入,自己挑图不动角色(见 types.ts 的 characterId 注释)
   const reader = new FileReader()
   reader.onload = () => {
     const url = String(reader.result)
@@ -932,6 +955,239 @@ function clearRef() {
   refImage.value = ''
 }
 
+/* —— 角色 ——
+   一个角色 = 一组设定图 + 一段固定的描述。选中后分两路进这一批:
+   脸部的三项设定接在提示词后面(见 composedPrompt),设定图并进参考图一起送
+   (见 charRefSrcs),合成后的完整提示词才落进历史。
+   于是"这条是照哪个角色出的"在记录上查得到(characterId) */
+/** 当前套用的角色。没有就是 undefined —— 模板与合成提示词都读它 */
+const activeCharacter = computed(() =>
+  characters.value.find((c) => c.id === activeCharId.value)
+)
+/* 当前角色的头像。角色可能只有设定没有参考图,那时返回空串,界面上退回图标 */
+const activeCharSrc = computed(() => coverSrc(activeCharacter.value?.ref))
+
+/* 会自动并进提示词的那一段(角色设定) */
+const charSpecPrefix = computed(() =>
+  activeCharacter.value ? characterFaceDesc(activeCharacter.value) : ''
+)
+
+/** 这次真正要发出去的提示词:用户自己写的在前,角色设定接在后面。
+ *  顺序不能反 —— 前段权重更高,把固定的那套长相顶在最前面,
+ *  "这一张要画什么"就被压到最后了。角色是加在场景上的,不是反过来 */
+function composedPrompt(): string {
+  const spec = charSpecPrefix.value
+  const text = prompt.value.trim()
+  if (!spec) return prompt.value
+  return text ? `${text}, ${spec}` : spec
+}
+
+/** 卸下当前角色 */
+function detachCharacter() {
+  activeCharId.value = ''
+}
+
+/** 选中/取消一个角色卡:再点当前这个即取消。
+ *  只动 activeCharId,不碰参考图槽 —— 角色和参考图是两个独立的输入,
+ *  角色那几张图在发请求时才并进去(见 charRefSrcs) */
+function toggleChar(id: string) {
+  activeCharId.value = activeCharId.value === id ? '' : id
+}
+
+/** 存下一个新角色(角色页交过来的草稿)。名字必填 —— 没名字的卡没法认 */
+async function saveCharFromPage(d: {
+  name: string
+  fields: CharacterFields
+  desc: string
+  refData: string
+}) {
+  const name = d.name.trim()
+  if (!name) return
+  // 与参考图存档同一档压缩:它只当参考用,不需要原分辨率
+  const ref = d.refData ? await refThumbOf(d.refData) : undefined
+  const c: Character = {
+    id: uid(),
+    name,
+    createdAt: Date.now(),
+    fields: { ...d.fields },
+    desc: d.desc.trim(),
+    ...(ref ? { ref } : {})
+  }
+  characters.value = [c, ...characters.value]
+  await saveCharacters(characters.value)
+}
+
+/** 删掉一个角色,并把它从当前选择里摘掉 ——
+    留着一个已经不存在的 id,下次生成会莫名多出一段描述 */
+async function deleteChar(id: string) {
+  characters.value = characters.value.filter((c) => c.id !== id)
+  if (activeCharId.value === id) detachCharacter()
+  await saveCharacters(characters.value)
+}
+
+/* —— 设定图 ——
+   五张视图,正脸是锚:其余四张都以正脸为参考图生成 —— 这是"同一张脸"的唯一保证。
+   结果只进角色自己的 views,不进历史 —— 它们是中转用的参考料,不是作品 */
+function viewOf(charId: string, kind: CharacterViewKind): CharacterView | undefined {
+  return charViews.value[charId]?.find((v) => v.kind === kind)
+}
+
+function kindLabel(kind: CharacterViewKind) {
+  return CHARACTER_VIEWS.find((v) => v.kind === kind)?.label || kind
+}
+
+/* 取景 → 实际尺寸。各厂商的尺寸表不一样,所以从可用尺寸里挑最接近方形/竖幅的;
+   挑不到(自由尺寸)就用当前选中的尺寸 */
+function viewSize(framing: 'square' | 'portrait'): string {
+  const list = allowedSizes(provider.value.id, config.value.model)
+  if (list === 'free') return size.value
+  const want = framing === 'square' ? 1 : 1.5
+  let best = ''
+  let bestGap = Infinity
+  for (const s of list) {
+    const [w, h] = s.split('x').map(Number)
+    if (!(w > 0 && h > 0)) continue
+    const gap = Math.abs(w / h - want)
+    if (gap < bestGap) {
+      bestGap = gap
+      best = s
+    }
+  }
+  return best || size.value
+}
+
+/** 结果图 → 压缩后的 Blob。设定图只当参考用,压到最长边 512 就够
+ *  —— 与参考图存档同一档参数,不另开一套 */
+async function resultRefBlob(item: ResultItem | undefined): Promise<Blob | undefined> {
+  if (!item) return undefined
+  const src = imageSrc(item)
+  if (!src) return undefined
+  try {
+    return await refThumbOf(await blobToDataURL(await (await fetch(src)).blob()))
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 生成一张设定图。
+ * 正脸:角色有主参考图(上传的 / 从作品提升的 / 上一版正脸)就以它为参考图,
+ * 没有就是纯文生图 —— 三种输入因此走同一条流水线;
+ * 其余四张一律以正脸为参考图。
+ * 返回是否成功,好让"补齐"那一步知道该停下还是继续。
+ */
+async function genCharView(charId: string, kind: CharacterViewKind): Promise<boolean> {
+  const view = CHARACTER_VIEWS.find((v) => v.kind === kind)
+  const c = characters.value.find((x) => x.id === charId)
+  if (!view || !c || charViewBusy.value) return false
+  const cfg = config.value
+  if (!cfg.model) {
+    fail('Set an image model in API settings first.')
+    return false
+  }
+  const refBlob = kind === 'front' ? c.ref : viewOf(c.id, 'front')?.data
+  // 除正脸外都得有正脸当锚,否则跑出来的只是"另一个长得有点像的人"
+  if (!refBlob && kind !== 'front') {
+    fail('Generate the front view first — the other views are built from it.')
+    return false
+  }
+  charViewBusy.value = kind
+  error.value = ''
+  let ok = false
+  try {
+    const prompt = [characterDesc(c), view.suffix].filter(Boolean).join(', ')
+    const refSrc = refBlob ? await blobToDataURL(refBlob) : ''
+    const res = await generate(
+      {
+        prompt,
+        size: viewSize(view.framing),
+        n: 1,
+        ...(refSrc ? { images: [refSrc] } : {})
+      },
+      cfg
+    )
+    const blob = await resultRefBlob(res[0])
+    if (!blob) throw new Error('Upstream returned no usable image')
+    await putCharView(c.id, kind, blob)
+    const rest = (charViews.value[c.id] || []).filter((v) => v.kind !== kind)
+    charViews.value = { ...charViews.value, [c.id]: [...rest, { kind, data: blob }] }
+    /* 重跑正脸之后,其余四张就是照上一张正脸出的了。提醒一句,但不替用户删 ——
+       删是不可逆的,而"要不要重跑"只有他自己知道 */
+    if (kind === 'front' && rest.length) {
+      notice.value =
+        'Other views were built from the previous front view — regenerate them if the face changed.'
+    }
+    ok = true
+  } catch (e: any) {
+    fail(e?.message || 'Could not generate this view')
+  } finally {
+    charViewBusy.value = ''
+  }
+  return ok
+}
+
+/** 一次补齐五张。串行跑:每张都以前一张为参考图,并行只会互相抢带宽;
+ *  中途失败(多半是配置或配额)就直接停下,免得连错四次 */
+async function genRemainingViews(charId: string) {
+  for (const v of CHARACTER_VIEWS) {
+    if (viewOf(charId, v.kind)) continue
+    if (!(await genCharView(charId, v.kind))) return
+  }
+}
+
+/** 把某张视图指定成角色的主参考图 —— 送参考图时它排在最前面 */
+async function useViewAsRef(charId: string, kind: CharacterViewKind) {
+  const c = characters.value.find((x) => x.id === charId)
+  const v = viewOf(charId, kind)
+  if (!c || !v) return
+  c.ref = v.data
+  c.refKind = kind
+  await saveCharacters(characters.value)
+  notice.value = `${kindLabel(kind)} is now ${c.name}'s reference image.`
+}
+
+/* 取出某个角色的设定图并缓存。已经取过就不再读 IndexedDB ——
+   启动时不碰这些图,5 张 × N 个角色全读进来太重 */
+async function loadCharViews(id: string) {
+  if (!id || charViews.value[id]) return
+  const rows = await getCharViews(id)
+  const known = new Set<string>(CHARACTER_VIEWS.map((v) => v.kind))
+  /* 存储层只知道"有个 kind 字符串",这里按已知视图清单收窄 ——
+     万一库里留着旧版写下的未知 kind,不该让它混进网格 */
+  charViews.value = {
+    ...charViews.value,
+    [id]: rows
+      .filter((r) => known.has(r.kind))
+      .map((r) => ({ kind: r.kind as CharacterViewKind, data: r.data }))
+  }
+}
+
+// 在创作区选中某个角色时顺手取一次;角色页那边由 @open 触发
+watch(activeCharId, (id) => loadCharViews(id))
+
+/* 角色最多并进几张参考图。再多上游多半不认,而请求体会迅速变大 */
+const MAX_CHAR_REFS = 4
+
+/** 当前角色的图 → data URL,发请求时并进参考图。
+ *  角色不占表单里的参考图槽 —— 表单上看到的始终是用户自己挑的那张,
+ *  角色这几张只在这一刻合进来。主参考图排最前(它就是这张脸),后面按视图顺序补 */
+async function charRefSrcs(): Promise<string[]> {
+  const c = activeCharacter.value
+  if (!c) return []
+  // 视图是按需加载的,这里先确保取过一次
+  await loadCharViews(c.id)
+  const out: string[] = []
+  if (c.ref) out.push(await blobToDataURL(c.ref))
+  for (const v of CHARACTER_VIEWS) {
+    if (out.length >= MAX_CHAR_REFS) break
+    // 已被指定成主参考图的那张不再重复送
+    if (v.kind === c.refKind) continue
+    const view = viewOf(c.id, v.kind)
+    if (view) out.push(await blobToDataURL(view.data))
+  }
+  return out
+}
+
 // —— 生图 ——
 // 当前这一批的请求句柄,用于中途终止
 const controller = ref<AbortController | null>(null)
@@ -972,8 +1228,9 @@ async function doGenerate() {
     return
   }
 
-  // 发起前锁定这一批的参数,后面一律读快照,避免中途改参数串味
-  running.value = { prompt: prompt.value, size: size.value, n: n.value }
+  // 发起前锁定这一批的参数,后面一律读快照,避免中途改参数串味。
+  // 套了角色时这里锁的是合成后的提示词 —— 真正发出去的就是它
+  running.value = { prompt: composedPrompt(), size: size.value, n: n.value }
   /* 普通生成也纳入分组:同一次点生成就是一批。group 让生成的结果在图墙上
      可归拢,和对比出图共用同一个字段语义(见 groupId 注释) */
   const genGroupId = `gen-${Date.now().toString(36)}`
@@ -982,6 +1239,11 @@ async function doGenerate() {
   // 种子也是快照的一部分:中途改它不该影响已经发出的这一批
   const seedNum = seedFor()
   const refSrc = refImage.value
+  /* 参考图可以不止一张:用户自己挑的图 + 角色的那几张一起送 ——
+     单张太弱,多视图才锁得住同一张脸。用户那张排最前,它多半就是这次要改的底图 */
+  const refList: string[] = []
+  if (refSrc) refList.push(refSrc)
+  for (const s of await charRefSrcs()) if (!refList.includes(s)) refList.push(s)
   const startedAt = Date.now()
   controller.value = new AbortController()
 
@@ -995,7 +1257,7 @@ async function doGenerate() {
         prompt: running.value.prompt,
         size: running.value.size,
         n: running.value.n,
-        ...(refSrc ? { image: refSrc } : {}),
+        ...(refList.length ? { images: refList } : {}),
         ...(seedNum !== undefined ? { seed: seedNum } : {}),
         // 由厂商能力表决定带哪些扩展参数:auto 与已知不支持的都不发
         ...extras
@@ -1017,6 +1279,8 @@ async function doGenerate() {
       refSrc: refSrc || undefined,
       /* 「拉自某条记录改一个变量重跑」的出处。普通手写提示词这里是空,不入链 */
       parentId: pendingParentId.value,
+      // 套了角色就记下是谁 —— 预览里才说得清"这条是照哪个角色出的"
+      characterId: activeCharId.value || undefined,
       elapsedMs: Date.now() - startedAt
     })
     await persist(record)
@@ -1047,6 +1311,8 @@ async function recordFor(
     groupId?: string
     /* 这一批是「从某条记录拉下来改的」时的父记录 id。见 pendingParentId */
     parentId?: string
+    /* 这一批套用的角色 id。见 Character */
+    characterId?: string
     elapsedMs: number
     // 完整配方里其余的三项:重跑时要用它们还原当时的条件
     configId?: string
@@ -1065,6 +1331,7 @@ async function recordFor(
     hasRef: meta.hasRef,
     groupId: meta.groupId,
     parentId: meta.parentId,
+    characterId: meta.characterId,
     configId: meta.configId,
     seed: meta.seed,
     elapsedMs: meta.elapsedMs,
@@ -1119,6 +1386,10 @@ async function doRace() {
   }
   const runPrompt = prompt.value
   const refSrc = refImage.value
+  /* 角色在对比出图里同样要并进去:那是另一条链路,参考图得在这儿另做一份快照 */
+  const refList: string[] = []
+  if (refSrc) refList.push(refSrc)
+  for (const s of await charRefSrcs()) if (!refList.includes(s)) refList.push(s)
   raceGroupId.value = `race-${Date.now().toString(36)}`
   /* 尺寸与扩展参数在发起前逐配置定下来:中途改参数不该影响已经发出的这一批,
      而且各模型的合法尺寸/参数本来就不一样,不能拿一家的能力套所有家 */
@@ -1152,7 +1423,7 @@ async function doRace() {
               prompt: runPrompt,
               size: slot.size,
               n: 1,
-              ...(refSrc ? { image: refSrc } : {}),
+              ...(refList.length ? { images: refList } : {}),
               ...(slot.seed !== undefined ? { seed: slot.seed } : {}),
               ...slot.extras
             },
@@ -1384,6 +1655,11 @@ function usePreviewPrompt(p: ReuseParams) {
   if (p.quality && provider.value.quality !== 'no') quality.value = p.quality
   if (p.background && provider.value.background !== 'no') background.value = p.background
   seed.value = p.seed !== undefined ? String(p.seed) : ''
+  /* 配方是自洽的:它的 prompt 里已经含了当时前置的角色描述。
+     所以这里不"还原"角色 —— 还原会让描述再前置一次,变成重复;
+     但必须先把当前选着的角色卸下:否则刚选的角色描述会跟着这段配方一起发出去、
+     设定图也会跟着并进参考图,而用户要的是"照这条记录重跑" */
+  detachCharacter()
   /* 参考图整项覆盖,而不是"有才设":这条记录当初没用参考图,却留着上一张的
      参考图,下一次生成就会悄悄变成图生图 —— 那是最不该发生的意外 */
   refImage.value = p.ref || ''
@@ -1425,7 +1701,9 @@ async function coverOf(item: ResultItem | undefined): Promise<Blob | undefined> 
   }
 }
 
-// 预览菜单:收藏当前预览的提示词到库(连带参数与一张封面)
+// 预览里「存进提示词库」:连带参数与一张封面存下来。
+// 不切页、也不关预览 —— 存库是顺手做的一步,不该把用户从正在看的图上带走。
+// 回执由预览卡上的按钮自己给(存完短暂变成 Saved)
 async function favoriteFromPreview(p: FavoritePayload) {
   if (!p.prompt.trim()) return
   const item: PromptItem = {
@@ -1442,8 +1720,6 @@ async function favoriteFromPreview(p: FavoritePayload) {
   }
   libItems.value = [item, ...libItems.value]
   await persistLib()
-  closePreview()
-  page.value = 'lib'
 }
 
 // 预览菜单:把当前图用作参考图。接口只认 data URL,Blob 要现转一趟
@@ -1568,6 +1844,10 @@ function createAssignCollection(title: string) {
         <template #home>
           <PhHouse class="seg-ico" aria-hidden="true" />
         </template>
+        <template #chars>
+          <!-- 人形:角色是"同一个人跨图保持一致"的那件事 -->
+          <PhMaskHappy class="seg-ico" aria-hidden="true" />
+        </template>
         <template #lib>
           <!-- Phosphor 的 Books:表达"收藏成册的提示词库" -->
           <PhBooks class="seg-ico" aria-hidden="true" />
@@ -1624,7 +1904,6 @@ function createAssignCollection(title: string) {
                 @input="onPromptEdit"
                 @keydown.enter.exact="onEnter"
               />
-
             </div>
 
             <!-- 二、参数 icon 行(横线下方),点击 icon 展开对应选项 -->
@@ -1643,21 +1922,21 @@ function createAssignCollection(title: string) {
                 <span class="param-sep" aria-hidden="true"></span>
                 <b class="param-val param-val-name param-val-sub">{{ activeTextName }}</b>
               </button>
+              <!-- 角色:和模型并排 —— 两者是同一层的东西(用谁出图),都该一眼可见。
+                   收进「更多」里等于每次用角色都要先展开一次。
+                   选中的角色直接露头像,名字进 tooltip:一排参数里放文字名会把行撑长 -->
               <button
-                class="param-btn has-val"
-                :class="{ on: openPanel === 'n' }"
-                :disabled="compareMode"
-                :data-tip="
-                  compareMode ? 'One image per model in compare mode' : `Images · ${n}`
-                "
-                aria-label="Count"
-                @click="togglePanel('n')"
+                class="param-btn"
+                :class="{ on: openPanel === 'chars', filled: !!activeCharId }"
+                :data-tip="activeCharacter ? `Character · ${activeCharacter.name}` : 'Character'"
+                aria-label="Character"
+                @click="togglePanel('chars')"
               >
-                <PhSquaresFour aria-hidden="true" />
-                <b class="param-val">{{ shownN }} {{ shownN === 1 ? 'image' : 'images' }}</b>
+                <img v-if="activeCharSrc" class="param-avatar" :src="activeCharSrc" alt="" />
+                <PhMaskHappy v-else aria-hidden="true" />
               </button>
-              <!-- 尺寸/画质/背景/参考图收进这一个入口:参数行默认只留模型与张数,
-                   最常改的两个直接可达,其余点开就是完整面板,不必挤成一长排。
+              <!-- 尺寸/张数/画质/背景/参考图收进这一个入口:参数行只留模型与角色,
+                   其余点开就是完整面板,不必挤成一长排。
                    有非默认值就点亮,免得改过的参数在行上不留痕迹 -->
               <button
                 class="param-btn"
@@ -1744,7 +2023,7 @@ function createAssignCollection(title: string) {
                   <div v-if="shownPanel === 'config'" class="pp-body">
                     <!-- 出图与改写分两组,各自标各自的"当前";空组不渲染 -->
                     <div v-if="imageConfigs.length" class="pp-group">
-                      <span class="pp-label">Image model</span>
+                      <span class="pp-label"><PhImageSquare class="pp-label-ico" aria-hidden="true" />Image model</span>
                       <!-- 芯片就是多选:点一下加入/移出这次生成。
                            选一个 = 平时那样,选两个以上 = 对比模式 ——
                            不再有单独的"对比"开关,多选本身就是那个开关。
@@ -1770,7 +2049,7 @@ function createAssignCollection(title: string) {
                       </button>
                     </div>
                     <div v-if="textConfigs.length" class="pp-group">
-                      <span class="pp-label">Text model</span>
+                      <span class="pp-label"><PhTextT class="pp-label-ico" aria-hidden="true" />Text model</span>
                       <button
                         v-for="c in textConfigs"
                         :key="c.id"
@@ -1789,10 +2068,71 @@ function createAssignCollection(title: string) {
                     </div>
                   </div>
 
+                  <!-- 角色:这里只负责"这次用哪个"。新建、编辑、设定图都在角色页 ——
+                       那是这一站的重点,不该挤在参数面板里 -->
+                  <div v-if="shownPanel === 'chars'" class="pp-body">
+                    <div class="pp-group">
+                      <span class="pp-label"><PhMaskHappy class="pp-label-ico" aria-hidden="true" />Character</span>
+                      <!-- 头像即标识:名字进 title。面板本身是滚动容器,
+                           自绘 tooltip 会被裁掉,所以这里用原生的 -->
+                      <button
+                        v-for="c in characters"
+                        :key="c.id"
+                        class="char-pick"
+                        :class="{ on: activeCharId === c.id }"
+                        :title="c.name"
+                        :aria-label="c.name"
+                        @click="toggleChar(c.id)"
+                      >
+                        <img v-if="c.ref" class="char-pick-img" :src="coverSrc(c.ref)" alt="" />
+                        <PhMaskHappy v-else class="char-pick-ph" aria-hidden="true" />
+                      </button>
+                      <span v-if="!characters.length" class="pp-note">
+                        None yet — create one on the Characters page.
+                      </span>
+                      <button class="pp-action" @click="page = 'chars'">Manage characters</button>
+                    </div>
+                  </div>
+
+                  <!-- 张数:它是"偶尔改一次"的参数,和尺寸/画质放一起,
+                       不再单独占参数行上的一格 -->
+                  <div v-if="shownPanel === 'more'" class="pp-body">
+                    <!-- 固定四档 + 手填挤在同一行:它们回答的是同一个问题(要几张),
+                         分成两行只是把一组选项拆散 -->
+                    <div class="pp-group">
+                      <span class="pp-label"><PhStack class="pp-label-ico" aria-hidden="true" />Count</span>
+                      <!-- 对比模式下一家只出一张(见 doRace),这里如实说明并收起选项 ——
+                           留着能点但改了没用的胶囊,比看不到更糟 -->
+                      <span v-if="compareMode" class="pp-note">One image per model in compare mode</span>
+                      <template v-else>
+                        <button
+                          v-for="c in 4"
+                          :key="c"
+                          class="preset"
+                          :class="{ on: n === c }"
+                          @click="n = c"
+                        >
+                          {{ c }} {{ c === 1 ? 'image' : 'images' }}
+                        </button>
+                        <!-- 手填并进这一行:它只是张数的另一种填法,不是独立参数 -->
+                        <input
+                          class="num-input"
+                          type="number"
+                          min="1"
+                          :max="N_MAX"
+                          :value="n"
+                          :placeholder="`1-${N_MAX}`"
+                          aria-label="Custom count"
+                          @change="clampN"
+                        />
+                      </template>
+                    </div>
+                  </div>
+
                   <!-- 尺寸 -->
                   <div v-if="shownPanel === 'more'" class="pp-body">
                     <div class="pp-group">
-                      <span class="pp-label">Size</span>
+                      <span class="pp-label"><PhRuler class="pp-label-ico" aria-hidden="true" />Size</span>
                       <button
                         v-for="s in sizeOptions"
                         :key="s"
@@ -1819,7 +2159,7 @@ function createAssignCollection(title: string) {
                     <!-- 种子:它只对"复现同一张图"有意义,所以自成一格,并把话说全 ——
                          上游从不回传它实际用的那个数,所以这里空着就是"每次都不同" -->
                     <div v-if="provider.seed !== 'no'" class="pp-group">
-                      <span class="pp-label">Seed</span>
+                      <span class="pp-label"><PhHash class="pp-label-ico" aria-hidden="true" />Seed</span>
                       <input
                         class="num-input seed-input"
                         :value="seed"
@@ -1835,48 +2175,18 @@ function createAssignCollection(title: string) {
                     </div>
                   </div>
 
-                  <!-- 张数 -->
-                  <div v-if="shownPanel === 'n'" class="pp-body">
-                    <div class="pp-group">
-                      <span class="pp-label">Count</span>
-                      <button
-                        v-for="c in 4"
-                        :key="c"
-                        class="preset"
-                        :class="{ on: n === c }"
-                        @click="n = c"
-                      >
-                        {{ c }} {{ c === 1 ? 'image' : 'images' }}
-                      </button>
-                    </div>
-                    <div class="pp-group">
-                      <span class="pp-label">Custom</span>
-                      <input
-                        class="num-input"
-                        type="number"
-                        min="1"
-                        :max="N_MAX"
-                        :value="n"
-                        :placeholder="`1-${N_MAX}`"
-                        aria-label="Custom count"
-                        @change="clampN"
-                      />
-                    </div>
-                  </div>
-
                   <!-- 画质:已知不认的厂商不列出来,免得选了却被上游 400 -->
                   <div v-if="shownPanel === 'more' && provider.quality !== 'no'" class="pp-body">
                     <div class="pp-group">
-                      <span class="pp-label">Quality</span>
+                      <span class="pp-label"><PhGauge class="pp-label-ico" aria-hidden="true" />Quality</span>
                       <button
                         v-for="o in QUALITY_OPTIONS"
                         :key="o.value"
-                        class="preset preset-rich"
+                        class="preset"
                         :class="{ on: quality === o.value }"
                         @click="quality = o.value"
                       >
-                        <span>{{ o.label }}</span>
-                        <em class="preset-hint">{{ o.hint }}</em>
+                        {{ o.label }}
                       </button>
                     </div>
                   </div>
@@ -1884,7 +2194,7 @@ function createAssignCollection(title: string) {
                   <!-- 背景 -->
                   <div v-if="shownPanel === 'more' && provider.background !== 'no'" class="pp-body">
                     <div class="pp-group">
-                      <span class="pp-label">Background</span>
+                      <span class="pp-label"><PhPaintBucket class="pp-label-ico" aria-hidden="true" />Background</span>
                       <button
                         v-for="o in BACKGROUND_OPTIONS"
                         :key="o.value"
@@ -1901,7 +2211,7 @@ function createAssignCollection(title: string) {
                   <!-- 参考图放最后:它是一次性的输入,不是常规参数 -->
                   <div v-if="shownPanel === 'more'" class="pp-body">
                     <div class="pp-group">
-                      <span class="pp-label">Reference</span>
+                      <span class="pp-label"><PhImageSquare class="pp-label-ico" aria-hidden="true" />Reference</span>
                       <template v-if="!refImage">
                         <label class="ref-pick" for="ref-file">+ Choose a reference image</label>
                       </template>
@@ -2017,6 +2327,21 @@ function createAssignCollection(title: string) {
         @import="importLibItems"
       />
 
+      <!-- 角色 -->
+      <CharacterPage
+        v-else-if="page === 'chars'"
+        :characters="characters"
+        :views="charViews"
+        :busy="charViewBusy"
+        :text-config="textConfig || undefined"
+        @save="saveCharFromPage"
+        @remove="deleteChar"
+        @open="loadCharViews"
+        @generate="genCharView"
+        @generate-all="genRemainingViews"
+        @use-ref="useViewAsRef"
+      />
+
       <!-- 历史记录 -->
       <HistoryPage
         v-else-if="page === 'history'"
@@ -2058,6 +2383,7 @@ function createAssignCollection(title: string) {
       :entry="previewEntry"
       :items="history"
       :collections="collections"
+      :characters="characters"
       @close="closePreview"
       @navigate="openPreview"
       @use-prompt="usePreviewPrompt"
@@ -2432,6 +2758,14 @@ function createAssignCollection(title: string) {
   height: 17px;
   flex-shrink: 0;
 }
+/* 角色有头像时胶囊里放头像:一张脸比一个通用的人形图标好认得多 */
+.param-avatar {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  object-fit: cover;
+  display: block;
+}
 .param-btn:hover {
   color: var(--text);
   border-color: var(--line-strong);
@@ -2541,10 +2875,22 @@ function createAssignCollection(title: string) {
   align-items: center;
   gap: 8px;
 }
+/* 参数名是每组选项的锚点:比选项更沉一点,扫读时才找得到自己要看的那一组。
+   但仍然小于选项本身 —— 它是标签,不是内容 */
 .pp-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   font-size: var(--fs-xs);
-  color: var(--text-3);
+  font-weight: 600;
+  color: var(--text-2);
   margin-right: 2px;
+}
+/* 图标与文字同色同重,不再额外减淡 —— 一弱就白加了 */
+.pp-label-ico {
+  flex: none;
+  width: 14px;
+  height: 14px;
 }
 .pp-thumb {
   width: 40px;
@@ -2645,26 +2991,6 @@ function createAssignCollection(title: string) {
   color: var(--text-2);
   background: var(--surface);
 }
-/* 带注解的胶囊(画质档位):主标签 + 一句代价说明,同一行排布 */
-.preset-rich {
-  display: inline-flex;
-  align-items: baseline;
-  gap: 6px;
-}
-.preset-hint {
-  font-style: normal;
-  font-size: var(--fs-micro);
-  color: var(--text-3);
-  transition: color var(--dur) var(--ease);
-}
-.preset-rich:hover .preset-hint {
-  color: var(--text-2);
-}
-.preset-rich.on .preset-hint {
-  color: inherit;
-  opacity: 0.75;
-}
-
 /* 参考图选择 */
 .ref-pick {
   padding: 8px 14px;
@@ -2678,6 +3004,47 @@ function createAssignCollection(title: string) {
 .ref-pick:hover {
   border-color: var(--line-strong);
   color: var(--text);
+}
+
+/* —— 角色 ——
+   选谁在参数行的角色胶囊里(与模型并排),列表在它展开的面板里 */
+/* 角色选择:一圈一个头像,名字在 title 里。选中态用全站"当前项"那套墨色描边
+   (导航滑块、选中胶囊同一套语言),不是给头像换底色 —— 头像的底色是它自己 */
+.char-pick {
+  flex: none;
+  width: 40px;
+  height: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  border: 2px solid var(--line);
+  border-radius: 50%;
+  background: var(--bg-elev);
+  color: var(--text-3);
+  cursor: pointer;
+  transition: border-color var(--dur) var(--ease), transform var(--dur) var(--ease);
+}
+.char-pick:hover {
+  border-color: var(--line-strong);
+  transform: translateY(-1px);
+}
+.char-pick.on {
+  border-color: var(--cta);
+}
+.char-pick-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.char-pick-ph {
+  width: 18px;
+  height: 18px;
+}
+.pp-action:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
 .err {

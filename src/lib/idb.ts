@@ -6,6 +6,12 @@ const STORE = 'history'
    只能把所有封面整批丢掉(见 git 历史的 savePrompts)。挪到这里之后,
    封面与历史图共用浏览器级配额,那个"整批丢封面"的降级路径也就不需要了 */
 const COVER_STORE = 'covers'
+/* 角色的参考图单独一个 store,不和提示词封面挤在一起 ——
+   putCovers 会按"目录里现存的封面"反向裁剪,角色图混进去会被当成孤儿删掉 */
+const CHAR_STORE = 'chars'
+/* 角色的设定图与主参考图共用一个 store:
+   主图 key 是裸的角色 id(启动时要读它),视图 key 是 `${角色id}:${视图}`(按需取) */
+const VIEW_SEP = ':'
 /* ===== 历史容量 =====================================================
    不按固定条数淘汰,而是看浏览器给的配额:只有占用接近上限时才清理最旧的一批。
    固定条数会在空间还很宽裕时就静默删记录,而每条记录的体积差很多,
@@ -32,7 +38,7 @@ export interface PruneResult {
 
 function openDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, 3)
+    const req = indexedDB.open(DB_NAME, 4)
     req.onupgradeneeded = () => {
       const db = req.result
       const tx = req.transaction
@@ -46,6 +52,10 @@ function openDB(): Promise<IDBDatabase> {
       // v3 新增:提示词封面
       if (!db.objectStoreNames.contains(COVER_STORE)) {
         db.createObjectStore(COVER_STORE, { keyPath: 'id' })
+      }
+      // v4 新增:角色的参考图
+      if (!db.objectStoreNames.contains(CHAR_STORE)) {
+        db.createObjectStore(CHAR_STORE, { keyPath: 'id' })
       }
     }
     req.onsuccess = () => resolve(req.result)
@@ -128,6 +138,110 @@ export async function putCovers(covers: CoverRecord[]): Promise<void> {
       for (const k of keysReq.result) if (!keep.has(String(k))) store.delete(k)
       for (const c of covers) if (!existing.has(c.id)) store.put(c)
     }
+    tx.oncomplete = () => resolve()
+    tx.onerror = () => reject(tx.error)
+  })
+}
+
+/* ===== 角色的参考图 =====
+   与提示词封面同一套做法:名字与描述在 localStorage 目录里,图按 id 存在这里 */
+export interface CharRefRecord {
+  id: string
+  data: Blob
+}
+
+/** 读出全部角色参考图。角色不会太多,一次读完最简单,调用方按 id 贴回条目 */
+export async function getAllCharRefs(): Promise<Map<string, Blob>> {
+  try {
+    const db = await openDB()
+    const rows = await new Promise<Array<{ id: string; data: Blob }>>((resolve, reject) => {
+      const req = db.transaction(CHAR_STORE, 'readonly').objectStore(CHAR_STORE).getAll()
+      req.onsuccess = () => resolve(req.result as Array<{ id: string; data: Blob }>)
+      req.onerror = () => reject(req.error)
+    })
+    const out = new Map<string, Blob>()
+    for (const row of rows) {
+      // 这个 store 是新加的,不会有老的 data URL 数据;但脏数据仍要跳过
+      if (row.data instanceof Blob) out.set(row.id, row.data)
+    }
+    return out
+  } catch {
+    // 读不出来就当没有:角色本身还能用,不该因为一张图而整块打不开
+    return new Map()
+  }
+}
+
+/**
+ * 写回角色参考图:只补库里还没有的那几张,并删掉已经不在目录里的那些。
+ * 与封面同理,参考图是原图,不做全量重写
+ */
+export async function putCharRefs(refs: CharRefRecord[]): Promise<void> {
+  const db = await openDB()
+  const keep = new Set(refs.map((r) => r.id))
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(CHAR_STORE, 'readwrite')
+    const store = tx.objectStore(CHAR_STORE)
+    const keysReq = store.getAllKeys()
+    keysReq.onsuccess = () => {
+      const keys = keysReq.result.map(String)
+      const existing = new Set(keys)
+      /* 设定图的 key 是 `${角色id}:${视图}`,不是裸的角色 id。
+         只比对裸 id 的话,每次保存角色都会把刚生成好的设定图整批删掉 ——
+         所以凡是"某个还在的角色名下"的 key 都算保留。
+         角色 id 是 uuid,不含冒号,按第一个冒号切归属是安全的。
+         反过来说:角色从列表里移除后,它的主图与全部视图会在这里一起被收走,
+         不需要另写一套"删角色的图" */
+      for (const k of keys) {
+        const cut = k.indexOf(VIEW_SEP)
+        const owner = cut > 0 ? k.slice(0, cut) : k
+        if (!keep.has(owner)) store.delete(k)
+      }
+      for (const r of refs) if (!existing.has(r.id)) store.put(r)
+    }
+    tx.oncomplete = () => resolve()
+    tx.onerror = () => reject(tx.error)
+  })
+}
+
+/* ===== 角色的设定图 =====
+   只在这个界面打开时才取,不在启动时加载:5 张图 × N 个角色全部读进内存太重 */
+
+/** 读出某个角色的全部设定图。先按 key 前缀筛出自己那几张,再逐张取 ——
+ *  不整车读进来,免得把别的角色的图也拉进内存 */
+export async function getCharViews(charId: string): Promise<Array<{ kind: string; data: Blob }>> {
+  try {
+    const db = await openDB()
+    const prefix = charId + VIEW_SEP
+    const keys = await new Promise<string[]>((resolve, reject) => {
+      const req = db.transaction(CHAR_STORE, 'readonly').objectStore(CHAR_STORE).getAllKeys()
+      req.onsuccess = () => resolve(req.result.map(String))
+      req.onerror = () => reject(req.error)
+    })
+    const out: Array<{ kind: string; data: Blob }> = []
+    for (const key of keys.filter((k) => k.startsWith(prefix))) {
+      const data = await new Promise<Blob | undefined>((resolve, reject) => {
+        const req = db.transaction(CHAR_STORE, 'readonly').objectStore(CHAR_STORE).get(key)
+        req.onsuccess = () => {
+          const row = req.result as { data?: Blob } | undefined
+          resolve(row?.data)
+        }
+        req.onerror = () => reject(req.error)
+      })
+      if (data instanceof Blob) out.push({ kind: key.slice(prefix.length), data })
+    }
+    return out
+  } catch {
+    // 读不出来就当没有:角色本身还能用,不该因为设定图而整块打不开
+    return []
+  }
+}
+
+/** 写入一张视图。同一个 kind 再写就是覆盖(重生成) */
+export async function putCharView(charId: string, kind: string, data: Blob): Promise<void> {
+  const db = await openDB()
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(CHAR_STORE, 'readwrite')
+    tx.objectStore(CHAR_STORE).put({ id: `${charId}${VIEW_SEP}${kind}`, data })
     tx.oncomplete = () => resolve()
     tx.onerror = () => reject(tx.error)
   })

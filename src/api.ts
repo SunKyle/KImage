@@ -1,4 +1,4 @@
-import type { ApiConfig, GenParams, HistoryEntry, PromptItem, ResultItem, ReuseParams, Collection } from './types'
+import type { ApiConfig, GenParams, HistoryEntry, PromptItem, ResultItem, ReuseParams, Collection, Character, CharacterFields, CharacterViewKind } from './types'
 import type { PruneResult, CoverRecord } from './lib/idb'
 import { titleFromPrompt } from './lib/text'
 import {
@@ -11,6 +11,8 @@ import {
   detectMimeFromDataUrl,
   getAllCovers,
   putCovers,
+  getAllCharRefs,
+  putCharRefs,
   ensurePersisted
 } from './lib/idb'
 
@@ -253,13 +255,12 @@ export const TEXT_PROVIDERS: TextProvider[] = [
 /* ===== 扩展参数的取值与界面文案 =====================================
    放在这里是为了让主界面和历史预览共用同一份文案,避免两处各写一套
    后出现「面板显示低、预览显示 low」这类不一致。
-   hint 是界面上给档位的代价注解。
    ------------------------------------------------------------------ */
 export const QUALITY_OPTIONS = [
-  { value: 'auto', label: 'Auto', hint: 'Model decides' },
-  { value: 'low', label: 'Low', hint: 'Fast, cheaper' },
-  { value: 'medium', label: 'Medium', hint: 'Balanced' },
-  { value: 'high', label: 'High', hint: 'Finer, slower' }
+  { value: 'auto', label: 'Auto' },
+  { value: 'low', label: 'Low' },
+  { value: 'medium', label: 'Medium' },
+  { value: 'high', label: 'High' }
 ]
 export const BACKGROUND_OPTIONS = [
   { value: 'auto', label: 'Auto' },
@@ -889,6 +890,194 @@ export function saveCollections(list: Collection[]): void {
   } catch {
     /* ignore: 写不下就不写,下次改动再试 */
   }
+}
+
+/* ===== 角色 =====
+   目录只有名字/设定/时间,每条几百字节,localStorage 足够;
+   参考图是 Blob,按 id 存在 IndexedDB,读的时候贴回去(与提示词封面同一套做法) */
+const CHAR_KEY = 'kimage.characters'
+
+/* 角色描述文本:按固定顺序把结构化设定拼起来,再接上自由描述。
+   顺序固定很重要 —— 顺序一变,上游拿到的条件就变了,一致性也就无从谈起。
+   加结构化字段之前存下来的角色只有 desc,那种情况整段返回,不做任何改写。
+   这个"全量"版本只用在设定图自己的生成上(见 App 的 genCharView)—— */
+export function characterDesc(c: Character): string {
+  const f = c.fields
+  const parts = f
+    ? [f.identity, f.hair, f.eyes, f.outfit, f.marks].map((s) => (s || '').trim()).filter(Boolean)
+    : []
+  const free = (c.desc || '').trim()
+  if (free) parts.push(free)
+  return parts.join(', ')
+}
+
+/* 并进普通创作提示词的只有这三项:身份、头发、眼睛。
+   为什么不带 outfit 与 marks —— 这两项是"这一张发生什么"的一部分:
+   你写"在太空里",前置的 armored jacket 就在跟它打架。衣服该由场景和参考图决定。
+   而脸是跨场景不该变的那部分,写进文字里才划算(参考图管像不像,文字管说清楚)。
+   加结构化字段之前的老角色没有 fields,退回全量描述,总比什么都不送强 */
+export function characterFaceDesc(c: Character): string {
+  const f = c.fields
+  if (!f) return characterDesc(c)
+  return [f.identity, f.hair, f.eyes].map((s) => (s || '').trim()).filter(Boolean).join(', ')
+}
+
+/* —— 角色的设定图 ——
+   五张视图各自的修饰词与取景。顺序就是生成顺序:正脸是锚,其余四张都以它当参考图,
+   才谈得上"同一张脸"。取景分方形与竖幅 —— 头像装得下方形,全身只有竖幅才放得开。
+
+   注意:修饰词里绝对不能出现 "character reference sheet" 这类词。
+   它在图像模型那里是一个很强的排版概念(设定表 = 正面 + 侧面 + 背面并排 + 细节放大),
+   写进去模型就真的给你画一张拼版,而不是一张干净的单人图。
+   要的是"单个人物占满画面",所以正面把"single / one person / filling the frame"说死 */
+export const CHARACTER_VIEWS: Array<{
+  kind: CharacterViewKind
+  label: string
+  // 追加在角色设定之后的修饰词,写明取景与用途
+  suffix: string
+  framing: 'square' | 'portrait'
+}> = [
+  {
+    kind: 'front',
+    label: 'Front',
+    suffix:
+      'single front-facing headshot portrait of one person, neutral expression, plain background, centered, filling the frame',
+    framing: 'square'
+  },
+  {
+    kind: 'threeQuarter',
+    label: '3/4',
+    suffix:
+      'single three-quarter view headshot portrait of one person, neutral expression, plain background, centered, filling the frame',
+    framing: 'square'
+  },
+  {
+    kind: 'full',
+    label: 'Full body',
+    suffix:
+      'single full-body shot of one person standing, head to toe, plain background, centered, filling the frame',
+    framing: 'portrait'
+  },
+  {
+    /* 细节图:这一张要的就是格子,和 Expressions 同理 ——
+       服装纹样、武器、义体、疤痕这些在全身图里只有几个像素,
+       摊成特写格子,模型才有得可依 */
+    kind: 'detail',
+    label: 'Details',
+    suffix:
+      'a 2x2 grid of close-up detail shots of this character: costume fabric, accessories, equipment and distinctive features, plain background',
+    framing: 'square'
+  },
+  {
+    kind: 'expression',
+    label: 'Expressions',
+    suffix: 'a 2x2 grid of different facial expressions, plain background',
+    framing: 'square'
+  }
+]
+
+/**
+ * 用文本模型把一句话拆成角色的五项设定。
+ * 走 /api/enhance 那条路 —— 与提示词改写共用一套代理、鉴权与超时,只是档位不同。
+ * 能拆多细取决于用户配的文本模型;返回的字段可能仍为空(模型没按格式回),
+ * 那种情况由调用方决定怎么提示。
+ */
+export async function draftCharacterFields(
+  cfg: ApiConfig,
+  idea: string,
+  signal?: AbortSignal
+): Promise<CharacterFields> {
+  const resp = await fetch('/api/enhance', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    signal,
+    body: JSON.stringify({
+      prompt: idea,
+      mode: 'character',
+      textModel: cfg.model,
+      baseUrl: cfg.baseUrl,
+      apiKey: cfg.apiKey
+    })
+  })
+  if (!resp.ok) {
+    let msg = `Request failed (${resp.status})`
+    try {
+      const body = await resp.json()
+      if (body?.error) msg = body.error
+      if (body?.detail) msg = `${msg} — ${body.detail}`
+    } catch {
+      /* ignore */
+    }
+    throw new Error(msg)
+  }
+  const data = (await resp.json()) as { prompt?: string }
+  return parseCharacterFields(data.prompt || '')
+}
+
+/**
+ * 把模型回的那几行拆成五个字段。
+ * 它偶尔会加粗、加项目符号、包代码围栏或写中文冒号,所以先剥掉这些装饰再按前缀认;
+ * 认不出来的行直接丢掉,不报错 —— 少一两个字段不该让整次起稿失败。
+ */
+export function parseCharacterFields(text: string): CharacterFields {
+  const out: CharacterFields = { identity: '', hair: '', eyes: '', outfit: '', marks: '' }
+  const keys: Record<string, keyof CharacterFields> = {
+    identity: 'identity',
+    hair: 'hair',
+    eyes: 'eyes',
+    outfit: 'outfit',
+    marks: 'marks'
+  }
+  for (const raw of text.split('\n')) {
+    const line = raw
+      // 加粗/斜体/行内代码,以及行首的项目符号与引号
+      .replace(/[*`_"']/g, '')
+      .replace(/^[\s>•·\-–—]+/, '')
+      .trim()
+    const m = /^([A-Za-z]+)\s*[:：]\s*(.+)$/.exec(line)
+    if (!m) continue
+    const key = keys[m[1].toLowerCase()]
+    if (key) out[key] = m[2].trim()
+  }
+  return out
+}
+
+/** 读出角色列表,并把参考图从 IndexedDB 贴回条目上 */
+export async function loadCharacters(): Promise<Character[]> {
+  let list: Character[] = []
+  try {
+    const raw = localStorage.getItem(CHAR_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    // 与作品集同理:本地数据也可能被写坏,不滤一遍会让角色区整块崩掉
+    if (!Array.isArray(parsed)) return []
+    list = parsed.filter(
+      (c): c is Character => !!c && typeof c === 'object' && typeof (c as Character).name === 'string'
+    )
+  } catch {
+    return []
+  }
+  const refs = await getAllCharRefs()
+  for (const c of list) {
+    const ref = refs.get(c.id)
+    if (ref) c.ref = ref
+  }
+  return list
+}
+
+/** 整份覆盖写回:目录小而全量重写最省心;参考图那边只补新增、删掉已经不在目录里的 */
+export async function saveCharacters(list: Character[]): Promise<void> {
+  try {
+    // Blob 进不了 JSON(会变成 {}),序列化前必须把 ref 从条目上摘掉
+    localStorage.setItem(CHAR_KEY, JSON.stringify(list.map(({ ref: _ref, ...rest }) => rest)))
+  } catch {
+    /* ignore: 写不下就不写,下次改动再试 */
+  }
+  await putCharRefs(
+    list
+      .filter((c): c is Character & { ref: Blob } => c.ref instanceof Blob)
+      .map((c) => ({ id: c.id, data: c.ref }))
+  )
 }
 
 /* ===== 提示词库(收藏) ===== */

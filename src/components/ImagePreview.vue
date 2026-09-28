@@ -1,21 +1,33 @@
 <script setup lang="ts">
 import { ref, computed, nextTick, onMounted, onUnmounted, watch } from 'vue'
+import type { Component } from 'vue'
 import {
   PhCaretLeft,
   PhCaretRight,
   PhCaretUp,
   PhCaretDown,
-  PhDotsThreeVertical,
   PhArrowBendUpLeft,
   PhImageSquare,
   PhX,
   PhCopy,
   PhHeart,
   PhStack,
-  PhPlus
+  PhPlus,
+  PhCrop,
+  PhSparkle,
+  PhCube,
+  PhHash,
+  PhSquare,
+  PhTimer,
+  PhCalendarBlank,
+  PhDownloadSimple,
+  PhTrash,
+  PhStar,
+  PhCheck,
+  PhMaskHappy
 } from '@phosphor-icons/vue'
 import { BACKGROUND_OPTIONS, QUALITY_OPTIONS, extOf, imageSrc, optionLabel, reuseParamsOf, thumbSrc } from '../api'
-import type { HistoryEntry, ResultItem, ReuseParams, FavoritePayload, Collection } from '../types'
+import type { HistoryEntry, ResultItem, ReuseParams, FavoritePayload, Collection, Character } from '../types'
 import { blobToDataURL } from '../lib/idb'
 
 const props = defineProps<{
@@ -25,6 +37,8 @@ const props = defineProps<{
   items: HistoryEntry[]
   // 作品集目录:这张卡把当前记录挂到某个集下
   collections: Collection[]
+  // 角色目录:用来把记录上的 characterId 翻成名字
+  characters: Character[]
 }>()
 const emit = defineEmits<{
   (e: 'close'): void
@@ -39,26 +53,27 @@ const emit = defineEmits<{
 }>()
 
 const active = ref(0)
-const menuOpen = ref(false)
-// 菜单展开后点别处收起。ref 挂在包着按钮和菜单的那层上:
-// 只监听菜单的话,点按钮收起会先被判成"外部点击",关掉又被 click 打开,反而关不上
-const menuEl = ref<HTMLElement | null>(null)
-// 作品集选择器与 ⋮ 菜单同一套"点外面就收"的口径,共用一个外层监听
-const collOpen = ref(false)
+// 作品集的「新建」输入框:点开就地在行尾长出来,点别处即放弃
+const collAdding = ref(false)
 const collNewTitle = ref('')
 const collEl = ref<HTMLElement | null>(null)
 function onDocPointerDown(e: PointerEvent) {
   const t = e.target as Node | null
-  if (menuEl.value && t && menuEl.value.contains(t)) return
   if (collEl.value && t && collEl.value.contains(t)) return
-  if (menuOpen.value) menuOpen.value = false
-  if (collOpen.value) collOpen.value = false
+  // 点开输入框又去点别处,当作放弃新建:残留一个半截名字比直接收起更碍事
+  if (collAdding.value) {
+    collAdding.value = false
+    collNewTitle.value = ''
+  }
 }
 // 复制后的短暂回执:复制 Prompt 现在是显眼的主操作,必须有反馈
 const copied = ref(false)
 // 复制失败也是一种必须给出的回执:写不进剪贴板时不能假装成功
 const copyFailed = ref(false)
 let copiedTimer: number | undefined
+// 存进提示词库后的短暂回执:不再跳页之后,没有反馈就不知道到底存进去没有
+const saved = ref(false)
+let savedTimer: number | undefined
 // 弹层的焦点管理:打开时记住原来的焦点,关闭时还回去;容器负责接住初始焦点
 const panelEl = ref<HTMLElement | null>(null)
 let lastFocused: HTMLElement | null = null
@@ -88,11 +103,11 @@ function onImgLoad(e: Event) {
 // 每次打开、或上下翻到另一条记录,都回到初始视图
 function resetView() {
   active.value = 0
-  menuOpen.value = false
-  collOpen.value = false
+  collAdding.value = false
   collNewTitle.value = ''
   copied.value = false
   copyFailed.value = false
+  saved.value = false
   loadedRatio.value = 0
 }
 watch(
@@ -252,9 +267,11 @@ function trapTab(e: KeyboardEvent) {
 function onKey(e: KeyboardEvent) {
   if (!props.visible) return
   if (e.key === 'Escape') {
-    // 菜单开着先收菜单,再按一次才关预览
-    if (menuOpen.value) menuOpen.value = false
-    else close()
+    // 作品集的新建框开着先收它,再按一次才关预览
+    if (collAdding.value) {
+      collAdding.value = false
+      collNewTitle.value = ''
+    } else close()
   } else if (e.key === 'Tab') trapTab(e)
   else if (e.key === 'ArrowLeft') prev()
   else if (e.key === 'ArrowRight') next()
@@ -275,29 +292,29 @@ onUnmounted(() => {
   window.removeEventListener('keydown', onKey)
   document.removeEventListener('pointerdown', onDocPointerDown)
   window.clearTimeout(copiedTimer)
+  window.clearTimeout(savedTimer)
 })
 
-// 菜单动作
-function menuAction(kind: 'favorite' | 'download' | 'remove') {
-  if (!props.entry) return
-  if (kind === 'favorite') {
-    // 连参数和这张图的原始载荷一起交出去:库里既复现参数,又留一张清晰的封面
-    const item = props.entry.results[active.value]
-    emit('favorite', {
-      prompt: props.entry.prompt,
-      // 模型也带上:库里没有它,卡片就只能显示参数,看不出这张是谁出的
-      model: props.entry.model,
-      size: props.entry.size,
-      quality: props.entry.quality,
-      background: props.entry.background,
-      image: item
-    })
-  } else if (kind === 'download') {
-    download()
-  } else if (kind === 'remove') {
-    emit('remove')
-  }
-  menuOpen.value = false
+/* 存进提示词库:连参数和这张图的原始载荷一起交出去 ——
+   库里既复现参数,又留一张清晰的封面。
+   落盘在主界面。原先存完会关掉预览、跳到库页,现在不跳了,
+   所以回执交给按钮自己给,免得存没存进去全凭猜 */
+function saveToLibrary() {
+  const e = props.entry
+  // 空提示词存进去没有意义(主界面也会拦下),这里同样不报「已存」
+  if (!e || !e.prompt.trim()) return
+  emit('favorite', {
+    prompt: e.prompt,
+    // 模型也带上:库里没有它,卡片就只能显示参数,看不出这张是谁出的
+    model: e.model,
+    size: e.size,
+    quality: e.quality,
+    background: e.background,
+    image: e.results[active.value]
+  })
+  saved.value = true
+  window.clearTimeout(savedTimer)
+  savedTimer = window.setTimeout(() => (saved.value = false), 1600)
 }
 
 /* —— 创作链 ——
@@ -316,24 +333,65 @@ const chain = computed<HistoryEntry[]>(() => {
   return out
 })
 
-/* —— 作品集归属 ——
-   把当前记录挂到一个集下(或摘出)。目录由主界面持有并落盘,这里只挑选项 */
-const currentCollectionTitle = computed(() => {
-  const cid = props.entry?.collectionId
-  if (!cid) return ''
-  return props.collections.find((c) => c.id === cid)?.title ?? ''
+/* —— 生成信息 ——
+   把这条记录的出图条件摊成"标签 + 值"的规格项,只列真有的:
+   全是「自动」的记录不必堆一排没信息的占位 */
+const specs = computed<{ icon: Component; k: string; v: string }[]>(() => {
+  const e = props.entry
+  if (!e) return []
+  const out: { icon: Component; k: string; v: string }[] = [
+    { icon: PhCrop, k: 'Aspect Ratio', v: e.size === 'auto' ? 'Auto' : e.size.replace('x', '×') }
+  ]
+  if (e.quality) out.push({ icon: PhSparkle, k: 'Quality', v: optionLabel(QUALITY_OPTIONS, e.quality) })
+  if (e.background)
+    out.push({ icon: PhSquare, k: 'Background', v: optionLabel(BACKGROUND_OPTIONS, e.background) })
+  /* 套了哪个角色:这张图里"是谁"。角色被删掉之后只剩一个翻不出名字的 id,
+     那种情况不占一行 —— 宁可少一行,也别显示一串十六进制 */
+  if (e.characterId) {
+    const name = props.characters.find((c) => c.id === e.characterId)?.name
+    if (name) out.push({ icon: PhMaskHappy, k: 'Character', v: name })
+  }
+  if (e.hasRef) out.push({ icon: PhImageSquare, k: 'Reference', v: 'Included' })
+  if (e.seed !== undefined) out.push({ icon: PhHash, k: 'Seed', v: String(e.seed) })
+  if (e.elapsedMs) out.push({ icon: PhTimer, k: 'Duration', v: fmtElapsed(e.elapsedMs) })
+  out.push({ icon: PhCalendarBlank, k: 'Created', v: fmtTime(e.createdAt) })
+  return out
 })
-function assignColl(id: string) {
-  emit('assign-collection', id)
-  collOpen.value = false
+
+/* —— 作品集 ——
+   一行可见的集卡片:封面取该集最新一条的缩略图,张数按归属统计。
+   点一下就把当前记录归到那个集;再点当前所在的集即摘出。
+   目录由主界面持有并落盘,这里只发意图 */
+const collCards = computed(() =>
+  props.collections.map((c) => {
+    // history 最新在前,所以第一条就是该集最近的一张,拿它当封面
+    const owned = props.items.filter((h) => h.collectionId === c.id)
+    return {
+      id: c.id,
+      title: c.title,
+      count: owned.length,
+      cover: owned.length ? thumbSrc(owned[0]) : ''
+    }
+  })
+)
+function toggleColl(id: string) {
+  emit('assign-collection', props.entry?.collectionId === id ? '' : id)
 }
 function createColl() {
   const t = collNewTitle.value.trim()
   if (!t) return
   emit('create-collection', t)
   collNewTitle.value = ''
-  collOpen.value = false
+  collAdding.value = false
 }
+// 输入框长在行尾,行是横滑的 —— 点开时把它滚进视野并聚焦,否则可能露不出来
+const collInputEl = ref<HTMLInputElement | null>(null)
+watch(collAdding, async (v) => {
+  if (!v) return
+  await nextTick()
+  collEl.value?.scrollTo({ left: collEl.value.scrollWidth })
+  collInputEl.value?.focus()
+})
 </script>
 
 <template>
@@ -355,143 +413,150 @@ function createColl() {
             <div class="stage">
               <div class="img-wrap" :style="{ aspectRatio: String(boxRatio) }">
                 <img :src="imgs[active]" :alt="`Result ${active + 1}`" @load="onImgLoad" />
-                <button v-if="imgs.length > 1" class="nav prev tip-below" @click="prev" data-tip="Previous (←)" aria-label="Previous">
+              </div>
+
+              <!-- 缩略图行:横排在主图下方,两端各一枚左右翻页键。
+                   这两颗不给文字提示 —— 左右箭头本身已经说明动作,
+                   而气泡贴在卡片边缘,怎么摆都容易被裁掉一截。
+                   键盘方向键一样能翻,读屏靠 aria-label -->
+              <div v-if="imgs.length > 1" class="rail">
+                <button class="rail-nav" @click="prev" aria-label="Previous">
                   <PhCaretLeft aria-hidden="true" />
                 </button>
-                <button v-if="imgs.length > 1" class="nav next tip-below" @click="next" data-tip="Next (→)" aria-label="Next">
+                <div class="thumbs no-bar">
+                  <button
+                    v-for="(src, i) in imgs"
+                    :key="i"
+                    class="thumb"
+                    :class="{ active: i === active }"
+                    :style="{ aspectRatio: String(thumbRatio) }"
+                    :aria-label="`Image ${i + 1}`"
+                    @click="active = i"
+                  >
+                    <img :src="src" :alt="`Thumbnail ${i + 1}`" />
+                  </button>
+                </div>
+                <button class="rail-nav" @click="next" aria-label="Next">
                   <PhCaretRight aria-hidden="true" />
-                </button>
-              </div>
-              <!-- 缩略图导航:按出图比例成条,图多时这一列自己滚 -->
-              <div v-if="imgs.length > 1" class="thumbs no-bar">
-                <button
-                  v-for="(src, i) in imgs"
-                  :key="i"
-                  class="thumb"
-                  :class="{ active: i === active }"
-                  :style="{ aspectRatio: String(thumbRatio) }"
-                  :aria-label="`Image ${i + 1}`"
-                  @click="active = i"
-                >
-                  <img :src="src" :alt="`Thumbnail ${i + 1}`" />
                 </button>
               </div>
             </div>
 
             <!-- 信息侧栏 -->
             <aside class="side no-bar">
-              <!-- 顶行分两组:左边翻记录,右边是当前这条的操作 -->
+              <!-- 顶行:左边是这条记录的操作(标记 / 下载 / 删除),
+                   右边是沿历史翻记录与关闭。原先这两组压在图上,
+                   现在统一收到这里 —— 图片区因此完全让给图片本身 -->
               <div class="toolbar">
-                <!-- 上下翻历史:history 最新在前,所以 ↑ 是更新的那条 -->
-                <div v-if="items.length > 1" class="tnav">
+                <div class="tbar-acts">
                   <button
-                    class="tpill tip-below"
-                    :disabled="!canGoUp"
-                    @click="goEntry(-1)"
-                    data-tip="Newer (↑)"
-                    aria-label="Newer"
+                    class="tbtn tip-below tip-start"
+                    @click="toggleMark"
+                    :aria-pressed="marked"
+                    :data-tip="marked ? 'Unmark image' : 'Mark image'"
+                    :aria-label="marked ? 'Unmark image' : 'Mark image'"
                   >
-                    <PhCaretUp aria-hidden="true" />
+                    <PhHeart :weight="marked ? 'fill' : 'regular'" aria-hidden="true" />
                   </button>
-                  <span class="tpos">{{ entryIndex + 1 }} / {{ items.length }}</span>
                   <button
-                    class="tpill tip-below"
-                    :disabled="!canGoDown"
-                    @click="goEntry(1)"
-                    data-tip="Older (↓)"
-                    aria-label="Older"
+                    class="tbtn tip-below"
+                    @click="download"
+                    data-tip="Download"
+                    aria-label="Download"
                   >
-                    <PhCaretDown aria-hidden="true" />
+                    <PhDownloadSimple aria-hidden="true" />
+                  </button>
+                  <button
+                    class="tbtn danger tip-below"
+                    @click="emit('remove')"
+                    data-tip="Delete"
+                    aria-label="Delete"
+                  >
+                    <PhTrash aria-hidden="true" />
                   </button>
                 </div>
 
-                <div class="toolbar-main">
-                  <span ref="menuEl" class="menu-wrap">
-                    <button class="tpill tip-below" @click="menuOpen = !menuOpen" data-tip="More actions" aria-label="More actions">
-                      <PhDotsThreeVertical weight="bold" aria-hidden="true" />
+                <div class="tbar-end">
+                  <!-- 上下翻历史:history 最新在前,所以 ↑ 是更新的那条。
+                       这两枚不给文字提示 —— 方向 + 计数已经说明一切 -->
+                  <template v-if="items.length > 1">
+                    <button class="tbtn" :disabled="!canGoUp" @click="goEntry(-1)" aria-label="Newer">
+                      <PhCaretUp aria-hidden="true" />
                     </button>
-                    <Transition name="po">
-                      <div v-if="menuOpen" class="menu">
-                        <button class="mitem" @click="menuAction('favorite')">Save to library</button>
-                        <button class="mitem" @click="menuAction('download')">Download</button>
-                        <button class="mitem danger" @click="menuAction('remove')">Delete</button>
-                      </div>
-                    </Transition>
-                  </span>
-                  <button class="tpill tip-below" @click="close" data-tip="Close (Esc)" aria-label="Close">
+                    <span class="tbar-num">{{ entryIndex + 1 }} / {{ items.length }}</span>
+                    <button class="tbtn" :disabled="!canGoDown" @click="goEntry(1)" aria-label="Older">
+                      <PhCaretDown aria-hidden="true" />
+                    </button>
+                  </template>
+                  <button class="tbtn tip-below tip-end" @click="close" data-tip="Close (Esc)" aria-label="Close">
                     <PhX aria-hidden="true" />
                   </button>
                 </div>
               </div>
 
-              <!-- 提示词:小节标题带分隔线,复制收在标题右侧,贴着它作用的内容 -->
-              <section class="block">
-                <header class="blk-head">
-                  <span class="blk-title">Prompt</span>
-                  <!-- 两个动作收在一组:blk-head 是 space-between,直接并排会被推到中间去 -->
-                  <div class="blk-acts">
-                    <button
-                      class="blk-act tip-left"
-                      :class="{ done: copied, fail: copyFailed }"
-                      @click="copyPrompt"
-                      :data-tip="copyFailed ? 'Copy failed — select the text manually' : 'Copy to clipboard'"
-                      :aria-label="copyFailed ? 'Copy failed' : copied ? 'Copied' : 'Copy to clipboard'"
-                    >
-                      <PhCopy aria-hidden="true" />
-                      <span>{{ copyFailed ? 'Copy failed' : copied ? 'Copied' : 'Copy' }}</span>
-                    </button>
-                    <button
-                      class="blk-act"
-                      :class="{ on: marked }"
-                      @click="toggleMark"
-                      :aria-pressed="marked"
-                      :aria-label="marked ? 'Unmark image' : 'Mark image'"
-                    >
-                      <PhHeart
-                        :weight="marked ? 'fill' : 'regular'"
-                        aria-hidden="true"
-                      />
-                      <span>{{ marked ? 'Marked' : 'Mark' }}</span>
-                    </button>
-                  </div>
+              <!-- 提示词:侧栏的主角,独占一张可滚的卡 ——
+                   与下面几张信息卡同一套外观,复制/存库贴在正文下方 -->
+              <section class="block card">
+                <header class="card-head">
+                  <span class="card-title">Prompt</span>
                 </header>
                 <div class="prompt-scroll">
                   <p class="prompt">{{ entry.prompt }}</p>
                 </div>
+                <div class="prompt-acts">
+                  <button
+                    class="blk-act tip-below tip-start"
+                    :class="{ done: copied, fail: copyFailed }"
+                    @click="copyPrompt"
+                    :data-tip="copyFailed ? 'Copy failed — select the text manually' : 'Copy to clipboard'"
+                    :aria-label="copyFailed ? 'Copy failed' : copied ? 'Copied' : 'Copy to clipboard'"
+                  >
+                    <!-- 复制成功后换成对钩:文字 Copy → Copied 只是一处变化,
+                         图标一起换才一眼看得出来。图标同为 14px,按钮宽度不会跳 -->
+                    <PhCheck v-if="copied" aria-hidden="true" />
+                    <PhCopy v-else aria-hidden="true" />
+                    <span>{{ copyFailed ? 'Copy failed' : copied ? 'Copied' : 'Copy' }}</span>
+                  </button>
+                  <button
+                    class="blk-act"
+                    :class="{ done: saved }"
+                    @click="saveToLibrary"
+                    aria-label="Save to library"
+                  >
+                    <PhCheck v-if="saved" aria-hidden="true" />
+                    <PhStar v-else aria-hidden="true" />
+                    <span>{{ saved ? 'Saved' : 'Save to library' }}</span>
+                  </button>
+                </div>
               </section>
 
-              <!-- 参数与时间:放在提示词之后,作为这条记录的"底注" -->
-              <div class="side-head">
-                <div class="side-tags">
-                  <!-- 模型放首位:它是这条记录最关键的来源信息,尺寸退到其后 -->
-                  <span v-if="entry.model" class="tag tag-model">{{ entry.model }}</span>
-                  <span class="tag">{{ entry.size === 'auto' ? 'Auto' : entry.size.replace('x', '×') }}</span>
-                  <!-- 扩展参数只在非默认档时出现:全都是「自动」的记录不必堆一排无信息的标签 -->
-                  <span v-if="entry.quality" class="tag">
-                    Quality · {{ optionLabel(QUALITY_OPTIONS, entry.quality) }}
-                  </span>
-                  <span v-if="entry.background" class="tag">
-                    Background · {{ optionLabel(BACKGROUND_OPTIONS, entry.background) }}
-                  </span>
-                  <span v-if="entry.hasRef" class="tag">Reference</span>
-                  <span v-if="entry.seed !== undefined" class="tag">Seed · {{ entry.seed }}</span>
-                  <span v-if="entry.elapsedMs" class="tag tag-dim">{{ fmtElapsed(entry.elapsedMs) }}</span>
-                </div>
-                <span class="meta">{{ fmtTime(entry.createdAt) }}</span>
-              </div>
-
-              <!-- 创作链:从别的记录改一个变量跑出来的,往上游列几层父记录。
-                   点任一层就直接翻到那条 —— 链条在预览内部就能顺着走完 -->
-              <section v-if="chain.length" class="chain-sec">
-                <header class="blk-head">
-                  <span class="blk-title">Borrowed from</span>
+              <!-- 生成信息:模型打头,下面是出图条件的规格表。
+                   用卡片把它跟提示词分开 —— 提示词是"要什么",这里是"怎么生成的" -->
+              <section class="card gen-card">
+                <header class="card-head">
+                  <PhCube class="card-ico" aria-hidden="true" />
+                  <span class="card-title">{{ entry.model || 'Unknown model' }}</span>
                 </header>
-                <div class="chain">
+                <div class="gen-grid">
+                  <div v-for="s in specs" :key="s.k" class="gen-item">
+                    <component :is="s.icon" class="gen-item-ico" aria-hidden="true" />
+                    <span class="gen-item-text">
+                      <span class="gen-k">{{ s.k }}</span>
+                      <span class="gen-v">{{ s.v }}</span>
+                    </span>
+                  </div>
+                </div>
+              </section>
+
+              <!-- 灵感来源:从别的记录改一个变量跑出来的,就往上游列几层父记录。
+                   点任一层直接翻到那条 —— 顺链回溯不用退出预览 -->
+              <section v-if="chain.length" class="stack">
+                <div class="sec-cap">Inspired by</div>
+                <div class="card card-rows">
                   <button
                     v-for="(anc, i) in chain"
                     :key="anc.id"
                     class="chain-row"
-                    :class="{ top: i === 0 }"
                     :aria-label="`Open ${i === 0 ? 'the source' : 'an earlier source'} record`"
                     @click="emit('navigate', anc)"
                   >
@@ -502,52 +567,51 @@ function createColl() {
                 </div>
               </section>
 
-              <!-- 作品集归属:把这条记录挂到一个集下(或摘出)。目录在主界面,这里只挑 -->
-              <section class="coll-sec">
-                <header class="blk-head">
-                  <span class="blk-title">Collection</span>
-                </header>
-                <div ref="collEl" class="coll-wrap">
-                  <button class="coll-select" @click="collOpen = !collOpen" aria-haspopup="menu" :aria-expanded="collOpen">
-                    <PhStack aria-hidden="true" />
-                    <span class="coll-sel-name">{{ currentCollectionTitle || 'None' }}</span>
-                    <PhCaretDown class="coll-sel-caret" aria-hidden="true" />
+              <!-- 作品集:一行的集卡片,点一下归到那个集、再点摘出。
+                   张数与封面都按归属现算,一眼看出每组装了多少 -->
+              <section class="stack">
+                <div class="sec-cap">Collections</div>
+                <div ref="collEl" class="coll-row no-bar">
+                  <button
+                    v-for="c in collCards"
+                    :key="c.id"
+                    class="coll-card"
+                    :class="{ on: entry.collectionId === c.id }"
+                    :aria-pressed="entry.collectionId === c.id"
+                    @click="toggleColl(c.id)"
+                  >
+                    <img v-if="c.cover" class="coll-cover" :src="c.cover" alt="" />
+                    <span v-else class="coll-cover coll-cover-ph" aria-hidden="true">
+                      <PhStack />
+                    </span>
+                    <span class="coll-meta">
+                      <span class="coll-name">{{ c.title }}</span>
+                      <span class="coll-count">{{ c.count }} {{ c.count === 1 ? 'image' : 'images' }}</span>
+                    </span>
                   </button>
-                  <Transition name="po">
-                    <div v-if="collOpen" class="menu coll-menu" role="menu">
-                      <button
-                        v-for="c in collections"
-                        :key="c.id"
-                        class="mitem"
-                        :class="{ busy: entry.collectionId === c.id }"
-                        role="menuitem"
-                        @click="assignColl(c.id)"
-                      >
-                        {{ c.title }}
-                      </button>
-                      <button
-                        v-if="entry.collectionId"
-                        class="mitem danger"
-                        role="menuitem"
-                        @click="assignColl('')"
-                      >
-                        Remove from collection
-                      </button>
-                      <div v-if="!collections.length" class="coll-empty">No collections yet</div>
-                      <div class="coll-new">
-                        <input
-                          v-model="collNewTitle"
-                          class="coll-input"
-                          :placeholder="`New name…`"
-                          aria-label="New collection name"
-                          @keyup.enter="createColl"
-                        />
-                        <button class="coll-add" :disabled="!collNewTitle.trim()" @click="createColl">
-                          <PhPlus aria-hidden="true" /> New
-                        </button>
-                      </div>
-                    </div>
-                  </Transition>
+
+                  <!-- 新建:点开就地在行尾长出一个输入框,回车即建 -->
+                  <template v-if="collAdding">
+                    <input
+                      ref="collInputEl"
+                      v-model="collNewTitle"
+                      class="coll-input"
+                      placeholder="Name…"
+                      aria-label="New collection name"
+                      @keyup.enter="createColl"
+                      @keyup.esc="collAdding = false"
+                    />
+                    <button class="coll-card coll-confirm" :disabled="!collNewTitle.trim()" @click="createColl">
+                      Add
+                    </button>
+                  </template>
+                  <button v-else class="coll-card coll-new" aria-label="New collection" @click="collAdding = true">
+                    <span class="coll-cover coll-cover-ph" aria-hidden="true"><PhPlus /></span>
+                    <span class="coll-meta">
+                      <span class="coll-name">New</span>
+                      <span class="coll-count">collection</span>
+                    </span>
+                  </button>
                 </div>
               </section>
 
@@ -594,23 +658,28 @@ function createColl() {
   padding: clamp(12px, 4vw, 40px);
 }
 .preview {
-  /* 出图比例(--ratio)与是否带缩略图条(--rail,0/1)由组件按当前这张图注入 */
+  /* 出图比例(--ratio)与是否有缩略图行(--rail,0/1)由组件按当前这张图注入 */
   --prev-h: min(92vh, 880px);
   --stage-pad: var(--sp-4);
-  /* 320px 而不是 300px:300 减去左右各 24 的内边距只剩 252,
-     提示词换行太密、参数标签一行排不下三个 */
+  /* 320px 而不是 300px:300 减去左右各 16 的内边距只剩 268,
+     提示词换行太密、作品集一行排不下 */
   --side-w: 320px;
-  --thumb-w: 46px;
+  /* 缩略图行的总高:46px 的图块 + 上下各 2px 内边距 */
+  --thumb-h: 50px;
+  /* 主图与缩略图行之间的间距 */
+  --rail-gap: var(--sp-3);
 
   /* 高度取确定值,不随内容伸缩:展开提示词只在侧栏内部滚动,卡片高度保持不变 */
   height: var(--prev-h);
-  /* 宽度跟着图片比例走:图占满可用高度后推出来的宽度 + 缩略图条 + 内边距 + 侧栏。
-     这样竖图不再左右留空,横图也挤不掉侧栏 */
+  /* 宽度跟着图片比例走。缩略图行改到主图下方后占了高度,要先把这一条减掉,
+     再按比例推出图宽,加上内边距与侧栏 —— 否则竖图会顶破卡片底部 */
   width: min(
     100%,
     calc(
-      (var(--prev-h) - 2 * var(--stage-pad)) * var(--ratio, 1) + var(--rail, 0) *
-        (var(--thumb-w) + var(--sp-4)) + 2 * var(--stage-pad) + var(--side-w)
+      (
+          var(--prev-h) - 2 * var(--stage-pad) -
+            var(--rail, 0) * (var(--thumb-h) + var(--rail-gap))
+        ) * var(--ratio, 1) + 2 * var(--stage-pad) + var(--side-w)
     )
   );
   background: var(--bg);
@@ -622,105 +691,65 @@ function createColl() {
   box-shadow: var(--sh-md);
 }
 
-/* 顶行分两组:左=翻记录,右=本条的操作;两组各自成团 */
+/* 顶行分两组:左=本条记录的操作,右=翻记录与关闭 */
 .toolbar {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: var(--sp-3);
+  gap: var(--sp-2);
 }
-/* 翻记录的箭头组:两个圆钮夹一个位置指示 */
-.tnav {
+.tbar-acts,
+.tbar-end {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 2px;
 }
-.tpos {
-  min-width: 46px;
+/* 右组吃满剩余宽度:不管有没有翻记录那几枚,关闭都落在最右 */
+.tbar-end {
+  margin-left: auto;
+  gap: 6px;
+}
+/* 面板里的图标按钮:底本身就是 --surface,不需要图上那层深色覆盖层。
+   一行六个全描边会太吵,所以留白 + 悬停出底 */
+.tbtn {
+  flex-shrink: 0;
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  color: var(--text-2);
+  cursor: pointer;
+  transition: color var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+.tbtn svg {
+  width: 17px;
+  height: 17px;
+}
+.tbtn:hover {
+  color: var(--text);
+  background: var(--bg-elev);
+}
+/* 翻到头的那一端不参与悬停反馈 */
+.tbtn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+.tbtn:disabled:hover {
+  background: none;
+}
+/* 删除是整行里唯一的破坏性动作:悬停才转红 */
+.tbtn.danger:hover {
+  color: var(--danger);
+  background: color-mix(in oklch, var(--danger) 10%, transparent);
+}
+/* 翻记录的计数:等宽数字,免得 1/9 与 12/58 之间宽度跳 */
+.tbar-num {
+  min-width: 40px;
   text-align: center;
   font-size: var(--fs-xs);
   color: var(--text-3);
   font-variant-numeric: tabular-nums;
-}
-/* 没有翻记录那组时,右侧这组也要靠右 */
-.toolbar-main {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-left: auto;
-}
-/* 圆形图标按钮:与主页面的 .param-btn / .icob 同一套造型。
-   宽高必须相等 —— 靠左右 padding 撑宽会变成椭圆 */
-.tpill {
-  flex-shrink: 0;
-  width: 34px;
-  height: 34px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  background: var(--surface);
-  color: var(--text-2);
-  cursor: pointer;
-  transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease),
-    background var(--dur) var(--ease);
-}
-.tpill svg {
-  width: 17px;
-  height: 17px;
-}
-/* 只有禁用态(翻到头的那一端)不参与悬停反馈 */
-.tpill:not(:disabled):hover {
-  color: var(--text);
-  border-color: var(--line-strong);
-  background: var(--bg-elev);
-}
-.tpill:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
-.menu-wrap {
-  position: relative;
-  display: inline-flex;
-}
-.menu {
-  position: absolute;
-  right: 0;
-  top: calc(100% + 6px);
-  min-width: 150px;
-  background: var(--surface);
-  border: 1px solid var(--line);
-  border-radius: var(--r-sm);
-  box-shadow: var(--sh-md);
-  padding: 4px;
-  z-index: 5;
-}
-.mitem {
-  display: block;
-  width: 100%;
-  text-align: left;
-  padding: 8px 10px;
-  font-size: var(--fs-sm);
-  color: var(--text-2);
-  border-radius: var(--r-sm);
-  transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
-}
-.mitem:hover {
-  background: var(--bg-elev);
-  color: var(--text);
-}
-.mitem.danger {
-  color: var(--danger);
-}
-.po-enter-active,
-.po-leave-active {
-  transition: opacity 120ms var(--ease), transform 120ms var(--ease);
-}
-.po-enter-from,
-.po-leave-to {
-  opacity: 0;
-  transform: translateY(-4px);
 }
 
 .body {
@@ -734,31 +763,31 @@ function createColl() {
   flex: 1;
 }
 
-/* 图片区:图与缩略图作为一组居中,不再让图盒撑满整列 */
+/* 图片区:主图在上、缩略图行在下,整块居中 */
 .stage {
   position: relative;
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
-  /* 与 padding 取同一档:缩略图条左右两侧的间距才相等(8px 的 gap 会显得左边挤) */
-  gap: var(--sp-4);
-  padding: var(--sp-4);
+  gap: var(--rail-gap);
+  padding: var(--stage-pad);
   min-height: 0;
   background: var(--stage-bg);
 }
-/* 图盒按出图比例收缩:高度吃满可用空间,宽度由 aspect-ratio 推出。
-   max-width 兜住超宽图 */
+/* 图盒按出图比例收缩:高度吃掉缩略图行以外的可用空间,宽度由 aspect-ratio 推出。
+   max-width 兜住超宽图。
+   圆角落在 img 上,而不是靠 overflow:hidden 裁盒子 —— 左上角的操作条与它的
+   「…」菜单要能探出图盒,裁掉就点不到了 */
 .img-wrap {
   position: relative;
-  height: 100%;
+  flex: 1 1 auto;
+  min-height: 0;
   min-width: 0;
   max-width: 100%;
-  flex: 0 1 auto;
   display: flex;
   align-items: center;
   justify-content: center;
-  border-radius: var(--r);
-  overflow: hidden;
 }
 .img-wrap img {
   /* 撑满已定比例的盒子;比例与图一致时不留边,不一致时 contain 也不会变形 */
@@ -766,60 +795,54 @@ function createColl() {
   height: 100%;
   object-fit: contain;
   display: block;
+  border-radius: var(--r);
 }
-/* 压在图上的翻页键:圆形毛玻璃,同主页面输入框按钮的造型 */
-.nav {
-  position: absolute;
-  top: 50%;
-  transform: translateY(-50%);
-  width: 36px;
-  height: 36px;
+/* 缩略图行:两端各一枚左右翻页键,中间是可滚的缩略图 */
+.rail {
   display: flex;
   align-items: center;
+  /* 与主图等宽 */
+  align-self: stretch;
+  gap: var(--sp-2);
+}
+/* 行首行尾的翻页键:细箭头、不描边,免得跟缩略图抢视线 */
+.rail-nav {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
   justify-content: center;
-  color: var(--text-2);
-  background: color-mix(in oklch, var(--surface) 80%, transparent);
-  border: 1px solid var(--line);
   border-radius: 999px;
-  backdrop-filter: blur(6px) saturate(130%);
-  -webkit-backdrop-filter: blur(6px) saturate(130%);
+  color: var(--text-3);
   cursor: pointer;
-  transition: color var(--dur) var(--ease), background var(--dur) var(--ease),
-    border-color var(--dur) var(--ease), transform 120ms var(--ease);
+  transition: color var(--dur) var(--ease), background var(--dur) var(--ease);
 }
-.nav svg {
-  width: 18px;
-  height: 18px;
+.rail-nav svg {
+  width: 15px;
+  height: 15px;
 }
-.nav:hover {
-  background: var(--surface);
-  border-color: color-mix(in oklch, var(--accent) 45%, var(--line));
-  color: var(--accent);
-}
-.nav:active {
-  transform: translateY(-50%) scale(0.94);
-}
-.nav.prev {
-  left: 12px;
-}
-.nav.next {
-  right: 12px;
+.rail-nav:hover {
+  color: var(--text);
+  background: var(--bg-elev);
 }
 .thumbs {
   display: flex;
-  flex-direction: column;
+  align-items: center;
+  /* 吃掉翻页键之间的剩余宽度;图多时这一条自己左右滚,不把卡片撑高 */
+  flex: 1;
+  min-width: 0;
+  /* safe:溢出时从左边起排 —— 单纯的 center 会把最前几张顶进滚不到的地方 */
+  justify-content: safe center;
   gap: var(--sp-2);
-  /* 画布改为撑满高度后,缩略图条要自己保持垂直居中 */
-  align-self: center;
-  /* 图多时这一列自己滚,不把卡片撑高 */
-  max-height: 100%;
-  overflow-y: auto;
   padding: 2px;
+  overflow-x: auto;
+  overflow-y: hidden;
 }
 .thumb {
   flex-shrink: 0;
-  width: 46px;
-  /* 高由 aspect-ratio 决定:与出图比例一致,一眼看出竖幅还是横幅 */
+  /* 高固定,宽由 aspect-ratio 决定:与出图比例一致,一眼看出竖幅还是横幅 */
+  height: 46px;
   border-radius: 8px;
   overflow: hidden;
   border: 1px solid var(--line);
@@ -846,57 +869,101 @@ function createColl() {
 .side {
   display: flex;
   flex-direction: column;
-  /* 顶边收到 16px 与左栏图片对齐:头部行去掉后,这条基准线才露出来 */
-  padding: var(--sp-4) var(--sp-5) var(--sp-5);
+  /* 顶边收到 16px 与左栏图片对齐:头部行去掉后,这条基准线才露出来。
+     左右也收到 16px —— 作品集那行卡片横铺,省下的 16px 正好多露出一张 */
+  padding: var(--sp-4) var(--sp-4) var(--sp-5);
   border-left: 1px solid var(--line);
-  gap: var(--sp-5);
-  /* 整栏不滚:只有提示词那块在自己内部滚,工具栏、参数与底部操作始终留在原位 */
+  /* 收紧到 16px:卡片多了之后,24px 的间隙会把提示词挤没 */
+  gap: var(--sp-4);
+  /* 整栏不滚:只有提示词那块在自己内部滚,工具栏、生成信息与底部操作始终留在原位 */
   overflow: hidden;
 }
-/* 参数标签与时间是一组:时间贴着标签下方,间距比小节之间紧一档 */
-.side-head {
+/* —— 通用卡片:提示词 / 生成信息表 / 灵感来源都用它 ——
+   卡片本身不裁切:卡里的气泡提示要能探出卡片下缘。
+   整卡铺满列表行的那种(灵感来源)另加 .card-rows 去裁圆角 */
+.card {
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+}
+/* 行铺满整卡的列表:行的悬停底色要裁进圆角里 */
+.card-rows {
+  overflow: hidden;
+}
+.card-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--line);
+}
+.card-ico {
+  width: 15px;
+  height: 15px;
+  color: var(--text-2);
+  flex: none;
+}
+/* 小标题:一行全大写标签,给下面的卡起名,不占一条分割线 */
+.sec-cap {
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+/* 小标题 + 卡的组合 */
+.stack {
   display: flex;
   flex-direction: column;
-  gap: var(--sp-2);
-  /* 胶囊的左右内边距。时间要靠它对齐到标签内的文字,而不是对齐到胶囊边框 */
-  --tag-pad-x: 9px;
+  gap: 7px;
 }
-.side-tags {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
-}
-.tag {
-  font-size: var(--fs-micro);
-  color: var(--text-2);
-  background: var(--bg-elev);
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  padding: 2px var(--tag-pad-x);
-}
-.tag-model {
-  color: var(--accent);
-  border-color: color-mix(in oklch, var(--accent) 30%, var(--line));
-  background: var(--accent-soft);
-}
-/* 耗时属于度量值,比参数标签更低一级,再退一档灰 */
-.tag-dim {
-  color: var(--text-3);
-  /* 耗时是度量值,等宽数字免得 1.2s 与 12.3s 宽窄不一 */
-  font-variant-numeric: tabular-nums;
-}
-/* 时间已压到 "Sep 26, 18:52",仍留截断兜底:不同语言环境长度会变 */
-.meta {
-  /* 补上与胶囊等宽的缩进,让时间戳的文字和标签内的文字共用一条左边线 */
-  padding-left: var(--tag-pad-x);
+/* 卡头标题:提示词的「Prompt」与生成信息里的模型名共用 */
+.card-title {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: var(--fs-xs);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--text);
+}
+/* —— 生成信息 —— */
+/* 两列规格:每项一个小图标 + 「标签 / 值」两行 */
+.gen-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px 12px;
+  padding: 11px 12px;
+}
+.gen-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  min-width: 0;
+}
+.gen-item-ico {
+  width: 14px;
+  height: 14px;
   color: var(--text-3);
-  font-variant-numeric: tabular-nums;
+  flex: none;
+  margin-top: 1px;
+}
+.gen-item-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.gen-k {
+  font-size: var(--fs-micro);
+  color: var(--text-3);
+}
+.gen-v {
+  font-size: var(--fs-xs);
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 /* 提示词小节吃掉侧栏的剩余高度,再在里面划出滚动区:
    长提示词只把这一个区域撑出滚动条,不会把下面的参数和按钮推出视野 */
@@ -911,60 +978,73 @@ function createColl() {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  /* 给滚动条留一点余地,免得文字贴着它 */
-  padding-right: 4px;
+  /* 左侧与卡头的内边距对齐;右侧留 4px,再加滚动条自己的 8px,
+     合起来也是 12px,两边留白才对得上 */
+  padding: 10px 4px 0 12px;
 }
-/* 侧栏小节:标题带一条分隔线,把长侧栏切出层次 */
-.blk-head {
+/* 提示词卡底部的两个动作:描边胶囊,读作"对这段文字做的事" */
+.prompt-acts {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: var(--sp-3);
-  padding-bottom: 8px;
-  margin-bottom: var(--sp-3);
-  border-bottom: 1px solid var(--line);
+  gap: 6px;
+  padding: 10px 12px 11px;
 }
-.blk-title {
-  font-size: var(--fs-sm);
-  font-weight: 600;
-  color: var(--text-2);
-}
-/* 小节内的图标动作:默认弱化,悬停才浮出,免得和正文抢注意力。
-   两个动作收在 .blk-acts 里 —— blk-head 是 space-between,直接并排会被推到中间 */
-.blk-acts {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-}
+/* 卡里的动作:只留描边、不填底 —— 卡底本身就是 --surface,填同色看不出来 */
 .blk-act {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  padding: 3px 9px;
+  gap: 5px;
+  padding: 5px 11px;
   font-size: var(--fs-xs);
-  color: var(--text-3);
+  color: var(--text-2);
+  background: none;
+  border: 1px solid var(--line);
   border-radius: 999px;
   cursor: pointer;
-  transition: color var(--dur) var(--ease), background var(--dur) var(--ease);
+  transition: color var(--dur) var(--ease), background var(--dur) var(--ease),
+    border-color var(--dur) var(--ease);
 }
 .blk-act svg {
-  width: 15px;
-  height: 15px;
+  width: 14px;
+  height: 14px;
 }
 .blk-act:hover {
-  color: var(--accent);
-  background: var(--accent-soft);
+  color: var(--text);
+  border-color: var(--line-strong);
+  background: var(--bg-elev);
 }
-/* done = 复制成功后的短暂回执(1.6 秒);on = 这张图已被标记的常驻状态 */
-.blk-act.done,
-.blk-act.on {
+/* done = 复制成功后的短暂回执(1.6 秒) */
+.blk-act.done {
   color: var(--accent-strong);
   background: var(--accent-soft);
+  border-color: color-mix(in oklch, var(--accent) 40%, var(--line));
 }
 /* fail = 复制没写进剪贴板,如实标红 */
 .blk-act.fail {
   color: var(--danger);
   background: color-mix(in oklch, var(--danger) 10%, transparent);
+  border-color: color-mix(in oklch, var(--danger) 40%, var(--line));
+}
+/* 气泡默认居中展开。靠边的按钮(侧栏左右缘、缩略图行两端)居中会探出容器被裁掉,
+   所以给它们加 tip-start / tip-end 贴边对齐。
+   贴边后不再横向滑入:滑动的方向本来就会被容器裁掉一半,看着像抖了一下 */
+[data-tip].tip-start::after {
+  left: 0;
+  transform: translateY(0);
+}
+[data-tip].tip-start::before {
+  left: 12px;
+  transform: none;
+}
+[data-tip].tip-end::after {
+  left: auto;
+  right: 0;
+  transform: translateY(0);
+}
+[data-tip].tip-end::before {
+  left: auto;
+  right: 12px;
+  transform: none;
 }
 /* 弹层容器只用来接住初始焦点,聚焦环由内部控件承担 */
 .preview:focus {
@@ -1028,35 +1108,26 @@ function createColl() {
   flex: none;
 }
 
-/* —— 创作链 ——
-   侧栏里往上溯的几行父记录。每个源一行:缩略图 + 提示词截断 + 右箭提示可点 */
-.chain-sec {
-  margin-top: 2px;
-}
-.chain {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
+/* —— 灵感来源(创作链) ——
+   一张卡里叠几行父记录:缩略图 + 提示词截断 + 右箭 */
 .chain-row {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 9px;
   width: 100%;
-  padding: 4px;
+  padding: 8px 10px;
   border: 0;
-  border-radius: var(--r-sm);
   background: none;
   text-align: left;
   cursor: pointer;
   transition: background var(--dur) var(--ease);
 }
+/* 行与行之间一条发丝线,最后一行不画 */
+.chain-row + .chain-row {
+  border-top: 1px solid var(--line);
+}
 .chain-row:hover {
   background: var(--bg-elev);
-}
-/* 最近的那条来源与更旧的几层稍稍区分,读起来知道谁更近 */
-.chain-row.top .chain-thumb {
-  border-color: color-mix(in oklch, var(--accent) 40%, var(--line));
 }
 .chain-thumb {
   flex: none;
@@ -1084,113 +1155,116 @@ function createColl() {
   color: var(--text-3);
 }
 
-/* —— 作品集归属 —— */
-.coll-sec {
-  margin-top: 2px;
+/* —— 作品集 ——
+   一行横铺的集卡片:封面 + 名字 + 张数。多了左右滑,不进第二行把侧栏撑高 */
+.coll-row {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 2px;
 }
-.coll-wrap {
-  position: relative;
-}
-/* 选择器铺满侧栏宽度:像底注标签一样的存在,点开才见菜单 */
-.coll-select {
+.coll-card {
   display: flex;
   align-items: center;
   gap: 8px;
-  width: 100%;
-  padding: 8px 10px;
+  flex: none;
+  /* 宽度跟着标题走,但给个下限,免得只剩一个封面 */
+  min-width: 112px;
+  max-width: 168px;
+  padding: 6px 10px 6px 6px;
   border: 1px solid var(--line);
   border-radius: var(--r-sm);
   background: var(--surface);
-  color: var(--text);
-  font-size: var(--fs-sm);
+  text-align: left;
   cursor: pointer;
   transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease);
 }
-.coll-select:hover {
+.coll-card:hover {
   border-color: var(--line-strong);
   background: var(--bg-elev);
 }
-.coll-select svg {
-  width: 15px;
-  height: 15px;
-  color: var(--text-2);
-  flex: none;
+/* 当前这条归属的集:淡紫描边 + 浅底,一眼看出"就在这组里" */
+.coll-card.on {
+  border-color: color-mix(in oklch, var(--accent) 45%, var(--line));
+  background: var(--accent-soft);
 }
-.coll-sel-name {
-  flex: 1;
+.coll-cover {
+  flex: none;
+  width: 30px;
+  height: 30px;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+}
+/* 还没图的集:一枚灰底图标占位,免得卡片高低不齐 */
+.coll-cover-ph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-elev);
+  color: var(--text-3);
+}
+.coll-cover-ph svg {
+  width: 14px;
+  height: 14px;
+}
+.coll-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
   min-width: 0;
+}
+.coll-name {
+  font-size: var(--fs-xs);
+  color: var(--text);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  text-align: left;
 }
-.coll-sel-caret {
+.coll-count {
+  font-size: var(--fs-micro);
   color: var(--text-3);
+  white-space: nowrap;
 }
-/* 菜单贴近当前集;当前归属的集加个浅底表明"这正是这条所在的" */
-.coll-menu {
-  right: auto;
-  left: 0;
-  width: 100%;
-}
-.mitem.busy {
-  background: var(--accent-soft);
-  color: var(--accent-strong);
-}
-.coll-empty {
-  padding: 8px 10px;
-  font-size: var(--fs-xs);
-  color: var(--text-3);
-}
-/* 菜单底部的行内新建:输入框 + 一个小按钮 */
+/* 新建:虚线的"空卡",与已有的集并排但不抢注意力 */
 .coll-new {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 4px 2px;
-  border-top: 1px solid var(--line);
-  margin-top: 4px;
+  border-style: dashed;
 }
+.coll-new .coll-name {
+  color: var(--text-2);
+}
+/* 行内新建输入框:与卡片同高,回车即建 */
 .coll-input {
-  flex: 1;
-  height: 30px;
+  flex: none;
+  width: 124px;
+  min-height: 44px;
   padding: 0 10px;
-  border: 1px solid var(--line);
-  border-radius: 999px;
+  border: 1px solid var(--accent);
+  border-radius: var(--r-sm);
   background: var(--surface);
   color: var(--text);
   font-size: var(--fs-xs);
   outline: none;
-  transition: border-color var(--dur) var(--ease);
 }
-.coll-input:focus {
-  border-color: var(--accent);
-}
-.coll-add {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
+.coll-confirm {
   flex: none;
-  height: 30px;
-  padding: 0 10px;
-  border: 0;
-  border-radius: 999px;
+  min-width: 0;
+  min-height: 44px;
+  justify-content: center;
+  padding: 0 12px;
+  border-color: var(--cta);
   background: var(--cta);
   color: var(--cta-text);
   font-size: var(--fs-xs);
-  cursor: pointer;
-  transition: background var(--dur) var(--ease), opacity var(--dur) var(--ease);
 }
-.coll-add:hover:not(:disabled) {
+.coll-confirm:hover:not(:disabled) {
+  border-color: var(--cta-hover);
   background: var(--cta-hover);
 }
-.coll-add:disabled {
-  opacity: 0.6;
+.coll-confirm:disabled {
+  opacity: 0.5;
   cursor: default;
-}
-.coll-add svg {
-  width: 13px;
-  height: 13px;
 }
 
 .modal-enter-active,
@@ -1222,20 +1296,25 @@ function createColl() {
     overflow-y: auto;
   }
   .stage {
-    /* 竖排后这一行的高度由内容决定,图盒的 height:100% 会失去依据,
+    /* 竖排后这一行的高度由内容决定,图盒的 flex 高度会失去依据,
        所以这里给一个确定高度,顺带保证图片有足够的展示空间;
-       窄屏从 56vh 收到 48vh:375×812 下留给下方侧栏的高度从约 250px 提到约 320px */
-    height: 48vh;
-    min-height: 260px;
+       缩略图行现在也在 stage 里,高度比之前多留一条(48vh → 56vh) */
+    height: 56vh;
+    min-height: 300px;
   }
-  /* 触控目标放大到 40px:34px 在手机上容易点错 */
-  .tpill {
+  /* 触控目标放大到 40px:30px 在手机上容易点错 */
+  .tbtn {
     width: 40px;
     height: 40px;
   }
-  .tpill svg {
+  .tbtn svg {
     width: 18px;
     height: 18px;
+  }
+  /* 缩略图行两端的翻页键也一样 */
+  .rail-nav {
+    width: 40px;
+    height: 40px;
   }
   /* 底部两个主次按钮同步加厚,与放大的图标按钮观感一致 */
   .act {
@@ -1253,7 +1332,12 @@ function createColl() {
   }
   .prompt-scroll {
     overflow-y: visible;
-    padding-right: 0;
+    /* 竖排后整页滚,卡内不再出滚动条,右侧也就不必再让出那 8px */
+    padding: 10px 12px 0;
+  }
+  /* iOS Safari 聚焦字号 <16px 的输入框会放大整页,作品集新建框提到 16px */
+  .coll-input {
+    font-size: var(--fs-lg);
   }
 }
 </style>
