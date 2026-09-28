@@ -306,8 +306,10 @@ function onImportFile(e: Event) {
       </div>
     </header>
 
-    <!-- 内容收在 640px 一列:设置页是表单,铺满 1080 会读得很散 -->
-    <div class="pg-wrap">
+    <!-- 列表铺满内容区:行内的 Current 徽标与行菜单因此贴到两缘,像一张完整的
+         设置纸(历史页、提示词库页也都是铺满的)。表单另说 —— 单行输入拉到
+         900px 宽会读得很散,所以它收窄并居中 -->
+    <div class="pg-wrap" :class="{ 'is-form': mode === 'form' }">
       <!-- ===== 视图一:已保存的接口列表 ===== -->
       <template v-if="mode === 'list'">
         <!-- 一整张纸包住所有分组:主页的容器语言是「浮在纸上的柔光」,
@@ -679,8 +681,13 @@ function onImportFile(e: Event) {
   transform: translateY(-4px);
 }
 .pg-wrap {
-  max-width: 640px;
   margin-top: var(--sp-5);
+}
+/* 表单收窄并居中。列表不设上限:它是「一行一项 + 行尾操作」的清单,
+   铺满时两侧的徽标与菜单正好互为对边,收窄反而在右边留出一块空白 */
+.pg-wrap.is-form {
+  max-width: 720px;
+  margin-inline: auto;
 }
 
 /* —— 一张纸,不是一组卡片 ——
