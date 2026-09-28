@@ -340,6 +340,55 @@ export function saveActiveTextId(id: string) {
   localStorage.setItem(TEXT_ACTIVE_KEY, id)
 }
 
+/** 连通性测试的判决。判断在服务端做(只有它知道怎么打上游),文案在这里拼 */
+export interface TestResult {
+  ok: boolean
+  /** auth=密钥被拒 endpoint=没有这个端点 server=上游自己出错 network/timeout=没连上 */
+  code?: 'auth' | 'endpoint' | 'server' | 'network' | 'timeout'
+  status: number | null
+  ms: number
+  detail?: string
+}
+
+/* 测这条配置通不通。发的是真实端点上的一个空请求:上游会因缺参数回 400,
+   而 400 恰好证明地址、路径与密钥这条链是通的(见 server 的 /api/test)。
+   它不会真的生成图,所以点几次都不花钱 */
+export async function testConnection(config: ApiConfig): Promise<TestResult> {
+  try {
+    const resp = await fetch('/api/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        baseUrl: config.baseUrl,
+        apiKey: config.apiKey,
+        model: config.model,
+        protocol: getProvider(config.vendor || inferVendor(config.baseUrl), config.model).protocol,
+        kind: config.kind === 'text' ? 'text' : 'image'
+      })
+    })
+    const data = await resp.json().catch(() => null)
+    // 地址本身没通过校验这类情况,后端会以 400 + error 回,不是网络故障
+    if (!resp.ok) {
+      return {
+        ok: false,
+        code: 'network',
+        status: resp.status,
+        ms: 0,
+        detail: data?.error || `Test failed (${resp.status})`
+      }
+    }
+    return data as TestResult
+  } catch (e) {
+    return {
+      ok: false,
+      code: 'network',
+      status: null,
+      ms: 0,
+      detail: e instanceof Error ? e.message : 'Request failed'
+    }
+  }
+}
+
 /**
  * 调用后端代理生图。
  * 返回标准化后的 ResultItem 列表(图片载荷统一是 Blob)。

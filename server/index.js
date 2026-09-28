@@ -630,6 +630,103 @@ app.get('/api/health', (_req, res) => {
   res.json({ ok: true })
 })
 
+/** 上游原文里那句给人看的话:整页 HTML 只取标题,JSON 取 message,其余截断 */
+function shortDetail(text) {
+  if (!text) return ''
+  if (looksLikeHtml(text)) {
+    const t = htmlTitle(text)
+    return `The host answered with an HTML page${t ? `: ${t}` : ''}`
+  }
+  try {
+    const j = JSON.parse(text)
+    const m = j?.error?.message ?? j?.message
+    if (typeof m === 'string' && m.trim()) return m.trim().slice(0, 300)
+  } catch {
+    /* 不是 JSON 就原样截断 */
+  }
+  return text.slice(0, 300)
+}
+
+/**
+ * 连通性测试。
+ * 发一个"故意不完整"的请求(空 JSON):上游会因为缺参数回 400,而 400 恰好
+ * 证明地址、路径前缀、密钥这条链路是通的 —— 401/403 才是密钥的问题。
+ * 这样既把整条路走了一遍,又不会真的生成一张图(那要花钱)。
+ * 不图省事去打 GET /models:那是 OpenAI 的可选端点,不少中转没实现它,
+ * 拿它的 404 判"不通"会误伤本来好好的配置。
+ *
+ * 判决发回前端,文案由前端拼 —— 与 /api/generate 同一套分工。
+ */
+app.post('/api/test', rateLimit, async (req, res) => {
+  const { baseUrl, apiKey, model, protocol, kind } = req.body || {}
+  const base = String(baseUrl || '').replace(/\/+$/, '')
+  if (!/^https?:\/\//i.test(base)) {
+    return res.status(400).json({ error: 'Enter a valid Base URL' })
+  }
+
+  /* 打真实端点而不是固定的某个探活地址:测试要回答的是"这条配置能不能用",
+     而能被用起来的前提正是这段路径前缀对得上 */
+  const target =
+    protocol === 'gemini'
+      ? `${base}/v1beta/models/${encodeURIComponent(model || '')}:generateContent`
+      : base + (kind === 'text' ? '/chat/completions' : '/images/generations')
+
+  try {
+    await assertSafeTarget(target)
+  } catch (e) {
+    return res.status(400).json({ error: e.message })
+  }
+
+  const headers = { 'Content-Type': 'application/json' }
+  if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`
+
+  const started = Date.now()
+  const ac = new AbortController()
+  // 测试不该等两分钟(生图的超时是 120s):十五秒没动静就当不可达
+  const timer = setTimeout(() => ac.abort(), 15_000)
+  try {
+    const upstream = await fetch(target, {
+      method: 'POST',
+      headers,
+      body: '{}',
+      signal: ac.signal,
+      dispatcher: dispatcherFor(target)
+    })
+    const text = await upstream.text()
+    const ms = Date.now() - started
+    const status = upstream.status
+
+    // 200(不该发生)与"缺参数被拒"都算通:端点存在、密钥被接受了
+    if (upstream.ok || status === 400 || status === 422) {
+      return res.json({ ok: true, status, ms })
+    }
+    // 限流也算通 —— 它同样要过了鉴权才会被限
+    if (status === 429) return res.json({ ok: true, status, ms })
+
+    const code =
+      status === 401 || status === 403
+        ? 'auth'
+        : status === 404 || status === 405
+          ? 'endpoint'
+          : 'server'
+    return res.json({ ok: false, code, status, ms, detail: shortDetail(text) })
+  } catch (e) {
+    const code = e?.cause?.code || e?.code || ''
+    const timedOut = e?.name === 'AbortError'
+    return res.json({
+      ok: false,
+      code: timedOut ? 'timeout' : 'network',
+      status: null,
+      ms: Date.now() - started,
+      detail: timedOut
+        ? 'No response within 15 seconds. The endpoint may be unreachable or blocked.'
+        : CONNECT_HINTS[code] || e?.message || 'Request failed'
+    })
+  } finally {
+    clearTimeout(timer)
+  }
+})
+
 // 生产模式：托管构建后的前端静态文件（dist 存在时）
 if (fs.existsSync(DIST)) {
   app.use(express.static(DIST))

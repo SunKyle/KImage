@@ -5,12 +5,15 @@ import {
   PhDotsThreeVertical,
   PhCaretRight,
   PhCheck,
+  PhCheckCircle,
+  PhWarningCircle,
+  PhPlugsConnected,
   PhEye,
   PhEyeSlash
 } from '@phosphor-icons/vue'
 import BrandIcon from './BrandIcon.vue'
-import { PROVIDERS, TEXT_PROVIDERS, getProvider, inferVendor } from '../api'
-import type { Provider, TextProvider } from '../api'
+import { PROVIDERS, TEXT_PROVIDERS, getProvider, inferVendor, testConnection } from '../api'
+import type { Provider, TextProvider, TestResult } from '../api'
 import type { ApiConfig } from '../types'
 
 /* 接口设置:独立页面。
@@ -174,6 +177,51 @@ function submit() {
   }
   urlError.value = ''
   emit('save', { ...draft.value, baseUrl: url })
+}
+
+/* 连通性测试。结果只对"当前这一版草稿"有效:改任何一个字段它都可能不再成立,
+   所以草稿一动就清掉 —— 留着上一次的 "Connected" 会让人以为新地址也验过了 */
+const testing = ref(false)
+const testResult = ref<{ ok: boolean; text: string; detail?: string } | null>(null)
+watch(
+  () => [draft.value.baseUrl, draft.value.apiKey, draft.value.model, draft.value.vendor, draft.value.kind],
+  () => {
+    testResult.value = null
+  }
+)
+
+/* 判决翻成人话。服务端只回 ok / code / status 这些机器可读的东西,
+   怎么说由这里定 —— 与生图那条路同一套分工 */
+function testMessage(r: TestResult): { text: string; detail?: string } {
+  // 局域网或本地中转常常几十毫秒就回来了,写成 "0.0s" 会显得没测一样
+  const took = r.ms < 1000 ? `${r.ms} ms` : `${(r.ms / 1000).toFixed(1)}s`
+  if (r.ok) return { text: `Connected in ${took}` }
+  if (r.code === 'auth') return { text: `The endpoint rejected the key (${r.status})`, detail: r.detail }
+  if (r.code === 'endpoint')
+    return { text: `No such endpoint at this address (${r.status})`, detail: r.detail }
+  if (r.code === 'timeout') return { text: 'No response within 15s', detail: r.detail }
+  if (r.code === 'server') return { text: `Reachable, but it answered ${r.status}`, detail: r.detail }
+  return { text: 'Could not reach the endpoint', detail: r.detail }
+}
+
+async function runTest() {
+  if (testing.value) return
+  const url = draft.value.baseUrl.trim()
+  // 地址是测试的前提,空着就没必要往后走 —— 与保存同一句提示
+  if (!url) {
+    urlError.value =
+      'No Base URL yet — paste the endpoint your provider gave you, e.g. https://api.openai.com/v1'
+    return
+  }
+  urlError.value = ''
+  testing.value = true
+  testResult.value = null
+  try {
+    const r = await testConnection({ ...draft.value, baseUrl: url })
+    testResult.value = { ok: r.ok, ...testMessage(r) }
+  } finally {
+    testing.value = false
+  }
 }
 
 /* 配置的厂商:老配置没写 vendor 就按域名猜,和主页面用的是同一套推断。
@@ -581,8 +629,20 @@ function onImportFile(e: Event) {
 
           <div class="form-foot">
             <button class="btn-ink" type="submit">Save</button>
+            <button class="btn-line" type="button" :disabled="testing" @click="runTest">
+              <PhPlugsConnected aria-hidden="true" />
+              {{ testing ? 'Testing…' : 'Test' }}
+            </button>
             <button class="btn-line" type="button" @click="emit('cancel')">Cancel</button>
-            <span class="hint">Saved configs appear on the home page in one click.</span>
+            <!-- 测出来的结果顶掉常驻那行提示:它更要紧,而且草稿一改就消失,
+                 不会长期占着位置 -->
+            <span v-if="testResult" class="test-line" :class="testResult.ok ? 'ok' : 'bad'">
+              <PhCheckCircle v-if="testResult.ok" aria-hidden="true" />
+              <PhWarningCircle v-else aria-hidden="true" />
+              <b>{{ testResult.text }}</b>
+              <i v-if="testResult.detail" :title="testResult.detail">{{ testResult.detail }}</i>
+            </span>
+            <span v-else class="hint">Saved configs appear on the home page in one click.</span>
           </div>
         </div>
       </form>
@@ -1218,6 +1278,39 @@ function onImportFile(e: Event) {
   font-size: var(--fs-xs);
   color: var(--text-3);
 }
+/* 连通性测试的结果。成功也走中性色 —— 这一页只有一个墨色主行动(保存),
+   绿色勾会跟它抢注意力;真出问题时才用红,并且只有那一句是红的,
+   上游原文仍退到次要色 */
+.form-foot .test-line {
+  margin-left: auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--fs-xs);
+  color: var(--text-2);
+}
+.form-foot .test-line svg {
+  flex: none;
+  width: 14px;
+  height: 14px;
+}
+.form-foot .test-line b {
+  font-weight: 500;
+  white-space: nowrap;
+}
+.form-foot .test-line i {
+  /* 上游原文可能很长,让它先被挤掉而不是把按钮顶出去 */
+  min-width: 0;
+  font-style: normal;
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.form-foot .test-line.bad {
+  color: var(--danger);
+}
 /* 主行动:墨色药丸,与主页的生成键同一套 */
 .btn-ink {
   display: inline-flex;
@@ -1241,6 +1334,9 @@ function onImportFile(e: Event) {
 }
 /* 放弃修改:描边药丸,比主行动轻 */
 .btn-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   height: 36px;
   padding: 0 var(--sp-4);
   border: 1px solid var(--line);
@@ -1250,10 +1346,19 @@ function onImportFile(e: Event) {
   transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease),
     background var(--dur) var(--ease);
 }
-.btn-line:hover {
+.btn-line svg {
+  flex: none;
+  width: 15px;
+  height: 15px;
+}
+.btn-line:hover:not(:disabled) {
   color: var(--text);
   border-color: var(--line-strong);
   background: var(--bg-elev);
+}
+.btn-line:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 /* 窄屏:输入框提到 16px,防止 iOS Safari 聚焦时放大整页 */
@@ -1270,6 +1375,16 @@ function onImportFile(e: Event) {
   }
   .row-main-btn {
     grid-template-columns: auto 1fr;
+  }
+  /* 三个按钮加一行结果在一行里放不下:让结果独占一行(它有 margin-left: auto,
+     换行后要摆回左边) */
+  .form-foot {
+    flex-wrap: wrap;
+  }
+  .form-foot .hint,
+  .form-foot .test-line {
+    flex-basis: 100%;
+    margin-left: 0;
   }
 }
 </style>
