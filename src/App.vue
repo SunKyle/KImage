@@ -43,6 +43,8 @@ import {
   loadPrompts,
   savePrompts,
   normalizePrompt,
+  loadCollections,
+  saveCollections,
   getProvider,
   inferVendor,
   allowedSizes,
@@ -57,7 +59,7 @@ import {
 import { blobToDataURL, urlToBlob } from './lib/idb'
 import { titleFromPrompt } from './lib/text'
 import type { Cap, EnhanceMode, Provider } from './api'
-import type { ApiConfig, FavoritePayload, HistoryEntry, PromptItem, ResultItem, ReuseParams } from './types'
+import type { ApiConfig, Collection, FavoritePayload, HistoryEntry, PromptItem, ResultItem, ReuseParams } from './types'
 
 // —— 状态 ——
 const prompt = ref('')
@@ -133,6 +135,8 @@ function runUndo() {
 // 发起生成时锁定的参数快照:生成中途改尺寸/张数/提示词,不会影响已发出的这一批
 const running = ref({ prompt: '', size: '1024x1024', n: 1 })
 const history = ref<HistoryEntry[]>([])
+// 作品集目录(只有标题 + id)。归属关系挂在记录上,这里只存目录
+const collections = ref<Collection[]>([])
 const libItems = ref<PromptItem[]>([])
 const refImage = ref('') // 图生图参考图 (data URL)
 // 四个平级页面:首页 / 提示词库 / 历史记录 / 接口设置,同时只挂载一个
@@ -597,6 +601,8 @@ onMounted(() => {
     // 老记录没有列表缩略图,后台慢慢补;不 await,免得拖慢首屏
     backfillThumbs(h)
   })
+  // 作品集目录是同步读的 localStorage,直接落一次
+  collections.value = loadCollections()
 })
 
 /* 新建一份配置(进入独立的新增接口表单页)。
@@ -1488,6 +1494,52 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   await saveHistoryRecord(toRaw(entry))
 }
 
+/* —— 作品集(Collection) ——
+   把一组生成归拢起来,并让它们不被存储清理淘汰(见 idb.ts 的 pruneHistory)。
+   目录本身轻量,放 localStorage;归属挂在记录上,在这里同步内存并落盘 */
+
+/** 新建一个作品集。空标题用占位名兜底;返回新 id 方便调用方顺手把它选中 */
+function createCollection(title: string): string {
+  const c: Collection = {
+    id: uid(),
+    title: title.trim() || 'Untitled collection',
+    createdAt: Date.now()
+  }
+  collections.value = [c, ...collections.value]
+  saveCollections(collections.value)
+  return c.id
+}
+
+/** 删除作品集:目录里摘掉,并把它名下所有记录的归属一并清掉、落盘。
+    清掉归属之后那些记录就重新可以被自动清理 —— 这是删作品的预期语义 */
+function deleteCollection(id: string) {
+  collections.value = collections.value.filter((c) => c.id !== id)
+  saveCollections(collections.value)
+  for (const h of history.value) {
+    if (h.collectionId === id) {
+      delete h.collectionId
+      saveHistoryRecord(toRaw(h))
+    }
+  }
+}
+
+/** 把预览里当前这条记录挂到某个作品集下(collectionId 为空串即摘出)。
+    改的是内存 + 落盘,不重跑裁剪 —— 归属不影响裁剪体积 */
+function assignCollection(collectionId: string) {
+  const entry = previewEntry.value
+  if (!entry) return
+  if (collectionId) entry.collectionId = collectionId
+  else delete entry.collectionId
+  saveHistoryRecord(toRaw(entry))
+}
+
+/** 预览里「新建作品集并纳入当前这条」:连建带挂一次做完,
+    免得用户先建好再回来翻那条的去挂 */
+function createAssignCollection(title: string) {
+  const id = createCollection(title)
+  if (previewEntry.value) assignCollection(id)
+}
+
 </script>
 
 <template>
@@ -1969,10 +2021,13 @@ async function toggleMark(entry: HistoryEntry, index: number) {
       <HistoryPage
         v-else-if="page === 'history'"
         :items="history"
+        :collections="collections"
         @open="openPreview"
         @use="usePreviewPrompt"
         @remove="removeHistoryEntry"
         @mark="toggleMark"
+        @create-collection="createCollection"
+        @delete-collection="deleteCollection"
       />
 
       <!-- 接口设置 -->
@@ -2002,6 +2057,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
       :visible="!!previewEntry"
       :entry="previewEntry"
       :items="history"
+      :collections="collections"
       @close="closePreview"
       @navigate="openPreview"
       @use-prompt="usePreviewPrompt"
@@ -2009,6 +2065,8 @@ async function toggleMark(entry: HistoryEntry, index: number) {
       @reference="setAsReference"
       @remove="removeHistoryItem"
       @mark="toggleMark"
+      @assign-collection="assignCollection"
+      @create-collection="createAssignCollection"
     />
 
     <!-- 存储清理等中性提示:以前只在生图工作台里铺一块,切到别的页面就看不见了。

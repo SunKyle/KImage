@@ -1,4 +1,4 @@
-import type { ApiConfig, GenParams, HistoryEntry, PromptItem, ResultItem, ReuseParams } from './types'
+import type { ApiConfig, GenParams, HistoryEntry, PromptItem, ResultItem, ReuseParams, Collection } from './types'
 import type { PruneResult, CoverRecord } from './lib/idb'
 import { titleFromPrompt } from './lib/text'
 import {
@@ -856,6 +856,39 @@ export async function removeHistoryRecord(id: string) {
 /** 覆盖写回一条历史。改的是结果项上的「标记」,条目本身没变,所以不必重跑裁剪 */
 export async function saveHistoryRecord(entry: HistoryEntry) {
   await putOne(entry)
+}
+
+/* ===== 作品集(Collection)目录 ===========================================
+   作品集只存"标题 + id"的目录 —— 每条几百字节,localStorage 足够。
+   归属关系(哪条记录属于哪个作品集)挂在记录自己的 collectionId 上,
+   和记录一起存在 IndexedDB,所以这里不需要接触 IDB。
+   ------------------------------------------------------------------------ */
+const COLL_KEY = 'kimage.collections'
+
+/** 读出作品集目录。目录是本地数据,但别信它一定干净:同步工具截断、手改时
+    当数组直接用会让页面崩,滤一遍扔掉坏项 */
+export function loadCollections(): Collection[] {
+  try {
+    const raw = localStorage.getItem(COLL_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter(
+      (c): c is Collection =>
+        !!c && typeof c === 'object' && typeof (c as Collection).title === 'string'
+    )
+  } catch {
+    return []
+  }
+}
+
+/** 整份覆盖写回。目录小,全量重写最省心 */
+export function saveCollections(list: Collection[]): void {
+  try {
+    localStorage.setItem(COLL_KEY, JSON.stringify(list))
+  } catch {
+    /* ignore: 写不下就不写,下次改动再试 */
+  }
 }
 
 /* ===== 提示词库(收藏) ===== */

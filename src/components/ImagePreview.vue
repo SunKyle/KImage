@@ -10,10 +10,12 @@ import {
   PhImageSquare,
   PhX,
   PhCopy,
-  PhHeart
+  PhHeart,
+  PhStack,
+  PhPlus
 } from '@phosphor-icons/vue'
-import { BACKGROUND_OPTIONS, QUALITY_OPTIONS, extOf, imageSrc, optionLabel, reuseParamsOf } from '../api'
-import type { HistoryEntry, ResultItem, ReuseParams, FavoritePayload } from '../types'
+import { BACKGROUND_OPTIONS, QUALITY_OPTIONS, extOf, imageSrc, optionLabel, reuseParamsOf, thumbSrc } from '../api'
+import type { HistoryEntry, ResultItem, ReuseParams, FavoritePayload, Collection } from '../types'
 import { blobToDataURL } from '../lib/idb'
 
 const props = defineProps<{
@@ -21,6 +23,8 @@ const props = defineProps<{
   entry: HistoryEntry | null
   // 全部历史,用于上下翻页在记录之间切换
   items: HistoryEntry[]
+  // 作品集目录:这张卡把当前记录挂到某个集下
+  collections: Collection[]
 }>()
 const emit = defineEmits<{
   (e: 'close'): void
@@ -30,6 +34,8 @@ const emit = defineEmits<{
   (e: 'reference', item: ResultItem): void
   (e: 'remove'): void
   (e: 'mark', entry: HistoryEntry, index: number): void
+  (e: 'assign-collection', collectionId: string): void
+  (e: 'create-collection', title: string): void
 }>()
 
 const active = ref(0)
@@ -37,11 +43,16 @@ const menuOpen = ref(false)
 // 菜单展开后点别处收起。ref 挂在包着按钮和菜单的那层上:
 // 只监听菜单的话,点按钮收起会先被判成"外部点击",关掉又被 click 打开,反而关不上
 const menuEl = ref<HTMLElement | null>(null)
+// 作品集选择器与 ⋮ 菜单同一套"点外面就收"的口径,共用一个外层监听
+const collOpen = ref(false)
+const collNewTitle = ref('')
+const collEl = ref<HTMLElement | null>(null)
 function onDocPointerDown(e: PointerEvent) {
-  if (!menuOpen.value) return
   const t = e.target as Node | null
-  if (t && menuEl.value?.contains(t)) return
-  menuOpen.value = false
+  if (menuEl.value && t && menuEl.value.contains(t)) return
+  if (collEl.value && t && collEl.value.contains(t)) return
+  if (menuOpen.value) menuOpen.value = false
+  if (collOpen.value) collOpen.value = false
 }
 // 复制后的短暂回执:复制 Prompt 现在是显眼的主操作,必须有反馈
 const copied = ref(false)
@@ -78,6 +89,8 @@ function onImgLoad(e: Event) {
 function resetView() {
   active.value = 0
   menuOpen.value = false
+  collOpen.value = false
+  collNewTitle.value = ''
   copied.value = false
   copyFailed.value = false
   loadedRatio.value = 0
@@ -286,6 +299,41 @@ function menuAction(kind: 'favorite' | 'download' | 'remove') {
   }
   menuOpen.value = false
 }
+
+/* —— 创作链 ——
+   这条记录如果是从另一条「改一个变量重跑」来的,就一路往上游找父记录。
+   只在预览里逆行看链条(最多 3 层),不做全屏树 —— 克制,够用就行。
+   chain[0] 是最近的那条父记录(直接来源),越往后越旧 */
+const chain = computed<HistoryEntry[]>(() => {
+  const out: HistoryEntry[] = []
+  let pid = props.entry?.parentId
+  while (pid && out.length < 3) {
+    const parent = props.items.find((e) => e.id === pid)
+    if (!parent) break
+    out.push(parent)
+    pid = parent.parentId
+  }
+  return out
+})
+
+/* —— 作品集归属 ——
+   把当前记录挂到一个集下(或摘出)。目录由主界面持有并落盘,这里只挑选项 */
+const currentCollectionTitle = computed(() => {
+  const cid = props.entry?.collectionId
+  if (!cid) return ''
+  return props.collections.find((c) => c.id === cid)?.title ?? ''
+})
+function assignColl(id: string) {
+  emit('assign-collection', id)
+  collOpen.value = false
+}
+function createColl() {
+  const t = collNewTitle.value.trim()
+  if (!t) return
+  emit('create-collection', t)
+  collNewTitle.value = ''
+  collOpen.value = false
+}
 </script>
 
 <template>
@@ -431,6 +479,77 @@ function menuAction(kind: 'favorite' | 'download' | 'remove') {
                 </div>
                 <span class="meta">{{ fmtTime(entry.createdAt) }}</span>
               </div>
+
+              <!-- 创作链:从别的记录改一个变量跑出来的,往上游列几层父记录。
+                   点任一层就直接翻到那条 —— 链条在预览内部就能顺着走完 -->
+              <section v-if="chain.length" class="chain-sec">
+                <header class="blk-head">
+                  <span class="blk-title">Borrowed from</span>
+                </header>
+                <div class="chain">
+                  <button
+                    v-for="(anc, i) in chain"
+                    :key="anc.id"
+                    class="chain-row"
+                    :class="{ top: i === 0 }"
+                    :aria-label="`Open ${i === 0 ? 'the source' : 'an earlier source'} record`"
+                    @click="emit('navigate', anc)"
+                  >
+                    <img class="chain-thumb" :src="thumbSrc(anc)" alt="" />
+                    <span class="chain-text">{{ anc.prompt }}</span>
+                    <PhCaretRight class="chain-go" aria-hidden="true" />
+                  </button>
+                </div>
+              </section>
+
+              <!-- 作品集归属:把这条记录挂到一个集下(或摘出)。目录在主界面,这里只挑 -->
+              <section class="coll-sec">
+                <header class="blk-head">
+                  <span class="blk-title">Collection</span>
+                </header>
+                <div ref="collEl" class="coll-wrap">
+                  <button class="coll-select" @click="collOpen = !collOpen" aria-haspopup="menu" :aria-expanded="collOpen">
+                    <PhStack aria-hidden="true" />
+                    <span class="coll-sel-name">{{ currentCollectionTitle || 'None' }}</span>
+                    <PhCaretDown class="coll-sel-caret" aria-hidden="true" />
+                  </button>
+                  <Transition name="po">
+                    <div v-if="collOpen" class="menu coll-menu" role="menu">
+                      <button
+                        v-for="c in collections"
+                        :key="c.id"
+                        class="mitem"
+                        :class="{ busy: entry.collectionId === c.id }"
+                        role="menuitem"
+                        @click="assignColl(c.id)"
+                      >
+                        {{ c.title }}
+                      </button>
+                      <button
+                        v-if="entry.collectionId"
+                        class="mitem danger"
+                        role="menuitem"
+                        @click="assignColl('')"
+                      >
+                        Remove from collection
+                      </button>
+                      <div v-if="!collections.length" class="coll-empty">No collections yet</div>
+                      <div class="coll-new">
+                        <input
+                          v-model="collNewTitle"
+                          class="coll-input"
+                          :placeholder="`New name…`"
+                          aria-label="New collection name"
+                          @keyup.enter="createColl"
+                        />
+                        <button class="coll-add" :disabled="!collNewTitle.trim()" @click="createColl">
+                          <PhPlus aria-hidden="true" /> New
+                        </button>
+                      </div>
+                    </div>
+                  </Transition>
+                </div>
+              </section>
 
               <!-- 底部操作:主次并排,占满侧栏宽度。
                    主操作叫 "Reuse" 是因为它交回去的是整条配方(提示词、尺寸、张数、
@@ -907,6 +1026,171 @@ function menuAction(kind: 'favorite' | 'download' | 'remove') {
   width: 16px;
   height: 16px;
   flex: none;
+}
+
+/* —— 创作链 ——
+   侧栏里往上溯的几行父记录。每个源一行:缩略图 + 提示词截断 + 右箭提示可点 */
+.chain-sec {
+  margin-top: 2px;
+}
+.chain {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.chain-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 4px;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: none;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--dur) var(--ease);
+}
+.chain-row:hover {
+  background: var(--bg-elev);
+}
+/* 最近的那条来源与更旧的几层稍稍区分,读起来知道谁更近 */
+.chain-row.top .chain-thumb {
+  border-color: color-mix(in oklch, var(--accent) 40%, var(--line));
+}
+.chain-thumb {
+  flex: none;
+  width: 34px;
+  height: 34px;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+}
+.chain-text {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--fs-xs);
+  line-height: 1.45;
+  color: var(--text-2);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.chain-go {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  color: var(--text-3);
+}
+
+/* —— 作品集归属 —— */
+.coll-sec {
+  margin-top: 2px;
+}
+.coll-wrap {
+  position: relative;
+}
+/* 选择器铺满侧栏宽度:像底注标签一样的存在,点开才见菜单 */
+.coll-select {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: var(--text);
+  font-size: var(--fs-sm);
+  cursor: pointer;
+  transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+.coll-select:hover {
+  border-color: var(--line-strong);
+  background: var(--bg-elev);
+}
+.coll-select svg {
+  width: 15px;
+  height: 15px;
+  color: var(--text-2);
+  flex: none;
+}
+.coll-sel-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+}
+.coll-sel-caret {
+  color: var(--text-3);
+}
+/* 菜单贴近当前集;当前归属的集加个浅底表明"这正是这条所在的" */
+.coll-menu {
+  right: auto;
+  left: 0;
+  width: 100%;
+}
+.mitem.busy {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+.coll-empty {
+  padding: 8px 10px;
+  font-size: var(--fs-xs);
+  color: var(--text-3);
+}
+/* 菜单底部的行内新建:输入框 + 一个小按钮 */
+.coll-new {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 4px 2px;
+  border-top: 1px solid var(--line);
+  margin-top: 4px;
+}
+.coll-input {
+  flex: 1;
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: var(--fs-xs);
+  outline: none;
+  transition: border-color var(--dur) var(--ease);
+}
+.coll-input:focus {
+  border-color: var(--accent);
+}
+.coll-add {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+  height: 30px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--cta);
+  color: var(--cta-text);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+  transition: background var(--dur) var(--ease), opacity var(--dur) var(--ease);
+}
+.coll-add:hover:not(:disabled) {
+  background: var(--cta-hover);
+}
+.coll-add:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.coll-add svg {
+  width: 13px;
+  height: 13px;
 }
 
 .modal-enter-active,

@@ -111,9 +111,12 @@ export interface HistoryEntry {
      不限于对比。可选:普通生成与加这个字段之前的记录都没有 */
   groupId?: string
   /* 「拉自某条记录改一个变量重跑」时的出处:被复现的那条记录的 id。
-     只有走 Reuse(预览卡 / 历史页的 use)才记,用户手动敲新提示词没有。
-     一条链,不是树:父可以没有,也不能有多个。可选:老记录与普通手写生成都没有 */
+      只有走 Reuse(预览卡 / 历史页的 use)才记,用户手动敲新提示词没有。
+      一条链,不是树:父可以没有,也不能有多个。可选:老记录与普通手写生成都没有 */
   parentId?: string
+  /* 归属的作品集 id(见 Collection)。把一组生成归拢时挂到某个作品集下,
+     挂了的记录不会被存储清理自动淘汰。可选:老记录与未归类的都没有 */
+  collectionId?: string
   createdAt: number
   // 上游可能返回一张或多张图
   results: ResultItem[]
@@ -126,6 +129,16 @@ export interface HistoryEntry {
   // 可选:老记录没有这两个字段,回退到解析 size
   w?: number
   h?: number
+}
+
+// 一个作品集(Collection):把若干条生成记录归拢成一组作品。
+// 目录只存标题与 id —— 轻量,几百字节,放 localStorage 正合适;
+// 归属关系(哪条记录属于哪个作品集)挂在记录自己的 collectionId 上,和记录同在 IndexedDB
+export interface Collection {
+  id: string
+  // 作品集的标题(如"人物练习"/"参赛稿")。空内容允许为空串,但创建时尽量给一个
+  title: string
+  createdAt: number
 }
 
 // 「使用提示词」时带回的一组参数,用于一键复现当时的出图条件

@@ -158,18 +158,11 @@ async function storageUsage(): Promise<{ usage: number; quota: number } | null> 
   return null
 }
 
-/** 按 createdAt 升序取主键,最旧的排在最前 */
-function oldestKeys(db: IDBDatabase): Promise<IDBValidKey[]> {
-  return new Promise((resolve, reject) => {
-    const req = db.transaction(STORE, 'readonly').objectStore(STORE).index('createdAt').getAllKeys()
-    req.onsuccess = () => resolve(req.result)
-    req.onerror = () => reject(req.error)
-  })
-}
-
 /**
  * 空间吃紧时清掉最旧的一批历史;还宽裕就原样返回 null。
  * 替代了原来的「按固定条数淘汰」——那个会在空间充裕时就静默删记录。
+ * 归属某个作品集(collectionId 不为空)的记录是用户特意归拢的,
+ * 绝不在此自动清掉 —— 哪怕它们是同类里最旧的。
  * 返回清了多少条,交由界面告知用户。
  */
 export async function pruneHistory(): Promise<PruneResult | null> {
@@ -180,23 +173,46 @@ export async function pruneHistory(): Promise<PruneResult | null> {
   // 有余量就不动历史
   if (est && usageRatio < HIGH_WATER) return null
 
-  const keys = await oldestKeys(db)
+  /* 全表读「id / 归属 / 时间」:要避让挂了作品集的记录,只凭 createdAt 键做不到 */
+  const all = await new Promise<Array<{ id: string; collectionId?: string; createdAt: number }>>(
+    (resolve, reject) => {
+      const req = db.transaction(STORE, 'readonly').objectStore(STORE).getAll()
+      req.onsuccess = () =>
+        resolve(
+          (req.result as Array<{ id: string; collectionId?: string; createdAt: number }>).map(
+            (r) => ({
+              id: r.id,
+              ...(r.collectionId !== undefined ? { collectionId: r.collectionId } : {}),
+              createdAt: r.createdAt
+            })
+          )
+        )
+      req.onerror = () => reject(req.error)
+    }
+  )
   // 配额驱动时按比例清;拿不到配额则退回条数兜底
-  const want = est ? Math.ceil(keys.length * PRUNE_RATIO) : Math.max(0, keys.length - HARD_LIMIT)
-  const count = Math.min(Math.max(0, keys.length - MIN_KEEP), want)
+  const want = est ? Math.ceil(all.length * PRUNE_RATIO) : Math.max(0, all.length - HARD_LIMIT)
+  const count = Math.min(Math.max(0, all.length - MIN_KEEP), want)
   if (count <= 0) return null
 
-  const removedIds = keys.slice(0, count).map((k) => String(k))
+  // 从最旧的往新挑,只挑没挂作品集的;挂了的不进候选,空间留给能看到的那批去腾
+  const removedIds = all
+    .filter((r) => !r.collectionId)
+    .sort((a, b) => a.createdAt - b.createdAt)
+    .slice(0, count)
+    .map((r) => r.id)
+  // 全部都在作品集里就什么都不清:宁可空间继续吃紧,也不动用户归拢的作品
+  if (removedIds.length === 0) return null
+
   await new Promise<void>((resolve, reject) => {
     const tx = db.transaction(STORE, 'readwrite')
     const store = tx.objectStore(STORE)
-    // keys 已按 createdAt 升序,前面的是最旧的
-    for (let i = 0; i < count; i++) store.delete(keys[i])
+    for (const id of removedIds) store.delete(id)
     tx.oncomplete = () => resolve()
     tx.onerror = () => reject(tx.error)
   })
 
-  return { removed: count, removedIds, usageRatio }
+  return { removed: removedIds.length, removedIds, usageRatio }
 }
 
 export async function putOne<T extends { id: string }>(item: T): Promise<void> {

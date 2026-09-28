@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   PhHeart,
   PhArrowLineUp,
@@ -7,11 +7,14 @@ import {
   PhClockCounterClockwise,
   PhDownloadSimple,
   PhCheckCircle,
-  PhCircle
+  PhCircle,
+  PhStack,
+  PhPlus,
+  PhX
 } from '@phosphor-icons/vue'
 import { exportImages, imageSrc, reuseParamsOf, thumbSrc } from '../api'
 import { blobToDataURL } from '../lib/idb'
-import type { HistoryEntry, ResultItem, ReuseParams } from '../types'
+import type { Collection, HistoryEntry, ResultItem, ReuseParams } from '../types'
 
 /* 历史记录:独立页面。
    展示沿用首页「Recent creations」图墙的做法 —— 一条记录里的多张图摊平成一块块图,
@@ -22,6 +25,7 @@ type Tile = { key: string; entry: HistoryEntry; index: number; item: ResultItem 
 
 const props = defineProps<{
   items: HistoryEntry[]
+  collections: Collection[]
 }>()
 
 const emit = defineEmits<{
@@ -29,6 +33,8 @@ const emit = defineEmits<{
   (e: 'use', params: ReuseParams): void
   (e: 'remove', entry: HistoryEntry): void
   (e: 'mark', entry: HistoryEntry, index: number): void
+  (e: 'create-collection', title: string): void
+  (e: 'delete-collection', id: string): void
 }>()
 
 /* 交回整条配方(提示词、参数、种子、当时的模型配置、参考图)。
@@ -50,8 +56,45 @@ const imageCount = computed(() => tiles.value.length)
 // 筛选的是图块,所以数量按张算而不是按条算
 const onlyMarked = ref(false)
 const markedCount = computed(() => tiles.value.filter((t) => t.item.marked).length)
+// 作品集筛选:'' = 不在任意作品集?不 —— '' 表示「不筛」,看全量。
+// 选中某集时只留归属它的记录;选中后想重回全量,再点一次该集即可
+const activeColl = ref('')
 const shownTiles = computed(() =>
-  onlyMarked.value ? tiles.value.filter((t) => t.item.marked) : tiles.value
+  tiles.value.filter(
+    (t) =>
+      (!onlyMarked.value || t.item.marked) &&
+      (!activeColl.value || t.entry.collectionId === activeColl.value)
+  )
+)
+// 有没有一个筛子在起作用,决定空态文案与「查看全部」的去向
+const filterActive = computed(() => onlyMarked.value || !!activeColl.value)
+
+// 作品集的新建:一排胶囊后跟一个「+」,点开变成行内小输入框,回车即建
+const adding = ref(false)
+const newTitle = ref('')
+function submitNew() {
+  const t = newTitle.value.trim()
+  if (!t) return
+  emit('create-collection', t)
+  newTitle.value = ''
+  adding.value = false
+}
+function activeCollTitle() {
+  const c = props.collections.find((c) => c.id === activeColl.value)
+  return c?.title ?? ''
+}
+function clearFilter() {
+  onlyMarked.value = false
+  activeColl.value = ''
+}
+// 正在筛的那个集被删掉了,就回落回全量 —— 不然筛着一个不存在的集,页面卡在空态
+watch(
+  () => [props.collections, activeColl.value],
+  () => {
+    if (activeColl.value && !props.collections.some((c) => c.id === activeColl.value)) {
+      activeColl.value = ''
+    }
+  }
 )
 
 /* —— 多选下载 ——
@@ -242,19 +285,59 @@ function fmt(ts: number) {
 
     <!-- 保留规则单独占一行:不写出来,记录被自动清掉时用户会以为丢了 -->
     <div class="lib-tools">
-      <div class="mark-filter" role="group" aria-label="Filter">
-        <button class="chip" :class="{ on: !onlyMarked }" :aria-pressed="!onlyMarked" @click="onlyMarked = false">
-          All
-        </button>
-        <button class="chip" :class="{ on: onlyMarked }" :aria-pressed="onlyMarked" @click="onlyMarked = true">
-          Marked <span class="chip-n">{{ markedCount }}</span>
-        </button>
+      <div class="filters">
+        <div class="mark-filter" role="group" aria-label="Filter">
+          <button class="chip" :class="{ on: !onlyMarked }" :aria-pressed="!onlyMarked" @click="onlyMarked = false">
+            All
+          </button>
+          <button class="chip" :class="{ on: onlyMarked }" :aria-pressed="onlyMarked" @click="onlyMarked = true">
+            Marked <span class="chip-n">{{ markedCount }}</span>
+          </button>
+        </div>
+        <!-- 作品集筛选:按集看整组作品。没建过集时不占位,免得空页面多一行噪声 -->
+        <div v-if="collections.length || adding" class="coll-filter" role="group" aria-label="Collections">
+          <PhStack class="coll-ico" aria-hidden="true" />
+          <span v-for="c in collections" :key="c.id" class="coll-chip">
+            <button
+              class="chip"
+              :class="{ on: activeColl === c.id }"
+              :aria-pressed="activeColl === c.id"
+              @click="activeColl = activeColl === c.id ? '' : c.id"
+            >
+              {{ c.title }}
+            </button>
+            <button
+              class="chip-x"
+              :aria-label="`Delete collection ${c.title}`"
+              @click="emit('delete-collection', c.id)"
+            >
+              <PhX aria-hidden="true" />
+            </button>
+          </span>
+          <template v-if="adding">
+            <input
+              v-model="newTitle"
+              class="coll-input"
+              :placeholder="`Name…`"
+              aria-label="New collection name"
+              @keyup.enter="submitNew"
+              @keyup.esc="adding = false"
+            />
+            <button class="chip" :disabled="!newTitle.trim()" @click="submitNew">Add</button>
+            <button class="chip" @click="adding = false">Cancel</button>
+          </template>
+          <button v-else class="chip coll-add" aria-label="New collection" @click="adding = true">
+            <PhPlus aria-hidden="true" />
+          </button>
+        </div>
       </div>
       <p class="lib-note">
         {{
           selecting
             ? 'Pick images to download, then hit Download.'
-            : 'Saved locally. Oldest records are cleared automatically when storage runs low.'
+            : activeColl
+              ? `In “${activeCollTitle()}” — saved here isn't cleared by storage cleanup.`
+              : 'Saved locally. Oldest records are cleared automatically when storage runs low.'
         }}
       </p>
     </div>
@@ -351,18 +434,33 @@ function fmt(ts: number) {
 
     <div v-else class="lib-none">
       <div class="none-ico" aria-hidden="true">
-        <PhHeart v-if="onlyMarked" aria-hidden="true" />
+        <PhStack v-if="activeColl" aria-hidden="true" />
+        <PhHeart v-else-if="onlyMarked" aria-hidden="true" />
         <PhClockCounterClockwise v-else aria-hidden="true" />
       </div>
-      <h2 class="none-title">{{ onlyMarked ? 'No marked images yet' : 'No generations yet' }}</h2>
+      <h2 class="none-title">
+        {{
+          activeColl
+            ? onlyMarked
+              ? 'No marked images in this collection yet'
+              : 'No images in this collection yet'
+            : onlyMarked
+              ? 'No marked images yet'
+              : 'No generations yet'
+        }}
+      </h2>
       <p class="none-sub">
         {{
-          onlyMarked
-            ? 'Hover an image and click the heart to mark it. Marks are per image, so images in a record stay independent.'
-            : 'Generate from the home page and your results are saved here automatically, ready to revisit and reuse.'
+          activeColl
+            ? onlyMarked
+              ? 'Open a collection image in the preview and mark it — or drop the mark filter to see the whole collection.'
+              : 'Open any result in the preview and add it to this collection there.'
+            : onlyMarked
+              ? 'Hover an image and click the heart to mark it. Marks are per image, so images in a record stay independent.'
+              : 'Generate from the home page and your results are saved here automatically, ready to revisit and reuse.'
         }}
       </p>
-      <button v-if="onlyMarked" class="none-action" @click="onlyMarked = false">View all</button>
+      <button v-if="filterActive" class="none-action" @click="clearFilter">View all</button>
     </div>
   </section>
 </template>
@@ -469,10 +567,78 @@ function fmt(ts: number) {
   padding-bottom: var(--sp-4);
   border-bottom: 1px solid var(--line);
 }
+/* 两块筛选(全部/已标记 + 作品集)收在一列,换行时整体对齐 */
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-3) var(--sp-4);
+}
 /* 筛选胶囊与提示词库页的分类胶囊同一套规格 */
 .mark-filter {
   display: flex;
   gap: 6px;
+}
+/* 作品集筛选组:图标打头,中间每个集一颗可点胶囊 + 一颗删除小圆点;
+   空集也照样显示,好让用户回头删掉或往里面加图 */
+.coll-filter {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.coll-ico {
+  width: 15px;
+  height: 15px;
+  color: var(--text-3);
+  margin-right: 2px;
+}
+.coll-chip {
+  display: inline-flex;
+  align-items: center;
+}
+/* 删除集的小叉:贴着胶囊放,点击目标是 24px 圆形,够得着又不太戳眼 */
+.chip-x {
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: 2px;
+  border: 0;
+  border-radius: 999px;
+  background: none;
+  color: var(--text-3);
+  cursor: pointer;
+  transition: color var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+.chip-x:hover {
+  color: var(--danger);
+  background: color-mix(in oklch, var(--danger) 10%, transparent);
+}
+.chip-x svg {
+  width: 14px;
+  height: 14px;
+}
+/* 行内新建框:比胶囊矮一档,回车确认,Esc 取消 */
+.coll-input {
+  width: 130px;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: var(--fs-xs);
+  outline: none;
+  transition: border-color var(--dur) var(--ease);
+}
+.coll-input:focus {
+  border-color: var(--accent);
+}
+.chip:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 .chip {
   display: inline-flex;
