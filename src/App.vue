@@ -73,7 +73,7 @@ import {
 import { blobToDataURL, urlToBlob, getCharViews, putCharView } from './lib/idb'
 import { titleFromPrompt } from './lib/text'
 import type { Cap, EnhanceMode, Provider } from './api'
-import type { ApiConfig, Collection, FavoritePayload, HistoryEntry, PromptItem, ResultItem, ReuseParams, Character, CharacterFields, CharacterView, CharacterViewKind } from './types'
+import type { ApiConfig, Collection, FavoritePayload, HistoryEntry, PromptItem, ResultItem, ReuseParams, Character, CharacterFields, CharacterStat, CharacterView, CharacterViewKind } from './types'
 
 // —— 状态 ——
 const prompt = ref('')
@@ -159,6 +159,9 @@ const refImage = ref('') // 图生图参考图 (data URL)
    角色是独立的输入:它不占表单里的参考图槽,只在发请求那一刻并进参考图一起送
    (见 charRefSrcs)。表单上看到的是什么,发出去的参考图就由这里决定 */
 const characters = ref<Character[]>([])
+/* 角色页的组件句柄:第 1 步存完由它把向导推进到下一步
+   (见 saveCharFromPage)。这一页自己管向导的步数,所以"存完该去哪"得由它说了算 */
+const charPageRef = ref<{ onSaved: (id: string) => void } | null>(null)
 /* 这次创作套用的角色 id。空 = 不用角色 */
 const activeCharId = ref('')
 /* 设定图:按角色 id 缓存已取出的视图。只在这个角色被选中时才读 IndexedDB ——
@@ -987,6 +990,14 @@ function detachCharacter() {
   activeCharId.value = ''
 }
 
+/** 从角色卡直接开画:套上这个角色并切回工作台。
+ *  交给 toggleChar 会变成"再点一次取消",这里要的是明确的选中,所以直接赋值。
+ *  回顶部由 navView 的 watch 统一负责(见 useLibItem 同一条路径) */
+function createWithCharacter(id: string) {
+  activeCharId.value = id
+  page.value = 'home'
+}
+
 /** 选中/取消一个角色卡:再点当前这个即取消。
  *  只动 activeCharId,不碰参考图槽 —— 角色和参考图是两个独立的输入,
  *  角色那几张图在发请求时才并进去(见 charRefSrcs) */
@@ -1015,6 +1026,9 @@ async function saveCharFromPage(d: {
   }
   characters.value = [c, ...characters.value]
   await saveCharacters(characters.value)
+  /* 存完把 id 交回角色页,让向导推进到"主视图"那一步。
+     这里不负责跳转 —— 向导的步数归角色页自己管 */
+  charPageRef.value?.onSaved(c.id)
 }
 
 /** 删掉一个角色,并把它从当前选择里摘掉 ——
@@ -1024,6 +1038,22 @@ async function deleteChar(id: string) {
   if (activeCharId.value === id) detachCharacter()
   await saveCharacters(characters.value)
 }
+
+/* 每个角色被用了几次、最后一次是什么时候。数据全在历史里 ——
+   记录带着 characterId(见 types.ts),这里只做一次聚合,不新增存储。
+   角色页靠它把"清单"说成"资产":一个没人用过的角色和一个出过上百张的,
+   在列表里应该长得不一样 */
+const charStats = computed<Record<string, CharacterStat>>(() => {
+  const m: Record<string, CharacterStat> = {}
+  for (const h of history.value) {
+    const id = h.characterId
+    if (!id) continue
+    const s = m[id] || (m[id] = { count: 0, lastAt: 0 })
+    s.count += 1
+    if (h.createdAt > s.lastAt) s.lastAt = h.createdAt
+  }
+  return m
+})
 
 /* —— 设定图 ——
    五张视图,正脸是锚:其余四张都以正脸为参考图生成 —— 这是"同一张脸"的唯一保证。
@@ -1108,9 +1138,18 @@ async function genCharView(charId: string, kind: CharacterViewKind): Promise<boo
     )
     const blob = await resultRefBlob(res[0])
     if (!blob) throw new Error('Upstream returned no usable image')
+    /* 换掉的那张旧图不再有任何界面引用它,连同它的 object URL 一起放掉 ——
+       反复重跑同一格,否则每次都在内存里留一张全尺寸图 */
+    releaseSrc(viewOf(c.id, kind)?.data)
     await putCharView(c.id, kind, blob)
     const rest = (charViews.value[c.id] || []).filter((v) => v.kind !== kind)
     charViews.value = { ...charViews.value, [c.id]: [...rest, { kind, data: blob }] }
+    /* 重跑的那张正好是主参考图时,主图必须跟着换 ——
+       否则网格显示新的、送出去的参考图还是旧的,一个说新一个说旧 */
+    if (c.refKind === kind) {
+      c.ref = blob
+      await saveCharacters(characters.value)
+    }
     /* 重跑正脸之后,其余四张就是照上一张正脸出的了。提醒一句,但不替用户删 ——
        删是不可逆的,而"要不要重跑"只有他自己知道 */
     if (kind === 'front' && rest.length) {
@@ -1222,6 +1261,9 @@ async function doGenerate() {
     openConfigManager()
     return
   }
+  /* 发出去了,参数面板就没有再开着的理由:它是"发之前调一调"的东西,
+     而这一批的参数此刻已经锁进 running 快照,面板留着只会挡住下面的图墙 */
+  openPanel.value = ''
   // 选了多个模型时走另一条链路:一次发给每个模型,结果并排
   if (compareMode.value) {
     await doRace()
@@ -2074,7 +2116,8 @@ function createAssignCollection(title: string) {
                     <div class="pp-group">
                       <span class="pp-label"><PhMaskHappy class="pp-label-ico" aria-hidden="true" />Character</span>
                       <!-- 头像即标识:名字进 title。面板本身是滚动容器,
-                           自绘 tooltip 会被裁掉,所以这里用原生的 -->
+                           自绘 tooltip 会被裁掉,所以这里用原生的。
+                           角色卡片的样式在角色页,这里只负责"选谁" -->
                       <button
                         v-for="c in characters"
                         :key="c.id"
@@ -2087,10 +2130,11 @@ function createAssignCollection(title: string) {
                         <img v-if="c.ref" class="char-pick-img" :src="coverSrc(c.ref)" alt="" />
                         <PhMaskHappy v-else class="char-pick-ph" aria-hidden="true" />
                       </button>
+                      <!-- 不在这里放"去管理"的入口:新建与编辑都在角色页,
+                           顶部导航就是那一页,再挂一个按钮只是把输入框撑长 -->
                       <span v-if="!characters.length" class="pp-note">
                         None yet — create one on the Characters page.
                       </span>
-                      <button class="pp-action" @click="page = 'chars'">Manage characters</button>
                     </div>
                   </div>
 
@@ -2330,13 +2374,16 @@ function createAssignCollection(title: string) {
       <!-- 角色 -->
       <CharacterPage
         v-else-if="page === 'chars'"
+        ref="charPageRef"
         :characters="characters"
         :views="charViews"
+        :stats="charStats"
         :busy="charViewBusy"
         :text-config="textConfig || undefined"
         @save="saveCharFromPage"
         @remove="deleteChar"
         @open="loadCharViews"
+        @create="createWithCharacter"
         @generate="genCharView"
         @generate-all="genRemainingViews"
         @use-ref="useViewAsRef"
@@ -3009,7 +3056,8 @@ function createAssignCollection(title: string) {
 /* —— 角色 ——
    选谁在参数行的角色胶囊里(与模型并排),列表在它展开的面板里 */
 /* 角色选择:一圈一个头像,名字在 title 里。选中态用全站"当前项"那套墨色描边
-   (导航滑块、选中胶囊同一套语言),不是给头像换底色 —— 头像的底色是它自己 */
+   (导航滑块、选中胶囊同一套语言),不是给头像换底色 —— 头像的底色是它自己。
+   这里是"选谁",不是"看谁":完整档案卡在角色页,不在这条参数行里 */
 .char-pick {
   flex: none;
   width: 40px;

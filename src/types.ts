@@ -189,6 +189,16 @@ export interface Character {
   views?: CharacterView[]
 }
 
+/* 一个角色的用量:被拿去出过多少张作品、最后一次是什么时候。
+   不落盘 —— 全部从历史记录里按 characterId 聚合出来(记录自己带着出处)。
+   与提示词短标题同理:派生得出来的东西不再存一份,老角色也立刻就有数 */
+export interface CharacterStat {
+  // 拿这个角色生成过的记录条数。设定图那五张不进历史,所以只算作品
+  count: number
+  // 最后一次生成的时间戳(毫秒)。0 表示还没用过
+  lastAt: number
+}
+
 // 「使用提示词」时带回的一组参数,用于一键复现当时的出图条件
 // 全部可选:套用前要按当前厂商的能力逐项校验
 export interface ReuseParams {

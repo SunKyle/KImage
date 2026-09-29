@@ -172,8 +172,12 @@ export async function getAllCharRefs(): Promise<Map<string, Blob>> {
 }
 
 /**
- * 写回角色参考图:只补库里还没有的那几张,并删掉已经不在目录里的那些。
- * 与封面同理,参考图是原图,不做全量重写
+ * 写回角色参考图:整批覆盖写,并删掉已经不在目录里的那些。
+ *
+ * 为什么不能"只补库里还没有的":角色的主参考图是会被改的 ——
+ * 「Use as reference」就是把主图换成另一张视图。跳过错在的 key,
+ * 内存里当场生效、刷新后却读回旧的那张,用户看到的就是"改了又弹回去"。
+ * 每个角色最多一张、都是 512px 的压缩图,全量重写这点开销不值得省
  */
 export async function putCharRefs(refs: CharRefRecord[]): Promise<void> {
   const db = await openDB()
@@ -184,7 +188,6 @@ export async function putCharRefs(refs: CharRefRecord[]): Promise<void> {
     const keysReq = store.getAllKeys()
     keysReq.onsuccess = () => {
       const keys = keysReq.result.map(String)
-      const existing = new Set(keys)
       /* 设定图的 key 是 `${角色id}:${视图}`,不是裸的角色 id。
          只比对裸 id 的话,每次保存角色都会把刚生成好的设定图整批删掉 ——
          所以凡是"某个还在的角色名下"的 key 都算保留。
@@ -196,7 +199,7 @@ export async function putCharRefs(refs: CharRefRecord[]): Promise<void> {
         const owner = cut > 0 ? k.slice(0, cut) : k
         if (!keep.has(owner)) store.delete(k)
       }
-      for (const r of refs) if (!existing.has(r.id)) store.put(r)
+      for (const r of refs) store.put(r)
     }
     tx.oncomplete = () => resolve()
     tx.onerror = () => reject(tx.error)
