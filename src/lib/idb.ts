@@ -209,6 +209,15 @@ export async function putCharRefs(refs: CharRefRecord[]): Promise<void> {
 /* ===== 角色的设定图 =====
    只在这个界面打开时才取,不在启动时加载:5 张图 × N 个角色全部读进内存太重 */
 
+/* 上传底图在这个 store 里的 key 后缀。与设定图共用 `${角色id}:${后缀}` 这套前缀,
+   所以 putCharRefs 按归属裁剪时,它会跟着角色一起被收走,不必另写一套删除逻辑 */
+const SOURCE_KEY = 'source'
+
+/** 某个角色"第一步上传的那张底图"在 store 里的 key */
+export function charSourceKey(id: string): string {
+  return id + VIEW_SEP + SOURCE_KEY
+}
+
 /** 读出某个角色的全部设定图。先按 key 前缀筛出自己那几张,再逐张取 ——
  *  不整车读进来,免得把别的角色的图也拉进内存 */
 export async function getCharViews(charId: string): Promise<Array<{ kind: string; data: Blob }>> {
@@ -222,6 +231,8 @@ export async function getCharViews(charId: string): Promise<Array<{ kind: string
     })
     const out: Array<{ kind: string; data: Blob }> = []
     for (const key of keys.filter((k) => k.startsWith(prefix))) {
+      // 底图的 key 也挂在这个前缀下,但它不是一张视图(见 charSourceKey)
+      if (key === charSourceKey(charId)) continue
       const data = await new Promise<Blob | undefined>((resolve, reject) => {
         const req = db.transaction(CHAR_STORE, 'readonly').objectStore(CHAR_STORE).get(key)
         req.onsuccess = () => {

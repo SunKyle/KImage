@@ -94,7 +94,6 @@ const background = ref('auto')
    这里空着才是"不传"。上游从不告诉我们它实际用了哪个数,所以这里只能由用户自己填,
    填了才有"同一张图再微调"可言 */
 const seed = ref('')
-const loading = ref(false)
 const error = ref('')
 // 错误区默认收成一行:上游原文动辄上百字,整段铺开会把输入区顶得很高
 const errorOpen = ref(false)
@@ -110,6 +109,37 @@ function fail(msg: string, retryable = false) {
 const errorLong = computed(() => error.value.length > 90)
 // 存储清理的事后告知。它不是错误,所以单独一条通道,中性配色
 const notice = ref('')
+
+/* —— 提示的自动收起 ——
+   它是"说过就算"的中性通知(存好了、空间快满了),不该一直占着画面底部等人来关;
+   但也不能一闪而过:长句得留够读的时间,所以按长度给时长。
+   新提示进来时上一条的计时会被这里重置(同一个 ref,watch 又会跑一遍) */
+let noticeTimer = 0
+/** 读一条提示要多久。短句 4 秒;长的每字再加 60ms ——
+ *  "存储快满"那种一句能到一百多字,照 4 秒收掉等于没提示 */
+function noticeMs(msg: string) {
+  return Math.min(9000, 4000 + msg.length * 60)
+}
+function clearNotice() {
+  window.clearTimeout(noticeTimer)
+  notice.value = ''
+}
+/** 把指针停在浮条上时不计时:长一点的提示用户可能正在读,
+ *  读到一半整条消失,会让人怀疑自己是不是记错了 */
+function holdNotice() {
+  window.clearTimeout(noticeTimer)
+}
+/** 指针移开,接着计时。整条重新算而不是接着上一段:实现简单,
+ *  而且用户等于又看了一遍 —— 多留这几秒不亏 */
+function releaseNotice() {
+  window.clearTimeout(noticeTimer)
+  if (notice.value) noticeTimer = window.setTimeout(clearNotice, noticeMs(notice.value))
+}
+watch(notice, (v) => {
+  window.clearTimeout(noticeTimer)
+  if (v) noticeTimer = window.setTimeout(clearNotice, noticeMs(v))
+})
+onBeforeUnmount(() => window.clearTimeout(noticeTimer))
 
 /* ===== 删除的撤销窗口 ================================================
    删除不再弹确认框,而是立刻生效、几秒内可撤销(见 components/UndoToast.vue)。
@@ -146,8 +176,6 @@ function runUndo() {
   pendingUndo.value = null
   p?.undo()
 }
-// 发起生成时锁定的参数快照:生成中途改尺寸/张数/提示词,不会影响已发出的这一批
-const running = ref({ prompt: '', size: '1024x1024', n: 1 })
 const history = ref<HistoryEntry[]>([])
 // 作品集目录(只有标题 + id)。归属关系挂在记录上,这里只存目录
 const collections = ref<Collection[]>([])
@@ -201,11 +229,18 @@ const canvasItem = ref<ResultItem | null>(null)
 /* 画布的出处记录,存回新记录时用来接上派生关系(parentId)。
    本地上传的图为 null —— 它没有出处 */
 const canvasSource = ref<HistoryEntry | null>(null)
+/* 画布上这张图"下一版"该接在哪条记录后面。它与 canvasSource 分开 ——
+   保存之后画布留在原地(见 saveEdit),出处就变成刚存下的那一条;
+   而 canvasSource 说的始终是"这张图当初从哪来",那个不该跟着变 */
+const canvasParent = ref<HistoryEntry | null>(null)
+/* 子组件实例。保存落盘结束后要给画布回执一声(见 CanvasEditor 的 finishSave) */
+const canvasRef = ref<{ finishSave: () => void } | null>(null)
 
 function openCanvas(entry: HistoryEntry, index: number) {
   releaseCanvasLocal()
   canvasItem.value = entry.results[index] ?? null
   canvasSource.value = entry
+  canvasParent.value = entry
   // 画布是整页的,预览要是还开着会盖在上面,所以进来就把它收掉
   closePreview()
   page.value = 'canvas'
@@ -216,6 +251,7 @@ function openCanvasFile(file: File) {
   releaseCanvasLocal()
   canvasItem.value = { type: 'b64', data: file }
   canvasSource.value = null
+  canvasParent.value = null
   closePreview()
   page.value = 'canvas'
 }
@@ -236,6 +272,7 @@ function discardCanvas() {
   releaseCanvasLocal()
   canvasItem.value = null
   canvasSource.value = null
+  canvasParent.value = null
 }
 
 /* 顶部横条的实际高度,写进 --mast-h 给自由画布用。
@@ -257,22 +294,24 @@ onBeforeUnmount(() => mastRO?.disconnect())
 /* 画布存回来的像素 → 新记录。走 recordFor 而不是自己拼一条:
    缩略图、真实像素这些图墙要用的字段都由它一并补齐 */
 async function saveEdit(payload: { blob: Blob; w: number; h: number }) {
-  /* 出处可有可无:从历史打开的那张接着挂派生关系,
-     本地新上传的没有 —— 它本来就不属于哪条生成记录的延续 */
-  const src = canvasSource.value
+  const parent = canvasParent.value
   const record = await recordFor([{ type: 'b64', data: payload.blob }], {
-    /* 提示词沿来源记录。画布是本地加工,没有发生新的生成 ——
+    /* 提示词沿上一版。画布是本地加工,没有发生新的生成 ——
        编一句像 "cropped" 的提示词塞进去,只会让这条记录以后没法被复用。
-       本地上传的图没有来源,提示词就空着 */
-    prompt: src?.prompt ?? '',
+       本地上传的图没有上一版,提示词就空着 */
+    prompt: parent?.prompt ?? '',
     size: `${payload.w}x${payload.h}`,
-    model: src?.model,
-    parentId: src?.id,
+    model: parent?.model,
+    parentId: parent?.id,
     elapsedMs: 0
   })
   await persist(record)
-  // 存完把这张撤下:画布回到空态,免得再点一次"保存"重复存出同一条
-  discardCanvas()
+  /* 画布留在原地,不撤图。存完往往要顺着同一个方向接着改,
+     撤下去等于每存一次都得重新找图、重新定位一遍。
+     这一版成为下一版的出处:于是"改一版存一版"自然连成一条链,
+     再存出来的是链上的下一个节点,不是重复的一条 */
+  canvasParent.value = record
+  canvasRef.value?.finishSave()
   notice.value = 'Saved to history.'
 }
 
@@ -627,35 +666,59 @@ const selectedConfigs = computed(() =>
 )
 // 多选即对比
 const compareMode = computed(() => selectedConfigs.value.length > 1)
-/* 一个槽位 = 一个模型 × 这一次请求。它只用来盯这一批的进展
-   (占位格子数、失败统计、生成键的忙闲),结果出来后各条走普通的历史记录 ——
-   没有单独的"对比面板":同一批图不该有两套呈现方式 */
-type RaceSlot = {
-  configId: string
+/* —— 生成中的每一张 = 一个槽 ——
+   为什么不是"一次点击一个槽"而是一张一个:用户要的是每格能单独停,
+   而"一次请求出 4 张"没法停下其中一张 —— 上游回来就是一整包。
+   所以张数 4 就发 4 次各出一张,多模型对比则是每模型一个槽。
+
+   代价是请求数等于张数。换来的是:每格自己转、自己停、先回来先出图。
+   落盘仍按"一次点击 = 一条记录"归并(见 recordKey),
+   所以历史里看到的条数和以前一模一样 */
+type GenSlot = {
+  id: string
+  /* 落盘归并键。同一批里同键的槽合成一条历史记录:
+     单模型出 4 张 → 一条记录带 4 张图(与从前一致);
+     对比 3 个模型 → 三条记录(也与从前一致) */
+  recordKey: string
+  /* 这一次点击共用的分组 id,与对比出图沿用同一个字段语义(见 HistoryEntry.groupId) */
+  groupId: string
+  /* —— 发起时锁死的整套条件 ——
+     中途改提示词、尺寸或配置,都不该影响已经发出去的那几张 */
+  config: ApiConfig
+  // 展示用的模型名(槽位上要写清这是哪家)
   label: string
   model: string
+  prompt: string
   size: string
-  // 发起时锁定的扩展参数:各模型不一样(OpenAI 有 quality,豆包没有)
   extras: Record<string, string>
-  // 发起时锁定的种子(该模型认 seed 且用户填了才有)
   seed?: number
+  refList: string[]
+  // 用户自己挑的那张参考图(角色的不算)。存快照是为了落盘时记下"当时用的哪张"
+  refSrc?: string
+  characterId?: string
+  parentId?: string
+  startedAt: number
   state: 'running' | 'done' | 'stopped' | 'error'
   results: ResultItem[]
   error?: string
   elapsedMs?: number
 }
-const raceSlots = ref<RaceSlot[]>([])
-// 同一次对比的各条记录共用一个分组 id
-const raceGroupId = ref('')
-const raceRunning = computed(() => raceSlots.value.some((s) => s.state === 'running'))
-/* 图墙的占位格子:单模型看张数,对比看模型数 —— 数量不同,形式一样 */
-const skeletonCount = computed(() =>
-  raceRunning.value ? raceSlots.value.length : running.value.n > 0 ? running.value.n : 1
-)
-// 占位按发起时锁定的尺寸取比例;对比时各家尺寸可能不同,取第一个就够
-const skeletonSize = computed(() =>
-  raceRunning.value ? raceSlots.value[0]?.size || size.value : running.value.size
-)
+const genSlots = ref<GenSlot[]>([])
+/* 中断手柄按槽各存一个。同一时刻可能有好几批在跑(生成键不再锁死),
+   共用一个手柄的话,停一张会把别张一起掐掉 */
+const slotControllers = new Map<string, AbortController>()
+/* 正在跑的槽。骨架格、忙闲、进度条都读它 —— 只有还没结束的槽才占位 */
+const activeSlots = computed(() => genSlots.value.filter((s) => s.state === 'running'))
+const loading = computed(() => genSlots.value.some((s) => s.state === 'running'))
+/* 这一批是不是在多模型对比(落盘键按模型分,所以键多于一个就是对比)。
+   骨架格上要不要写模型名、进度条上说"Comparing"还是"Generating",都看它 */
+const multiModel = computed(() => new Set(activeSlots.value.map((s) => s.recordKey)).size > 1)
+/* 进度条上那句话。单模型出几张时报个数 —— 用户想知道的是"还有几张在路上" */
+const runLabel = computed(() => {
+  if (multiModel.value) return 'Comparing'
+  const n = activeSlots.value.length
+  return n > 1 ? `Generating ${n} images` : 'Generating'
+})
 /* 参数行上的出图胶囊:多选时写成"主模型 +N"。这里必须说清楚 ——
    点一下芯片就从单模型变成多模型,生成键又只是个图标,
    不在胶囊上写明"这次要跑几个",加选一个模型就会变成一次双倍花费的意外 */
@@ -1132,11 +1195,20 @@ function composedPrompt(): string {
   return text ? `${text}, ${spec}` : spec
 }
 
-/** 读进来时校正一下角色记录。
+/** 读进来时校正一下角色记录,顺带补上后来才有的字段。
+ *
+ *  底图(sourceRef)是"其余四张要拿它当参考"之后才单独存的一份。在这之前,
+ *  记录里只有 ref,它装的是这两者之一:上传的底图,或某张设定图提升来的副本 ——
+ *  而 refKind 正好是这两者的标记(有值说明 ref 是某张视图的副本)。
+ *  所以只有不带 refKind 的老记录,它的 ref 才是真底图,可以补进 sourceRef。
+ *  反过来,refKind 是 'front' 的那种拿不回底图:那张早被正脸顶掉了。
+ *
  *  主视图只能是正面 —— 老数据里可能留着被设成别张的 refKind(那个功能已经去掉),
- *  清掉即可。ref 不动:它现在是这张角色的封面(正脸),丢了卡片就只剩占位图标 */
+ *  清掉即可。ref 不动:它是这张角色的封面,丢了卡片就只剩占位图标 */
 function normalizeChar(c: Character): Character {
+  const legacySource = c.refKind ? undefined : c.ref
   if (c.refKind && c.refKind !== 'front') delete c.refKind
+  if (!c.sourceRef && legacySource) c.sourceRef = legacySource
   return c
 }
 
@@ -1186,7 +1258,10 @@ async function saveCharFromPage(d: {
     createdAt: Date.now(),
     fields: { ...d.fields },
     desc: d.desc.trim(),
-    ...(ref ? { ref } : {})
+    /* 这一张同时是封面的底图(正脸出来之前先用它顶着)和"第一步的参考图"。
+       两者指向同一个 Blob,但语义不同,所以两个字段都写 ——
+       正脸生成后封面会被换成正脸,而参考图那份还得留着给其余四张用 */
+    ...(ref ? { ref, sourceRef: ref } : {})
   }
   characters.value = [c, ...characters.value]
   await saveCharacters(characters.value)
@@ -1258,6 +1333,7 @@ async function duplicateChar(id: string) {
     ...(src.fields ? { fields: { ...src.fields } } : {}),
     ...(src.desc ? { desc: src.desc } : {}),
     ...(src.ref ? { ref: reBlob(src.ref) } : {}),
+    ...(src.sourceRef ? { sourceRef: reBlob(src.sourceRef) } : {}),
     ...(src.refKind ? { refKind: src.refKind } : {})
   }
   const known = new Set<string>(CHARACTER_VIEWS.map((v) => v.kind))
@@ -1320,6 +1396,7 @@ async function importCharFile(file: File) {
         ...(imp.fields ? { fields: { ...imp.fields } } : {}),
         ...(imp.desc ? { desc: imp.desc } : {}),
         ...(imp.ref ? { ref: imp.ref } : {}),
+        ...(imp.sourceRef ? { sourceRef: imp.sourceRef } : {}),
         ...(imp.refKind ? { refKind: imp.refKind } : {})
       }
       // 与 duplicateChar 同一条顺序要求:图先写,再交给 saveCharacters 落盘
@@ -1454,11 +1531,27 @@ async function genCharView(charId: string, kind: CharacterViewKind): Promise<boo
     notice.value = 'Set an image model in API settings first.'
     return false
   }
-  const refBlob = kind === 'front' ? c.ref : viewOf(c.id, 'front')?.data
-  // 除正脸外都得有正脸当锚,否则跑出来的只是"另一个长得有点像的人"
-  if (!refBlob && kind !== 'front') {
-    notice.value = 'Generate the front view first — the other views are built from it.'
-    return false
+  /* —— 这一张拿哪几张图当参考 ——
+     正脸:用第一步上传的那张底图,它就是"这个人原本的样子"。
+     没传过就是纯文生图。回退 ref 是留给老数据的路 ——
+     那批角色的 ref 里存的就是图本身,没有单独一份底图
+     其余四张:正脸与底图一起送。正脸定"这张脸长什么样",
+     底图补上一张正面头像交代不了的东西(发型轮廓、体态、服装轮廓) */
+  const front = viewOf(c.id, 'front')?.data
+  const source = c.sourceRef ?? (kind === 'front' ? c.ref : undefined)
+  let refBlobs: Blob[]
+  if (kind === 'front') {
+    refBlobs = source ? [source] : []
+  } else {
+    // 没有正脸就没有锚,跑出来的只是"另一个长得有点像的人"
+    if (!front) {
+      notice.value = 'Generate the front view first — the other views are built from it.'
+      return false
+    }
+    /* 不认多图的模型只送正脸:宁可少一张,也不能为了多送一张把整个请求弄失败 ——
+       正脸是不可少的那个,四张之间靠它才串成同一个人 */
+    const caps = getProvider(cfg.vendor || inferVendor(cfg.baseUrl), cfg.model)
+    refBlobs = caps.multiImage === 'no' || !source ? [front] : [front, source]
   }
   charViewBusy.value = {
     ...charViewBusy.value,
@@ -1470,13 +1563,14 @@ async function genCharView(charId: string, kind: CharacterViewKind): Promise<boo
   let ok = false
   try {
     const prompt = [characterDesc(c), view.suffix].filter(Boolean).join(', ')
-    const refSrc = refBlob ? await blobToDataURL(refBlob) : ''
+    const images: string[] = []
+    for (const b of refBlobs) images.push(await blobToDataURL(b))
     const res = await generate(
       {
         prompt,
         size: viewSize(view.framing),
         n: 1,
-        ...(refSrc ? { images: [refSrc] } : {})
+        ...(images.length ? { images } : {})
       },
       cfg,
       ctl.signal
@@ -1489,15 +1583,15 @@ async function genCharView(charId: string, kind: CharacterViewKind): Promise<boo
     await putCharView(c.id, kind, blob)
     const rest = (charViews.value[c.id] || []).filter((v) => v.kind !== kind)
     charViews.value = { ...charViews.value, [c.id]: [...rest, { kind, data: blob }] }
-    /* 正脸同时是这张角色的封面与头像,生成成功后就写回主参考图 ——
+    /* 正脸同时是这张角色的封面与头像,生成成功后就写回 ref ——
        否则卡片上停留的还是那张上传的底图,跟刚生成的脸对不上。
-       底图只为这一步服务一次(此后不再参与任何请求,见 charRefSrcs),
-       所以这里可以放心覆盖;换掉的那张连同它的 object URL 一起放掉 */
+       底图不会被这一下顶掉:它另存了一份(sourceRef),
+       其余四张设定图还要拿它和正脸一起当参考 */
     if (kind === 'front') {
       const stale = c.ref
       c.ref = blob
       await saveCharacters(characters.value)
-      // 界面已经换成新图,那张旧底图此刻不再被任何地方引用
+      // 界面已经换成新图,旧封面那张不再被任何地方引用
       if (stale && stale !== blob) releaseSrc(stale)
     }
     /* 重跑正脸之后,其余四张就是照上一张正脸出的了。提醒一句,但不替用户删 ——
@@ -1591,8 +1685,6 @@ async function charRefSrcs(): Promise<string[]> {
 }
 
 // —— 生图 ——
-// 当前这一批的请求句柄,用于中途终止
-const controller = ref<AbortController | null>(null)
 
 /* 中文输入法里用回车「上屏」也会触发 keydown.enter(keyCode 229,isComposing 为真)。
    这里必须提前返回、且不能 preventDefault —— 一 prevent 就把输入法确认候选词的
@@ -1604,16 +1696,24 @@ function onEnter(e: KeyboardEvent) {
 }
 
 /* 用户手动改动提示词 = 开启一个新的实验分支,和"从某条记录拉下来再改"不再是同一件事。
-   所以来源要清掉:这一批落盘时就不会再挂父记录,链在这里断开 */
+   所以来源要清掉:这一批落盘时就不会再挂父记录,链在这里断开。
+   撤销点也一并清掉:Undo 是给"看完改写结果觉得不对,想回到原稿"用的 ——
+   改写完自己又动过笔,再点它就变成抹掉刚敲的这段,那个场景已经不成立了。
+   清掉之后按钮回到改写态,顺手也能再改写一次。
+   注意这里只认"用户敲的":改写结果与撤销都是程序赋值,不会走 @input,
+   所以它们不会自己把撤销点清掉(清空输入框的那个按键同理,那是要撤回来的场景) */
 function onPromptEdit() {
   pendingParentId.value = undefined
+  preEnhance.value = ''
 }
 
 async function doGenerate() {
-  if (loading.value) return
+  /* 这里不再用"正在生成"拦第二次点击:那正是要解决的问题 ——
+     生成键在跑的时候变成暂停键,于是生成中途发不出新的了。
+     现在每次点击各自成批,可以叠着跑 */
   /* 改写回来时会整体覆盖提示词。此刻发出去的图,用的是改写到一半的内容,
      而用户看到的输入框马上就要变成另一段文字 —— 这批图会和界面对不上。
-     按钮那边也置灰了,这里再拦一道是因为回车也能触发生成 */
+     改写按钮那边也置灰了,这里再拦一道是因为回车也能触发生成 */
   if (enhancing.value) return
   if (!prompt.value.trim()) {
     fail('Enter a prompt first')
@@ -1625,7 +1725,7 @@ async function doGenerate() {
     return
   }
   /* 发出去了,参数面板就没有再开着的理由:它是"发之前调一调"的东西,
-     而这一批的参数此刻已经锁进 running 快照,面板留着只会挡住下面的图墙 */
+     而这一批的参数此刻已经锁进槽里,面板留着只会挡住下面的图墙 */
   openPanel.value = ''
   // 选了多个模型时走另一条链路:一次发给每个模型,结果并排
   if (compareMode.value) {
@@ -1633,11 +1733,13 @@ async function doGenerate() {
     return
   }
 
-  // 发起前锁定这一批的参数,后面一律读快照,避免中途改参数串味。
-  // 套了角色时这里锁的是合成后的提示词 —— 真正发出去的就是它
-  running.value = { prompt: composedPrompt(), size: size.value, n: n.value }
-  /* 普通生成也纳入分组:同一次点生成就是一批。group 让生成的结果在图墙上
-     可归拢,和对比出图共用同一个字段语义(见 groupId 注释) */
+  /* 发起前锁定这一批的参数,后面一律读快照,避免中途改参数串味。
+     套了角色时这里锁的是合成后的提示词 —— 真正发出去的就是它 */
+  const runPrompt = composedPrompt()
+  const runSize = size.value
+  const runN = Math.max(1, n.value)
+  /* 同一次点生成就是一批。group 让生成的结果在图墙上可归拢,
+     和对比出图共用同一个字段语义(见 groupId 注释) */
   const genGroupId = `gen-${Date.now().toString(36)}`
   // 扩展参数与参考图同样要快照:它们在 await 期间可能被改动
   const extras = extraParams()
@@ -1649,55 +1751,163 @@ async function doGenerate() {
   const refList: string[] = []
   if (refSrc) refList.push(refSrc)
   for (const s of await charRefSrcs()) if (!refList.includes(s)) refList.push(s)
-  const startedAt = Date.now()
-  controller.value = new AbortController()
 
-  loading.value = true
+  /* 张数就是槽数。种子要逐张错开:原来一个请求带 n=4 时,上游按序号派生四张;
+     拆成四次请求后如果都传同一个种子,四次会拿到同一张图。
+     填了种子就 S、S+1、S+2 …… —— 指定种子仍然可复现,只是从"上游派生"
+     变成"我们自己接管这件事" */
+  const slots: GenSlot[] = Array.from({ length: runN }, (_, i) => {
+    const s = seedNum === undefined ? undefined : seedNum + i
+    return {
+      id: uid(),
+      // 单模型出几张 = 一条记录带几张图(与拆分前的粒度一致)
+      recordKey: genGroupId,
+      groupId: genGroupId,
+      config: config.value,
+      label: config.value.name || config.value.model || config.value.baseUrl || 'Model',
+      model: config.value.model || '',
+      prompt: runPrompt,
+      size: runSize,
+      extras,
+      ...(s !== undefined ? { seed: s } : {}),
+      refList,
+      refSrc: refSrc || undefined,
+      characterId: activeCharId.value || undefined,
+      parentId: pendingParentId.value,
+      startedAt: Date.now(),
+      state: 'running' as const,
+      results: []
+    }
+  })
+  await runBatch(slots)
+}
+
+/* 同时在跑的请求数上限。拆开之后"张数 = 请求数",一次 10 张原样并发
+   很容易被上游限流(429),而限流的报错长得像"这个模型坏了"。
+   排队只让慢的那几张等一等,不影响结果 */
+const SLOT_CONCURRENCY = 3
+
+/** 按上限并发跑。够用就好的轮子 —— 不引依赖,也不做动态调参 */
+async function runWithLimit<T>(items: T[], limit: number, run: (t: T) => Promise<void>) {
+  const queue = [...items]
+  const workers = Array.from({ length: Math.min(limit, queue.length) }, async () => {
+    for (let next = queue.shift(); next !== undefined; next = queue.shift()) await run(next)
+  })
+  await Promise.all(workers)
+}
+
+/** 跑一批槽,结束再落盘、收尾。单模型多张与多模型对比共用这一条 */
+async function runBatch(slots: GenSlot[]) {
+  genSlots.value = [...genSlots.value, ...slots]
   error.value = ''
   notice.value = ''
   canRetry.value = false
   try {
+    /* 上限内并发 —— 既不串成一条长队(多张的总耗时等于各张之和),
+       也不一次性全丢出去(自己把自己限流) */
+    await runWithLimit(slots, SLOT_CONCURRENCY, runSlot)
+  } finally {
+    await persistBatch(slots)
+    /* 结束的槽立刻撤出图墙:留下的只有图和提示。
+       骨架格一直挂在那儿会让人以为还在跑 */
+    const ids = new Set(slots.map((s) => s.id))
+    genSlots.value = genSlots.value.filter((s) => !ids.has(s.id))
+  }
+  reportBatch(slots)
+}
+
+/** 一个槽 = 一次请求 = 一张图。异常在这一层吃掉 ——
+ *  一张失败不该拖累同批的其它张,这正是拆开跑最值钱的地方 */
+async function runSlot(slot: GenSlot) {
+  // 排队期间被停掉的:不必再发出去
+  if (slot.state !== 'running') return
+  const ctl = new AbortController()
+  slotControllers.set(slot.id, ctl)
+  try {
     const res = await generate(
       {
-        prompt: running.value.prompt,
-        size: running.value.size,
-        n: running.value.n,
-        ...(refList.length ? { images: refList } : {}),
-        ...(seedNum !== undefined ? { seed: seedNum } : {}),
+        prompt: slot.prompt,
+        size: slot.size,
+        n: 1,
+        ...(slot.refList.length ? { images: slot.refList } : {}),
+        ...(slot.seed !== undefined ? { seed: slot.seed } : {}),
         // 由厂商能力表决定带哪些扩展参数:auto 与已知不支持的都不发
-        ...extras
+        ...slot.extras
       },
-      config.value,
-      controller.value.signal
+      slot.config,
+      ctl.signal
     )
-    const record = await recordFor(res, {
-      prompt: running.value.prompt,
-      size: running.value.size,
-      model: config.value.model || undefined,
+    slot.results = res
+    slot.state = 'done'
+  } catch (e: any) {
+    // 主动终止不是失败,但要说清是"你停的",不是模型坏了
+    slot.state = e?.name === 'AbortError' ? 'stopped' : 'error'
+    // 上游原文可能很长,槽位里放不下;完整内容留到汇总那条提示里
+    if (slot.state === 'error') {
+      slot.error = String(e?.message || 'Generation failed').slice(0, 300)
+    }
+  } finally {
+    slot.elapsedMs = Date.now() - slot.startedAt
+    slotControllers.delete(slot.id)
+  }
+}
+
+/** 落盘:同一批里按 recordKey 归并。
+ *  单模型的几张合成一条记录(与拆分前一致),对比的每模型一条(也与拆分前一致) */
+async function persistBatch(slots: GenSlot[]) {
+  const groups = new Map<string, GenSlot[]>()
+  for (const s of slots) {
+    const list = groups.get(s.recordKey)
+    if (list) list.push(s)
+    else groups.set(s.recordKey, [s])
+  }
+  for (const group of groups.values()) {
+    const ok = group.filter((s) => s.state === 'done' && s.results.length)
+    if (!ok.length) continue
+    // 条件取第一个槽:同键的这几个除了种子逐张递进,其余完全一样
+    const head = group[0]
+    /* 必须取原始数组:槽上的 results 是响应式代理,而 indexedDB 用结构化克隆
+       写盘,代理克隆不了(DataCloneError),记录会写不进去 —— 界面看着图还在
+       (内存里有),刷新就没了,还会误报"没能保存到本地" */
+    const results = ok.flatMap((s) => toRaw(s.results))
+    const record = await recordFor(results, {
+      prompt: head.prompt,
+      size: head.size,
+      model: head.model || undefined,
       // 只记真正发出去的扩展参数,免得预览里展示出当时并没生效的档位
-      quality: extras.quality,
-      background: extras.background,
-      hasRef: !!refSrc,
-      groupId: genGroupId,
-      configId: config.value.id,
-      seed: seedNum,
-      refSrc: refSrc || undefined,
+      quality: head.extras.quality,
+      background: head.extras.background,
+      hasRef: !!head.refSrc,
+      groupId: head.groupId,
+      configId: head.config.id,
+      seed: head.seed,
+      refSrc: head.refSrc,
       /* 「拉自某条记录改一个变量重跑」的出处。普通手写提示词这里是空,不入链 */
-      parentId: pendingParentId.value,
+      parentId: head.parentId,
       // 套了角色就记下是谁 —— 预览里才说得清"这条是照哪个角色出的"
-      characterId: activeCharId.value || undefined,
-      elapsedMs: Date.now() - startedAt
+      characterId: head.characterId,
+      // 一批里各张耗时不同,记最慢的那张 = 这一批总共要等多久
+      elapsedMs: Math.max(...ok.map((s) => s.elapsedMs || 0))
     })
     await persist(record)
-  } catch (e: any) {
-    // 主动终止不是失败,不报错也不入历史
-    if (e?.name === 'AbortError') return
-    // 走到这里说明请求真的发出去了,可以重试
-    fail(e?.message || 'Generation failed', true)
-  } finally {
-    loading.value = false
-    controller.value = null
   }
+}
+
+/** 这一批跑完说一句。全成败占用错误区(有原文和重试),部分失败走中性的 notice,
+ *  一张都没失败就什么都不说 —— 图自己会出现在图墙里 */
+function reportBatch(slots: GenSlot[]) {
+  const failed = slots.filter((s) => s.state === 'error')
+  if (!failed.length) return
+  /* 同一个模型的几张失败时不必把名字念好几遍:按名字收一遍,
+     一家的报错就用第一条(同一次请求失败,原因通常也只有一个) */
+  const byName = new Map<string, string>()
+  for (const s of failed) if (!byName.has(s.label)) byName.set(s.label, s.error || 'failed')
+  const names = [...byName.keys()].join(', ')
+  if (byName.size === new Set(slots.map((s) => s.label)).size) {
+    fail([...byName].map(([label, err]) => `${label}: ${err}`).join('\n'), true)
+    return
+  }
+  notice.value = `${failed.length} of ${slots.length} failed (${names}) — the rest are in your recent creations`
 }
 
 /* 把一组结果包成一条历史记录,并补上缩略图与真实像素。
@@ -1795,98 +2005,34 @@ async function doRace() {
   const refList: string[] = []
   if (refSrc) refList.push(refSrc)
   for (const s of await charRefSrcs()) if (!refList.includes(s)) refList.push(s)
-  raceGroupId.value = `race-${Date.now().toString(36)}`
+  const groupId = `race-${Date.now().toString(36)}`
   /* 尺寸与扩展参数在发起前逐配置定下来:中途改参数不该影响已经发出的这一批,
-     而且各模型的合法尺寸/参数本来就不一样,不能拿一家的能力套所有家 */
-  raceSlots.value = targets.map((c) => ({
-    configId: c.id,
-    label: c.name || c.model || c.baseUrl,
-    model: c.model || '',
-    size: sizeFor(c),
-    extras: extraParams(c),
-    seed: seedFor(c),
-    state: 'running',
-    results: []
-  }))
-  controller.value = new AbortController()
-  const signal = controller.value.signal
-
-  loading.value = true
-  error.value = ''
-  notice.value = ''
-  canRetry.value = false
-  try {
-    /* 张数固定 1:对比要看的是"哪个模型更好",不是每个模型各来三张。
-       并发发出 —— 串行的话总耗时是各家之和,等起来没法用 */
-    await Promise.all(
-      targets.map(async (cfg, i) => {
-        const slot = raceSlots.value[i]
-        const slotStart = Date.now()
-        try {
-          const res = await generate(
-            {
-              prompt: runPrompt,
-              size: slot.size,
-              n: 1,
-              ...(refList.length ? { images: refList } : {}),
-              ...(slot.seed !== undefined ? { seed: slot.seed } : {}),
-              ...slot.extras
-            },
-            cfg,
-            signal
-          )
-          slot.results = res
-          slot.elapsedMs = Date.now() - slotStart
-          slot.state = 'done'
-        } catch (e: any) {
-          // 主动终止不是失败,但要说清是"你停的",不是模型坏了
-          slot.state = e?.name === 'AbortError' ? 'stopped' : 'error'
-          // 上游原文可能很长,槽位里放不下;完整内容挂在节点的 title 上
-          if (slot.state === 'error') {
-            slot.error = String(e?.message || 'Generation failed').slice(0, 300)
-          }
-        }
-      })
-    )
-    /* 跑完的槽位落进历史:它们已经是用户看得见的图,和平时生成的图一视同仁,
-       在图墙里等着。 */
-    for (const slot of raceSlots.value) {
-      if (slot.state !== 'done' || !slot.results.length) continue
-      /* 必须取原始数组:槽位上的 results 是响应式代理,而 indexedDB 用结构化克隆
-         写盘,代理克隆不了(DataCloneError),记录会写不进去 —— 界面看着图还在
-         (内存里有),刷新就没了,还会误报"没能保存到本地" */
-      const results = toRaw(slot.results)
-      const record = await recordFor(results, {
-        prompt: runPrompt,
-        size: slot.size,
-        model: slot.model || undefined,
-        quality: slot.extras.quality,
-        background: slot.extras.background,
-        hasRef: !!refSrc,
-        groupId: raceGroupId.value,
-        configId: slot.configId,
-        seed: slot.seed,
-        refSrc: refSrc || undefined,
-        elapsedMs: slot.elapsedMs || 0
-      })
-      await persist(record)
+     而且各模型的合法尺寸/参数本来就不一样,不能拿一家的能力套所有家。
+     张数固定 1:对比要看的是"哪个模型更好",不是每个模型各来三张 */
+  const slots: GenSlot[] = targets.map((c) => {
+    const s = seedFor(c)
+    return {
+      id: uid(),
+      // 每个模型各自成一条记录:这正是对比的意义
+      recordKey: c.id,
+      groupId,
+      config: c,
+      label: c.name || c.model || c.baseUrl,
+      model: c.model || '',
+      prompt: runPrompt,
+      size: sizeFor(c),
+      extras: extraParams(c),
+      ...(s !== undefined ? { seed: s } : {}),
+      refList,
+      refSrc: refSrc || undefined,
+      characterId: activeCharId.value || undefined,
+      parentId: pendingParentId.value,
+      startedAt: Date.now(),
+      state: 'running' as const,
+      results: []
     }
-    /* 成败都从提示通道说一声。没有并排面板了,哪几家没出来只能在这里交代 ——
-       全盘皆输占用错误区(有原文和重试),部分失败走中性的 notice,不打断 */
-    const failed = raceSlots.value.filter((s) => s.state === 'error')
-    const names = failed.map((s) => s.model || s.label).join(', ')
-    if (failed.length === raceSlots.value.length) {
-      fail(
-        raceSlots.value.map((s) => `${s.model || s.label}: ${s.error || 'failed'}`).join('\n'),
-        true
-      )
-    } else if (failed.length) {
-      notice.value = `${names} failed — the rest are in your recent creations`
-    }
-  } finally {
-    loading.value = false
-    controller.value = null
-  }
+  })
+  await runBatch(slots)
 }
 
 /* 点芯片 = 加入/移出这次生成。这就是全部的开关:选一个跟平时一样,选两个以上就是对比 */
@@ -1907,14 +2053,29 @@ function toggleSelectedId(id: string) {
   selectedIds.value = [...selectedIds.value, id]
 }
 
-// 终止当前批次(单模型与对比共用同一个 controller)
-function stopGenerate() {
-  controller.value?.abort()
+/* 停掉一张。只掐这一个槽 —— 同一个模型出的另外几张、
+   以及叠着跑的另一批,都不该被牵连 */
+function stopSlot(id: string) {
+  const ctl = slotControllers.get(id)
+  if (ctl) {
+    ctl.abort()
+    return
+  }
+  /* 还没轮到它发出去(并发上限之外的那些)。不处理的话这一格会一直转 ——
+     用户点了停止却什么都没发生,比按钮没反应更糟 */
+  const slot = genSlots.value.find((s) => s.id === id)
+  if (slot?.state === 'running') slot.state = 'stopped'
+}
+/** 全部停下。骨架格上各自有停止键,这个入口是给"一次跑了十来张、
+ *  不想一个个点"的情况用的 */
+function stopAllSlots() {
+  for (const c of slotControllers.values()) c.abort()
+  // 排队中的那几个没有手柄可掐,得单独标记
+  for (const s of genSlots.value) if (s.state === 'running') s.state = 'stopped'
 }
 
 // 重试:按当前输入再发一次(用户可能已经改过提示词或参数,以界面上的为准)
 function retry() {
-  if (loading.value) return
   doGenerate()
 }
 
@@ -2393,22 +2554,21 @@ function createAssignCollection(title: string) {
                 </button>
                 <button
                   class="gen-icon"
-                  :disabled="!loading && (enhancing || !prompt.trim())"
-                  :aria-label="loading ? 'Stop' : compareMode ? 'Compare models' : 'Generate'"
+                  :disabled="enhancing || !prompt.trim()"
+                  :aria-label="compareMode ? 'Compare models' : 'Generate'"
                   :data-tip="
-                    loading
-                      ? 'Stop'
-                      : enhancing
-                        ? 'Rewriting the prompt…'
-                        : compareMode
-                          ? `Generate with ${selectedConfigs.length} models`
-                          : 'Generate with Enter'
+                    enhancing
+                      ? 'Rewriting the prompt…'
+                      : compareMode
+                        ? `Generate with ${selectedConfigs.length} models`
+                        : 'Generate with Enter'
                   "
-                  @click="loading ? stopGenerate() : doGenerate()"
+                  @click="doGenerate()"
                 >
-                  <!-- 生成中变为方块停止键,点击可终止这一批 -->
-                  <PhStop v-if="loading" aria-hidden="true" />
-                  <PhArrowRight v-else aria-hidden="true" />
+                  <!-- 生成中不再是停止键:它原来占着这个位置,于是"想接着发一批"
+                       这条最常走的路被自己的暂停键堵死了。
+                       停止入口下到每一张的占位格上(见图墙),这里始终是"再生成" -->
+                  <PhArrowRight aria-hidden="true" />
                 </button>
               </div>
             </div>
@@ -2651,21 +2811,27 @@ function createAssignCollection(title: string) {
              单独摆一排"对比面板"等于给同一批图两套呈现方式,关掉面板图就"消失"了,
              而它们本来就已经是历史记录 -->
         <div
-          v-if="loading || raceRunning || feedItems.length"
+          v-if="loading || feedItems.length"
           class="feed-zone"
           aria-live="polite"
         >
           <div class="section-head">
-            <span v-if="!loading && !raceRunning" class="sec-title">Recent creations</span>
+            <span v-if="!loading" class="sec-title">Recent creations</span>
             <!-- 生成中换成格子波 + 秒表:尺寸与字重都对齐 sec-title,
                  生成结束时从加载态切回标题不会跳一下 -->
             <LatticeLoader
               v-else
               class="sec-title"
-              :label="raceRunning ? 'Comparing' : 'Generating'"
+              :label="runLabel"
               :font-size="20"
             />
             <div class="sec-tools">
+              <!-- 挨个点骨架格上的停止键太费事时的出口。只在一张以上才出现 ——
+                   只有一张时那格上的停止键就在眼前,多摆一个入口是噪声 -->
+              <button v-if="activeSlots.length > 1" class="sec-stop" @click="stopAllSlots">
+                <PhStop weight="fill" aria-hidden="true" />
+                Stop all
+              </button>
               <button v-if="history.length" class="sec-more" @click="page = 'history'">
                 View all
                 <PhCaretRight aria-hidden="true" />
@@ -2685,13 +2851,26 @@ function createAssignCollection(title: string) {
           <div class="fold" :class="{ open: feedOpen }">
             <div class="fold-inner">
               <div class="feed-grid">
+                <!-- 占位格与在跑的那几张一一对应,不是一堆一模一样的空块:
+                     每格有自己的尺寸比例、自己的停止键 —— 点一下就只停这一张 -->
                 <div
-                  v-for="k in loading || raceRunning ? skeletonCount : 0"
-                  :key="`sk-${k}`"
+                  v-for="s in activeSlots"
+                  :key="s.id"
                   class="tile tile-skel"
-                  :style="{ aspectRatio: String(tileRatio(skeletonSize)) }"
+                  :style="{ aspectRatio: String(tileRatio(s.size)) }"
                 >
                   <div class="skel-shimmer"></div>
+                  <!-- 模型名只在对比时写:同一个模型出四张、四格都写一遍同样的名字,
+                       除了噪声没有别的用 -->
+                  <span v-if="multiModel" class="skel-label" :title="s.label">{{ s.label }}</span>
+                  <button
+                    class="skel-stop"
+                    :aria-label="`Stop generating with ${s.label}`"
+                    data-tip="Stop this one"
+                    @click="stopSlot(s.id)"
+                  >
+                    <PhStop weight="fill" aria-hidden="true" />
+                  </button>
                 </div>
                 <button
                   v-for="t in feedItems"
@@ -2810,12 +2989,19 @@ function createAssignCollection(title: string) {
       @create-collection="createAssignCollection"
     />
 
-    <!-- 存储清理等中性提示:以前只在生图工作台里铺一块,切到别的页面就看不见了。
-         这类提示(空间快满、覆盖未保存)跟"当前在哪个页面"无关,提到全局浮层,
-         哪个页面触发都在视野内,仍可手动关掉 -->
-    <div v-if="notice" class="note" role="status">
+    <!-- 中性提示(存好了、空间快满、覆盖未保存):以前只在生图工作台里铺一块,
+         切到别的页面就看不见了,所以提到全局浮层。
+         几秒后自己收起(见 clearNotice),指针停上去时不计时;
+         想提前关掉也留了个叉 -->
+    <div
+      v-if="notice"
+      class="note"
+      role="status"
+      @pointerenter="holdNotice"
+      @pointerleave="releaseNotice"
+    >
       <span class="note-msg">{{ notice }}</span>
-      <button class="note-close" @click="notice = ''" aria-label="Got it">
+      <button class="note-close" @click="clearNotice" aria-label="Got it">
         <PhX aria-hidden="true" />
       </button>
     </div>
@@ -2853,8 +3039,10 @@ function createAssignCollection(title: string) {
        它是平级页面,但不跟着上面那条 v-if 链走:常驻挂载、靠 active 开关显隐,
        理由见组件顶部(切去历史挑张图再切回来,手上那半张裁剪框不该没) -->
   <CanvasEditor
+    ref="canvasRef"
     :active="page === 'canvas'"
     :item="canvasItem"
+    :config="config"
     @save="saveEdit"
     @discard="discardCanvas"
     @pick="page = 'history'"
@@ -3650,10 +3838,14 @@ function createAssignCollection(title: string) {
   max-width: min(520px, calc(100vw - 32px));
   padding: 8px 12px;
   font-size: var(--fs-sm);
-  color: var(--text-2);
-  background: var(--bg-elev);
-  border: 1px solid var(--line);
-  box-shadow: var(--shadow-sm);
+  /* 与撤销浮条同一套墨底白字。它浮在什么画面上都有可能(画布页整屏都是图),
+     浅底浅字压上去就糊了 —— 深底才是在任何背景上都读得清的那一种。
+     深色模式下 --cta 自己会翻成浅色,这套不用跟着写第二遍 */
+  color: var(--cta-text);
+  background: var(--cta);
+  /* 这里原本写的是 --shadow-sm,那个变量根本不存在(全站只有 --sh-sm / --sh-md),
+     等于没有阴影 —— 浮条和底下的画糊成一片,这也是"看不清"的一半原因 */
+  box-shadow: var(--sh-md);
   border-radius: var(--r-sm);
 }
 .note-msg {
@@ -3668,7 +3860,8 @@ function createAssignCollection(title: string) {
   display: flex;
   align-items: center;
   justify-content: center;
-  color: var(--text-3);
+  /* 叉比正文轻一档:它是个出口,不是内容 */
+  color: color-mix(in srgb, var(--cta-text) 58%, transparent);
   border-radius: 999px;
   transition: color var(--dur) var(--ease), background var(--dur) var(--ease);
 }
@@ -3677,8 +3870,8 @@ function createAssignCollection(title: string) {
   height: 13px;
 }
 .note-close:hover {
-  color: var(--text);
-  background: var(--surface);
+  color: var(--cta-text);
+  background: color-mix(in srgb, var(--cta-text) 14%, transparent);
 }
 
 /* 长报错默认一行截断:上游原文动辄上百字,整段铺开会把输入区顶得很高 */
@@ -3888,6 +4081,25 @@ function createAssignCollection(title: string) {
   color: var(--text);
   background: var(--bg-elev);
 }
+/* 全部停下:与 View all / Collapse 同一排,沿同一套文字按钮语言 */
+.sec-stop {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 10px;
+  font-size: var(--fs-sm);
+  color: var(--text-3);
+  border-radius: 999px;
+  transition: color var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+.sec-stop svg {
+  width: 11px;
+  height: 11px;
+}
+.sec-stop:hover {
+  color: var(--text);
+  background: var(--bg-elev);
+}
 .sec-more svg,
 .sec-fold svg {
   width: 14px;
@@ -3983,6 +4195,51 @@ function createAssignCollection(title: string) {
   font-size: var(--fs-micro);
   opacity: 0.75;
   font-variant-numeric: tabular-nums;
+}
+
+/* 停止键:每格一个,只停它自己。
+   常驻而不是悬停才浮出 —— 触屏没有悬停,一个"看不见的停止键"等于没有;
+   这是用户唯一的停止入口(生成键不再兼任),更不该藏 */
+.skel-stop {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  z-index: 2;
+  width: 34px;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  /* 墨底白图标:骨架本身是浅灰的一整块,浅色按钮压上去看不出边界在哪 */
+  background: var(--cta);
+  color: var(--cta-text);
+  box-shadow: var(--sh-sm);
+  cursor: pointer;
+  transition: transform var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+}
+.skel-stop svg {
+  width: 13px;
+  height: 13px;
+}
+.skel-stop:hover {
+  transform: scale(1.06);
+  box-shadow: var(--sh-md);
+}
+/* 模型名:对比出图时几格长得一模一样,不写清哪格是哪家就只能靠猜。
+   右边界给停止键让位,不然长名字会钻到按钮底下 */
+.skel-label {
+  position: absolute;
+  left: 10px;
+  right: 52px;
+  bottom: 13px;
+  z-index: 2;
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  color: var(--text-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .skel-shimmer {

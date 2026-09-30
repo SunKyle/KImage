@@ -158,7 +158,7 @@ function removeFromCard(id: string) {
 }
 
 /* 两个视图态:列表(空)与详情(有 id)。
-   设定图与整套设定都挪进详情 —— 五张图加十项挤在一张卡上,
+   设定图与整套设定都挪进详情 —— 五张图加整套设定挤在一张卡上,
    既不好看也点不明白:点已有图会重新生成、想看大图又没地方看 */
 const detailId = ref('')
 // 正在全屏看的那张视图(空 = 没在看)
@@ -178,7 +178,7 @@ const draftError = ref('')
 const aiFilled = ref<Partial<Record<keyof CharacterFields, boolean>>>({})
 // 有标记 ⇒ 组说明换成那条图例,不然用户不知道这枚点是什么意思
 const hasAiFilled = computed(() => Object.values(aiFilled.value).some(Boolean))
-// 已经填过内容 ⇒ 起稿按钮变成 Re-draft(不然想重来一次只能手动清十栏)
+// 已经填过内容 ⇒ 起稿按钮变成 Re-draft(不然想重来一次只能手动清一遍)
 const hasSpec = computed(() => Object.values(draft.value.fields).some((s) => (s || '').trim()))
 
 function markEdited(key: keyof CharacterFields) {
@@ -229,7 +229,7 @@ function fmtDay(ts: number) {
   return `${p(d.getMonth() + 1)}-${p(d.getDate())}`
 }
 
-/** 特征胶囊:最多三枚 —— 卡片上只放得下这么多,完整的十项在详情页。
+/** 特征胶囊:最多三枚 —— 卡片上只放得下这么多,完整的规格表在详情页。
  *  候选多于三枚是有意的:跨场景不变的面貌特征排在前面,后两项兜底 ——
  *  老角色没有 face,靠它们仍能凑出三枚,不会只剩一行空白 */
 function traitsOf(c: Character): string[] {
@@ -503,13 +503,12 @@ function wizardViewOf(kind: CharacterViewKind): CharacterView | undefined {
 const wizardFront = computed(() => wizardViewOf('front'))
 
 /** 生成正脸会拿哪张图当参考。这是第 2 步最该说清的一件事:
- *  有主参考图就是图生图,没有就是纯文字生图 —— 出来的东西差别很大。
- *  正脸生成成功后 c.ref 里就是它自己(与封面同一张),所以"已经有正脸"等价于
- *  "参考图就是正脸";否则这一次是从第一步上传的那张底图重来 */
+ *  有参考图就是图生图,没有就是纯文字生图 —— 出来的东西差别很大。
+ *  指的是第一步上传的那张底图(见 types.ts 的 sourceRef);
+ *  老角色没有这一项,退回主图 —— 那批的 ref 里存的就是图本身 */
 const heroSource = computed(() => {
   const c = wizardChar.value
-  if (!c?.ref) return 'Text only — no reference image'
-  return wizardFront.value ? 'The front view' : 'The reference image you uploaded'
+  return c?.sourceRef || c?.ref ? 'Your reference image' : 'Text only — no reference image'
 })
 // 第 3 步的四张,主视图不在其中
 const wizardRest = computed(() =>
@@ -674,7 +673,8 @@ function onImportFile(e: Event) {
 
 function submit() {
   const d = draft.value
-  if (!d.name.trim()) return
+  // 姓名与性别是仅有的两条必填:一个给卡片当标题,一个给模型定这张脸
+  if (!d.name.trim() || !d.fields.gender.trim()) return
   // 字段与参考图各拷一份交出去,免得表单被继续改动时牵动已经发出的这次保存
   emit('save', { name: d.name, fields: { ...d.fields }, desc: d.desc, refData: d.ref })
   /* 这里不推进也不关表单:存完由父组件回调 onSaved 推向导走下一步 ——
@@ -683,7 +683,7 @@ function submit() {
 }
 
 /** 设定的摘要:挑最能认出这个人的几项连起来当副标题。
- *  不是全部十项 —— 完整的规格表就在下面那个面板里,副标题再抄一遍只是噪声 */
+ *  不是全部规格 —— 完整的规格表就在下面那个面板里,副标题再抄一遍只是噪声 */
 function summary(c: Character) {
   const f = c.fields
   if (!f) return c.desc || 'No spec yet'
@@ -708,8 +708,17 @@ type FieldSpec = {
   optional?: boolean
 }
 
+/* 性别不进 FACE_FIELDS —— 它不是一个填文字的栏位,而是一排按钮,
+   由模板单独渲染(见下面那一段)。但它仍然是一条规格:会拼进提示词、
+   也要进详情页的规格表,所以它得出现在 ALL_FIELDS 里 */
+const GENDER_FIELD: FieldSpec = { key: 'gender', label: 'Gender', hint: 'female' }
+
+/** 两个固定选项。不做输入框:图像模型认的就是这两个词,
+ *  而这一栏的意义恰恰是"别让模型自己挑" */
+const GENDERS = ['female', 'male']
+
 const FACE_FIELDS: FieldSpec[] = [
-  { key: 'identity', label: 'Identity', hint: 'cyberpunk female warrior' },
+  { key: 'identity', label: 'Identity', hint: 'veteran space smuggler, worn flight jacket' },
   { key: 'face', label: 'Face', hint: 'angular jaw, warm tan skin, late 30s' },
   { key: 'hair', label: 'Hair', hint: 'short silver hair, undercut' },
   { key: 'brows', label: 'Brows', hint: 'thick straight black brows' },
@@ -724,8 +733,22 @@ const SHEET_FIELDS: FieldSpec[] = [
   { key: 'marks', label: 'Marks', hint: 'chrome right arm, engraved dog tags', optional: true }
 ]
 
-/* 表单里十栏的完整顺序 —— 详情页的规格表按它排 */
-const ALL_FIELDS: FieldSpec[] = [...FACE_FIELDS, ...SHEET_FIELDS]
+/* 全部规格的完整顺序 —— 详情页的规格表、右栏摘要都按它排。
+   性别排在首位:它与其余各项一样是一条规格,只是表单上换了种控件 */
+const ALL_FIELDS: FieldSpec[] = [GENDER_FIELD, ...FACE_FIELDS, ...SHEET_FIELDS]
+
+/** 性别那排要摆出来的选项。模型偶尔会写出 female / male 之外的值(比如 non-binary)——
+ *  把它当成第三枚显示出来:已填的值在界面上看不见,比"选不中"更难理解,
+ *  一栏空着却拦不住保存,用户会以为是坏了 */
+const genderOptions = computed(() => {
+  const v = (draft.value.fields.gender || '').trim()
+  return v && !GENDERS.includes(v) ? [...GENDERS, v] : GENDERS
+})
+
+function pickGender(v: string) {
+  draft.value.fields.gender = v
+  markEdited('gender')
+}
 
 /* 两组字段,各有自己的标题。
    为什么要分成两组而不是一组加一条分界线 —— 这两组的差别是"会不会进你每一张图",
@@ -753,7 +776,7 @@ const FORM_GROUPS: FormGroup[] = [
   }
 ]
 
-/* 详情页的规格表:十项固定设定按顺序排,再做一条可选的备注 */
+/* 详情页的规格表:固定的那几项按顺序排,再做一条可选的备注 */
 const SPEC_LABELS: Array<[keyof CharacterFields, string]> = ALL_FIELDS.map((f) => [f.key, f.label])
 function specRows(c: Character) {
   const f = c.fields || emptyCharFields()
@@ -840,7 +863,7 @@ function specRows(c: Character) {
 
                为什么值得常驻:第 3 步要判断"这四张是不是同一个人",
                而原来那一屏上只有四张图 —— 设定与主视图都不在场,只能凭记忆比。
-               第 1 步同样用得着:一句话起稿会一次填进十栏,
+               第 1 步同样用得着:一句话起稿会一次填进所有栏位,
                这是一份"它到底读出了什么"的连读清单,不必在两组网格里来回找 -->
           <aside class="wz-rail" aria-label="Character summary">
             <!-- 主视图:第 3 步判断"这四张是不是同一个人"的基准。
@@ -856,7 +879,7 @@ function specRows(c: Character) {
             </div>
 
             <!-- 只列填了的项:空项在左边那两组网格里已经有一栏了,
-                 右栏再列十个 "—" 只是把"还没填"重复一遍 -->
+                 右栏再列一遍 "—" 只是把"还没填"重复一遍 -->
             <dl v-if="railRows.length" class="wz-rail-rows">
               <div v-for="r in railRows" :key="r.label" class="wz-rail-row">
                 <dt class="wz-rail-k">{{ r.label }}</dt>
@@ -919,30 +942,53 @@ function specRows(c: Character) {
                 </div>
               </div>
 
-              <!-- 名字单独一栏,不与下面十项同组:它是这个角色的标识,
-                   不进任何提示词(见 types.ts 的 CharacterFields 注释),
-                   而下面十项都是"发给模型的条件"。两者性质不同,所以分开放。
+              <!-- 姓名与性别裹成一层:它们是全表仅有的两条必填,而且都是
+                   "这个人是谁"的一部分 —— 姓名是给这张卡的,性别是给模型定脸
+                   的第一道条件。两者之间按组内的 8px,与下面各组的 24px 拉开。
 
-                   它同时也是全表唯一必填的一栏,所以要有一个讲出来的标记 ——
-                   原来靠"禁用的 Save 按钮"暗示,而按钮在卡脚,离这里很远。
-                   字号回到与其它输入框同档:它上面就是起稿块,
-                   再拿 20px/600 当标题,在一排 12–15px 里只会显得不搭 -->
-              <label class="wz-field">
-                <span class="wz-label">
-                  Name
-                  <span class="wz-mark is-required">Required</span>
-                </span>
-                <input
-                  v-model="draft.name"
-                  class="ed-input"
-                  placeholder="Name this character"
-                  aria-required="true"
-                />
-              </label>
+                   性别给按钮而不是输入框:模型只认 female / male 这两个词,
+                   留一栏自由文字等于又把这件事交回给它去猜 -->
+              <div class="wz-basics">
+                <label class="wz-field">
+                  <span class="wz-label">
+                    Name
+                    <span class="wz-mark is-required">Required</span>
+                  </span>
+                  <input
+                    v-model="draft.name"
+                    class="ed-input"
+                    placeholder="Name this character"
+                    aria-required="true"
+                  />
+                </label>
 
-              <!-- 十栏设定分成两组,各有自己的标题。
-                   这条界线的分量值得一个标题:上面八项会进你每一张成品,
-                   下面三项只塑造设定图 —— 它是这份设定里最要紧的一条区分。
+                <div class="wz-field" role="radiogroup" aria-label="Gender">
+                  <span class="wz-label">
+                    Gender
+                    <span class="wz-mark is-required">Required</span>
+                    <template v-if="aiFilled.gender">
+                      <span class="wz-ai" aria-hidden="true"></span>
+                      <span class="wz-sr">drafted by the model</span>
+                    </template>
+                  </span>
+                  <div class="wz-sex">
+                    <label v-for="g in genderOptions" :key="g" class="wz-sex-opt">
+                      <input
+                        type="radio"
+                        name="char-gender"
+                        :checked="draft.fields.gender.trim() === g"
+                        @change="pickGender(g)"
+                      />
+                      <span class="wz-sex-cap">{{ g }}</span>
+                    </label>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 设定分成两组,各有自己的标题。
+                   这条界线的分量值得一个标题:Spec 那一组会进你每一张成品,
+                   Reference sheet only 那组只塑造设定图 ——
+                   它是这份设定里最要紧的一条区分。
                    两组都由 FORM_GROUPS 生成,栏位的模板只写一遍 -->
               <div v-for="g in FORM_GROUPS" :key="g.title" class="wz-group">
                 <div class="wz-group-head">
@@ -970,7 +1016,7 @@ function specRows(c: Character) {
                     ></textarea>
                   </label>
 
-                  <!-- 备注不进 CharacterFields(它是自由文本,不参与起稿的十行),
+                  <!-- 备注不进 CharacterFields(它是自由文本,不参与起稿的那份固定行),
                        所以单独写一格,占满两列 -->
                   <label v-if="g.notes" class="wz-field is-wide">
                     <span class="wz-label">Notes</span>
@@ -1015,7 +1061,7 @@ function specRows(c: Character) {
 
             <template v-else-if="wizardChar">
               <!-- 存下之后这一步就没有可填的了(再点一次保存只会多一个副本),
-                   所以不再重复名字与十项设定 —— 右栏就在同一屏上,列两遍是同一份东西。
+                   所以不再重复名字与那份设定 —— 右栏就在同一屏上,列两遍是同一份东西。
                    这里只剩一句交接:设定从这一刻起归右栏,而下一步会拿什么当输入 -->
               <h3 class="wz-h">Saved</h3>
               <p class="wz-p">
@@ -1026,7 +1072,7 @@ function specRows(c: Character) {
                 <img class="wz-ref-thumb" :src="coverSrc(wizardChar.ref)" alt="" />
                 <span class="wz-ref-body">
                   <span class="wz-ref-main">Reference image</span>
-                  <span class="wz-ref-hint">The main view will be built from it</span>
+                  <span class="wz-ref-hint">The front view will be built from it</span>
                 </span>
               </div>
             </template>
@@ -1188,7 +1234,7 @@ function specRows(c: Character) {
           <button
             v-if="step === 1 && !wizardId"
             class="ed-btn primary"
-            :disabled="!draft.name.trim()"
+            :disabled="!draft.name.trim() || !draft.fields.gender.trim()"
             @click="submit"
           >
             Save &amp; continue
@@ -1415,7 +1461,9 @@ function specRows(c: Character) {
           <span v-else class="panel-note">
             {{
               hasFront
-                ? 'Every other view is built from the front view.'
+                ? detailChar.sourceRef
+                  ? 'Every other view is built from the front view and your reference image.'
+                  : 'Every other view is built from the front view.'
                 : 'Start with the front view — the other four unlock once it exists.'
             }}
           </span>
@@ -1809,7 +1857,7 @@ function specRows(c: Character) {
 
 /* 信息区:当前这一步的内容,间距 10px 一档。
    它就是那个滚动区 —— 卡片不滚,滚的是这一层(见 .wizard)。
-   十一栏加两组标题装不下时只有中间这段滑动,卡头卡脚不动,
+   这份表单加两组标题装不下时只有中间这段滑动,卡头卡脚不动,
    这才是"信息区域滚动"该有的样子。
    min-height:0 是关键:少了它 flex 子项不肯缩,滚动条根本出不来 */
 .wz-pane {
@@ -2012,23 +2060,31 @@ function specRows(c: Character) {
 }
 
 /* —— 第 1 步的表单 ——
-   这一页曾经是"九行控件同一个间距、同一种输入框、同一个视觉重量":
+   这一页曾经是"一行行控件同一个间距、同一种输入框、同一个视觉重量":
    角色名和 "Marks" 长得一模一样,看不出从哪儿下手,也看不出哪些是一段。
 
    现在分三档,每一档用不同的手段区分(面积 / 字号 / 颜色),不靠装饰:
      1 入口   起稿块   —— 淡墨底 + 描边,整张卡唯一一块"区域",重点在这
      2 分区   组标题   —— 15/600 满墨 + 下压一条横线
      3 字段   标签/提示 —— 12/500 灰、12/400 更灰,输入框一律 13px
-   名字不在三档里:它是一栏普通字段(见模板里的注释),只是多一枚 Required 标记。
+   姓名与性别不在三档里:两条必填的"基础信息",一栏是普通字段、一栏换成了按钮组,
+   分量都还是字段那一档,只是各多一枚 Required 标记(见模板里的注释)。
    间距同时承担分组:组与组 24px、组内 8–10px */
 .wz-form {
   /* 组与组 24px(--sp-5)、组内 8–10px。三倍的落差就是分层的依据,不靠边框;
      滚动已经交给信息区了,这里不必再为了省高度把层次压平 */
   gap: var(--sp-5);
 }
+/* 姓名 + 性别:两条必填自成一格,内部按组内的 8px,
+   与外面各组的 24px 拉开 —— 它们是一件事,不是两组 */
+.wz-basics {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
 
 /* 起稿块是这一页的重点:它是最常用的入口 —— 一句话交给模型,
-   下面十栏由它填出来。所以它拿的是整张卡上唯一一块"区域"待遇:
+   下面所有栏位由它填出来。所以它拿的是整张卡上唯一一块"区域"待遇:
    淡墨底 + 同色描边(别处的框都是白底细线),里面的输入槽比块底亮一档,
    于是"区域 - 输入槽 - 主按钮"三层一眼分得开。
    内边距与外层表单同档:它是这张卡上分量最重的一块,不该比包着它的地方更挤 */
@@ -2062,7 +2118,7 @@ function specRows(c: Character) {
   color: var(--text-2);
 }
 /* 输入槽。比块底亮一档、字号抬到 15px 并给正文色 ——
-   这一栏收的是"一个人的样子",是整页唯一写给人看的话,而下面十栏是填给模型的参数;
+   这一栏收的是"一个人的样子",是整页唯一写给人看的话,而下面各栏是填给模型的参数;
    字号与颜色把这两件事分开(15px 与首页的提示词框同档,不是新开的尺寸)。
    选择器带上 textarea 是为了压过 .ed-input 那几条:两个单类分处文件两头,
    靠先后顺序去赢太脆 */
@@ -2114,7 +2170,7 @@ textarea.wz-idea {
   gap: 10px;
 }
 /* 组标题行下面压一条横线:它是"分层"最直接的凭据 ——
-   光靠字号差,十栏的灰标签会把组标题淹掉 */
+   光靠字号差,那一排灰标签会把组标题淹掉 */
 .wz-group-head {
   display: flex;
   align-items: baseline;
@@ -2149,16 +2205,16 @@ textarea.wz-idea {
   color: var(--text-3);
 }
 /* "必填"要能压住视线:它是一条约束,不是一句补充。
-   全表只有这一栏必填,所以不必再用星号加图例那种写法 */
+   全表只有姓名与性别两栏必填,所以不必再用星号加图例那种写法 */
 .wz-mark.is-required {
   font-weight: 500;
   color: var(--text-2);
 }
 
 /* 字段区:两列,每格是"标签在上、输入在下"。
-   为什么两列 —— 十栏一行一个往下堆时整张表约 890px,而卡身可用高度是
+   为什么两列 —— 一栏一行往下堆时整张表有近千像素,而卡身可用高度是
    「视口 − 卡头 48 − 卡脚 60 − 上下留白 32」,900px 的屏只有约 760px:
-   校对十栏得上下翻。两列之后 11 行变 6 行,一屏能看全。
+   校对一遍得上下翻。两列之后十几行变六七行,一屏能看全。
    为什么标签在上而不是在左 —— 在左的话每列只剩 338 − 96 − 12 = 230px,
    13px 下约 37 字符,而字段值上限是 12 个词(约 70 字符) */
 .wz-fields {
@@ -2176,6 +2232,62 @@ textarea.wz-idea {
 /* 备注是自由文本,占满两列 */
 .wz-field.is-wide {
   grid-column: 1 / -1;
+}
+
+/* —— 性别:两枚胶囊 ——
+   外面那层 .wz-field 与 Name 完全一样,只把控件换掉。
+   选中态沿用全站那一套(见 SettingsPage 的 .purpose-opt):
+   墨色描边 + 抬高一点,而不是涂成实心 —— 两枚里有一个是默认值,
+   涂黑会让它看着像按钮而不是"已经选好的那个" */
+.wz-sex {
+  display: flex;
+  gap: var(--sp-2);
+}
+.wz-sex-opt {
+  /* 隐藏的 radio 是绝对定位的,得有个定位锚点收住它 */
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* 40px 是这一页所有可点区域的底线:再矮在触屏上就点不准了 */
+  min-height: 40px;
+  padding: 0 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--bg);
+  color: var(--text-2);
+  font-size: var(--fs-sm);
+  cursor: pointer;
+  transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease),
+    box-shadow var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+.wz-sex-opt:hover {
+  border-color: var(--line-strong);
+}
+/* 原生 radio 藏起来但留在 Tab 键序里:方向键切换、读屏念"已选中",
+   都是它自带的。换成 button 就得把这些重写一遍 */
+.wz-sex-opt input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+/* 值按原样存(提示词里要的就是那个词),只有摆在界面上时才首字母大写 */
+.wz-sex-cap {
+  text-transform: capitalize;
+}
+.wz-sex-opt:has(input:checked) {
+  border-color: var(--text);
+  background: var(--surface);
+  box-shadow: var(--sh-sm);
+  color: var(--text);
+}
+/* 全站不画焦点描边(见 style.css 的 :focus-visible),所以键盘聚焦
+   也走"描边 + 一圈晕"这条路,与 .ed-input:focus 同一套 */
+.wz-sex-opt:has(input:focus-visible) {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
 }
 .wz-label {
   display: flex;

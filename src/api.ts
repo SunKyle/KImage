@@ -1,5 +1,5 @@
-import type { ApiConfig, GenParams, HistoryEntry, PromptItem, ResultItem, ReuseParams, Collection, Character, CharacterDraft, CharacterFields, CharacterView, CharacterViewKind, ImportedCharacter } from './types'
-import type { PruneResult, CoverRecord } from './lib/idb'
+import type { ApiConfig, EditParams, GenParams, HistoryEntry, PromptItem, ResultItem, ReuseParams, Collection, Character, CharacterDraft, CharacterFields, CharacterView, CharacterViewKind, ImportedCharacter } from './types'
+import type { PruneResult, CoverRecord, CharRefRecord } from './lib/idb'
 import { titleFromPrompt } from './lib/text'
 import {
   getAll,
@@ -13,6 +13,7 @@ import {
   putCovers,
   getAllCharRefs,
   putCharRefs,
+  charSourceKey,
   ensurePersisted
 } from './lib/idb'
 
@@ -58,6 +59,11 @@ export interface Provider {
      界面就不会给出一个填了也白发、甚至被 400 拒掉的输入框。
      未知的按 'unknown' 处理:填了就照发,由上游自己决定收不收 */
   seed: Cap
+  /* 认不认多张参考图。标 'no' 的只送一张 ——
+     设定图那条流水线会退化成"只拿正脸当参考"(见 App 的 genCharView),
+     而不是发两张过去把整个请求弄失败。
+     未知的按"能发就发"处理,与上面几项一致:这里只拦明确知道的单图模型 */
+  multiImage: Cap
 }
 
 // 兜底项:baseUrl 认不出来时的归宿
@@ -70,6 +76,9 @@ const CUSTOM: Provider = {
   quality: 'unknown',
   background: 'unknown',
   seed: 'unknown',
+  /* 未知厂商按"发"处理:中转站背后多数是能收多张的 OpenAI / Gemini 系,
+     真发错了上游会报错说清楚,而静默退回单图是用户看不见的信息损失 */
+  multiImage: 'unknown',
   sizes: 'free',
   /* 未知厂商按"认 auto"处理:这里的兜底对象就是 OpenAI 兼容代理,
      如实转发比静默降级好 —— 真发错了会报错提示,而静默丢掉参数只会让人
@@ -101,6 +110,8 @@ const GEMINI: Provider = {
   /* 原生的 generationConfig 里有 seed 字段,但图像模型认不认没有实测过,
      所以标 unknown(填了就发),不假装支持也不假装不支持 */
   seed: 'unknown',
+  // 原生请求体的 parts 里可以并列多段 inlineData,多张参考图是它本来就认的形态
+  multiImage: 'yes',
   /* 给的都是能干净约分成 Gemini 认的宽高比的档位:
      1024x1024→1:1、1536x1024→3:2、1024x1536→2:3、1792x1024→16:9、1024x1792→9:16。
      约不出来的值不发这个参数(见 server 的 geminiRatio),不做隐式近似 */
@@ -124,6 +135,8 @@ export const PROVIDERS: Provider[] = [
     background: 'yes',
     // Images API 没有 seed 参数(那是 ChatGPT 界面里的东西),发了只会被拒
     seed: 'no',
+    // /images/edits 的 image[] 本来就收多张;dall-e-2 时代只收一张,但那条路已经不用了
+    multiImage: 'yes',
     sizes: ['auto', '1024x1024', '1536x1024', '1024x1536'],
     autoSize: true,
     edit: 'edits',
@@ -138,6 +151,8 @@ export const PROVIDERS: Provider[] = [
     background: 'no',
     // Ark 认不认 seed 没有实测过:按"填了就发"处理,真被拒了上游会报错
     seed: 'unknown',
+    // Seedream 的图像编辑只收一张参考图
+    multiImage: 'no',
     sizes: 'free',
     // Ark 的 size 是枚举,收到 "auto" 会直接报错;它也没有"模型自定比例"这一档
     autoSize: false,
@@ -153,6 +168,8 @@ export const PROVIDERS: Provider[] = [
     background: 'no',
     // 同 Ark:没有实测过,按"填了就发"处理
     seed: 'unknown',
+    // 万相的图像编辑同样是单图
+    multiImage: 'no',
     sizes: 'free',
     // 万相的 size 同样是枚举,没有 auto 档
     autoSize: false,
@@ -435,11 +452,18 @@ export async function generate(
     throw new Error(msg)
   }
 
-  /* 出图位置两家不一样,所以先把两条协议的结果都摊成同一个形状再看:
-     - OpenAI:      data[].b64_json | data[].url
-     - Gemini 原生: candidates[].content.parts[].inlineData.data
-       字段名还有 camelCase(inlineData/mimeType)和 snake_case(inline_data/mime_type)
-       两种 —— 我们实测那家中转的两种填法各回一套,都收 */
+  return await imagesFrom(resp)
+}
+
+/* 把上游的响应摊成同一个形状的图列表。出图与局部编辑共用 ——
+   两处各写一套解析,迟早有一边漏掉 Gemini 的 snake_case 变体。
+
+   出图位置两家不一样,所以先摊平再看:
+   - OpenAI:      data[].b64_json | data[].url
+   - Gemini 原生: candidates[].content.parts[].inlineData.data
+     字段名还有 camelCase(inlineData/mimeType)和 snake_case(inline_data/mime_type)
+     两种 —— 我们实测那家中转的两种填法各回一套,都收 */
+async function imagesFrom(resp: Response): Promise<ResultItem[]> {
   const data = (await resp.json()) as {
     data?: Array<{ b64_json?: string; url?: string }>
     candidates?: Array<{
@@ -491,6 +515,134 @@ export async function generate(
       return { type: 'url', data: '' }
     })
   )
+}
+
+/* ===== 画布里的 AI 编辑 ==============================================
+   给原图和一块区域,让上游重做那块像素。去背景 / 消除 / 局部重绘共用它,
+   差别只在 mask 怎么来、有没有指令(见 types.ts 的 EditParams)。
+
+   与 generate 分成两条端点:那条的语义是"画一张新图"(参考图只是引导),
+   这条是"在这张图上改一块"。合成一条的话,服务端没法按模式挑提示词,
+   客户端也得靠一个布尔值去分辨两种截然不同的意图。
+   -------------------------------------------------------------------- */
+
+/**
+ * 把想要的画幅收窄成目标厂商真认的取值。认不出来就给 undefined(等于不发)。
+ *
+ * 编辑那条路是不发 size 的,理由是"不发就等于保持原样" —— 恰恰相反:
+ * 多数上游在没收到 size 时退回自己的默认画幅,而那就是 1024x1024,
+ * 于是一张 3:2 的图改完变成方的(autoSize 那段注释早就写了这件事,
+ * 只是编辑这条路没跟上)。画布上"按参考图再生成一张"也吃同一个亏。
+ *
+ * 能自由定尺寸的厂商直接报原尺寸;只认枚举的按宽高比挑最接近的一档。
+ * auto 一律跳过 —— 它的意思是"模型自己定比例",正是要避开的那个。
+ */
+export function allowedSizeFor(
+  vendorId: string | undefined,
+  model: string,
+  want?: string
+): string | undefined {
+  if (!want) return undefined
+  const allowed = allowedSizes(vendorId, model)
+  if (allowed === 'free') return want
+  const m = String(want).match(/^(\d{1,5})x(\d{1,5})$/i)
+  if (!m) return undefined
+  const target = Number(m[1]) / Number(m[2])
+  let best: string | undefined
+  let gap = Infinity
+  for (const s of allowed) {
+    if (s === 'auto') continue
+    const sm = s.match(/^(\d{1,5})x(\d{1,5})$/i)
+    if (!sm) continue
+    /* 比的是比例的对数距离:1:1 偏到 2:1 和偏到 1:2 该算同样的偏差,
+       直接用差值算会把竖图一律判给横图 */
+    const d = Math.abs(Math.log(Number(sm[1]) / Number(sm[2]) / target))
+    if (d < gap) {
+      gap = d
+      best = s
+    }
+  }
+  return best
+}
+
+/**
+ * 在这一张图上改一块。
+ * 返回一张新图 —— 局部编辑不存在"给我四张选一张":区域是用户画出来的,
+ * 四张里挑一张等于让他重画四次选区。
+ */
+export async function editImage(
+  params: EditParams,
+  config: ApiConfig,
+  signal?: AbortSignal
+): Promise<ResultItem> {
+  const vendor = config.vendor || inferVendor(config.baseUrl)
+  const provider = getProvider(vendor, config.model)
+  /* 去背景要的是"抠出来",所以能要透明就要透明 —— 白底是当年没有这个
+     参数时的将就,不是用户想要的。只在厂商明确支持时才发:这一项被拒
+     会导致整条请求 400,而 background 的候选值里没有"auto"这种安全档
+     (见带 autoSize 那段注释的同一套取舍) */
+  const background = params.mode === 'remove-bg' && provider.background === 'yes' ? 'transparent' : ''
+  const resp = await fetch('/api/edit', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      ...params,
+      /* 收窄成目标厂商真认的取值。undefined 会被 JSON 丢掉,等于不发 */
+      size: allowedSizeFor(vendor, config.model || '', params.size),
+      background: background || undefined,
+      baseUrl: config.baseUrl,
+      apiKey: config.apiKey,
+      model: config.model || undefined,
+      /* 与 generate 同一套:vendor 决定打哪个端点,protocol 决定请求体走
+         OpenAI 形状还是 Gemini 原生形状(见 getProvider 的说明) */
+      vendor,
+      protocol: provider.protocol
+    }),
+    signal
+  })
+
+  if (!resp.ok) {
+    let msg = `Request failed (${resp.status})`
+    try {
+      const body = await resp.json()
+      if (body?.error) msg = body.error
+      if (body?.detail) msg = `${msg} — ${body.detail}`
+    } catch {
+      /* ignore */
+    }
+    throw new Error(msg)
+  }
+
+  const items = await imagesFrom(resp)
+  return items[0]
+}
+
+/**
+ * 以一张图作参考再画一张。画布上那条"按这张继续创作"走这里。
+ *
+ * 它打的是出图那条端点,不是编辑那条 —— 两者要的东西根本不同:
+ * 编辑是"在这张图上改一块",参考图是"照它的样子另画一张",画成什么样由提示词说。
+ *
+ * 只有一处收窄:size 要按厂商能力挑。画布那边的画幅是用户自己裁出来的,
+ * 直接原样发过去,只认枚举的厂商会整条 400。
+ * 只出四张选一张没有意义 —— 参考图是当前这张,出的就是接着要用的那一张 */
+export async function generateFrom(
+  params: { prompt: string; image: string; size: string },
+  config: ApiConfig,
+  signal?: AbortSignal
+): Promise<ResultItem> {
+  const vendor = config.vendor || inferVendor(config.baseUrl)
+  const items = await generate(
+    {
+      prompt: params.prompt,
+      size: allowedSizeFor(vendor, config.model || '', params.size) ?? params.size,
+      n: 1,
+      images: [params.image]
+    },
+    config,
+    signal
+  )
+  return items[0]
 }
 
 /* 改写强度:quick 保守补细节,creative 允许重构构图与风格。
@@ -834,6 +986,9 @@ type CharacterManifest = {
     refKind?: CharacterViewKind
     /** zip 内的相对路径。没有这一项就是没有那张图 */
     ref?: string
+    /* 第一步上传的那张底图。它不属于五张设定图,所以单独一项 ——
+       少了它,导入回来的角色在重跑其余四张时就只剩正脸一张参考图 */
+    source?: string
     views?: Partial<Record<CharacterViewKind, string>>
   }>
 }
@@ -897,6 +1052,13 @@ export async function exportCharacter(c: Character, views: CharacterView[]): Pro
     const name = `ref.${extOfBlob(c.ref)}`
     files[name] = new Uint8Array(await c.ref.arrayBuffer())
     entry.ref = name
+    images++
+  }
+  // 底图与封面图多数时候不是同一张(封面是生成出来的正脸),所以要分开写
+  if (c.sourceRef) {
+    const name = `source.${extOfBlob(c.sourceRef)}`
+    files[name] = new Uint8Array(await c.sourceRef.arrayBuffer())
+    entry.source = name
     images++
   }
   const map: Partial<Record<CharacterViewKind, string>> = {}
@@ -972,6 +1134,8 @@ export async function readCharacterZip(file: File): Promise<ImportedCharacter[]>
     }
 
     const refBytes = typeof c.ref === 'string' ? fileAt(c.ref) : undefined
+    // 老包(底图还是单独一项之前导的)没有 source,读到的就是空 —— 退化成单图参考
+    const sourceBytes = typeof c.source === 'string' ? fileAt(c.source) : undefined
     out.push({
       name: c.name.trim(),
       createdAt: typeof c.createdAt === 'number' ? c.createdAt : Date.now(),
@@ -980,6 +1144,9 @@ export async function readCharacterZip(file: File): Promise<ImportedCharacter[]>
       ...(typeof c.desc === 'string' && c.desc.trim() ? { desc: c.desc.trim() } : {}),
       ...(refBytes
         ? { ref: new Blob([refBytes as BlobPart], { type: sniffMime(refBytes) }) }
+        : {}),
+      ...(sourceBytes
+        ? { sourceRef: new Blob([sourceBytes as BlobPart], { type: sniffMime(sourceBytes) }) }
         : {}),
       // 主参考图取自哪张视图,只有在图确实带上了时才有意义
       ...(refBytes && typeof c.refKind === 'string' && known.has(c.refKind)
@@ -1075,9 +1242,12 @@ export function saveCollections(list: Collection[]): void {
    参考图是 Blob,按 id 存在 IndexedDB,读的时候贴回去(与提示词封面同一套做法) */
 const CHAR_KEY = 'kimage.characters'
 
-/* 面貌特征:跨场景不该变的那八项。这八项会并进每一张成品的提示词 ——
+/* 面貌特征:跨场景不该变的那九项。这九项会并进每一张成品的提示词 ——
    只给头发和眼睛时,肤色、脸型、眉形全靠模型自己从零重编,换个场景就不是同一个人了 */
 const CHAR_FACE_FIELDS: Array<keyof CharacterFields> = [
+  /* 性别排在最前:顺序就是这个条件的强弱顺序。它是这张脸最基础的一档,
+     而且只在用户没写、模型也没读到的时候才会出问题 —— 出了就是换一个人 */
+  'gender',
   'identity',
   'face',
   'hair',
@@ -1278,6 +1448,7 @@ export function parseCharacterDraft(text: string): CharacterDraft {
      "Face marks" 这类多词标签怎么写都能对上 —— 起稿那条提示里用可读的两词
      标签,比为了迁就解析器写成 "NoseMouth" 好得多(人要能直接读懂回的是什么) */
   const keys: Record<string, keyof CharacterFields> = {
+    gender: 'gender',
     identity: 'identity',
     face: 'face',
     hair: 'hair',
@@ -1334,6 +1505,9 @@ export async function loadCharacters(): Promise<Character[]> {
     if (c.fields) c.fields = { ...emptyCharFields(), ...c.fields }
     const ref = refs.get(c.id)
     if (ref) c.ref = ref
+    // 底图另有 key,不是设定图之一(见 idb.ts 的 charSourceKey)
+    const source = refs.get(charSourceKey(c.id))
+    if (source) c.sourceRef = source
   }
   return list
 }
@@ -1341,16 +1515,21 @@ export async function loadCharacters(): Promise<Character[]> {
 /** 整份覆盖写回:目录小而全量重写最省心;参考图那边只补新增、删掉已经不在目录里的 */
 export async function saveCharacters(list: Character[]): Promise<void> {
   try {
-    // Blob 进不了 JSON(会变成 {}),序列化前必须把 ref 从条目上摘掉
-    localStorage.setItem(CHAR_KEY, JSON.stringify(list.map(({ ref: _ref, ...rest }) => rest)))
+    /* Blob 进不了 JSON(会变成 {}),序列化前必须把两张图从条目上摘掉。
+       底图也要摘 —— 漏掉它整条角色都写不进 localStorage,而且是不声不响地失败 */
+    localStorage.setItem(
+      CHAR_KEY,
+      JSON.stringify(list.map(({ ref: _ref, sourceRef: _source, ...rest }) => rest))
+    )
   } catch {
     /* ignore: 写不下就不写,下次改动再试 */
   }
-  await putCharRefs(
-    list
-      .filter((c): c is Character & { ref: Blob } => c.ref instanceof Blob)
-      .map((c) => ({ id: c.id, data: c.ref }))
-  )
+  const refs: CharRefRecord[] = []
+  for (const c of list) {
+    if (c.ref instanceof Blob) refs.push({ id: c.id, data: c.ref })
+    if (c.sourceRef instanceof Blob) refs.push({ id: charSourceKey(c.id), data: c.sourceRef })
+  }
+  await putCharRefs(refs)
 }
 
 /* ===== 提示词库(收藏) ===== */
