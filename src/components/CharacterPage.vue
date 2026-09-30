@@ -5,8 +5,12 @@ import {
   PhPlus,
   PhCalendar,
   PhClockCounterClockwise,
+  PhCopy,
+  PhDownloadSimple,
+  PhDotsThreeVertical,
   PhTrash,
   PhSparkle,
+  PhUploadSimple,
   PhArrowLeft,
   PhArrowRight,
   PhArrowsClockwise,
@@ -15,10 +19,11 @@ import {
   PhCaretRight,
   PhCheck,
   PhEye,
+  PhImage,
   PhLockSimple,
   PhX
 } from '@phosphor-icons/vue'
-import { CHARACTER_VIEWS, coverSrc, draftCharacterFields } from '../api'
+import { CHARACTER_VIEWS, coverSrc, draftCharacterFields, emptyCharFields } from '../api'
 import LatticeLoader from './LatticeLoader.vue'
 import type {
   ApiConfig,
@@ -56,6 +61,12 @@ type DraftForm = { name: string; fields: CharacterFields; desc: string; ref: str
 const emit = defineEmits<{
   (e: 'save', payload: { name: string; fields: CharacterFields; desc: string; refData: string }): void
   (e: 'remove', id: string): void
+  // 复制:目录与图都由主界面拷一份(这一页不碰字节)
+  (e: 'duplicate', id: string): void
+  // 导出成一个 zip。文件本身也由主界面生成 —— 打包要读图,那不归这一页管
+  (e: 'export', id: string): void
+  // 导入:只把选中的文件交出去,怎么读怎么落盘由主界面决定(与上面同一条分工)
+  (e: 'import', file: File): void
   (e: 'open', id: string): void
   // 拿这个角色去开画:套上角色并切回工作台,由主界面负责跳转
   (e: 'create', id: string): void
@@ -64,23 +75,123 @@ const emit = defineEmits<{
   (e: 'useRef', charId: string, kind: CharacterViewKind): void
 }>()
 
-function emptyFields(): CharacterFields {
-  return { identity: '', hair: '', eyes: '', outfit: '', marks: '' }
+// 导入用的隐藏 file input:页头那个按钮点它(见模板里的注释)
+const importInput = ref<HTMLInputElement | null>(null)
+
+/* 卡上那三枚管理动作(复制 / 导出 / 删除)收进一个 ⋮ 菜单。
+   三枚圆钮常驻在每张图的右上角太吵,而它们都是低频动作。
+   同一时刻只开一个:键是角色 id,同一套写法见 PromptLibrary */
+const openCardMenu = ref('')
+// 菜单默认朝下开。最后一行离视口底部不够高时改朝上 —— 否则菜单会伸到屏幕外
+const cardMenuUp = ref(false)
+// 菜单大致高度(三项 + 内边距 + 与按钮的间距),留一点余量
+const MENU_ROOM = 130
+/* 指针离开这张卡就把菜单收掉。⋮ 本来就是悬停才出现的,菜单却不跟着走 ——
+   指针一挪开,图上就剩一块没有锚点的浮层挂在那儿。
+   两个细节:① 留 120ms 宽限,⋮ 与菜单之间隔了 6px,横穿那一下不算"离开";
+   ② 只认鼠标 —— 触摸抬手时浏览器也会发 pointerleave,照做会把刚点开的菜单立刻收掉 */
+const MENU_GRACE = 120
+let menuLeaveTimer: number | undefined
+
+/** 收起菜单。几条收起的路径(再点 ⋮、点别处、Esc、选中动作)都走这里,
+ *  顺手把宽限计时器清掉 —— 否则它晚一步才响,会把刚重新打开的那张收掉 */
+function closeCardMenu() {
+  window.clearTimeout(menuLeaveTimer)
+  openCardMenu.value = ''
+}
+
+function toggleCardMenu(id: string, e: MouseEvent) {
+  if (openCardMenu.value === id) {
+    closeCardMenu()
+    return
+  }
+  const r = (e.currentTarget as HTMLElement | null)?.getBoundingClientRect()
+  cardMenuUp.value = !!r && r.bottom + MENU_ROOM > window.innerHeight
+  window.clearTimeout(menuLeaveTimer)
+  openCardMenu.value = id
+}
+
+/* 指针从 ⋮ 挪向菜单要穿过那道 6px 的缝,缝里既不在 ⋮ 上也不在菜单上 ——
+   于是先起倒计时,人重新落回这一片(pointerenter)就把倒计时撤掉 */
+function onMenuEnter() {
+  window.clearTimeout(menuLeaveTimer)
+}
+function onMenuLeave(e: PointerEvent) {
+  if (e.pointerType !== 'mouse') return
+  window.clearTimeout(menuLeaveTimer)
+  menuLeaveTimer = window.setTimeout(closeCardMenu, MENU_GRACE)
+}
+
+/* 展开后点别处收起:管理动作低频,不该逼用户再点一次 ⋮ 才能走。
+   用 closest 判断"点的是不是某个菜单内部",而不是记住某一个容器 ——
+   列表里每张卡都挂着一个菜单,一个 ref 挂多处只会拿到最后一个 */
+function onDocPointerDown(e: PointerEvent) {
+  if (!openCardMenu.value) return
+  const t = e.target as Element | null
+  if (t && typeof t.closest === 'function' && t.closest('.menu-wrap')) return
+  closeCardMenu()
+}
+
+/* 三个动作各自包一层:先收起菜单再交出去。
+   菜单留着不关会盖住卡片,而这三个动作都会让主界面改 props、重渲染这张卡 */
+function duplicateFromCard(id: string) {
+  closeCardMenu()
+  emit('duplicate', id)
+}
+function exportFromCard(id: string) {
+  closeCardMenu()
+  emit('export', id)
+}
+function removeFromCard(id: string) {
+  closeCardMenu()
+  emit('remove', id)
 }
 
 /* 两个视图态:列表(空)与详情(有 id)。
-   设定图与五项设定都挪进详情 —— 五张图加五项挤在一张卡上,
+   设定图与整套设定都挪进详情 —— 五张图加十项挤在一张卡上,
    既不好看也点不明白:点已有图会重新生成、想看大图又没地方看 */
 const detailId = ref('')
 // 正在全屏看的那张视图(空 = 没在看)
 const viewer = ref<CharacterViewKind | ''>('')
 // 正在编辑(新建)的表单
 const editing = ref(false)
-const draft = ref<DraftForm>({ name: '', fields: emptyFields(), desc: '', ref: '' })
+const draft = ref<DraftForm>({ name: '', fields: emptyCharFields(), desc: '', ref: '' })
 // 起稿:一句话 + 请求状态 + 它自己的报错(不占用生图那套错误出口)
 const idea = ref('')
 const drafting = ref(false)
 const draftError = ref('')
+
+/* 起稿填过、而用户还没动过的字段。
+   校对要有个落点 —— 提示写着 "check what it got wrong",但看不出哪几项是
+   模型编的:模型给的值和人手写的值在界面上长得一模一样。
+   改一下那一项就抹掉标记(见 markEdited),扫一眼就知道还剩哪几处没看过 */
+const aiFilled = ref<Partial<Record<keyof CharacterFields, boolean>>>({})
+// 有标记 ⇒ 组说明换成那条图例,不然用户不知道这枚点是什么意思
+const hasAiFilled = computed(() => Object.values(aiFilled.value).some(Boolean))
+// 已经填过内容 ⇒ 起稿按钮变成 Re-draft(不然想重来一次只能手动清十栏)
+const hasSpec = computed(() => Object.values(draft.value.fields).some((s) => (s || '').trim()))
+
+function markEdited(key: keyof CharacterFields) {
+  if (aiFilled.value[key]) aiFilled.value[key] = false
+}
+
+/* 规格字段是 textarea,随内容长高。
+   为什么不用 <input>:字段值上限 12 个词(约 70 字符),两列之后每栏只有 338px,
+   在 13px 下约 55 字符 —— 边界值会被截在视野外,只能靠方向键摸。
+   封顶三行、再多内部滚(见样式),不然一栏长起来会把整行拉高 */
+const vGrow = {
+  mounted(el: HTMLTextAreaElement) {
+    grow(el)
+  },
+  updated(el: HTMLTextAreaElement) {
+    grow(el)
+  }
+}
+function grow(el: HTMLTextAreaElement) {
+  // 先归零再量:不归零的话 scrollHeight 只会越量越大,永远缩不回去
+  el.style.height = 'auto'
+  el.style.height = `${el.scrollHeight}px`
+}
 
 const detailChar = computed(() => props.characters.find((c) => c.id === detailId.value))
 
@@ -114,12 +225,13 @@ function roleOf(c: Character) {
   return (c.fields?.identity || '').trim() || (c.desc || '').trim() || 'No spec yet'
 }
 
-/** 特征胶囊:设定的后四项,最多三枚 —— 卡片上只放得下这么多,
- *  完整的五项在详情页 */
+/** 特征胶囊:最多三枚 —— 卡片上只放得下这么多,完整的十项在详情页。
+ *  候选多于三枚是有意的:跨场景不变的面貌特征排在前面,后两项兜底 ——
+ *  老角色没有 face,靠它们仍能凑出三枚,不会只剩一行空白 */
 function traitsOf(c: Character): string[] {
   const f = c.fields
   if (!f) return []
-  return [f.hair, f.eyes, f.outfit, f.marks]
+  return [f.face, f.hair, f.eyes, f.outfit, f.marks]
     .map((s) => (s || '').trim())
     .filter(Boolean)
     .slice(0, 3)
@@ -199,6 +311,7 @@ function isBusy(kind: string) {
 function openDetail(id: string) {
   detailId.value = id
   viewer.value = ''
+  closeCardMenu()
   // 进详情才去取图:列表阶段一张都不读 IndexedDB
   emit('open', id)
   window.scrollTo({ top: 0, behavior: 'smooth' })
@@ -224,12 +337,14 @@ function closeViewer() {
   nextTick(() => restoreFocus?.focus())
   restoreFocus = null
 }
-/** 把 Tab 圈在大图内部。不用 inert 关掉整个应用 —— 那要动主界面,
- *  而这个框里只有几个按钮,一个循环就够了 */
-function trapTab(e: KeyboardEvent) {
-  const box = viewerBox.value
+/** 把一个浮层里的 Tab 圈在它自己内部。不用 inert 关掉整个应用 —— 那要动主界面,
+ *  而浮层里的控件就那么几个,一个循环就够了。
+ *  大图里只有按钮,向导里还有输入框,所以两者都收 */
+function trapTab(box: HTMLElement | null, e: KeyboardEvent) {
   if (!box) return
-  const items = Array.from(box.querySelectorAll<HTMLElement>('button:not([disabled])'))
+  const items = Array.from(
+    box.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled])')
+  )
   if (!items.length) return
   const first = items[0]
   const last = items[items.length - 1]
@@ -267,31 +382,50 @@ function applyViewerRef() {
   if (c && viewer.value) emit('useRef', c.id, viewer.value)
 }
 
-/* Esc 逐层退:先关大图,再回列表 ——
+/* Esc 逐层退:先关大图,再关向导,最后回列表 ——
    开着大图按 Esc 直接退出详情会让人丢掉"我看的是哪个角色"。
    左右键在大图里翻页,和预览卡同一套操作 */
 function onKey(e: KeyboardEvent) {
   if (e.key === 'Escape') {
     if (viewer.value) closeViewer()
+    else if (openCardMenu.value) closeCardMenu()
+    else if (editing.value) closeWizard()
     else if (detailId.value) backToList()
     return
   }
-  if (!viewer.value) return
-  if (e.key === 'Tab') trapTab(e)
-  else if (e.key === 'ArrowLeft') stepViewer(-1)
-  else if (e.key === 'ArrowRight') stepViewer(1)
+  // 大图与向导都是模态,但同一时刻只会开一个(一个在详情里,一个在列表里)
+  if (viewer.value) {
+    if (e.key === 'Tab') trapTab(viewerBox.value, e)
+    else if (e.key === 'ArrowLeft') stepViewer(-1)
+    else if (e.key === 'ArrowRight') stepViewer(1)
+  } else if (editing.value && e.key === 'Tab') {
+    trapTab(wizardBox.value, e)
+  }
 }
-onMounted(() => window.addEventListener('keydown', onKey))
-onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
+onMounted(() => {
+  window.addEventListener('keydown', onKey)
+  document.addEventListener('pointerdown', onDocPointerDown)
+})
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onKey)
+  document.removeEventListener('pointerdown', onDocPointerDown)
+  window.clearTimeout(menuLeaveTimer)
+})
 
 function startEdit() {
-  draft.value = { name: '', fields: emptyFields(), desc: '', ref: '' }
+  draft.value = { name: '', fields: emptyCharFields(), desc: '', ref: '' }
   idea.value = ''
   draftError.value = ''
-  // 向导从头开始:上一次留下的 id 与步数必须清掉,否则会直接跳进旧角色的第 3 步
+  // 向导从头开始:上一次留下的 id、步数与起稿标记必须清掉,否则会直接跳进旧角色的第 3 步
   step.value = 1
   wizardId.value = ''
+  aiFilled.value = {}
   editing.value = true
+  /* 向导是漂浮卡,相当于开了一层模态:焦点得收进卡里。
+     落点选卡片本身而不是第一个输入框 —— 先让读屏念出这张卡是什么,
+     再让用户自己 Tab 进"名字"那一栏 */
+  restoreWizardFocus = document.activeElement as HTMLElement | null
+  nextTick(() => wizardBox.value?.focus())
 }
 
 /* —— 新建向导 ——
@@ -313,12 +447,27 @@ const STEPS: Array<{ n: WizardStep; label: string }> = [
 const step = ref<WizardStep>(1)
 // 向导进行中的角色 id。第 1 步存完才有,后两步都靠它取图
 const wizardId = ref('')
+// 漂浮卡本身:用来把焦点收进来、把 Tab 圈住(与看大图的 viewerBox 同一套)
+const wizardBox = ref<HTMLElement | null>(null)
+// 打开向导时焦点在哪,关掉要还回去
+let restoreWizardFocus: HTMLElement | null = null
 
 const wizardChar = computed(() => props.characters.find((c) => c.id === wizardId.value))
 function wizardViewOf(kind: CharacterViewKind): CharacterView | undefined {
   return props.views[wizardId.value]?.find((v) => v.kind === kind)
 }
 const wizardFront = computed(() => wizardViewOf('front'))
+
+/** 生成正脸会拿哪张图当参考。这是第 2 步最该说清的一件事:
+ *  有主参考图就是图生图,没有就是纯文字生图 —— 出来的东西差别很大。
+ *  主参考图可能来自第一步上传的图,也可能是被"设为主视图"的某张设定图,
+ *  两者的说法不一样,所以要分开说(见 App 的 genCharView 与 useViewAsRef) */
+const heroSource = computed(() => {
+  const c = wizardChar.value
+  if (!c?.ref) return 'Text only — no reference image'
+  const kind = CHARACTER_VIEWS.find((v) => v.kind === c.refKind)?.label
+  return kind ? `${kind} view, set as the main one` : 'The reference image you uploaded'
+})
 // 第 3 步的四张,主视图不在其中
 const wizardRest = computed(() =>
   CHARACTER_VIEWS.filter((v) => v.kind !== 'front').map((v) => ({ ...v, view: wizardViewOf(v.kind) }))
@@ -370,17 +519,25 @@ function closeWizard() {
   step.value = 1
   wizardId.value = ''
   draftError.value = ''
+  /* 焦点还回当初点开的那个按钮 —— 不还的话键盘用户关掉浮层后
+     焦点会掉到 body 上,得从头 Tab 一遍(与关大图同一条理由) */
+  const back = restoreWizardFocus
+  restoreWizardFocus = null
+  if (back) nextTick(() => back.focus())
 }
 
 /** 走完三步:把角色交给详情页 —— 那里是它的"落地页",
  *  有完整设定表、大图查看,以及"用它开画" */
 function finishWizard() {
   const id = wizardId.value
+  /* 走完是"换页"而不是"关浮层",所以不留焦点还回目标 ——
+     列表里那个按钮已经不在页面上了,还回去只会把焦点丢在 body */
+  restoreWizardFocus = null
   closeWizard()
   if (id) openDetail(id)
 }
 
-/* 起稿:一句话交给文本模型拆成五项设定,回填后可逐项修改。
+/* 起稿:一句话交给文本模型拆成这套设定 + 一个名字,回填后可逐项修改。
    只填字段、不出图 —— 先校对再花钱。结果只落在这张表单里,不写库 */
 async function draftWithAI() {
   const text = idea.value.trim()
@@ -393,14 +550,24 @@ async function draftWithAI() {
   drafting.value = true
   draftError.value = ''
   try {
-    const f = await draftCharacterFields(cfg, text)
+    const d = await draftCharacterFields(cfg, text)
     // 一项都没解出来 = 模型没按那个格式回。如实说,别假装已经填好了
-    if (!Object.values(f).some((s) => s.trim())) {
+    if (!Object.values(d.fields).some((s) => s.trim())) {
       draftError.value =
         'The model did not return a usable spec. Fill the fields by hand, or try another text model.'
       return
     }
-    draft.value.fields = f
+    /* 名字只在还空着的时候补:它是这张卡的标题,用户自己敲进去的那个
+       不该被一次起稿顶掉。想换成模型起的名字,先清空再点一次 */
+    if (!draft.value.name.trim() && d.name) draft.value.name = d.name
+    draft.value.fields = d.fields
+    /* 记下这一趟哪些栏是模型填的。空着的那些不标 —— 标了反而像在说
+       "这里有什么要看",而它们本来就该留空(见 server 那条提示) */
+    const marks: Partial<Record<keyof CharacterFields, boolean>> = {}
+    for (const k of Object.keys(d.fields) as Array<keyof CharacterFields>) {
+      if (d.fields[k].trim()) marks[k] = true
+    }
+    aiFilled.value = marks
   } catch (e: any) {
     draftError.value = e?.message || 'Could not draft the character'
   } finally {
@@ -417,6 +584,15 @@ function onPickRef(e: Event) {
   ;(e.target as HTMLInputElement).value = ''
 }
 
+/* 导入:只把文件交出去。zip 要解包、图要落 IndexedDB —— 那是主界面的活,
+   这一页从头到尾不碰字节(与参考图那条路同一分工) */
+function onImportFile(e: Event) {
+  const file = (e.target as HTMLInputElement).files?.[0]
+  // 清空 input:同一个文件选第二次也要能触发 change
+  ;(e.target as HTMLInputElement).value = ''
+  if (file) emit('import', file)
+}
+
 function submit() {
   const d = draft.value
   if (!d.name.trim()) return
@@ -427,26 +603,85 @@ function submit() {
      那一格既没有 id 也没有图。存失败时表单留着,改完可以直接再点一次 */
 }
 
-/** 设定的摘要:把非空的项连起来给卡片当副标题 */
+/** 设定的摘要:挑最能认出这个人的几项连起来当副标题。
+ *  不是全部十项 —— 完整的规格表就在下面那个面板里,副标题再抄一遍只是噪声 */
 function summary(c: Character) {
   const f = c.fields
   if (!f) return c.desc || 'No spec yet'
-  return [f.identity, f.hair, f.eyes, f.outfit, f.marks].filter((s) => s && s.trim()).join(' · ')
+  return [f.identity, f.face, f.hair, f.eyes, f.outfit]
+    .map((s) => (s || '').trim())
+    .filter(Boolean)
+    .join(' · ')
 }
 
-// 详情页的规格表:五项固定设定按顺序排,再做一条可选的备注
-const SPEC_LABELS: Array<[keyof CharacterFields, string]> = [
-  ['identity', 'Identity'],
-  ['hair', 'Hair'],
-  ['eyes', 'Eyes'],
-  ['outfit', 'Outfit'],
-  ['marks', 'Marks']
+/* —— 表单里的字段 ——
+   键、标签、占位示例、能否留空,集中在这里。分两组的原因与 api.ts 一致:
+   面貌特征会跟着每一张成品走,后两项只塑造设定图。
+   表单、详情页的规格表都由这张表生成,所以标签不会两处走样。
+
+   optional 只影响界面上那个 Optional 标记 —— 起稿时谁必须编、谁可以留空,
+   由 server 那条提示决定(那里才说得出"编出来会不会改变人物") */
+type FieldSpec = {
+  key: keyof CharacterFields
+  label: string
+  // 占位示例:写具体值而不是"请输入",它同时是这一栏该写什么的示范
+  hint: string
+  optional?: boolean
+}
+
+const FACE_FIELDS: FieldSpec[] = [
+  { key: 'identity', label: 'Identity', hint: 'cyberpunk female warrior' },
+  { key: 'face', label: 'Face', hint: 'angular jaw, warm tan skin, late 30s' },
+  { key: 'hair', label: 'Hair', hint: 'short silver hair, undercut' },
+  { key: 'brows', label: 'Brows', hint: 'thick straight black brows' },
+  { key: 'eyes', label: 'Eyes', hint: 'glowing blue optics' },
+  { key: 'noseMouth', label: 'Nose & mouth', hint: 'narrow straight nose, full lips' },
+  { key: 'facialHair', label: 'Facial hair', hint: 'clean-shaven' },
+  { key: 'faceMarks', label: 'Face marks', hint: 'scar over left brow', optional: true }
 ]
+
+const SHEET_FIELDS: FieldSpec[] = [
+  { key: 'outfit', label: 'Outfit', hint: 'armored jacket, neon trim' },
+  { key: 'marks', label: 'Marks', hint: 'chrome right arm, engraved dog tags', optional: true }
+]
+
+/* 表单里十栏的完整顺序 —— 详情页的规格表按它排 */
+const ALL_FIELDS: FieldSpec[] = [...FACE_FIELDS, ...SHEET_FIELDS]
+
+/* 两组字段,各有自己的标题。
+   为什么要分成两组而不是一组加一条分界线 —— 这两组的差别是"会不会进你每一张图",
+   是这个角色设定里最要紧的一条界线。脚注语气(11px 灰字)压不住它,
+   所以给它一个与 Spec 平级的标题,让它自己成为一段 */
+type FormGroup = {
+  title: string
+  hint: string
+  fields: FieldSpec[]
+  // 这一组末尾再补一个自由备注栏(占满两列)。备注不是 CharacterFields 的成员
+  notes?: boolean
+}
+
+const FORM_GROUPS: FormGroup[] = [
+  {
+    title: 'Spec',
+    hint: 'The face travels with every image you generate.',
+    fields: FACE_FIELDS
+  },
+  {
+    title: 'Reference sheet only',
+    hint: 'Outfit, marks and notes — never merged into your prompts.',
+    fields: SHEET_FIELDS,
+    notes: true
+  }
+]
+
+/* 详情页的规格表:十项固定设定按顺序排,再做一条可选的备注 */
+const SPEC_LABELS: Array<[keyof CharacterFields, string]> = ALL_FIELDS.map((f) => [f.key, f.label])
 function specRows(c: Character) {
-  const f = c.fields || emptyFields()
-  const rows = SPEC_LABELS.map(([k, label]) => ({ label, value: (f[k] || '').trim() }))
+  const f = c.fields || emptyCharFields()
+  const rows = SPEC_LABELS.map(([k, label]) => ({ label, value: (f[k] || '').trim(), wide: false }))
   const notes = (c.desc || '').trim()
-  if (notes) rows.push({ label: 'Notes', value: notes })
+  // 备注是自由文本,回看时占满整行
+  if (notes) rows.push({ label: 'Notes', value: notes, wide: true })
   return rows
 }
 </script>
@@ -463,16 +698,36 @@ function specRows(c: Character) {
             applied, so the face stays the same across images.
           </p>
         </div>
-        <button v-if="!editing" class="chars-new" @click="startEdit">
-          <PhPlus aria-hidden="true" />
-          New character
-        </button>
+        <!-- 导入放页头:它是一次针对整个角色区的动作(一个包里可能有多个角色),
+             不属于某一张卡。按钮用 <button> 触发那个隐藏 input 而不是用 label ——
+             label 本身进不了 Tab 键序,键盘用户就点不到 -->
+        <div v-if="!editing" class="chars-acts">
+          <button class="chars-import" @click="importInput?.click()">
+            <PhUploadSimple aria-hidden="true" />
+            Import
+          </button>
+          <button class="chars-new" @click="startEdit">
+            <PhPlus aria-hidden="true" />
+            New character
+          </button>
+        </div>
       </header>
 
-      <!-- —— 新建向导 ——
-           三步摊成一张卡:步骤条在头上,内容在中间,进退在脚下。
-           没做到的那一步在条上是锁的,点不动 —— 顺序靠结构说,不靠报错说 -->
-      <section v-if="editing" class="wizard">
+      <!-- —— 新建向导:漂浮卡 ——
+           创建是一条独立流程,不该插进列表里把页面顶开 —— 它是盖在这一页之上的一层,
+           关掉就回到原样。三步摊成一张卡:步骤条在头上,内容在中间,进退在脚下;
+           没做到的那一步在条上是锁的,点不动 —— 顺序靠结构说,不靠报错说。
+           暗幕是与卡片平级的另一个 fixed 元素,不是把卡包起来(理由见样式注释) -->
+      <div v-if="editing" class="wz-veil" aria-hidden="true"></div>
+      <section
+        v-if="editing"
+        ref="wizardBox"
+        class="wizard"
+        role="dialog"
+        aria-modal="true"
+        aria-label="New character"
+        tabindex="-1"
+      >
         <nav class="wz-steps" aria-label="Creation steps">
           <template v-for="s in STEPS" :key="s.n">
             <span
@@ -503,148 +758,236 @@ function specRows(c: Character) {
 
         <!-- 第 1 步:基础信息 / 参考图。存下之前是可填的表单,
              存下之后换成只读摘要(角色已经落库,再点一次保存只会多一个副本) -->
-        <div v-if="step === 1" class="wz-pane">
+        <div v-if="step === 1" class="wz-pane wz-form">
           <template v-if="!wizardId">
-            <div class="wz-lead">
-              <h3 class="wz-h">Basics</h3>
-              <p class="wz-p">
-                One line is enough — let the model draft the spec, then fix what it got wrong. A
-                reference image is optional, but it pins the shape far better than words can.
+            <!-- 一句话 → 整套设定。放在最上面:这是这一页最常用的入口 ——
+                 大多数人是一句话起稿、再逐栏校对,而不是从空白一栏栏手填。
+                 它是件工具,不是又一项要填的内容,所以给它一整块自己的底;
+                 模型要填的是下面的字段,报错也留在它旁边而不是表单末尾 -->
+            <div class="wz-draft">
+              <label class="wz-draft-label" for="cp-idea">Describe it in a sentence</label>
+              <div class="wz-draft-row">
+                <input
+                  id="cp-idea"
+                  v-model="idea"
+                  class="ed-input"
+                  placeholder="cyberpunk female warrior"
+                  @keyup.enter="draftWithAI"
+                />
+                <button
+                  class="ed-btn primary"
+                  :disabled="drafting || !idea.trim()"
+                  @click="draftWithAI"
+                >
+                  <PhSparkle aria-hidden="true" />
+                  {{ drafting ? 'Drafting…' : hasSpec ? 'Re-draft' : 'Draft with AI' }}
+                </button>
+              </div>
+              <p v-if="draftError" class="wz-err" role="alert">{{ draftError }}</p>
+              <p v-else-if="drafting" class="wz-draft-hint">Filling the name and spec…</p>
+              <!-- 有标出来的栏时换成图例。图例放在这里而不是各组的说明里:
+                   标记是这一块产生的,而且两组里都可能有 —— 挂在哪一组都是偏的 -->
+              <p v-else-if="hasAiFilled" class="wz-draft-hint">
+                <span class="wz-ai" aria-hidden="true"></span>
+                written by the model — clears once you edit that field
+              </p>
+              <p v-else class="wz-draft-hint">
+                Fills the name and the spec — check what it got wrong.
               </p>
             </div>
 
-            <input
-              v-model="draft.name"
-              class="ed-input"
-              placeholder="Name"
-              aria-label="Character name"
-            />
+            <!-- 名字单独一栏,不与下面十项同组:它是这个角色的标识,
+                 不进任何提示词(见 types.ts 的 CharacterFields 注释),
+                 而下面十项都是"发给模型的条件"。两者性质不同,所以分开放。
 
-            <div class="ed-draft">
+                 它同时也是全表唯一必填的一栏,所以要有一个讲出来的标记 ——
+                 原来靠"禁用的 Save 按钮"暗示,而按钮在卡脚,离这里很远。
+                 字号回到与其它输入框同档:它上面就是起稿块,
+                 再拿 20px/600 当标题,在一排 12–15px 里只会显得不搭 -->
+            <label class="wz-field">
+              <span class="wz-label">
+                Name
+                <span class="wz-mark is-required">Required</span>
+              </span>
               <input
-                v-model="idea"
+                v-model="draft.name"
                 class="ed-input"
-                placeholder="One line, e.g. cyberpunk female warrior"
-                aria-label="Character idea"
-                @keyup.enter="draftWithAI"
+                placeholder="Name this character"
+                aria-required="true"
               />
-              <button class="ed-btn primary" :disabled="drafting || !idea.trim()" @click="draftWithAI">
-                <PhSparkle aria-hidden="true" />
-                {{ drafting ? 'Drafting…' : 'Draft with AI' }}
-              </button>
+            </label>
+
+            <!-- 十栏设定分成两组,各有自己的标题。
+                 这条界线的分量值得一个标题:上面八项会进你每一张成品,
+                 下面三项只塑造设定图 —— 它是这份设定里最要紧的一条区分。
+                 两组都由 FORM_GROUPS 生成,栏位的模板只写一遍 -->
+            <div v-for="g in FORM_GROUPS" :key="g.title" class="wz-group">
+              <div class="wz-group-head">
+                <h4 class="wz-group-title">{{ g.title }}</h4>
+                <span class="wz-group-hint">{{ g.hint }}</span>
+              </div>
+
+              <div class="wz-fields">
+                <label v-for="f in g.fields" :key="f.key" class="wz-field">
+                  <span class="wz-label">
+                    {{ f.label }}
+                    <span v-if="f.optional" class="wz-mark">Optional</span>
+                    <template v-if="aiFilled[f.key]">
+                      <span class="wz-ai" aria-hidden="true"></span>
+                      <span class="wz-sr">drafted by the model</span>
+                    </template>
+                  </span>
+                  <textarea
+                    v-grow
+                    rows="1"
+                    v-model="draft.fields[f.key]"
+                    class="ed-input"
+                    :placeholder="f.hint"
+                    @input="markEdited(f.key)"
+                  ></textarea>
+                </label>
+
+                <!-- 备注不进 CharacterFields(它是自由文本,不参与起稿的十行),
+                     所以单独写一格,占满两列 -->
+                <label v-if="g.notes" class="wz-field is-wide">
+                  <span class="wz-label">Notes</span>
+                  <textarea
+                    v-grow
+                    rows="1"
+                    v-model="draft.desc"
+                    class="ed-input"
+                    placeholder="Anything else worth pinning down"
+                  ></textarea>
+                </label>
+              </div>
             </div>
 
-            <div class="ed-fields">
-              <label class="ed-label" for="cp-identity">Identity</label>
-              <input
-                id="cp-identity"
-                v-model="draft.fields.identity"
-                class="ed-input"
-                placeholder="cyberpunk female warrior"
-              />
-              <label class="ed-label" for="cp-hair">Hair</label>
-              <input
-                id="cp-hair"
-                v-model="draft.fields.hair"
-                class="ed-input"
-                placeholder="short silver hair"
-              />
-              <label class="ed-label" for="cp-eyes">Eyes</label>
-              <input
-                id="cp-eyes"
-                v-model="draft.fields.eyes"
-                class="ed-input"
-                placeholder="glowing blue optics"
-              />
-              <label class="ed-label" for="cp-outfit">Outfit</label>
-              <input
-                id="cp-outfit"
-                v-model="draft.fields.outfit"
-                class="ed-input"
-                placeholder="armored jacket, neon trim"
-              />
-              <label class="ed-label" for="cp-marks">Marks</label>
-              <input
-                id="cp-marks"
-                v-model="draft.fields.marks"
-                class="ed-input"
-                placeholder="scar over left brow, chrome arm"
-              />
+            <!-- 参考图:比文字更能定形状,但是可选的,所以放在最后 -->
+            <div class="wz-group">
+              <div class="wz-group-head">
+                <h4 class="wz-group-title">
+                  Reference image
+                  <span class="wz-mark">Optional</span>
+                </h4>
+              </div>
+
+              <!-- 空态与有图态占同样的高度:挑完图不该整块往上跳一下 -->
+              <div v-if="draft.ref" class="wz-ref">
+                <img class="wz-ref-thumb" :src="draft.ref" alt="Reference image" />
+                <span class="wz-ref-body">
+                  <span class="wz-ref-main">Reference image</span>
+                  <span class="wz-ref-hint">Applied on top of the spec when generating</span>
+                </span>
+                <button class="ed-btn" @click="draft.ref = ''">Remove</button>
+              </div>
+              <label v-else class="wz-ref wz-ref-pick" for="cp-file">
+                <PhImage aria-hidden="true" />
+                <span class="wz-ref-body">
+                  <span class="wz-ref-main">Add an image</span>
+                  <span class="wz-ref-hint">Pins the shape far better than words can</span>
+                </span>
+              </label>
             </div>
-
-            <input
-              v-model="draft.desc"
-              class="ed-input"
-              placeholder="Anything else (optional)"
-              aria-label="Extra notes"
-            />
-
-            <!-- 参考图可选:有图时它能直接定形状,比让模型照文字猜准得多 -->
-            <div class="ed-ref">
-              <img v-if="draft.ref" class="ed-thumb" :src="draft.ref" alt="Reference" />
-              <label v-else class="ed-pick" for="cp-file">+ Reference image (optional)</label>
-              <button v-if="draft.ref" class="ed-btn" @click="draft.ref = ''">Remove image</button>
-            </div>
-
-            <p v-if="draftError" class="ed-err" role="alert">{{ draftError }}</p>
           </template>
 
           <template v-else-if="wizardChar">
-            <div class="wz-lead">
-              <h3 class="wz-h">Basics</h3>
-              <p class="wz-p">Saved. This spec is what every view is built from.</p>
-            </div>
             <div class="wz-sum">
-              <span class="wz-sum-name">{{ wizardChar.name }}</span>
-              <img
-                v-if="wizardChar.ref"
-                class="ed-thumb"
-                :src="coverSrc(wizardChar.ref)"
-                alt="Reference"
-              />
+              <h4 class="wz-sum-name">{{ wizardChar.name }}</h4>
+              <span class="wz-sum-note">Saved</span>
             </div>
-            <dl class="spec">
-              <template v-for="r in specRows(wizardChar)" :key="r.label">
-                <dt class="spec-k">{{ r.label }}</dt>
-                <dd class="spec-v" :class="{ dim: !r.value }">{{ r.value || '—' }}</dd>
-              </template>
-            </dl>
+            <img
+              v-if="wizardChar.ref"
+              class="wz-sum-thumb"
+              :src="coverSrc(wizardChar.ref)"
+              alt=""
+            />
+            <div class="wz-group">
+              <div class="wz-group-head">
+                <h4 class="wz-group-title">Spec</h4>
+                <span class="wz-group-hint">This is what every view is built from.</span>
+              </div>
+              <div class="wz-fields">
+                <div
+                  v-for="r in specRows(wizardChar)"
+                  :key="r.label"
+                  class="wz-field is-readonly"
+                  :class="{ 'is-wide': r.wide }"
+                >
+                  <span class="wz-label">{{ r.label }}</span>
+                  <span class="wz-value" :class="{ dim: !r.value }">{{ r.value || '—' }}</span>
+                </div>
+              </div>
+            </div>
           </template>
         </div>
 
-        <!-- 第 2 步:主视图。它是整条流水线的锚,其余四张都照它生成 -->
+        <!-- 第 2 步:主视图。它是整条流水线的锚,其余四张都照它生成。
+             左图右事:空态、生成中、已有图共用同一个框,所以点下去之后画面不跳。
+             右边那一栏回答两件这一屏最该说清的事 ——
+             它会拿哪张图当参考,以及"接下来该点哪里" -->
         <div v-else-if="step === 2" class="wz-pane">
           <div class="wz-lead">
             <h3 class="wz-h">Main view</h3>
             <p class="wz-p">
-              The anchor every other view is built from, so it pays to get this one right before
-              moving on. Uploaded a reference image? That already works as the main one.
+              The anchor every other view is built from — so it pays to get this one right before
+              moving on.
             </p>
           </div>
 
-          <div class="wz-focus">
-            <div class="cell">
+          <div class="wz-hero">
+            <div class="wz-hero-shot">
+              <div class="cell">
+                <button
+                  v-if="wizardFront"
+                  class="cell-img has-img"
+                  :disabled="!!props.busy"
+                  aria-label="Regenerate the main view"
+                  @click="emit('generate', wizardId, 'front')"
+                >
+                  <img :src="coverSrc(wizardFront.data)" alt="" />
+                  <span class="cell-zoom" aria-hidden="true"><PhArrowsClockwise /></span>
+                </button>
+                <button
+                  v-else
+                  class="cell-img start"
+                  :class="{ busy: isBusy('front') }"
+                  :disabled="!!props.busy"
+                  aria-label="Generate the main view"
+                  @click="emit('generate', wizardId, 'front')"
+                >
+                  <span class="cell-ph" aria-hidden="true">+</span>
+                </button>
+                <span class="cell-label">{{ isBusy('front') ? 'Generating…' : 'Front' }}</span>
+              </div>
+            </div>
+
+            <div class="wz-hero-body">
+              <p class="wz-hero-note">
+                {{
+                  wizardFront
+                    ? 'Every other view is generated from this one — that is what keeps the face the same.'
+                    : 'One front-facing headshot. It becomes the reference every other view is built from.'
+                }}
+              </p>
+
+              <!-- 这一步最该说清、而界面上一直没地方说的一件事:正脸会拿哪张图当参考。
+                   有主参考图就是图生图,没有就是纯文字生图 —— 出来的东西差别很大 -->
+              <dl class="wz-facts">
+                <dt class="wz-facts-k">Generated from</dt>
+                <dd class="wz-facts-v">{{ heroSource }}</dd>
+              </dl>
+
+              <!-- 主按钮永远代表"接下来该做的那件事":还没有正脸时是它;
+                   有了之后主按钮交给卡脚那个 Next(见卡脚上的条件 class) -->
               <button
-                v-if="wizardFront"
-                class="cell-img has-img"
+                class="ed-btn"
+                :class="{ primary: !wizardFront }"
                 :disabled="!!props.busy"
-                aria-label="Regenerate the main view"
                 @click="emit('generate', wizardId, 'front')"
               >
-                <img :src="coverSrc(wizardFront.data)" alt="" />
-                <span class="cell-zoom" aria-hidden="true"><PhArrowsClockwise /></span>
+                <PhSparkle v-if="!props.busy" aria-hidden="true" />
+                {{ props.busy ? 'Generating…' : wizardFront ? 'Regenerate' : 'Generate main view' }}
               </button>
-              <button
-                v-else
-                class="cell-img start"
-                :class="{ busy: isBusy('front') }"
-                :disabled="!!props.busy"
-                aria-label="Generate the main view"
-                @click="emit('generate', wizardId, 'front')"
-              >
-                <span class="cell-ph" aria-hidden="true">+</span>
-              </button>
-              <span class="cell-label">{{ isBusy('front') ? 'Generating…' : 'Front' }}</span>
             </div>
           </div>
         </div>
@@ -670,7 +1013,12 @@ function specRows(c: Character) {
           </div>
 
           <div class="wz-grid">
-            <div v-for="cell in wizardRest" :key="cell.kind" class="cell">
+            <div
+              v-for="cell in wizardRest"
+              :key="cell.kind"
+              class="cell"
+              :class="{ 'is-portrait': cell.framing === 'portrait' }"
+            >
               <button
                 v-if="cell.view"
                 class="cell-img has-img"
@@ -708,9 +1056,13 @@ function specRows(c: Character) {
           <button v-else-if="step === 1" class="ed-btn primary" @click="goStep(2)">
             Next: main view
           </button>
+          <!-- 主按钮永远只该有一个:第 2 步还没有正脸时,主按钮是卡身里那个
+               "Generate main view";出了正脸才轮到这里的 Next(见卡身的条件 class)。
+               两个都涂黑会让"下一步做什么"变得含糊 -->
           <button
             v-else-if="step === 2"
-            class="ed-btn primary"
+            class="ed-btn"
+            :class="{ primary: !!wizardFront }"
             :disabled="!wizardFront"
             @click="goStep(3)"
           >
@@ -804,17 +1156,39 @@ function specRows(c: Character) {
               @click="openDetail(c.id)"
             ></button>
           </div>
-          <button
-            class="ctile-del"
-            :aria-label="`Delete ${c.name}`"
-            @click.stop="emit('remove', c.id)"
+          <!-- 图右上角一枚 ⋮:复制 / 导出 / 删除都收在它后面。
+               三枚圆钮常驻太吵,窄屏上还会占掉整条上沿(小卡只有约 176px 宽) -->
+          <div
+            class="ctile-menu menu-wrap"
+            :class="{ open: openCardMenu === c.id }"
+            @pointerenter="onMenuEnter"
+            @pointerleave="onMenuLeave"
           >
-            <PhTrash aria-hidden="true" />
-          </button>
+            <button
+              class="ctile-dots"
+              :aria-label="`More actions for ${c.name}`"
+              aria-haspopup="menu"
+              :aria-expanded="openCardMenu === c.id"
+              @click.stop="toggleCardMenu(c.id, $event)"
+            >
+              <PhDotsThreeVertical aria-hidden="true" />
+            </button>
+            <div v-if="openCardMenu === c.id" class="menu" :class="{ up: cardMenuUp }" role="menu">
+              <button class="mitem" role="menuitem" @click.stop="duplicateFromCard(c.id)">
+                <PhCopy aria-hidden="true" />Duplicate
+              </button>
+              <button class="mitem" role="menuitem" @click.stop="exportFromCard(c.id)">
+                <PhDownloadSimple aria-hidden="true" />Export
+              </button>
+              <button class="mitem danger" role="menuitem" @click.stop="removeFromCard(c.id)">
+                <PhTrash aria-hidden="true" />Delete
+              </button>
+            </div>
+          </div>
         </article>
       </div>
 
-      <div v-else-if="!editing" class="empty">
+      <div v-else class="empty">
         <PhMaskHappy class="empty-ico" aria-hidden="true" />
         <h3 class="empty-title">No characters yet</h3>
         <p class="empty-sub">
@@ -832,10 +1206,22 @@ function specRows(c: Character) {
           <PhArrowLeft aria-hidden="true" />
           All characters
         </button>
-        <button class="dt-del" @click="emit('remove', detailChar.id)">
-          <PhTrash aria-hidden="true" />
-          Delete
-        </button>
+        <!-- 三个动作都收在这一行:复制(改一个变体)、导出(带走)、删除(破坏性)。
+             删除仍然压成静默的字、悬停才亮红 —— 三个都是同样的份量会读不出主次 -->
+        <div class="dt-acts">
+          <button class="dt-act" @click="emit('duplicate', detailChar.id)">
+            <PhCopy aria-hidden="true" />
+            Duplicate
+          </button>
+          <button class="dt-act" @click="emit('export', detailChar.id)">
+            <PhDownloadSimple aria-hidden="true" />
+            Export
+          </button>
+          <button class="dt-del" @click="emit('remove', detailChar.id)">
+            <PhTrash aria-hidden="true" />
+            Delete
+          </button>
+        </div>
       </div>
 
       <!-- 身份区:头像用正脸,名字和设定一眼看全,进度与参考图作为标签摆在下面 -->
@@ -902,7 +1288,7 @@ function specRows(c: Character) {
             v-for="cell in sheetCells"
             :key="cell.kind"
             class="cell"
-            :class="{ 'is-ref': refKind === cell.kind }"
+            :class="{ 'is-ref': refKind === cell.kind, 'is-portrait': cell.framing === 'portrait' }"
           >
             <button
               v-if="cell.view"
@@ -1010,6 +1396,15 @@ function specRows(c: Character) {
     </div>
 
     <input id="cp-file" type="file" accept="image/*" hidden @change="onPickRef" />
+    <!-- 导入用的 file input:页头那个按钮点它。这里只认 .zip ——
+         角色包一定是 zip(设定 + 图),`.json` 那种没有脸的包不该被导进来 -->
+    <input
+      ref="importInput"
+      type="file"
+      accept=".zip,application/zip"
+      hidden
+      @change="onImportFile"
+    />
   </div>
 </template>
 
@@ -1041,6 +1436,43 @@ function specRows(c: Character) {
   line-height: 1.6;
   color: var(--text-2);
 }
+/* 页头右侧一组动作。页头只该有一个实心按钮,所以导入用描边款 ——
+   两个都涂黑等于没有主次 */
+.chars-acts {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+.chars-import {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  height: 34px;
+  padding: 0 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  color: var(--text-2);
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  cursor: pointer;
+  transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease),
+    background var(--dur) var(--ease);
+}
+.chars-import:hover {
+  color: var(--text);
+  background: var(--bg-elev);
+}
+.chars-import:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.chars-import svg {
+  width: 15px;
+  height: 15px;
+}
 /* 与设置页「Add config」、提示词库「New prompt」同款:黑药丸,标题行主操作 */
 .chars-new {
   display: inline-flex;
@@ -1065,25 +1497,51 @@ function specRows(c: Character) {
   height: 15px;
 }
 
-/* —— 新建向导 ——
+/* —— 新建向导:漂浮卡 ——
+   创建是一条独立流程,不该插进列表里把页面顶开 —— 它是盖在这一页之上的一层,
+   关掉就回到原样。与全屏看大图(viewer)同一套模态语言:暗幕 + 模糊 + 居中的卡。
    一张卡分三层:卡头步骤条 / 卡身当前步 / 卡脚进退。
    overflow:hidden 让卡头卡脚的底色被圆角切齐,不然会顶出四个直角 */
+
+/* 暗幕。与卡片是平级的两个 fixed 元素,而不是"卡包在暗幕里":
+   卡片要 overflow:hidden 来切圆角,一旦套进暗幕里,那层 overflow
+   会顺手把铺满视口的背景裁掉 */
+.wz-veil {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  background: color-mix(in srgb, var(--stage-bg) 86%, transparent);
+  backdrop-filter: blur(6px);
+}
 .wizard {
+  /* 用 top/left 50% + translate 居中,而不是外面再套一个 flex 容器:
+     卡片高度由内容决定,auto 高度下 margin:auto 居中并不成立,
+     而套容器就得把整块模板再缩进一级 —— 为居中多包一层不划算 */
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 71;
   display: flex;
   flex-direction: column;
-  margin-top: var(--sp-5);
+  width: min(720px, calc(100% - 2 * var(--sp-4)));
+  max-height: calc(100vh - 2 * var(--sp-4));
   border: 1px solid var(--line);
   border-radius: var(--r);
   background: var(--surface);
+  box-shadow: var(--sh-md);
+  /* 卡片自己不滚 —— 只有中间的信息区滚(见 .wz-pane)。
+     卡头卡脚于是天然钉在原地:滚动的是信息区,它们根本不在那个滚动容器里 */
   overflow: hidden;
 }
 /* 步骤条:横向三步,中间用短线连起来。
    线点亮 = 前一步做完了 —— 进度不必靠读文字,余光扫一眼就知道走到哪 */
 .wz-steps {
+  flex: none;
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 13px var(--sp-4);
+  padding: 11px var(--sp-4);
   border-bottom: 1px solid var(--line);
   background: var(--bg);
 }
@@ -1154,8 +1612,17 @@ function specRows(c: Character) {
   font-weight: 600;
 }
 
-/* 卡身:当前这一步的内容。间距与旧表单一致(10px 一档) */
+/* 卡身:当前这一步的内容,间距 10px 一档。
+   它就是那个滚动区 —— 卡片不滚,滚的是这一层(见 .wizard)。
+   十一栏加两组标题装不下时只有中间这段滑动,卡头卡脚不动,
+   这才是"信息区域滚动"该有的样子。
+   min-height:0 是关键:少了它 flex 子项不肯缩,滚动条根本出不来 */
 .wz-pane {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  /* 滚到底不再把滚动传给后面的页面 —— 否则滚过头会连背景一起滚走 */
+  overscroll-behavior: contain;
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -1186,15 +1653,47 @@ function specRows(c: Character) {
   color: var(--text-2);
 }
 
-/* 主视图那一步整屏就一张图,给它一个固定的大框 ——
-   它是这一屏唯一要看的东西,不该和四张小格平分宽度 */
-.wz-focus {
+/* 主视图那一步:左图右事。
+   为什么并排 —— 原来是"一个 300px 的方块浮在 720px 的卡中间",左右各空 390px,
+   而这一屏最该说清的两件事(拿哪张图当参考、接下来点哪里)一个字都没说。
+   并排之后图有分量,说明也有地方可放 */
+.wz-hero {
   display: flex;
-  justify-content: center;
-  padding: var(--sp-2) 0 var(--sp-3);
+  align-items: center;
+  gap: var(--sp-5);
 }
-.wz-focus .cell {
-  width: min(300px, 100%);
+.wz-hero-shot {
+  flex: none;
+  width: min(288px, 44%);
+}
+.wz-hero-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  flex: 1;
+  min-width: 0;
+}
+.wz-hero-note {
+  max-width: 46ch;
+  font-size: var(--fs-sm);
+  line-height: 1.6;
+  color: var(--text-2);
+}
+/* 事实行:标签 + 值,与详情页规格表同一套语言(dt/dd 两列)——
+   这里说的正是"这次会用到的条件",用同一套写法读者不必重新认 */
+.wz-facts {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: baseline;
+  gap: 4px var(--sp-3);
+}
+.wz-facts-k {
+  font-size: var(--fs-xs);
+  color: var(--text-3);
+}
+.wz-facts-v {
+  font-size: var(--fs-sm);
+  color: var(--text);
 }
 /* 其余四张:一排四格,与详情页的设定图同一套格子语言 */
 .wz-grid {
@@ -1203,64 +1702,310 @@ function specRows(c: Character) {
   gap: var(--sp-3);
 }
 
-/* 第 1 步回看时的只读摘要 */
-.wz-sum {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-.wz-sum-name {
-  font-size: var(--fs-lg);
-  font-weight: 600;
-  letter-spacing: var(--ls-tight);
-  color: var(--text);
-}
-
-/* 卡脚:主操作在左,回退与退出紧跟其后(与表单里一贯的主次排法一致) */
+/* 卡脚:主操作在左,回退与退出紧跟其后(与表单里一贯的主次排法一致)。
+   它不在滚动区里,所以滚动的永远是卡身,它自己不动 */
 .wz-foot {
+  flex: none;
   display: flex;
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
-  padding: var(--sp-3) var(--sp-4);
+  padding: 10px var(--sp-4);
   border-top: 1px solid var(--line);
   background: var(--bg);
 }
 
-/* —— 编辑表单 —— */
-.ed-draft,
-.ed-ref {
+/* —— 第 1 步的表单 ——
+   这一页曾经是"九行控件同一个间距、同一种输入框、同一个视觉重量":
+   角色名和 "Marks" 长得一模一样,看不出从哪儿下手,也看不出哪些是一段。
+
+   现在分三档,每一档用不同的手段区分(面积 / 字号 / 颜色),不靠装饰:
+     1 入口   起稿块   —— 淡墨底 + 描边,整张卡唯一一块"区域",重点在这
+     2 分区   组标题   —— 15/600 满墨 + 下压一条横线
+     3 字段   标签/提示 —— 12/500 灰、12/400 更灰,输入框一律 13px
+   名字不在三档里:它是一栏普通字段(见模板里的注释),只是多一枚 Required 标记。
+   间距同时承担分组:组与组 24px、组内 8–10px */
+.wz-form {
+  /* 组与组 24px(--sp-5)、组内 8–10px。三倍的落差就是分层的依据,不靠边框;
+     滚动已经交给信息区了,这里不必再为了省高度把层次压平 */
+  gap: var(--sp-5);
+}
+
+/* 起稿块是这一页的重点:它是最常用的入口 —— 一句话交给模型,
+   下面十一栏由它填出来。所以它拿的是整张卡上唯一一块"区域"待遇:
+   淡墨底 + 同色描边(别处的框都是白底细线),里面的输入框则是白的,
+   于是"区域 - 输入槽 - 主按钮"三层一眼分得开。
+   标题也跟着组标题同档(15/600 满墨),而不是又一个灰标签 */
+.wz-draft {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: var(--sp-3);
+  border: 1px solid color-mix(in oklch, var(--accent) 22%, var(--line));
+  border-radius: var(--r-sm);
+  background: var(--accent-soft);
+}
+.wz-draft-label {
+  font-size: var(--fs-md);
+  font-weight: 600;
+  color: var(--text);
+}
+.wz-draft-row {
   display: flex;
   align-items: center;
   gap: 8px;
 }
+.wz-draft-row .ed-input {
+  flex: 1;
+}
+/* 提示与报错都留在这块里:它们是"这一句交给模型"的结果。
+   原本挂在表单最末尾,离触发它的按钮隔了四行。
+   提示用 text-2 而不是 text-3:这块底是 bg-elev,text-3 在它上面只有 4.40:1,
+   过不了正文的 4.5 —— text-3 的 4.6:1 是按 bg / surface 标的 */
+.wz-draft-hint {
+  /* flex 是为了让图例里那枚小点与文字对齐;纯文案时就是一个普通的文本行 */
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+  color: var(--text-2);
+}
+.wz-err {
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+  color: var(--danger);
+}
+
+/* 组:标题 + 一句说明 + 内容 */
+.wz-group {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+/* 组标题行下面压一条横线:它是"分层"最直接的凭据 ——
+   光靠字号差,十栏的灰标签会把组标题淹掉 */
+.wz-group-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 2px 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+}
+.wz-group-title {
+  display: inline-flex;
+  /* 基线对齐:标题里有 "Optional" 这种小一号的字,居中会看起来是斜的 */
+  align-items: baseline;
+  gap: 8px;
+  /* 15px/600 满墨 —— 与字段标签(12/500 灰)差两档,
+     原来 13/600 和标签几乎一样重,所以组与组之间看不出边界 */
+  font-size: var(--fs-md);
+  font-weight: 600;
+  color: var(--text);
+}
+/* 说明用 text-3 而不是 text-4:后者在浅色面上过不了 4.5:1 */
+.wz-group-hint {
+  font-size: var(--fs-xs);
+  color: var(--text-3);
+}
+/* 标签行里的小标记:Optional / Required 用同一套,位置也一样 ——
+   有标记的那几栏一眼看得出来,没标记的就是普通栏。
+   不做胶囊:一块 --surface-hover 的底会把 11px 的灰字压到 4.17:1,
+   同一个意思,一行更淡的字就够了,也少一件装饰 */
+.wz-mark {
+  font-size: var(--fs-micro);
+  font-weight: 400;
+  color: var(--text-3);
+}
+/* "必填"要能压住视线:它是一条约束,不是一句补充。
+   全表只有这一栏必填,所以不必再用星号加图例那种写法 */
+.wz-mark.is-required {
+  font-weight: 500;
+  color: var(--text-2);
+}
+
+/* 字段区:两列,每格是"标签在上、输入在下"。
+   为什么两列 —— 十栏一行一个往下堆时整张表约 890px,而卡身可用高度是
+   「视口 − 卡头 48 − 卡脚 60 − 上下留白 32」,900px 的屏只有约 760px:
+   校对十栏得上下翻。两列之后 11 行变 6 行,一屏能看全。
+   为什么标签在上而不是在左 —— 在左的话每列只剩 338 − 96 − 12 = 230px,
+   13px 下约 37 字符,而字段值上限是 12 个词(约 70 字符) */
+.wz-fields {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  align-items: start;
+  gap: var(--sp-3) var(--sp-4);
+}
+.wz-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+/* 备注是自由文本,占满两列 */
+.wz-field.is-wide {
+  grid-column: 1 / -1;
+}
+.wz-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  /* 12/500 灰 —— 字段标签是这一页的第四档,比组标题低两档。
+     12px 与详情页规格表的 .spec-k 同一档,不是新开的尺寸 */
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  color: var(--text-2);
+}
+/* 起稿填过、还没动过的标记。一枚小点就够了 ——
+   用户一改那一栏就消失(见 markEdited),组说明里同时换成对应图例 */
+.wz-ai {
+  flex: none;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+/* 给读屏的"这栏是模型填的"。视觉上靠那枚点,但那枚点不值得被念出来 */
+.wz-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+/* 只读回看与填表共用同一套字段网格:填进去的和读回来的长得一样 */
+.wz-field.is-readonly .wz-label {
+  font-weight: 400;
+  color: var(--text-3);
+}
+.wz-value {
+  font-size: var(--fs-sm);
+  line-height: 1.6;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.wz-value.dim {
+  color: var(--text-3);
+}
+
+/* 参考图:空态与有图态同一个外框、同一个高度 —— 挑完图不该整块往上跳一下 */
+.wz-ref {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  min-height: 68px;
+  padding: 9px var(--sp-3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--bg);
+}
+.wz-ref-pick {
+  border-style: dashed;
+  border-color: var(--line-strong);
+  cursor: pointer;
+  transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+.wz-ref-pick:hover {
+  border-color: var(--accent);
+  background: var(--bg-elev);
+}
+.wz-ref-pick > svg {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  color: var(--text-3);
+  transition: color var(--dur) var(--ease);
+}
+.wz-ref-pick:hover > svg {
+  color: var(--text);
+}
+.wz-ref-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  flex: 1;
+  min-width: 0;
+}
+.wz-ref-main {
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  color: var(--text);
+}
+.wz-ref-hint {
+  font-size: var(--fs-xs);
+  /* 同 text-3 的账:这块底是 bg,悬停时变 bg-elev,text-3 在后者上只有 4.40:1 */
+  color: var(--text-2);
+}
+.wz-ref-thumb {
+  flex: none;
+  /* 48 + 上下内边距 18 + 边框 2 = 68,与空态的 min-height 分毫不差 ——
+     挑完图那一行不会悄悄长高两像素 */
+  width: 48px;
+  height: 48px;
+  object-fit: cover;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line);
+}
+
+/* 存下之后的回看:名字一行,下面是只读设定 */
+.wz-sum {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.wz-sum-name {
+  font-size: var(--fs-xl);
+  font-weight: 600;
+  letter-spacing: var(--ls-tight);
+  color: var(--text);
+}
+.wz-sum-note {
+  font-size: var(--fs-xs);
+  color: var(--text-3);
+}
+.wz-sum-thumb {
+  width: 64px;
+  height: 64px;
+  object-fit: cover;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line);
+}
+
+/* —— 表单控件:所有文本输入共用 —— */
 .ed-input {
   width: 100%;
   min-width: 0;
-  padding: 9px 12px;
+  padding: 10px 12px;
   border: 1px solid var(--line);
   border-radius: var(--r-sm);
   background: var(--bg);
   color: var(--text);
   font-size: var(--fs-sm);
-  transition: border-color var(--dur) var(--ease);
+  transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
 }
-.ed-draft .ed-input {
-  flex: 1;
-}
-.ed-input:focus {
-  border-color: var(--accent);
-}
-/* 五项设定:左标签右输入 */
-.ed-fields {
-  display: grid;
-  grid-template-columns: 78px 1fr;
-  align-items: center;
-  gap: 8px 10px;
-}
-.ed-label {
-  font-size: var(--fs-xs);
+/* 占位符显式定色:浏览器默认那一档灰在浅色面上过不了 4.5:1 */
+.ed-input::placeholder {
   color: var(--text-3);
+}
+/* 聚焦给一圈晕(accent-soft 这个 token 本来就是留给聚焦的);
+   只换描边色在键盘操作时太不起眼 */
+.ed-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+/* 规格字段是 textarea,随内容长高(见 vGrow)。
+   刻意不封顶:封顶就得配 overflow,字段里会多出一条自己的滚动条 ——
+   一页里不该有两条。长内容让这一格变高,整张卡跟着长,滚动交给卡片自己 */
+.wz-field textarea.ed-input {
+  resize: none;
+  line-height: 1.5;
+  overflow: hidden;
 }
 .ed-btn {
   display: inline-flex;
@@ -1289,6 +2034,12 @@ function specRows(c: Character) {
   opacity: 0.5;
   cursor: default;
 }
+/* 键盘走到哪个按钮上要看得见:这条以前是缺的,只有 hover 有反馈 */
+.ed-btn:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
 .ed-btn svg {
   width: 15px;
   height: 15px;
@@ -1307,25 +2058,6 @@ function specRows(c: Character) {
   border-color: var(--cta);
   color: var(--text);
   background: var(--bg-elev);
-}
-.ed-pick {
-  padding: 9px 14px;
-  border: 1px dashed var(--line-strong);
-  border-radius: var(--r-sm);
-  color: var(--text-2);
-  font-size: var(--fs-sm);
-  cursor: pointer;
-}
-.ed-thumb {
-  width: 56px;
-  height: 56px;
-  object-fit: cover;
-  border-radius: var(--r-sm);
-  border: 1px solid var(--line);
-}
-.ed-err {
-  font-size: var(--fs-sm);
-  color: var(--danger);
 }
 
 /* —— 列表:角色海报卡 —— */
@@ -1602,13 +2334,15 @@ function specRows(c: Character) {
   color: rgba(255, 255, 255, 0.6);
 }
 
-/* 删除:浮在图右上角的玻璃圆钮,压在照片上,刻意不走 token ——
-   仍按暖白纸调子避开纯黑纯白;加一道模糊让它"浮"住 */
-.ctile-del {
+/* 图上角的管理入口:一枚 ⋮ 打开复制 / 导出 / 删除,压在照片上,
+   刻意不走 token —— 仍按暖白纸调子避开纯黑纯白;加一道模糊让它"浮"住 */
+.ctile-menu {
   position: absolute;
   top: 16px;
   right: 16px;
   z-index: 4;
+}
+.ctile-dots {
   width: 36px;
   height: 36px;
   display: inline-flex;
@@ -1621,23 +2355,74 @@ function specRows(c: Character) {
   cursor: pointer;
   transition: opacity var(--dur) var(--ease), background var(--dur) var(--ease);
 }
-.ctile-del svg {
+.ctile-dots svg {
   width: 16px;
   height: 16px;
 }
-/* 能悬停的设备上才收起删除钮:每张图右上角常驻一枚深色圆点太吵。
-   触摸设备没有悬停,收起来就等于删不掉 —— 所以用 hover 能力判断,而不是屏宽 */
+/* 能悬停的设备上才收起这枚钮:每张图右上角常驻一枚深色圆点太吵。
+   触摸设备没有悬停,收起来就等于点不到 —— 所以用 hover 能力判断,而不是屏宽。
+   菜单开着时(.open)必须留下:⋮ 点开之后鼠标一移开就淡掉,
+   连同菜单一起看不见了(Safari 点按钮还不给焦点,focus-within 兜不住) */
 @media (hover: hover) {
-  .ctile-del {
+  .ctile-menu {
     opacity: 0;
   }
-  .ctile:hover .ctile-del,
-  .ctile-del:focus-visible {
+  .ctile:hover .ctile-menu,
+  .ctile-menu:focus-within,
+  .ctile-menu.open {
     opacity: 1;
   }
 }
-.ctile-del:hover {
+.ctile-dots:hover {
   background: rgba(24, 24, 22, 0.56);
+}
+
+/* ===== 卡上的下拉菜单(与 PromptLibrary 同一套外观) =====
+   .ctile-menu 自己就是绝对定位的,不用再给 .menu-wrap 一条相对定位 ——
+   两条同权重、谁在后面谁生效,那样会把入口从右上角拽回文档流。
+   模板里那个 menu-wrap 只是给"点别处收起"用的识别标记(见 onDocPointerDown) */
+.menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 6;
+  min-width: 152px;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  box-shadow: var(--sh-md);
+}
+/* 下方放不下时朝上开:末行的卡片用它,不然菜单会伸到视口外 */
+.menu.up {
+  top: auto;
+  bottom: calc(100% + 6px);
+}
+.mitem {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  text-align: left;
+  line-height: normal;
+  font-size: var(--fs-sm);
+  color: var(--text-2);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+.mitem svg {
+  width: 14px;
+  height: 14px;
+}
+.mitem:hover {
+  background: var(--bg-elev);
+  color: var(--text);
+}
+.mitem.danger:hover {
+  color: var(--danger, #b4232a);
 }
 
 /* —— 详情 —— */
@@ -1666,7 +2451,15 @@ function specRows(c: Character) {
   width: 15px;
   height: 15px;
 }
-/* 删除是破坏性动作,平时压成静默的一行字,悬停才亮红 */
+/* 顶栏右侧一组动作:复制 / 导出是常规动作,删除是破坏性的 ——
+   前者悬停提亮到正文色,后者悬停才亮红。三个同重会读不出主次 */
+.dt-acts {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.dt-act,
 .dt-del {
   display: inline-flex;
   align-items: center;
@@ -1678,10 +2471,15 @@ function specRows(c: Character) {
   cursor: pointer;
   transition: color var(--dur) var(--ease), background var(--dur) var(--ease);
 }
+.dt-act:hover {
+  color: var(--text);
+  background: var(--bg-elev);
+}
 .dt-del:hover {
   color: var(--danger);
   background: color-mix(in oklch, var(--danger) 8%, transparent);
 }
+.dt-act svg,
 .dt-del svg {
   width: 15px;
   height: 15px;
@@ -1830,6 +2628,10 @@ function specRows(c: Character) {
   flex-direction: column;
   gap: 7px;
   min-width: 0;
+  /* 竖幅那一格比别人高,同一行里它把整行撑起来。
+     按底部对齐后,五张图的下沿与五个标签就落在同一条线上 ——
+     这正是参考图的排法:图高低不同,但都站在同一道基线上 */
+  justify-content: flex-end;
 }
 /* 空格子是虚线框(点一下即生成),有图的转实线(点一下看大图) */
 .cell-img {
@@ -1850,6 +2652,13 @@ function specRows(c: Character) {
 }
 .cell-img.has-img {
   border-style: solid;
+}
+/* 竖幅的输出只有 Full body 一张(见 api.ts 的 framing)。
+   它按 2:3 生成(App 的 PORTRAIT_RATIO),塞进 1:1 的格子会被 cover 上下各切掉约 1/6 ——
+   头和脚都没了。所以这一格改用同一个 2:3 装它:比例对齐,cover 一点不裁;
+   方块图仍用 1:1,它们的输出本来就是方的 */
+.cell.is-portrait .cell-img {
+  aspect-ratio: 2 / 3;
 }
 /* 墨色描边只给空格子:那是"点一下就生成"的召唤。
    有图的格子不给描边反馈 —— 它的反馈是上面那层遮幕,
@@ -2104,20 +2913,35 @@ function specRows(c: Character) {
 }
 
 @media (max-width: 720px) {
-  /* 标题行靠 flex-wrap 自己换行(与设置页同一套),不改成 column ——
-     改成 column 会让 action 按钮另起一行的位置和别的页不一样 */
-  .ed-fields {
+  /* 窄屏放不下两列,退回一列。标签本来就在输入上方,所以结构不必再改,
+     只要把网格收成一列 —— 上一版标签在左,窄屏还得额外把标签挪上去 */
+  .wz-fields {
     grid-template-columns: 1fr;
-    gap: 6px;
   }
-  .ed-label {
-    margin-top: 4px;
+  /* 16px 以下 iOS Safari 聚焦时会放大整页(与提示词库同一档处理)。
+     名字那栏现在也用 .ed-input,所以一并覆盖到了 */
+  .ed-input {
+    font-size: 16px;
+  }
+  /* 起稿那一行拆成上下:窄屏里输入框和按钮挤在一行,输入框只剩十来厘米宽 */
+  .wz-draft-row {
+    flex-wrap: wrap;
+  }
+  .wz-draft-row .ed-btn {
+    width: 100%;
+    height: 44px;
   }
   /* 窄屏:三步的标签一起挤会先被截断的是第三段,
      所以把连接线收短、步间距压小 —— 圆点比标签更需要留在原地 */
   .wz-steps {
     gap: 6px;
-    padding: 12px var(--sp-3);
+    padding: 12px var(--sp-4);
+  }
+  /* 卡片把留白收一档:视口本来就窄,给表单多留一点宽度。
+     高度上限也用同一档 —— 上下各留这么点,卡不至于贴到屏幕边 */
+  .wizard {
+    width: calc(100% - 2 * var(--sp-3));
+    max-height: calc(100vh - 2 * var(--sp-3));
   }
   .wz-line {
     flex: 0 0 10px;
@@ -2135,6 +2959,16 @@ function specRows(c: Character) {
   .wz-grid {
     grid-template-columns: repeat(2, 1fr);
     gap: var(--sp-2);
+  }
+  /* 窄屏并排会把图压到看不清:图上、事下 */
+  .wz-hero {
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--sp-4);
+  }
+  .wz-hero-shot {
+    width: min(288px, 100%);
+    align-self: center;
   }
   /* 窄屏卡更小、一排两枚:auto-fill 自己退列,不用手写列数 */
   .grid {
@@ -2185,11 +3019,16 @@ function specRows(c: Character) {
     margin-bottom: 8px;
   }
   /* 触控目标放大到 40px */
-  .ctile-del,
+  .ctile-dots,
   .viewer-x,
   .viewer-nav {
     width: 40px;
     height: 40px;
+  }
+  /* 顶栏三枚动作在窄屏会挤:收一档内边距,别逼着它们换行 */
+  .dt-act,
+  .dt-del {
+    padding: 6px 9px;
   }
 }
 

@@ -1,4 +1,4 @@
-import type { ApiConfig, GenParams, HistoryEntry, PromptItem, ResultItem, ReuseParams, Collection, Character, CharacterFields, CharacterViewKind } from './types'
+import type { ApiConfig, GenParams, HistoryEntry, PromptItem, ResultItem, ReuseParams, Collection, Character, CharacterDraft, CharacterFields, CharacterView, CharacterViewKind, ImportedCharacter } from './types'
 import type { PruneResult, CoverRecord } from './lib/idb'
 import { titleFromPrompt } from './lib/text'
 import {
@@ -813,6 +813,184 @@ export async function exportImages(
   return { exported, skipped }
 }
 
+/* ===== 角色的导入导出 =====
+   与提示词库那处不同:角色**必须**带图。设定图只在 IndexedDB 里存一份
+   (不进历史,见 App 的 genCharView),所以只导设定的 JSON 得到的是一个没有脸的角色 ——
+   对方还得重新生成五张,而重新生成出来的脸已经不是同一个了。所以走 zip。
+
+   包里图片的路径写在 manifest 里,不靠命名约定:读的一方按 manifest 取文件,
+   于是单角色包可以平铺在根目录(好看),将来的多角色包放各自子目录,
+   两边都不用改读取逻辑 */
+
+/** 导出包的 manifest。版本号先留着:以后改结构时可以据此分支,而不是猜 */
+type CharacterManifest = {
+  format: 'kimage-character'
+  version: 1
+  characters: Array<{
+    name: string
+    createdAt: number
+    fields?: CharacterFields
+    desc?: string
+    refKind?: CharacterViewKind
+    /** zip 内的相对路径。没有这一项就是没有那张图 */
+    ref?: string
+    views?: Partial<Record<CharacterViewKind, string>>
+  }>
+}
+
+/** Blob → 扩展名。设定图统一是 JPEG,但参考图可能是用户上传的 PNG,
+ *  所以照实判,不写死(与 extOf 同一份 MIME 表) */
+function extOfBlob(blob: Blob): string {
+  const t = (blob.type || '').toLowerCase()
+  if (t.includes('jpeg') || t.includes('jpg')) return 'jpg'
+  if (t.includes('webp')) return 'webp'
+  if (t.includes('gif')) return 'gif'
+  return 'png'
+}
+
+/** 按魔数认图片类型,不认扩展名:参考图是以 data URL 送给上游的,
+ *  前缀里的 MIME 就是这里定的 —— 写错会被上游拒掉。
+ *  (data URL 那个版本见 lib/idb.ts 的 detectMimeFromDataUrl) */
+function sniffMime(b: Uint8Array): string {
+  if (b[0] === 0xff && b[1] === 0xd8) return 'image/jpeg'
+  if (b[0] === 0x89 && b[1] === 0x50) return 'image/png'
+  if (b[0] === 0x47 && b[1] === 0x49) return 'image/gif'
+  // WEBP 是 RIFF 容器:前 4 字节 "RIFF",第 8-11 字节 "WEBP"
+  if (b[0] === 0x52 && b[8] === 0x57 && b[9] === 0x45) return 'image/webp'
+  return 'image/jpeg'
+}
+
+/** 文件名里不能出现的字符去掉。名字可能很长,截一段够认出来就行 */
+function safeFile(name: string, fallback: string): string {
+  const cleaned = name.replace(/[\\/:*?"<>|]/g, '').replace(/\.+$/, '').trim().slice(0, 40)
+  return cleaned || fallback
+}
+
+/** 包名带角色名,一堆下载里一眼认得出;同日导两次也不会互相覆盖 */
+function characterZipName(name: string): string {
+  const d = new Date()
+  const p = (x: number) => String(x).padStart(2, '0')
+  const stamp = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`
+  return `kimage-character-${safeFile(name, 'character')}-${stamp}.zip`
+}
+
+/**
+ * 导出一个角色:character.json + 主参考图 + 五张设定图,打成一个 zip。
+ *
+ * 与 exportImages 同一套:动态引入 fflate(导出是低频动作,不该进首屏那份包)、
+ * level 0(图已是压缩格式,再压只是白烧 CPU)、串行读字节。
+ * 返回包内实际写进去的图片张数,好在界面上如实回执 —— 一个只有设定的角色
+ * 也能导出,那种包小得多,该让用户知道。
+ */
+export async function exportCharacter(c: Character, views: CharacterView[]): Promise<number> {
+  const files: Record<string, Uint8Array> = {}
+  const entry: CharacterManifest['characters'][number] = {
+    name: c.name,
+    createdAt: c.createdAt,
+    ...(c.fields ? { fields: c.fields } : {}),
+    ...(c.desc ? { desc: c.desc } : {}),
+    ...(c.refKind ? { refKind: c.refKind } : {})
+  }
+
+  let images = 0
+  if (c.ref) {
+    const name = `ref.${extOfBlob(c.ref)}`
+    files[name] = new Uint8Array(await c.ref.arrayBuffer())
+    entry.ref = name
+    images++
+  }
+  const map: Partial<Record<CharacterViewKind, string>> = {}
+  for (const v of views) {
+    const name = `${v.kind}.${extOfBlob(v.data)}`
+    files[name] = new Uint8Array(await v.data.arrayBuffer())
+    map[v.kind] = name
+    images++
+  }
+  if (Object.keys(map).length) entry.views = map
+
+  const manifest: CharacterManifest = { format: 'kimage-character', version: 1, characters: [entry] }
+  files['character.json'] = new TextEncoder().encode(JSON.stringify(manifest, null, 2))
+
+  const { zip } = await import('fflate')
+  const bytes = await new Promise<Uint8Array>((resolve, reject) => {
+    zip(files, { level: 0 }, (err, out) => (err ? reject(err) : resolve(out)))
+  })
+  /* fflate 的返回类型挂在 ArrayBufferLike 上,而 BlobPart 只收 ArrayBuffer 支撑的视图 ——
+     拿到的确实是普通 Uint8Array,转一下类型即可(与 exportImages 同一处理) */
+  downloadBlob(new Blob([bytes as BlobPart], { type: 'application/zip' }), characterZipName(c.name))
+  return images
+}
+
+/** 读一个角色 zip。返回的每条都换过 id ——
+ *  不沿用文件里的 id:它可能与现有的撞上,而列表里两条同 id 会让渲染与删除都错乱
+ *  (与配置的导入同一条理由)。内容来自外部文件,所以逐项规整,坏的就丢掉。 */
+export async function readCharacterZip(file: File): Promise<ImportedCharacter[]> {
+  const { unzip } = await import('fflate')
+  // 先把字节读出来:unzip 的回调不是 async,不能在里面 await
+  const zipBytes = new Uint8Array(await file.arrayBuffer())
+  const entries = await new Promise<Record<string, Uint8Array>>((resolve, reject) => {
+    unzip(zipBytes, (err, out) => (err ? reject(err) : resolve(out)))
+  })
+
+  /* manifest 不一定在根目录:用户很可能解压看一眼再重新打包,于是整包多套了一层
+     文件夹(macOS 还会塞一个 __MACOSX)。按 basename 找它,并以它所在的目录为基准
+     解析图路径 —— 否则一个明明看得见 character.json 的包会被判成"不是角色包" */
+  const manifestKey = Object.keys(entries).find(
+    (k) => !k.startsWith('__MACOSX/') && k.split('/').pop() === 'character.json'
+  )
+  if (!manifestKey) {
+    throw new Error('That zip has no character.json — it is not a character export.')
+  }
+  const base = manifestKey.slice(0, manifestKey.length - 'character.json'.length)
+  // 基准目录下有就用它,没有就退回原路径(兼容手写/其它工具生成的包)
+  const fileAt = (path: string): Uint8Array | undefined => entries[base + path] || entries[path]
+
+  let parsed: CharacterManifest
+  try {
+    parsed = JSON.parse(new TextDecoder().decode(entries[manifestKey]))
+  } catch {
+    throw new Error('character.json inside that zip is not valid JSON.')
+  }
+  if (!Array.isArray(parsed?.characters)) {
+    throw new Error('character.json inside that zip has no characters.')
+  }
+
+  const known = new Set<string>(CHARACTER_VIEWS.map((v) => v.kind))
+  const out: ImportedCharacter[] = []
+  for (const c of parsed.characters) {
+    if (!c || typeof c.name !== 'string' || !c.name.trim()) continue
+
+    const views: ImportedCharacter['views'] = []
+    for (const [kind, path] of Object.entries(c.views || {})) {
+      // 认不出的视图名丢掉:库里只认这五种(与 loadCharViews 同一条筛选)
+      const bytes = typeof path === 'string' ? fileAt(path) : undefined
+      if (!known.has(kind) || !bytes) continue
+      views.push({
+        kind: kind as CharacterViewKind,
+        data: new Blob([bytes as BlobPart], { type: sniffMime(bytes) })
+      })
+    }
+
+    const refBytes = typeof c.ref === 'string' ? fileAt(c.ref) : undefined
+    out.push({
+      name: c.name.trim(),
+      createdAt: typeof c.createdAt === 'number' ? c.createdAt : Date.now(),
+      // 补齐缺的键:外部文件里的设定可能是老版本写的(见 emptyCharFields)
+      ...(c.fields ? { fields: { ...emptyCharFields(), ...c.fields } } : {}),
+      ...(typeof c.desc === 'string' && c.desc.trim() ? { desc: c.desc.trim() } : {}),
+      ...(refBytes
+        ? { ref: new Blob([refBytes as BlobPart], { type: sniffMime(refBytes) }) }
+        : {}),
+      // 主参考图取自哪张视图,只有在图确实带上了时才有意义
+      ...(refBytes && typeof c.refKind === 'string' && known.has(c.refKind)
+        ? { refKind: c.refKind as CharacterViewKind }
+        : {}),
+      views
+    })
+  }
+  return out
+}
+
 /* ===== 历史记录(IndexedDB,容量不受限、真正持久) ===== */
 /** 把一条历史摊成可复现的完整配方,交给主界面按当前厂商的能力逐项套用。
  *  参考图不在返回值里 —— 记录里存的是 Blob,转 data URL 要异步,由调用方补上 */
@@ -897,39 +1075,83 @@ export function saveCollections(list: Collection[]): void {
    参考图是 Blob,按 id 存在 IndexedDB,读的时候贴回去(与提示词封面同一套做法) */
 const CHAR_KEY = 'kimage.characters'
 
+/* 面貌特征:跨场景不该变的那八项。这八项会并进每一张成品的提示词 ——
+   只给头发和眼睛时,肤色、脸型、眉形全靠模型自己从零重编,换个场景就不是同一个人了 */
+const CHAR_FACE_FIELDS: Array<keyof CharacterFields> = [
+  'identity',
+  'face',
+  'hair',
+  'brows',
+  'eyes',
+  'noseMouth',
+  'facialHair',
+  'faceMarks'
+]
+/* 只塑造设定图的两项:衣服与装备属于"这一张发生什么",该由场景决定 ——
+   你写"在太空里",前置的 armored jacket 就在跟它打架 */
+const CHAR_SHEET_ONLY_FIELDS: Array<keyof CharacterFields> = ['outfit', 'marks']
+
+/* 字段顺序。顺序固定很重要 —— 顺序一变,上游拿到的条件就变了,一致性也就无从谈起。
+   两组拼在一起就是完整顺序,不含备注(备注单独接在最后) */
+const CHAR_FIELD_ORDER: Array<keyof CharacterFields> = [
+  ...CHAR_FACE_FIELDS,
+  ...CHAR_SHEET_ONLY_FIELDS
+]
+
+/* 一份空设定:解析、新建表单、读入老数据都拿它当底。
+   由 CHAR_FIELD_ORDER 生成而不是手写十遍 —— 加字段时只有一处要改 */
+export function emptyCharFields(): CharacterFields {
+  const out = {} as CharacterFields
+  for (const k of CHAR_FIELD_ORDER) out[k] = ''
+  return out
+}
+
+/* 字段值里的换行与连续空白收敛成单个空格。
+   规格字段现在是可换行的 textarea(单行装不下 12 个词的字段值),
+   换行只是排版,原样拼进提示词会在句子中间插一段空白 */
+function inline(s: string | undefined): string {
+  return (s || '').replace(/\s+/g, ' ').trim()
+}
+
 /* 角色描述文本:按固定顺序把结构化设定拼起来,再接上自由描述。
-   顺序固定很重要 —— 顺序一变,上游拿到的条件就变了,一致性也就无从谈起。
    加结构化字段之前存下来的角色只有 desc,那种情况整段返回,不做任何改写。
    这个"全量"版本只用在设定图自己的生成上(见 App 的 genCharView)—— */
 export function characterDesc(c: Character): string {
   const f = c.fields
-  const parts = f
-    ? [f.identity, f.hair, f.eyes, f.outfit, f.marks].map((s) => (s || '').trim()).filter(Boolean)
-    : []
-  const free = (c.desc || '').trim()
+  const parts = f ? CHAR_FIELD_ORDER.map((k) => inline(f[k])).filter(Boolean) : []
+  const free = inline(c.desc)
   if (free) parts.push(free)
   return parts.join(', ')
 }
 
-/* 并进普通创作提示词的只有这三项:身份、头发、眼睛。
-   为什么不带 outfit 与 marks —— 这两项是"这一张发生什么"的一部分:
-   你写"在太空里",前置的 armored jacket 就在跟它打架。衣服该由场景和参考图决定。
-   而脸是跨场景不该变的那部分,写进文字里才划算(参考图管像不像,文字管说清楚)。
+/* 并进普通创作提示词的只有面貌特征那八项(见 CHAR_FACE_FIELDS)。
+   为什么会细分到眉毛和脸型:只给 hair 和 eyes 时,肤色、骨相、眉形全靠模型
+   自己从零重编,场景一换就不是同一个人了。而 face marks 与 facialHair 之所以
+   也在这里,是因为它们一旦只出现在设定图里、不进创作提示词,就会每张图丢一次。
+
    加结构化字段之前的老角色没有 fields,退回全量描述,总比什么都不送强 */
 export function characterFaceDesc(c: Character): string {
   const f = c.fields
   if (!f) return characterDesc(c)
-  return [f.identity, f.hair, f.eyes].map((s) => (s || '').trim()).filter(Boolean).join(', ')
+  return CHAR_FACE_FIELDS.map((k) => inline(f[k])).filter(Boolean).join(', ')
 }
 
 /* —— 角色的设定图 ——
    五张视图各自的修饰词与取景。顺序就是生成顺序:正脸是锚,其余四张都以它当参考图,
    才谈得上"同一张脸"。取景分方形与竖幅 —— 头像装得下方形,全身只有竖幅才放得开。
 
+   顺序也按"它补上了什么"来排:脸定人 → 把这张脸转到别的方向看 →
+   全身交代体型与服装轮廓 → 细部特写交代材质与零件 → 表情收情绪跨度。
+   这个顺序只影响列表与"一次补齐"的先后,不影响任何一张的提示词。
+
    注意:修饰词里绝对不能出现 "character reference sheet" 这类词。
    它在图像模型那里是一个很强的排版概念(设定表 = 正面 + 侧面 + 背面并排 + 细节放大),
    写进去模型就真的给你画一张拼版,而不是一张干净的单人图。
-   要的是"单个人物占满画面",所以正面把"single / one person / filling the frame"说死 */
+   要的是"单个人物占画面主体",所以正面把 "single / one person" 说死。
+
+   另外不写 "filling the frame":那是"把主体塞满画面"的意思,配上 headshot
+   会让模型的头顶直接顶到画面上沿 —— 发型轮廓、头饰、帽子这些认人的线索
+   第一个被切掉。改成"完整入画 + 头顶留白":要的是主体在框内,且框里有余量 */
 export const CHARACTER_VIEWS: Array<{
   kind: CharacterViewKind
   label: string
@@ -941,31 +1163,51 @@ export const CHARACTER_VIEWS: Array<{
     kind: 'front',
     label: 'Front',
     suffix:
-      'single front-facing headshot portrait of one person, neutral expression, plain background, centered, filling the frame',
+      'single front-facing headshot of one person, head and shoulders fully in frame with headroom above the head, neutral expression, plain background, centered',
     framing: 'square'
   },
   {
-    kind: 'threeQuarter',
-    label: '3/4',
+    /* 头部转面:左右正侧 + 上下 45° 俯仰,拼成一张 2×2。
+       正脸只管正面那一张脸,"换个方向才看得见"的东西它一个都交代不了:
+       正侧交代鼻梁高度、下颌线、耳朵位置与发型的侧面走向;
+       俯视交代颅顶与发顶;仰视交代下颌底与鼻底。
+       模型拿到这四格,画侧脸、抬头、低头时才不至于把人的脸重新编一个。
+
+       俯仰指的是相机高度(高角度俯拍 / 低角度仰拍),不是让人自己抬低头 ——
+       要的是"同一张脸换个方向看",不是四种表情。
+
+       它排在正脸之后:原来这个位置是 3/4,而 3/4 只是"同一个方向的另一张头像",
+       与这里第一格的正侧几乎重复;换成转面之后,五格里"脸"这条线才算走完。
+
+       注意 kind 仍叫 detail 而不是 angles:它是索引里的键。
+       改名会让库里已经存下的那些 detail 图对不上(见 App 的 loadCharViews
+       会按已知 kind 过滤),图还在、但画面上会凭空少一格 */
+    kind: 'detail',
+    label: 'Angles',
     suffix:
-      'single three-quarter view headshot portrait of one person, neutral expression, plain background, centered, filling the frame',
+      'a 2x2 turnaround grid of head angles of the same person, head and shoulders in every panel, identical framing, lighting and plain background: left side profile, right side profile, high angle from 45 degrees above eye level, low angle from 45 degrees below eye level, neutral expression',
     framing: 'square'
   },
   {
     kind: 'full',
     label: 'Full body',
     suffix:
-      'single full-body shot of one person standing, head to toe, plain background, centered, filling the frame',
+      'single full-body shot of one person standing, the whole figure head to toe in frame with a small margin above the head and below the feet, plain background, centered',
     framing: 'portrait'
   },
   {
-    /* 细节图:这一张要的就是格子,和 Expressions 同理 ——
-       服装纹样、武器、义体、疤痕这些在全身图里只有几个像素,
-       摊成特写格子,模型才有得可依 */
-    kind: 'detail',
+    /* 四格细部特写:眼睛、皮肤与脸部标记、手、面料与配件。
+       这些是前面几张交代不了的 —— 头像里眼睛只占几十个像素,
+       机械臂上的纹样、皮衣的缝线更是看不见。模型要画特写时(比如提示词里写
+       "close-up of the hands"),没有这几格就只能凭空编,而编出来的
+       多半和参考图里不是同一双手。
+
+       四格必须点明"同一人、同一打光、同一背景",否则模型会画成四个不同的人;
+       末尾压一句 no text, no labels —— 拼图里最容易被顺手加上的就是标注文字 */
+    kind: 'closeups',
     label: 'Details',
     suffix:
-      'a 2x2 grid of close-up detail shots of this character: costume fabric, accessories, equipment and distinctive features, plain background',
+      'a 2x2 grid of close-up detail shots of the same person under identical lighting on the same plain background, one detail per panel: the eyes, the skin and any face marks, the hands, the fabric and the accessories described above, no text, no labels',
     framing: 'square'
   },
   {
@@ -977,16 +1219,20 @@ export const CHARACTER_VIEWS: Array<{
 ]
 
 /**
- * 用文本模型把一句话拆成角色的五项设定。
+ * 用文本模型把一句话拆成角色的结构化设定。
  * 走 /api/enhance 那条路 —— 与提示词改写共用一套代理、鉴权与超时,只是档位不同。
  * 能拆多细取决于用户配的文本模型;返回的字段可能仍为空(模型没按格式回),
  * 那种情况由调用方决定怎么提示。
+ *
+ * 除结构化设定外还带一个名字:名字不进任何提示词(它是个标识,不是长相描述),
+ * 但它是这张卡片的标题、也是"该叫什么"这件事的答案 —— 让模型顺手起一个,
+ * 比让用户对着空输入框想一个更省事。起不来时调用方照旧可以手填
  */
 export async function draftCharacterFields(
   cfg: ApiConfig,
   idea: string,
   signal?: AbortSignal
-): Promise<CharacterFields> {
+): Promise<CharacterDraft> {
   const resp = await fetch('/api/enhance', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -1011,20 +1257,35 @@ export async function draftCharacterFields(
     throw new Error(msg)
   }
   const data = (await resp.json()) as { prompt?: string }
-  return parseCharacterFields(data.prompt || '')
+  return parseCharacterDraft(data.prompt || '')
 }
 
+/* 起稿模型常把"没有"写成 none / n/a 而不是留空,原样拼进提示词就是一段噪声。
+   唯一的例外是 facialHair:那一项里"没有"是有意义的信息(无须),
+   转成模型认得的 clean-shaven,其余一律清空 */
+const NONE_ISH = /^(none|n\/?a|null|nothing|no|-|—|–)$/i
+
 /**
- * 把模型回的那几行拆成五个字段。
+ * 把模型回的那几行拆成「名字 + 结构化设定」。
  * 它偶尔会加粗、加项目符号、包代码围栏或写中文冒号,所以先剥掉这些装饰再按前缀认;
  * 认不出来的行直接丢掉,不报错 —— 少一两个字段不该让整次起稿失败。
+ * 名字那行不一定有(老版本提示词没有它),缺了就是空串,由调用方决定怎么办。
  */
-export function parseCharacterFields(text: string): CharacterFields {
-  const out: CharacterFields = { identity: '', hair: '', eyes: '', outfit: '', marks: '' }
+export function parseCharacterDraft(text: string): CharacterDraft {
+  const fields = emptyCharFields()
+  let name = ''
+  /* 查表前把标签里的非字母全部去掉,所以 "Nose & mouth" / "Facial hair" /
+     "Face marks" 这类多词标签怎么写都能对上 —— 起稿那条提示里用可读的两词
+     标签,比为了迁就解析器写成 "NoseMouth" 好得多(人要能直接读懂回的是什么) */
   const keys: Record<string, keyof CharacterFields> = {
     identity: 'identity',
+    face: 'face',
     hair: 'hair',
+    brows: 'brows',
     eyes: 'eyes',
+    nosemouth: 'noseMouth',
+    facialhair: 'facialHair',
+    facemarks: 'faceMarks',
     outfit: 'outfit',
     marks: 'marks'
   }
@@ -1034,12 +1295,20 @@ export function parseCharacterFields(text: string): CharacterFields {
       .replace(/[*`_"']/g, '')
       .replace(/^[\s>•·\-–—]+/, '')
       .trim()
-    const m = /^([A-Za-z]+)\s*[:：]\s*(.+)$/.exec(line)
+    // 标签段允许空格与 & —— 不允许的话 "Nose & mouth:" 会因为 & 挡住冒号而整行作废
+    const m = /^([A-Za-z][A-Za-z &]*?)\s*[:：]\s*(.+)$/.exec(line)
     if (!m) continue
-    const key = keys[m[1].toLowerCase()]
-    if (key) out[key] = m[2].trim()
+    const label = m[1].toLowerCase().replace(/[^a-z]/g, '')
+    const value = m[2].trim()
+    if (label === 'name') {
+      name = NONE_ISH.test(value) ? '' : value
+      continue
+    }
+    const key = keys[label]
+    if (!key) continue
+    fields[key] = NONE_ISH.test(value) ? (key === 'facialHair' ? 'clean-shaven' : '') : value
   }
-  return out
+  return { name, fields }
 }
 
 /** 读出角色列表,并把参考图从 IndexedDB 贴回条目上 */
@@ -1059,6 +1328,10 @@ export async function loadCharacters(): Promise<Character[]> {
   }
   const refs = await getAllCharRefs()
   for (const c of list) {
+    /* 老角色的 fields 里没有后来加的字段(face / brows / noseMouth ...)。
+       在入口补齐空串,后面所有读的地方就能当它们一定存在 —— 不补的话
+       CharacterFields 这个类型就是在骗人,每读一处都得再防一次 undefined */
+    if (c.fields) c.fields = { ...emptyCharFields(), ...c.fields }
     const ref = refs.get(c.id)
     if (ref) c.ref = ref
   }

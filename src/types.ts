@@ -146,20 +146,47 @@ export interface Collection {
   createdAt: number
 }
 
-// 角色的结构化设定。生成时按固定顺序拼成一段描述,前置到提示词最前面。
-// 拆成字段而不是一整段自由文本,是为了让「AI 创建」能逐项填、用户也能逐项校对
+/* 角色的结构化设定。生成时按固定顺序拼成一段描述,前置到提示词最前面。
+   拆成字段而不是一整段自由文本,是为了让「AI 创建」能逐项填、用户也能逐项校对。
+
+   前八项是"面貌特征",会跟着每一张成品走(见 api.ts 的 characterFaceDesc)——
+   它们回答的是"这个人长什么样",跨场景不该变。后两项只喂给设定图:
+   衣服与装备属于"这一张发生什么",该由场景决定 */
 export interface CharacterFields {
   // 身份 / 职业 / 风格,如 "cyberpunk female warrior"
   identity: string
+  // 脸型与骨相、肤色、看起来的年龄
+  face: string
   hair: string
+  // 眉形、粗细、眉色
+  brows: string
   eyes: string
+  // 鼻梁鼻头、唇形厚薄
+  noseMouth: string
+  // 胡须 / 胡茬 / 无须。必须有个明确值,否则每张图横跳
+  facialHair: string
+  /* 面部疤痕、痣、胎记、面纹、面部义体。
+     这一项只在设定里明说时才该有值 —— 默认长出来等于给每个角色都添一道疤 */
+  faceMarks: string
   outfit: string
   marks: string
 }
 
-/* 设定图里的一张视图。detail 是"细节图":服装、配件、身上特征的特写 ——
-   全身图里这些只有几个像素,模型抓不住,单独来一张特写才说得清 */
-export type CharacterViewKind = 'front' | 'threeQuarter' | 'full' | 'expression' | 'detail'
+/* 一次 AI 起稿的结果:名字 + 结构化设定。
+   名字不是 CharacterFields 的一员 —— 它是个标识(卡片的标题、消息里的称呼),
+   不参与任何提示词的拼装,所以和"这个人长什么样"那套字段分开 */
+export interface CharacterDraft {
+  name: string
+  fields: CharacterFields
+}
+
+/* 设定图里的一张视图。kind 是索引里的键(存进 IndexedDB 时按它定位),
+   所以改语义可以改 label 与提示词,但别改这个字符串 —— 改了库里已存的图会对不上。
+
+   两个相邻的名字不是笔误:detail 是头部转面那张 2×2(标签 Angles),
+   closeups 是细部特写那张 2×2(标签 Details)。前者是历史键名,留它是为了
+   库里已经生成好的 Angles 图还能对上;新加的就照内容老实叫 closeups */
+export type CharacterViewKind = 'front' | 'detail' | 'full' | 'closeups' | 'expression'
 
 export interface CharacterView {
   kind: CharacterViewKind
@@ -184,9 +211,23 @@ export interface Character {
   /* 主参考图取自哪张视图。存它是因为刷新后 ref 与视图是两次独立的 IDB 读取,
      Blob 不是同一个实例,靠身份比较认不出"这张正在用";从外部上传的图没有这个值 */
   refKind?: CharacterViewKind
-  /* 设定图里正脸以外的视图(3/4、全身、表情、动作)。
+  /* 设定图里正脸以外的视图(Angles、全身、Details、表情)。
      只用于查看与挑选主图、不参与生成,所以不在启动时加载 */
   views?: CharacterView[]
+}
+
+/* 从一个角色 zip 里读出来的角色。刻意不带 id ——
+   文件里的 id 可能与现有的撞上,而列表里两条同 id 会让渲染和删除都错乱,
+   所以导入这一步的职责之一就是换新的(见 api.ts 的 readCharacterZip) */
+export interface ImportedCharacter {
+  name: string
+  createdAt: number
+  fields?: CharacterFields
+  desc?: string
+  ref?: Blob
+  refKind?: CharacterViewKind
+  /* 包内带过来的设定图。没带的视图就是没有 —— 与库里那五格一一对应 */
+  views: CharacterView[]
 }
 
 /* 一个角色的用量:被拿去出过多少张作品、最后一次是什么时候。

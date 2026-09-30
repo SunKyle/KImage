@@ -57,6 +57,8 @@ import {
   characterFaceDesc,
   loadCharacters,
   saveCharacters,
+  exportCharacter,
+  readCharacterZip,
   getProvider,
   inferVendor,
   allowedSizes,
@@ -73,7 +75,7 @@ import {
 import { blobToDataURL, urlToBlob, getCharViews, putCharView } from './lib/idb'
 import { titleFromPrompt } from './lib/text'
 import type { Cap, EnhanceMode, Provider } from './api'
-import type { ApiConfig, Collection, FavoritePayload, HistoryEntry, PromptItem, ResultItem, ReuseParams, Character, CharacterFields, CharacterStat, CharacterView, CharacterViewKind } from './types'
+import type { ApiConfig, Collection, FavoritePayload, HistoryEntry, PromptItem, ResultItem, ReuseParams, Character, CharacterFields, CharacterStat, CharacterView, CharacterViewKind, ImportedCharacter } from './types'
 
 // —— 状态 ——
 const prompt = ref('')
@@ -930,14 +932,22 @@ async function refThumbOf(src: string): Promise<Blob | undefined> {
   }
 }
 
-// 用 canvas 压缩图片:超过 maxEdge 的最长边等比缩放,透明图铺白底,输出 JPEG
-function compressImage(dataUrl: string, maxEdge = 1024, quality = 0.85): Promise<string> {
+/* 用 canvas 压缩图片:超过 maxEdge 的最长边等比缩放,透明图铺白底,输出 JPEG。
+   force = 即使是"本来就小于上限"的图也重编码一遍 —— 默认不这么做是为了
+   让调用方能把没缩过的原始载荷原样留下(画质一点不丢);
+   但原图如果是 PNG(模型给的多半是),原样留下就是 1MB 上下,那时才需要 force */
+function compressImage(
+  dataUrl: string,
+  maxEdge = 1024,
+  quality = 0.85,
+  force = false
+): Promise<string> {
   return new Promise((resolve) => {
     const img = new Image()
     img.onload = () => {
       let { width, height } = img
       const scale = Math.min(1, maxEdge / Math.max(width, height))
-      if (scale >= 1) return resolve(dataUrl) // 本来就小,原样保留
+      if (scale >= 1 && !force) return resolve(dataUrl) // 本来就小,原样保留
       width = Math.round(width * scale)
       height = Math.round(height * scale)
       const c = document.createElement('canvas')
@@ -1014,8 +1024,9 @@ async function saveCharFromPage(d: {
 }) {
   const name = d.name.trim()
   if (!name) return
-  // 与参考图存档同一档压缩:它只当参考用,不需要原分辨率
-  const ref = d.refData ? await refThumbOf(d.refData) : undefined
+  /* 上传的参考图会当角色卡封面直接铺出来,所以按显示级存(见 CHAR_IMAGE_MAX),
+     不走那条"只喂给模型"的 refThumbOf —— 512 做卡面一眼就糊 */
+  const ref = d.refData ? await charImageBlob(d.refData) : undefined
   const c: Character = {
     id: uid(),
     name,
@@ -1031,12 +1042,144 @@ async function saveCharFromPage(d: {
   charPageRef.value?.onSaved(c.id)
 }
 
-/** 删掉一个角色,并把它从当前选择里摘掉 ——
-    留着一个已经不存在的 id,下次生成会莫名多出一段描述 */
-async function deleteChar(id: string) {
+/* 删掉一个角色。与别处(提示词 / 配置 / 历史)同一套:
+   立刻从列表消失、几秒内可撤销,真正落盘发生在窗口结束时。
+   落盘那一步顺带把它的图一起收走 —— saveCharacters → putCharRefs 是按 key 归属
+   清理的,角色不在了,它的主参考图与五张设定图会一并删掉(见 idb.ts) */
+function deleteChar(id: string) {
+  const at = characters.value.findIndex((c) => c.id === id)
+  if (at < 0) return
+  const gone = characters.value[at]
+  const wasActive = activeCharId.value === id
   characters.value = characters.value.filter((c) => c.id !== id)
-  if (activeCharId.value === id) detachCharacter()
-  await saveCharacters(characters.value)
+  /* 这一条不能等窗口结束:当前套用的角色是个 id 引用,
+     留着一个已经不在列表里的 id,下一次生成会莫名多出一段角色描述 */
+  if (wasActive) detachCharacter()
+
+  scheduleUndo({
+    label: 'Character deleted',
+    undo: () => {
+      // 放回原来的位置:列表顺序有意义(最近建的在前)
+      characters.value.splice(Math.min(at, characters.value.length), 0, gone)
+      // 恢复「当前套用的角色」—— 它当初是被这次删除夺走的,现在物归原主
+      if (wasActive) activeCharId.value = id
+      /* 撤销要立刻落盘:窗口里别的操作可能已经把"它不在"写进去了。
+         图是整批按归属清理的,所以这一步同时保住它的主图与设定图 */
+      saveCharacters(characters.value)
+    },
+    purge: () => {
+      /* 到这里才真正落盘删除,同时把图从内存里放掉 ——
+         卡片的 object URL 由弱引用表带出,不收就等于把一个已删角色的
+         六张图一直留在内存里(见 idb.ts 与 api.ts 的 releaseSrc) */
+      for (const v of charViews.value[id] || []) releaseSrc(v.data)
+      releaseSrc(gone.ref)
+      const rest = { ...charViews.value }
+      delete rest[id]
+      charViews.value = rest
+      saveCharacters(characters.value)
+    }
+  })
+}
+
+/** Blob 的切片:拿到一个指向同一批字节、但**实例是新的** Blob。
+ *  复制角色时必须换实例 —— 两个角色共用同一个 Blob 会共用同一个 object URL,
+ *  一边撤销(见 deleteChar 的 purge / releaseSrc)另一边正在显示的图就裂了。
+ *  slice 不复制底层字节,只多一个引用 */
+function reBlob(b: Blob): Blob {
+  return b.slice(0, b.size, b.type)
+}
+
+/* 复制一个角色:名字、设定、备注、图全拷一份,插在原件后面。
+   设定图在 IndexedDB 里按角色 id 存,所以得读出来再写到新 id 名下。
+
+   下面三处报错都用 notice 而不是 fail:fail 写的是 home 那条 .err,
+   它只在创作区渲染 —— 用户人在角色页,写过去等于什么都没说 */
+async function duplicateChar(id: string) {
+  const at = characters.value.findIndex((c) => c.id === id)
+  if (at < 0) return
+  const src = characters.value[at]
+  const copy: Character = {
+    id: uid(),
+    name: `${src.name} copy`,
+    createdAt: Date.now(),
+    ...(src.fields ? { fields: { ...src.fields } } : {}),
+    ...(src.desc ? { desc: src.desc } : {}),
+    ...(src.ref ? { ref: reBlob(src.ref) } : {}),
+    ...(src.refKind ? { refKind: src.refKind } : {})
+  }
+  const known = new Set<string>(CHARACTER_VIEWS.map((v) => v.kind))
+  /* 先写图、再 saveCharacters:后者顺带按 key 归属清理,顺序反了会把刚写进去的
+     设定图当成"已经不在的角色名下的"删掉(见 idb.ts 的 putCharRefs) */
+  try {
+    for (const r of await getCharViews(id)) {
+      if (known.has(r.kind)) await putCharView(copy.id, r.kind, reBlob(r.data))
+    }
+    characters.value = [
+      ...characters.value.slice(0, at + 1),
+      copy,
+      ...characters.value.slice(at + 1)
+    ]
+    await saveCharacters(characters.value)
+    notice.value = `Duplicated as “${copy.name}”.`
+  } catch {
+    notice.value = 'Could not duplicate this character.'
+  }
+}
+
+/* 导出一个角色为 zip(带图)。设定图是懒加载的,所以先确保取过 ——
+   不取的话导出包里会少掉那五张,而这正是这个功能的意义所在 */
+async function exportChar(id: string) {
+  const c = characters.value.find((x) => x.id === id)
+  if (!c) return
+  try {
+    if (!charViews.value[id]) await loadCharViews(id)
+    const images = await exportCharacter(c, charViews.value[id] || [])
+    notice.value = images
+      ? `Exported “${c.name}” with ${images} image${images === 1 ? '' : 's'}.`
+      : `Exported “${c.name}” — it has no images yet, so the zip is settings only.`
+  } catch (e: any) {
+    notice.value = e?.message || 'Could not export this character'
+  }
+}
+
+/* 导入角色 zip。文件里的 id 一律换新 —— 与现有的撞上会让列表里出现两条同 id,
+   渲染和删除都会错乱(与配置的导入同一条理由) */
+async function importCharFile(file: File) {
+  let list: ImportedCharacter[]
+  try {
+    list = await readCharacterZip(file)
+  } catch (e: any) {
+    notice.value = e?.message || 'Could not read that file'
+    return
+  }
+  if (!list.length) {
+    notice.value = 'That zip has no usable characters in it.'
+    return
+  }
+
+  const added: Character[] = []
+  try {
+    for (const imp of list) {
+      const c: Character = {
+        id: uid(),
+        name: imp.name,
+        createdAt: imp.createdAt,
+        ...(imp.fields ? { fields: { ...imp.fields } } : {}),
+        ...(imp.desc ? { desc: imp.desc } : {}),
+        ...(imp.ref ? { ref: imp.ref } : {}),
+        ...(imp.refKind ? { refKind: imp.refKind } : {})
+      }
+      // 与 duplicateChar 同一条顺序要求:图先写,再交给 saveCharacters 落盘
+      for (const v of imp.views) await putCharView(c.id, v.kind, v.data)
+      added.push(c)
+    }
+    characters.value = [...added, ...characters.value]
+    await saveCharacters(characters.value)
+    notice.value =
+      added.length === 1 ? `Imported “${added[0].name}”.` : `Imported ${added.length} characters.`
+  } catch {
+    notice.value = 'Could not save the imported characters.'
+  }
 }
 
 /* 每个角色被用了几次、最后一次是什么时候。数据全在历史里 ——
@@ -1066,15 +1209,23 @@ function kindLabel(kind: CharacterViewKind) {
   return CHARACTER_VIEWS.find((v) => v.kind === kind)?.label || kind
 }
 
-/* 取景 → 实际尺寸。各厂商的尺寸表不一样,所以从可用尺寸里挑最接近方形/竖幅的;
-   挑不到(自由尺寸)就用当前选中的尺寸 */
+/* 竖幅的目标比例。全身像用 2:3:站姿人形只有竖框装得下,
+   9:16 会把人大幅缩小、面料与配饰的细节跟着丢,3:4 又偏紧、容易切到脚 */
+const PORTRAIT_RATIO = 2 / 3
+
+/* 取景 → 实际尺寸。
+   比例是按视图写死的(见 api.ts 的 framing:正脸 / 3-4 / 细节 / 表情一律方形,
+   只有全身是竖幅),但像素值写不死 —— 各厂商只认自己那几档,
+   所以这里做的是"在它认的档位里挑最接近那个比例的"。
+   厂商不限尺寸时,候选换成应用自己那组常用值:FREE_SIZES 里有 1024x1792 这一档竖幅,
+   全身图才装得下。这里刻意不沿用创作区当前尺寸 —— 那是给作品用的,
+   可能是个宽幅,拿来当全身图的画框会得到一张横过来的人 */
 function viewSize(framing: 'square' | 'portrait'): string {
-  const list = allowedSizes(provider.value.id, config.value.model)
-  if (list === 'free') return size.value
-  const want = framing === 'square' ? 1 : 1.5
+  const allowed = allowedSizes(provider.value.id, config.value.model)
+  const want = framing === 'square' ? 1 : PORTRAIT_RATIO
   let best = ''
   let bestGap = Infinity
-  for (const s of list) {
+  for (const s of allowed === 'free' ? FREE_SIZES : allowed) {
     const [w, h] = s.split('x').map(Number)
     if (!(w > 0 && h > 0)) continue
     const gap = Math.abs(w / h - want)
@@ -1083,20 +1234,39 @@ function viewSize(framing: 'square' | 'portrait'): string {
       best = s
     }
   }
+  // 一档都没挑出来(候选里只有 auto 这类非尺寸值):退回创作区当前尺寸
   return best || size.value
 }
 
-/** 结果图 → 压缩后的 Blob。设定图只当参考用,压到最长边 512 就够
- *  —— 与参考图存档同一档参数,不另开一套 */
-async function resultRefBlob(item: ResultItem | undefined): Promise<Blob | undefined> {
-  if (!item) return undefined
-  const src = imageSrc(item)
+/* —— 角色身上的图 ——
+   角色有两处图:ref(卡面与头像)与 5 张设定图。它们和 record.ref 的用处不同 ——
+   后者只是"当时用了哪张参考图"的复现凭据,只喂给模型,压到最长边 512 就够
+   (见 refThumbOf);而角色这两处是要给人看的:角色卡封面、详情页头像、
+   以及全屏查看器里能铺到 600px 宽 —— 2× 屏就是 1200px。
+   512 一到那个尺寸一眼就糊,所以这条路按显示级编:最长边 1280、JPEG q0.88。
+   1280 是照着全屏查看器定的(600 CSS px × 2),再大对观感没有增益,
+   只是让一套 6 张图多占几 MB */
+const CHAR_IMAGE_MAX = 1280
+async function charImageBlob(src: string): Promise<Blob | undefined> {
   if (!src) return undefined
   try {
-    return await refThumbOf(await blobToDataURL(await (await fetch(src)).blob()))
+    /* 先把字节抓回来再转 data URL:src 可能是上游回的外链,
+       直接塞进 <img> 会让 canvas 被跨域污染,toDataURL 直接抛错 */
+    const raw = await blobToDataURL(await urlToBlob(src))
+    /* force 重编码:模型给的多半是 PNG,原样留下就是 1MB 上下 ——
+       一套六张图好几 MB,画质上却看不出多出来的好处 */
+    const out = await compressImage(raw, CHAR_IMAGE_MAX, 0.88, true)
+    const blob = await urlToBlob(out)
+    return blob.type.startsWith('image/') ? blob : undefined
   } catch {
     return undefined
   }
+}
+
+/** 一张生成结果 → 落进角色设定图的 Blob(显示级,见上面 CHAR_IMAGE_MAX) */
+async function resultRefBlob(item: ResultItem | undefined): Promise<Blob | undefined> {
+  if (!item) return undefined
+  return charImageBlob(imageSrc(item))
 }
 
 /**
@@ -1111,14 +1281,16 @@ async function genCharView(charId: string, kind: CharacterViewKind): Promise<boo
   const c = characters.value.find((x) => x.id === charId)
   if (!view || !c || charViewBusy.value) return false
   const cfg = config.value
+  /* 这里几个报错都走 notice 而不是 fail:这条流水线只有站在角色页才会触发,
+     而 fail 写的是 home 那条 .err —— 在角色页触发时它不渲染,等于没提示 */
   if (!cfg.model) {
-    fail('Set an image model in API settings first.')
+    notice.value = 'Set an image model in API settings first.'
     return false
   }
   const refBlob = kind === 'front' ? c.ref : viewOf(c.id, 'front')?.data
   // 除正脸外都得有正脸当锚,否则跑出来的只是"另一个长得有点像的人"
   if (!refBlob && kind !== 'front') {
-    fail('Generate the front view first — the other views are built from it.')
+    notice.value = 'Generate the front view first — the other views are built from it.'
     return false
   }
   charViewBusy.value = kind
@@ -1158,7 +1330,7 @@ async function genCharView(charId: string, kind: CharacterViewKind): Promise<boo
     }
     ok = true
   } catch (e: any) {
-    fail(e?.message || 'Could not generate this view')
+    notice.value = e?.message || 'Could not generate this view'
   } finally {
     charViewBusy.value = ''
   }
@@ -2382,6 +2554,9 @@ function createAssignCollection(title: string) {
         :text-config="textConfig || undefined"
         @save="saveCharFromPage"
         @remove="deleteChar"
+        @duplicate="duplicateChar"
+        @export="exportChar"
+        @import="importCharFile"
         @open="loadCharViews"
         @create="createWithCharacter"
         @generate="genCharView"

@@ -154,18 +154,32 @@ Rules:
 - Prefer one strong visual direction over a pile of adjectives.
 - Stay under 110 words, one paragraph.`,
   /* 拆角色设定用固定前缀而不是 JSON:少一整类"围栏/多余解释"的解析坑,
-     而且人可以直接读懂回的是什么。五个字段必须都给,缺项由它自己补一致的内容。 */
+     而且人可以直接读懂回的是什么。标签用可读的多词写法,解析侧会把
+     非字母去掉再查表,所以 "Nose & mouth" 也能对上。
+
+     分两档是要紧的:有些字段编出来只是把描述写具体(好事,模糊才是漂移的源头),
+     有些编出来等于改了这个角色是谁 —— 默认给每个人脸上添一道疤、或者按默认
+     模板塞一身义体,是错的。所以后者只在原句真的提到时才写。 */
   character: `You turn a one-line idea into a reusable character spec for an image-generation model.
 
 Rules:
-- Output exactly five lines, in this order, and nothing else:
+- Output exactly eleven lines, in this order, and nothing else:
+Name: <a short name or callsign for this character, one to three words, no quotes>
 Identity: <who this character is, plus the overall style>
-Hair: <hairstyle and hair color>
+Face: <face shape and bone structure, skin tone, apparent age>
+Hair: <hairstyle, length and hair color>
+Brows: <eyebrow shape, thickness and color>
 Eyes: <eye color and any eye feature>
+Nose & mouth: <nose and lip shape>
+Facial hair: <beard, moustache or stubble — or "clean-shaven" / "none" if it does not fit>
+Face marks: <scars, moles, birthmarks, facial tattoos or facial implants — leave empty if the idea does not mention any>
 Outfit: <clothing, armor, gear>
-Marks: <scars, tattoos, implants, signature accessories>
-- Every one of the five lines must be present. If the idea says nothing about a field, invent something specific that fits the rest.
-- Each value is a short comma-separated phrase in English, under 12 words.
+Marks: <body scars, tattoos, implants, signature accessories — leave empty if the idea does not mention any>
+- The name must read as a name, not a description. Invent one that fits when the idea does not give a name.
+- Name, Identity, Face, Hair, Brows, Eyes, Nose & mouth, Facial hair and Outfit must always have a value. If the idea says nothing about one of them, invent something specific that fits the rest.
+- Facial hair must always be stated explicitly, including when the answer is none. Leaving it blank makes the model guess differently in every image.
+- Write "Face marks:" or "Marks:" with nothing after the colon when the idea gives no reason for them. Do not invent scars, tattoos or implants.
+- Every value except the name is a short comma-separated phrase in English, under 12 words.
 - Describe only the character itself. Never mention background, lighting, camera, lens or composition — the user supplies the scene separately.
 - No preamble, no explanation, no markdown, no quotes.`
 }
@@ -368,7 +382,7 @@ app.post('/api/generate', rateLimit, async (req, res) => {
        compressImage 压过的 JPEG */
     const parts = [{ text: prompt }]
     /* 原生协议天然能收多张:每张参考图各占一段 inlineData,
-       所以角色的"正脸 + 3/4 + 全身"可以一起送上去 */
+       所以角色的"正脸 + 全身 + 转面"可以一起送上去 */
     for (const ref of refs) {
       const [meta, b64] = ref.split(',')
       const mime = (meta.match(/data:([^;]+)/) || [])[1] || 'image/jpeg'
