@@ -21,6 +21,7 @@ import {
   PhTimer,
   PhCalendarBlank,
   PhDownloadSimple,
+  PhPencilSimple,
   PhTrash,
   PhStar,
   PhCheck,
@@ -46,6 +47,8 @@ const emit = defineEmits<{
   (e: 'usePrompt', params: ReuseParams): void
   (e: 'favorite', payload: FavoritePayload): void
   (e: 'reference', item: ResultItem): void
+  // 进自由画布:交回的是"本条记录里的第几张",主界面自己从预览的那条上取
+  (e: 'edit', index: number): void
   (e: 'remove'): void
   (e: 'mark', entry: HistoryEntry, index: number): void
   (e: 'assign-collection', collectionId: string): void
@@ -212,6 +215,12 @@ async function useThisPrompt() {
   const ref = e.ref ? await blobToDataURL(e.ref) : undefined
   emit('usePrompt', { ...reuseParamsOf(e), ref })
   close()
+}
+
+/* 把当前这张图交给自由画布做本地加工。这里不关预览 ——
+   主界面把编辑面板叠在预览之上,编辑完回到预览,是一段连续的操作 */
+function editThis() {
+  emit('edit', active.value)
 }
 
 /* 把当前这张图作为参考图交给主界面。
@@ -633,6 +642,13 @@ watch(collAdding, async (v) => {
                 <button class="act" @click="useAsReference">
                   <PhImageSquare aria-hidden="true" />
                   As reference
+                </button>
+                <!-- 进自由画布。占满一整行:侧栏 320px 装不下第三个带文案的按钮,
+                     硬塞进去会把上面两枚挤到换行。它也确实值得单占一行 ——
+                     这是"对这张图动手"与"拿这张图去出图"两类动作的分界 -->
+                <button class="act wide" @click="editThis">
+                  <PhPencilSimple aria-hidden="true" />
+                  Edit on canvas
                 </button>
               </div>
             </aside>
@@ -1063,8 +1079,14 @@ watch(collAdding, async (v) => {
    留白已由 .block 的 flex: 1 吃掉,不再需要 margin-top: auto 把它顶到底 */
 .side-actions {
   display: flex;
+  /* 允许换行:「Edit on canvas」整行铺开,上面两枚仍在同一行并排 */
+  flex-wrap: wrap;
   gap: var(--sp-2);
   padding-top: var(--sp-3);
+}
+/* 独占整行(不计 gap 的 8px) */
+.act.wide {
+  flex: 1 0 100%;
 }
 .act {
   flex: 1;

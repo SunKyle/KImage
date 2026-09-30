@@ -240,6 +240,18 @@ export interface CharacterStat {
   lastAt: number
 }
 
+/* 一个角色名下的一件作品:历史里一条带 characterId 的记录中的一张图。
+   与 CharacterStat 同源 —— 从记录里派生,不落盘。
+   entry 整个带着:预览是"按记录"打开的(见 App 的 openPreview),
+   而一条记录可能不止一张图,index 说明点的是其中哪一张 */
+export interface CharacterWork {
+  // 记录 id + 序号,做列表 key 用
+  key: string
+  entry: HistoryEntry
+  index: number
+  item: ResultItem
+}
+
 // 「使用提示词」时带回的一组参数,用于一键复现当时的出图条件
 // 全部可选:套用前要按当前厂商的能力逐项校验
 export interface ReuseParams {

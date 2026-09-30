@@ -506,10 +506,6 @@ watch(
 .rs-item[data-pressed] {
   transform: scale(0.96);
 }
-.rs-item:focus-visible {
-  outline: 2px solid var(--rs-thumb);
-  outline-offset: 3px;
-}
 @media (hover: hover) and (pointer: fine) {
   .rs-item[aria-checked='false']:hover {
     opacity: var(--rs-hover);

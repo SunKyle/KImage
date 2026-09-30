@@ -315,13 +315,12 @@ function onImportFile(e: Event) {
     <!-- ===== 浏览 ===== -->
     <template v-if="view === 'grid'">
       <header class="lib-head">
-        <div>
-          <h1 class="lib-title">Prompt Library</h1>
-          <p class="lib-sub">
-            {{ items.length }} {{ items.length === 1 ? 'prompt' : 'prompts' }} · saved in this
-            browser
-          </p>
-        </div>
+        <!-- 页面名不在这儿写第二遍:顶部横条的字标已经在说"Prompt Library"。
+             编辑器那一步的标题另有其名(Edit / New prompt),不在此列 -->
+        <p class="lib-sub">
+          {{ items.length }} {{ items.length === 1 ? 'prompt' : 'prompts' }} · saved in this
+          browser
+        </p>
       </header>
 
       <!-- 一行:搜索 + 新建 + 更多。三者都是"从这里开始"的动作,分到两行就散了;

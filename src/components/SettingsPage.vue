@@ -371,10 +371,9 @@ function onImportFile(e: Event) {
 <template>
   <section class="pg" aria-label="API settings">
     <header class="pg-head">
-      <div>
-        <h1 class="pg-title">API settings</h1>
-        <p class="pg-sub">Works with any OpenAI-compatible API. Configs are stored locally and never uploaded.</p>
-      </div>
+      <!-- 页面名不在这儿写第二遍:顶部横条的字标已经在说"Settings"。
+           这里留的是这一页特有的说明 —— 它跟哪类接口配合、数据放在哪 -->
+      <p class="pg-sub">Works with any OpenAI-compatible API. Configs are stored locally and never uploaded.</p>
       <div v-if="mode === 'list'" class="pg-ops">
         <button class="pg-new" @click="emit('create')">
           <PhPlus aria-hidden="true" />
@@ -684,12 +683,6 @@ function onImportFile(e: Event) {
   justify-content: space-between;
   gap: var(--sp-4);
   padding-top: var(--sp-2);
-}
-.pg-title {
-  font-family: var(--font-sans);
-  font-size: var(--fs-3xl);
-  font-weight: 700;
-  letter-spacing: var(--ls-tight);
 }
 .pg-sub {
   margin-top: 6px;

@@ -30,6 +30,15 @@ function dispatcherFor(target) {
   return NO_PROXY.some((s) => host === s || host.endsWith(`.${s}`)) ? undefined : proxyAgent
 }
 
+/* 代理是"路上多一跳",它随时可能掉线 —— 节点过期、规则改了、客户端在切节点都会。
+   而目标域名往往直连是通的(尤其是国内的中转站)。所以配了代理的目标按
+   [代理, 直连] 依次尝试:只有连接层失败才走下一跳,上游真回了错误码就照常透出。
+   反过来不成立:没配代理的目标不会去猜一个代理来试。 */
+function dispatchAttempts(target) {
+  const proxy = dispatcherFor(target)
+  return proxy ? [proxy, undefined] : [undefined]
+}
+
 /* ===== 目标地址校验(防 SSRF) ========================================
    这个接口按请求体里的 baseUrl 转发,等于把"发起请求"这件事交给了调用方。
    不加限制时任何人都能拿它探测内网(如 http://127.0.0.1:1、169.254.169.254)。
@@ -365,8 +374,10 @@ app.post('/api/generate', rateLimit, async (req, res) => {
      上游没有对应的 'auto' 取值,所以仍然只在显式选择时才带上。
      Gemini 那条路是例外:它根本没有 size 参数,size 会被约分成宽高比(见 geminiRatio)。 */
 
-  /* 两条路的请求体完全不同,各自成段 */
-  let payload
+  /* 两条路的请求体完全不同,各自成段。
+     做成"每次调用现造一份"而不是算好一个变量:代理那一跳失败要再直连试一次,
+     而 FormData / 字符串体发过一次就被消耗掉了,得能重来。 */
+  let buildBody
   if (isGemini) {
     headers['Content-Type'] = 'application/json'
     const ratio = geminiRatio(size)
@@ -388,43 +399,47 @@ app.post('/api/generate', rateLimit, async (req, res) => {
       const mime = (meta.match(/data:([^;]+)/) || [])[1] || 'image/jpeg'
       parts.push({ inlineData: { mimeType: mime, data: b64 } })
     }
-    payload = JSON.stringify({
-      contents: [{ parts }],
-      ...(Object.keys(gen).length ? { generationConfig: gen } : {})
-    })
+    buildBody = () =>
+      JSON.stringify({
+        contents: [{ parts }],
+        ...(Object.keys(gen).length ? { generationConfig: gen } : {})
+      })
   } else if (isImageGen) {
     // OpenAI 系图生图:gpt-image 等模型不接受 JSON 里的 data-url base64,
     // 必须走 multipart 文件上传(或在个别服务下传公网 URL)
-    const fd = new FormData()
-    if (model) fd.append('model', model)
-    fd.append('prompt', prompt)
-    fd.append('n', String(n))
-    if (size) fd.append('size', size)
-    for (const [k, v] of Object.entries(extras)) fd.append(k, String(v))
-    /* 单张仍用 image —— 与一直以来的行为完全一致,不给最常见的那条路添风险;
-       多张才改用 image[],那是 OpenAI 的 /images/edits 收多图时的字段名。
-       字段名各家未必相同,上游拒绝时会原样透出来,照提示改即可 */
-    const field = refs.length > 1 ? 'image[]' : 'image'
-    refs.forEach((ref, i) => {
-      const [meta, b64] = ref.split(',')
-      const mime = (meta.match(/data:([^;]+)/) || [])[1] || 'image/jpeg'
-      const type = mime.includes('png') ? 'png' : 'jpeg'
-      fd.append(
-        field,
-        new Blob([Buffer.from(b64, 'base64')], { type: mime }),
-        `image-${i + 1}.${type}`
-      )
-    })
-    payload = fd // fetch 自动设置 multipart boundary
+    buildBody = () => {
+      const fd = new FormData()
+      if (model) fd.append('model', model)
+      fd.append('prompt', prompt)
+      fd.append('n', String(n))
+      if (size) fd.append('size', size)
+      for (const [k, v] of Object.entries(extras)) fd.append(k, String(v))
+      /* 单张仍用 image —— 与一直以来的行为完全一致,不给最常见的那条路添风险;
+         多张才改用 image[],那是 OpenAI 的 /images/edits 收多图时的字段名。
+         字段名各家未必相同,上游拒绝时会原样透出来,照提示改即可 */
+      const field = refs.length > 1 ? 'image[]' : 'image'
+      refs.forEach((ref, i) => {
+        const [meta, b64] = ref.split(',')
+        const mime = (meta.match(/data:([^;]+)/) || [])[1] || 'image/jpeg'
+        const type = mime.includes('png') ? 'png' : 'jpeg'
+        fd.append(
+          field,
+          new Blob([Buffer.from(b64, 'base64')], { type: mime }),
+          `image-${i + 1}.${type}`
+        )
+      })
+      return fd // fetch 自动设置 multipart boundary
+    }
   } else {
     headers['Content-Type'] = 'application/json'
-    payload = JSON.stringify({
-      model: model || undefined,
-      prompt,
-      n,
-      ...(size ? { size } : {}),
-      ...extras
-    })
+    buildBody = () =>
+      JSON.stringify({
+        model: model || undefined,
+        prompt,
+        n,
+        ...(size ? { size } : {}),
+        ...extras
+      })
   }
 
   // 前端点"终止"会断开连接;这里同步中断对上游的请求,
@@ -441,13 +456,33 @@ app.post('/api/generate', rateLimit, async (req, res) => {
   })
 
   try {
-    const upstream = await fetch(target, {
-      method: 'POST',
-      headers,
-      body: payload,
-      signal: ac.signal,
-      dispatcher: dispatcherFor(target)
-    })
+    /* 依次尝试 [代理, 直连](没配代理就只有直连一次,见 dispatchAttempts)。
+       换下一跳只看 fetch 本身有没有抛错:上游回了错误码是"这条配置能不能用"的答案,
+       重试没有意义;用户点终止与超时中断抛 AbortError,同样直接交出去。
+       reachedUpstream 用来区分"压根没连上"与"连上了但读响应失败",
+       前者才该提代理,后者该按原来的连接码给提示。 */
+    let upstream = null
+    let connectErr = null
+    let proxyJumpFailed = false
+    let reachedUpstream = false
+    for (const dispatcher of dispatchAttempts(target)) {
+      try {
+        upstream = await fetch(target, {
+          method: 'POST',
+          headers,
+          body: buildBody(),
+          signal: ac.signal,
+          dispatcher
+        })
+        reachedUpstream = true
+        break
+      } catch (e) {
+        if (e?.name === 'AbortError') throw e
+        connectErr = e
+        if (dispatcher) proxyJumpFailed = true // 抛错的是代理那一跳
+      }
+    }
+    if (!upstream) throw connectErr
 
     const text = await upstream.text()
 
@@ -539,7 +574,13 @@ app.post('/api/generate', rateLimit, async (req, res) => {
     const cause = e?.cause
     const code = cause?.code || cause?.errno || ''
     const reason = [code, cause?.message].filter(Boolean).join(' ') || String(e)
-    const hint = CONNECT_HINTS[code] || ''
+    /* 连不上且动过代理时,原样的提示会让人跑去"配置 UPSTREAM_PROXY" ——
+       可它早就配好了,真正的毛病是那一跳不通。这时说清两跳都试过、问题在代理 */
+    const hint =
+      !reachedUpstream && proxyJumpFailed
+        ? 'Tried both the configured UPSTREAM_PROXY and a direct connection — neither worked. ' +
+          'Check that the proxy is running and its node is healthy, or unset UPSTREAM_PROXY to go direct.'
+        : CONNECT_HINTS[code] || ''
     // 生产环境只回显目标主机名:完整地址会被当成内网探测器用
     const where = PROD_LIKE ? targetUrl.host : target
     return res.status(502).json({
@@ -614,22 +655,41 @@ app.post('/api/enhance', rateLimit, async (req, res) => {
     if (!res.writableEnded) ac.abort()
   })
 
-  try {
-    const upstream = await fetch(target, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        model: textModel,
-        messages: [
-          // 顺序有讲究:先两档的基本规则,再图生图的变更导向,最后目标模型的结构偏好
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: prompt }
-        ],
-        temperature: ENHANCE_TEMPERATURE[enhanceMode]
-      }),
-      signal: ac.signal,
-      dispatcher: dispatcherFor(target)
+  const buildBody = () =>
+    JSON.stringify({
+      model: textModel,
+      messages: [
+        // 顺序有讲究:先两档的基本规则,再图生图的变更导向,最后目标模型的结构偏好
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: prompt }
+      ],
+      temperature: ENHANCE_TEMPERATURE[enhanceMode]
     })
+
+  try {
+    // 与 /api/generate 同一套:代理那一跳连不上时再直连试一次(见 dispatchAttempts)
+    let upstream = null
+    let connectErr = null
+    let proxyJumpFailed = false
+    let reachedUpstream = false
+    for (const dispatcher of dispatchAttempts(target)) {
+      try {
+        upstream = await fetch(target, {
+          method: 'POST',
+          headers,
+          body: buildBody(),
+          signal: ac.signal,
+          dispatcher
+        })
+        reachedUpstream = true
+        break
+      } catch (e) {
+        if (e?.name === 'AbortError') throw e
+        connectErr = e
+        if (dispatcher) proxyJumpFailed = true // 抛错的是代理那一跳
+      }
+    }
+    if (!upstream) throw connectErr
 
     const text = await upstream.text()
 
@@ -675,7 +735,12 @@ app.post('/api/enhance', rateLimit, async (req, res) => {
     const cause = e?.cause
     const code = cause?.code || cause?.errno || ''
     const reason = [code, cause?.message].filter(Boolean).join(' ') || String(e)
-    const hint = CONNECT_HINTS[code] || ''
+    // 与 /api/generate 同一套措辞:两跳都试过了,就别再让人去"配置 UPSTREAM_PROXY"
+    const hint =
+      !reachedUpstream && proxyJumpFailed
+        ? 'Tried both the configured UPSTREAM_PROXY and a direct connection — neither worked. ' +
+          'Check that the proxy is running and its node is healthy, or unset UPSTREAM_PROXY to go direct.'
+        : CONNECT_HINTS[code] || ''
     // 生产环境只回显目标主机名:完整地址会被当成内网探测器用
     const where = PROD_LIKE ? targetUrl.host : target
     return res.status(502).json({

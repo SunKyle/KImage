@@ -1,88 +1,21 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
-/* React Bits 的 LatticeLoader,移植成 Vue 3。
-   波形完全交给 CSS:每个格子按图案里的顺序错开 animation-delay,自己循环,
-   所以运行期没有逐帧 JS。唯一写 DOM 的地方是那个计时器(每 100ms 一次),
-   走 ref 直接改 textContent,不触发组件重渲染 —— 和 RubberSegment 里
-   滑块裁剪同一个理由:MotionValue / 定时器这类高频写入要绕开渲染周期。 */
+/* 出图 / 起稿时的加载指示,形态是「取景框」:
+   四角括弧向内收放,像相机对焦锁定的那一下。
+   动画全部交给 CSS —— 呼吸走 scale 这个独立变换属性,于是它能和
+   结束态收拢用的 transform 叠加而互不覆盖,也就不必为切换态再包一层壳。
+   运行期唯一写 DOM 的地方是秒表计时器(每 100ms 一次),走 ref 直接改
+   textContent,不触发组件重渲染 —— 与 RubberSegment 里滑块裁剪同一个理由。 */
 
-type Plan = { cells: (number | null)[]; loop: number; scale: number; lit?: number }
 type Mark = 'done' | 'error'
 
-const PATTERNS: Record<string, Record<number, Plan>> = {
-  arrow: { 3: { cells: [1, 2, 3, 0, 1, 2, 1, 2, 3], loop: 7.2, scale: 1 } },
-  dots: { 3: { cells: [0, 1, 2, 0, 1, 2, 0, 1, 2], loop: 3, scale: 2.4 } },
-  ripple: { 3: { cells: [2, 1, 2, 1, 0, 1, 2, 1, 2], loop: 4.8, scale: 1.5 } },
-  spiral: { 3: { cells: [0, 1, 2, 7, 8, 3, 6, 5, 4], loop: 9, scale: 1.2, lit: 0.35 } },
-  orbit: {
-    3: { cells: [0, 1, 2, 7, null, 3, 6, 5, 4], loop: 8, scale: 1.2 },
-    4: {
-      cells: [0, 1, 2, 3, 11, null, null, 4, 10, null, null, 5, 9, 8, 7, 6],
-      loop: 6,
-      scale: 1.2,
-      lit: 0.45
-    }
-  },
-  snake: {
-    3: { cells: [0, 1, 2, 5, 4, 3, 6, 7, 8], loop: 9, scale: 1, lit: 0.35 },
-    4: {
-      cells: [0, 1, 2, 3, 7, 6, 5, 4, 8, 9, 10, 11, 15, 14, 13, 12],
-      loop: 16,
-      scale: 1,
-      lit: 0.25
-    }
-  },
-  sweep: {
-    4: { cells: [0, 1, 2, 3, 1, 2, 3, 4, 2, 3, 4, 5, 3, 4, 5, 6], loop: 5, scale: 1, lit: 0.45 }
-  },
-  spin: {
-    4: {
-      cells: [0, 0, 1, 1, 0, 0, 1, 1, 3, 3, 2, 2, 3, 3, 2, 2],
-      loop: 4,
-      scale: 1.6,
-      lit: 0.35
-    }
-  },
-  rain: {
-    4: {
-      cells: [0, 2, 1, 3, 1, 3, 2, 4, 2, 4, 3, 5, 3, 5, 4, 6],
-      loop: 4,
-      scale: 1.2,
-      lit: 0.35
-    }
-  },
-  pulse: {
-    4: {
-      cells: [2, 1, 1, 2, 1, 0, 0, 1, 1, 0, 0, 1, 2, 1, 1, 2],
-      loop: 2.4,
-      scale: 2.5,
-      lit: 0.45
-    }
-  }
+/* 勾与叉各一条路径(viewBox 24×24)。
+   配 pathLength="1" 把实际长度归一化,描边进度就能写成与图形长度无关的 dashoffset */
+const MARK_PATH: Record<Mark, string> = {
+  done: 'M7.6 12.3 10.9 15.6 16.6 8.6',
+  error: 'M8.6 8.6 15.4 15.4M15.4 8.6 8.6 15.4'
 }
-const DEFAULT_PATTERN: Record<3 | 4, string> = { 3: 'orbit', 4: 'sweep' }
-const MARKS: Record<3 | 4, Record<Mark, number[]>> = {
-  3: { done: [2, 3, 5, 7], error: [0, 2, 4, 6, 8] },
-  4: { done: [7, 8, 10, 13], error: [0, 3, 5, 6, 9, 10, 12, 15] }
-}
-
-/** 具名图案缺这一档就退回该档的默认图案 */
-function resolvePattern(pattern: string | CustomPattern, grid: 3 | 4): Plan {
-  if (typeof pattern === 'string') {
-    return PATTERNS[pattern]?.[grid] ?? PATTERNS[DEFAULT_PATTERN[grid]][grid]
-  }
-  const cells = Array.from({ length: grid * grid }, (_, i) => pattern.cells[i] ?? null)
-  const max = Math.max(0, ...cells.filter((v): v is number => v != null))
-  return {
-    cells,
-    loop: pattern.loop ?? max + 4.2,
-    scale: pattern.scale ?? 1,
-    lit: pattern.lit ?? 0.62
-  }
-}
-
-type CustomPattern = { cells: (number | null)[]; loop?: number; scale?: number; lit?: number }
 
 /** 十分之一秒 → “12.3s” / “1m 02.3s” */
 function fmt(ds: number) {
@@ -104,23 +37,14 @@ const props = withDefaults(
     /** 出错后的动词 */
     errorLabel?: string
     status?: 'working' | 'done' | 'error'
-    pattern?: string | CustomPattern
-    grid?: 3 | 4
-    shape?: 'square' | 'round'
-    /** 格子、动词、计时器的墨色,默认继承当前文字颜色 */
+    /** 括弧的墨色,默认继承当前文字颜色 */
     color?: string
     doneColor?: string
     errorColor?: string
-    cellSize?: number
-    gap?: number
+    /** 取景框边长由它推算:两处的量级都要和相邻文字对齐 */
     fontSize?: number
-    /** 相邻格子的点亮间隔,整圈时长随它等比缩放 */
-    step?: number
-    /** 暗轮廓的可见度 */
+    /** 静息的浓度。工作途中不再明暗起伏,起伏只由缩放表达 */
     idleOpacity?: number
-    glow?: boolean
-    /** 空着就用墨色 */
-    glowColor?: string
     showTimer?: boolean
     /** 受控的已用秒数;给了就不再自己计时 */
     elapsed?: number
@@ -130,53 +54,38 @@ const props = withDefaults(
     doneLabel: 'Done in',
     errorLabel: 'Failed after',
     status: 'working',
-    pattern: 'orbit',
-    grid: 3,
-    shape: 'round',
     color: 'currentColor',
     doneColor: '#22c55e',
     errorColor: '#ef4444',
-    cellSize: 6,
-    gap: 2,
     fontSize: 14,
-    step: 90,
-    idleOpacity: 0.15,
-    glow: false,
-    glowColor: '',
+    idleOpacity: 0.72,
     showTimer: true
   }
 )
 
-const n = computed<3 | 4>(() => (props.grid === 4 ? 4 : 3))
-const plan = computed(() => resolvePattern(props.pattern, n.value))
-const marks = computed(() => MARKS[n.value])
-const d = computed(() => props.step * plan.value.scale)
-const cycle = computed(() => Math.round(plan.value.loop * d.value))
-/** 标记层只按下标摆位,图案里的 null 空洞与它无关 */
-const slots = computed(() => plan.value.cells.map((_, i) => i))
-
+/* 边长取 1.25 倍字号:三个尺寸(边长、臂长、线宽)都按它等比推出去,
+   于是 20px 的区段标题和 12px 的面板小字共用一套几何,不必各配一遍 */
+const size = computed(() => Math.round(props.fontSize * 1.25))
 const vars = computed(() => ({
-  '--ll-n': String(n.value),
-  '--ll-cell': `${props.cellSize}px`,
-  '--ll-gap': `${props.gap}px`,
+  '--ll-size': `${size.value}px`,
+  '--ll-stroke': `${(size.value * 0.072).toFixed(2)}px`,
+  '--ll-arm': `${(size.value * 0.336).toFixed(2)}px`,
+  '--ll-corner': `${(size.value * 0.112).toFixed(2)}px`,
   '--ll-font': `${props.fontSize}px`,
   '--ll-color': props.color,
   '--ll-mark': props.status === 'error' ? props.errorColor : props.doneColor,
-  '--ll-idle': String(props.idleOpacity),
-  '--ll-glow': props.glowColor || props.color,
-  '--ll-mark-glow': props.glowColor || (props.status === 'error' ? props.errorColor : props.doneColor),
-  '--ll-cycle': `${cycle.value}ms`
+  '--ll-idle': String(props.idleOpacity)
 }))
 
-/* 标记层只在非工作态可见,工作途中要记住上一次是勾还是叉 */
-const lastMark = ref<Mark>('done')
-const mark = computed<Mark>(() => (props.status === 'working' ? lastMark.value : props.status))
+/* 只有非工作态才挂这条路径:靠 v-if 连元素一起换掉,
+   描边进度才会重新跑一遍 —— 只改 d 是唤不醒 CSS 动画的 */
+const markPath = computed(() => (props.status === 'error' ? MARK_PATH.error : MARK_PATH.done))
+
 const announce = ref('')
 
 watch(
   () => props.status,
   (s) => {
-    if (s !== 'working') lastMark.value = s
     announce.value =
       s === 'working'
         ? `${props.label}, in progress`
@@ -218,33 +127,14 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <span
-    class="lattice-loader"
-    role="status"
-    :data-status="status"
-    :data-shape="shape"
-    :data-glow="glow ? '' : undefined"
-    :style="vars"
-  >
-    <span class="lattice-loader__grid" aria-hidden="true">
-      <span class="lattice-loader__layer lattice-loader__run">
-        <span
-          v-for="(unit, i) in plan.cells"
-          :key="i"
-          class="lattice-loader__cell"
-          :data-hole="unit == null ? '' : undefined"
-          :data-lit="plan.lit && plan.lit !== 0.62 ? Math.round(plan.lit * 100) : undefined"
-          :style="unit == null ? undefined : { animationDelay: `${Math.round(unit * d)}ms` }"
-        />
+  <span class="lattice-loader" role="status" :data-status="status" :style="vars">
+    <span class="lattice-loader__glyph" aria-hidden="true">
+      <span class="lattice-loader__run">
+        <i></i><i></i><i></i><i></i>
       </span>
-      <span class="lattice-loader__layer lattice-loader__mark">
-        <span
-          v-for="i in slots"
-          :key="i"
-          class="lattice-loader__cell"
-          :data-on="marks[mark].includes(i) ? '' : undefined"
-        />
-      </span>
+      <svg class="lattice-loader__mark" viewBox="0 0 24 24">
+        <path v-if="status !== 'working'" :key="status" :d="markPath" pathLength="1" />
+      </svg>
     </span>
     <span class="lattice-loader__label" aria-hidden="true">
       <span class="lattice-loader__text" :data-active="status === 'working' ? '' : undefined">{{ label }}</span>
@@ -258,21 +148,18 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .lattice-loader {
-  --ll-n: 3;
-  --ll-cell: 6px;
-  --ll-gap: 2px;
+  --ll-size: 18px;
+  --ll-stroke: 1.3px;
+  --ll-arm: 6px;
+  --ll-corner: 2px;
   --ll-font: 14px;
   --ll-color: currentColor;
   --ll-mark: #22c55e;
-  --ll-idle: 0.15;
-  --ll-glow: currentColor;
-  --ll-mark-glow: #22c55e;
-  --ll-peak: 1;
-  --ll-cycle: 864ms;
+  --ll-idle: 0.72;
+  /* 对焦一个来回的时长。想改速就从外面盖它,不必碰组件 */
+  --ll-cycle: 2000ms;
   --ll-ease-out: cubic-bezier(0.23, 1, 0.32, 1);
-  --ll-ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
 
-  position: relative;
   display: inline-flex;
   align-items: center;
   gap: calc(var(--ll-font) * 0.625);
@@ -281,97 +168,107 @@ onBeforeUnmount(() => {
   line-height: 1;
 }
 
-.lattice-loader__grid {
-  display: grid;
+.lattice-loader__glyph {
+  position: relative;
   flex: none;
+  width: var(--ll-size);
+  height: var(--ll-size);
 }
 
-.lattice-loader__layer {
-  grid-area: 1 / 1;
-  display: grid;
-  grid-template-columns: repeat(var(--ll-n), var(--ll-cell));
-  gap: var(--ll-gap);
-}
-
-.lattice-loader__cell {
-  width: var(--ll-cell);
-  height: var(--ll-cell);
-  border-radius: max(1px, calc(var(--ll-cell) * 0.25));
-  background: var(--ll-color);
-  opacity: var(--ll-idle);
-}
-
-.lattice-loader[data-shape='round'] .lattice-loader__cell {
-  border-radius: 50%;
-}
-
-.lattice-loader[data-glow] .lattice-loader__run .lattice-loader__cell:not([data-hole]) {
-  box-shadow: 0 0 calc(var(--ll-cell) * 1.2) calc(var(--ll-cell) * 0.12) var(--ll-glow);
-}
-
-.lattice-loader[data-glow] .lattice-loader__mark .lattice-loader__cell[data-on] {
-  box-shadow: 0 0 calc(var(--ll-cell) * 1.2) calc(var(--ll-cell) * 0.12) var(--ll-mark-glow);
-}
-
+/* 呼吸只动 scale,收拢只动 transform:两个属性各自独立叠加,
+   所以结束态能在"还在轻轻呼吸"的同时往内收,不必拆成两层元素 */
 .lattice-loader__run {
-  transition: opacity 200ms ease;
+  position: absolute;
+  inset: 0;
+  color: var(--ll-color);
+  opacity: var(--ll-idle);
+  animation: ll-breathe var(--ll-cycle) cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  transition:
+    opacity 260ms ease,
+    transform 300ms cubic-bezier(0.4, 0, 0.2, 1);
 }
 
-.lattice-loader__run .lattice-loader__cell {
-  animation: lattice-on var(--ll-cycle) var(--ll-ease-in-out) infinite;
+/* 四角括弧:每片只画相邻两条边,角上给一点圆角收势 */
+.lattice-loader__run i {
+  position: absolute;
+  width: var(--ll-arm);
+  height: var(--ll-arm);
 }
 
-.lattice-loader__run .lattice-loader__cell[data-lit='45'] {
-  animation-name: lattice-on-45;
+.lattice-loader__run i:nth-child(1) {
+  top: 0;
+  left: 0;
+  border-top: var(--ll-stroke) solid currentColor;
+  border-left: var(--ll-stroke) solid currentColor;
+  border-top-left-radius: var(--ll-corner);
 }
 
-.lattice-loader__run .lattice-loader__cell[data-lit='35'] {
-  animation-name: lattice-on-35;
+.lattice-loader__run i:nth-child(2) {
+  top: 0;
+  right: 0;
+  border-top: var(--ll-stroke) solid currentColor;
+  border-right: var(--ll-stroke) solid currentColor;
+  border-top-right-radius: var(--ll-corner);
 }
 
-.lattice-loader__run .lattice-loader__cell[data-lit='25'] {
-  animation-name: lattice-on-25;
+.lattice-loader__run i:nth-child(3) {
+  right: 0;
+  bottom: 0;
+  border-right: var(--ll-stroke) solid currentColor;
+  border-bottom: var(--ll-stroke) solid currentColor;
+  border-bottom-right-radius: var(--ll-corner);
 }
 
-.lattice-loader__run .lattice-loader__cell[data-hole] {
-  animation: none;
-  opacity: calc(var(--ll-idle) * 0.47);
+.lattice-loader__run i:nth-child(4) {
+  bottom: 0;
+  left: 0;
+  border-bottom: var(--ll-stroke) solid currentColor;
+  border-left: var(--ll-stroke) solid currentColor;
+  border-bottom-left-radius: var(--ll-corner);
+}
+
+/* 收工:括弧往内收拢着退场,像快门合上 —— 位置让给随后画出来的勾/叉 */
+.lattice-loader:not([data-status='working']) .lattice-loader__run {
+  opacity: 0;
+  transform: scale(0.62);
 }
 
 .lattice-loader__mark {
-  opacity: 0;
-  transform: scale(0.9);
-  transform-origin: center;
-  transition:
-    opacity 160ms var(--ll-ease-out),
-    transform 160ms var(--ll-ease-out);
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
 }
 
-.lattice-loader__mark .lattice-loader__cell {
-  transition:
-    opacity 200ms ease,
-    background-color 200ms ease;
+.lattice-loader__mark path {
+  fill: none;
+  stroke: var(--ll-mark);
+  /* 视口是 24,与 --ll-stroke 的 0.072 同源,所以随尺寸等比缩放 */
+  stroke-width: 1.73;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-dasharray: 1;
+  stroke-dashoffset: 1;
+  animation: ll-draw 380ms var(--ll-ease-out) 80ms forwards;
 }
 
-.lattice-loader__mark .lattice-loader__cell[data-on] {
-  background: var(--ll-mark);
-  opacity: var(--ll-peak);
+/* 对焦:口径往内收再放回,收得最深的一刻像合焦 */
+@keyframes ll-breathe {
+  0%,
+  100% {
+    scale: 1;
+  }
+
+  50% {
+    scale: 0.72;
+  }
 }
 
-.lattice-loader:not([data-status='working']) .lattice-loader__run {
-  opacity: 0;
-}
-
-.lattice-loader:not([data-status='working']) .lattice-loader__run .lattice-loader__cell {
-  animation-play-state: paused;
-}
-
-.lattice-loader:not([data-status='working']) .lattice-loader__mark {
-  opacity: 1;
-  transform: none;
-  transition:
-    opacity 200ms ease,
-    transform 200ms var(--ll-ease-out);
+@keyframes ll-draw {
+  to {
+    stroke-dashoffset: 0;
+  }
 }
 
 .lattice-loader__label {
@@ -417,85 +314,20 @@ onBeforeUnmount(() => {
   white-space: nowrap;
 }
 
-@keyframes lattice-on {
-  0%,
-  100% {
-    opacity: var(--ll-idle);
-  }
-
-  18%,
-  42% {
-    opacity: var(--ll-peak);
-  }
-
-  62% {
-    opacity: var(--ll-idle);
-  }
-}
-
-@keyframes lattice-on-45 {
-  0%,
-  100% {
-    opacity: var(--ll-idle);
-  }
-
-  13%,
-  31% {
-    opacity: var(--ll-peak);
-  }
-
-  45% {
-    opacity: var(--ll-idle);
-  }
-}
-
-@keyframes lattice-on-35 {
-  0%,
-  100% {
-    opacity: var(--ll-idle);
-  }
-
-  10%,
-  24% {
-    opacity: var(--ll-peak);
-  }
-
-  35% {
-    opacity: var(--ll-idle);
-  }
-}
-
-@keyframes lattice-on-25 {
-  0%,
-  100% {
-    opacity: var(--ll-idle);
-  }
-
-  7%,
-  17% {
-    opacity: var(--ll-peak);
-  }
-
-  25% {
-    opacity: var(--ll-idle);
-  }
-}
-
+/* 减少动态:定在一个中间口径的对焦位上;勾/叉也不再自绘,直接给完整的。
+   这一段的 animation: none 盖得住 style.css 里那条全局的 animation-duration 抑制 */
 @media (prefers-reduced-motion: reduce) {
   .lattice-loader__run {
-    --ll-peak: 0.7;
+    animation: none;
+    scale: 0.88;
   }
 
-  .lattice-loader__run .lattice-loader__cell {
-    animation-delay: 0ms !important;
-    animation-duration: 1400ms !important;
+  .lattice-loader__mark path {
+    animation: none;
+    stroke-dashoffset: 0;
   }
 
-  .lattice-loader .lattice-loader__mark {
-    transform: none;
-  }
-
-  .lattice-loader .lattice-loader__text {
+  .lattice-loader__text {
     filter: none;
   }
 }

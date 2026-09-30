@@ -1,10 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount, watch, toRaw } from 'vue'
 import {
-  PhHouse,
-  PhBooks,
-  PhClockCounterClockwise,
-  PhGear,
   PhSun,
   PhMoon,
   PhSlidersHorizontal,
@@ -29,9 +25,10 @@ import {
 import PromptLibrary from './components/PromptLibrary.vue'
 import ImagePreview from './components/ImagePreview.vue'
 import HistoryPage from './components/HistoryPage.vue'
+import CanvasEditor from './components/CanvasEditor.vue'
 import CharacterPage from './components/CharacterPage.vue'
 import SettingsPage from './components/SettingsPage.vue'
-import RubberSegment from './components/RubberSegment.vue'
+import NavSegment from './components/NavSegment.vue'
 import LatticeLoader from './components/LatticeLoader.vue'
 import UndoToast from './components/UndoToast.vue'
 import {
@@ -74,8 +71,9 @@ import {
 } from './api'
 import { blobToDataURL, urlToBlob, getCharViews, putCharView } from './lib/idb'
 import { titleFromPrompt } from './lib/text'
+import { NAV_ITEMS } from './lib/nav'
 import type { Cap, EnhanceMode, Provider } from './api'
-import type { ApiConfig, Collection, FavoritePayload, HistoryEntry, PromptItem, ResultItem, ReuseParams, Character, CharacterFields, CharacterStat, CharacterView, CharacterViewKind, ImportedCharacter } from './types'
+import type { ApiConfig, Collection, FavoritePayload, HistoryEntry, PromptItem, ResultItem, ReuseParams, Character, CharacterFields, CharacterStat, CharacterView, CharacterViewKind, CharacterWork, ImportedCharacter } from './types'
 
 // —— 状态 ——
 const prompt = ref('')
@@ -169,12 +167,115 @@ const activeCharId = ref('')
 /* 设定图:按角色 id 缓存已取出的视图。只在这个角色被选中时才读 IndexedDB ——
    启动时不碰,5 张图 × N 个角色全读进来太重 */
 const charViews = ref<Record<string, CharacterView[]>>({})
-/* 正在生成哪一张视图(空 = 空闲)。一次只跑一张,免得几个请求互相排队 */
-const charViewBusy = ref('')
-// 五个平级页面:首页 / 角色 / 提示词库 / 历史记录 / 接口设置,同时只挂载一个
-type Page = 'home' | 'chars' | 'lib' | 'history' | 'settings'
+/* 各角色正在生成哪几张视图(没有该角色的键 = 空闲)。
+   必须落到角色维度上:同一时间可以跑多张,而且是好几个角色的 ——
+   只记 kind 的话,A 的正脸在跑时切到 B,B 的格子也会显示成"生成中"。
+   同一张重复点会被忽略(见 genCharView) */
+const charViewBusy = ref<Record<string, CharacterViewKind[]>>({})
+/* 重跑设定图的中断手柄,按"角色 + 视图"各存一个:同时跑几张时,
+   停一张不能把别张掐掉;不同角色的同一视图也得分得开 */
+const charViewControllers = new Map<string, AbortController>()
+/** 中断手柄的键。角色 id 与视图名拼一格 —— 两边都可能撞,只有合起来才唯一 */
+function charViewKey(charId: string, kind: CharacterViewKind) {
+  return `${charId}:${kind}`
+}
+// 六个平级页面:首页 / 角色 / 画布 / 提示词库 / 历史记录 / 接口设置,同时只挂载一个
+type Page = 'home' | 'chars' | 'canvas' | 'lib' | 'history' | 'settings'
 const page = ref<Page>('home')
 const previewEntry = ref<HistoryEntry | null>(null)
+
+/* ===== 自由画布 =====================================================
+   它是导航上的一个平级页面,不是一个弹层 —— 所以只把"画布上摆着哪张图"
+   交给它(item),其余(工具箱、视图、操作序列)全归组件自己管。
+   页面本身不用 v-if 而用 v-show 挂载,所以切去历史挑张图再切回来,
+   手上那半张裁剪框还在。
+
+   画布上的图有两个来路:从历史里挑一张,或本地上传一张新的。
+   产物都是一条普通的历史记录 —— 来自历史的那张挂在源记录之下(parentId),
+   于是创作链上"这张是从哪张裁出来的"一眼可见,不必另建一套数据结构;
+   上传的没有出处,就是一条独立的记录。
+   尺寸按编辑后的真实像素记,而不是沿用源记录的 size —— 裁完比例可能已经变了,
+   沿用会让图墙按错误的宽高比排版(图墙是按 w/h 排的)。
+   ------------------------------------------------------------------ */
+const canvasItem = ref<ResultItem | null>(null)
+/* 画布的出处记录,存回新记录时用来接上派生关系(parentId)。
+   本地上传的图为 null —— 它没有出处 */
+const canvasSource = ref<HistoryEntry | null>(null)
+
+function openCanvas(entry: HistoryEntry, index: number) {
+  releaseCanvasLocal()
+  canvasItem.value = entry.results[index] ?? null
+  canvasSource.value = entry
+  // 画布是整页的,预览要是还开着会盖在上面,所以进来就把它收掉
+  closePreview()
+  page.value = 'canvas'
+}
+/* 本地上传的图直接摆上画布。它没有来源记录 ——
+   保存时落成一条新的历史记录,不接派生关系:这张不是从哪条生成记录来的 */
+function openCanvasFile(file: File) {
+  releaseCanvasLocal()
+  canvasItem.value = { type: 'b64', data: file }
+  canvasSource.value = null
+  closePreview()
+  page.value = 'canvas'
+}
+/* 画布上这张若是本地文件,它的 object URL 归画布独有 ——
+   换图或撤图时得撤掉,不然那张图的字节一直被 URL 强引用着。
+   来自历史的图不能这么干:它的 URL 和历史列表共用一份 */
+function releaseCanvasLocal() {
+  if (canvasSource.value || !canvasItem.value) return
+  releaseSrc(canvasItem.value)
+}
+// 预览里点「Edit on canvas」:目标就是正在看的那条记录里的当前那张
+function editFromPreview(index: number) {
+  const e = previewEntry.value
+  if (e) openCanvas(e, index)
+}
+// 画布上把这张图撤下来(回到空态)。空态里那个"去历史挑一张"由导航接手
+function discardCanvas() {
+  releaseCanvasLocal()
+  canvasItem.value = null
+  canvasSource.value = null
+}
+
+/* 顶部横条的实际高度,写进 --mast-h 给自由画布用。
+   导航条是最顶层、每一页都在,画布就铺在它下面 —— 让出多少高度得知道。
+   不能写死:窄屏下这条会从一行变成两行,高度跟着变 */
+const mastEl = ref<HTMLElement | null>(null)
+let mastRO: ResizeObserver | null = null
+onMounted(() => {
+  const el = mastEl.value
+  if (!el || typeof ResizeObserver === 'undefined') return
+  const sync = () =>
+    document.documentElement.style.setProperty('--mast-h', `${el.offsetHeight}px`)
+  sync()
+  mastRO = new ResizeObserver(sync)
+  mastRO.observe(el)
+})
+onBeforeUnmount(() => mastRO?.disconnect())
+
+/* 画布存回来的像素 → 新记录。走 recordFor 而不是自己拼一条:
+   缩略图、真实像素这些图墙要用的字段都由它一并补齐 */
+async function saveEdit(payload: { blob: Blob; w: number; h: number }) {
+  /* 出处可有可无:从历史打开的那张接着挂派生关系,
+     本地新上传的没有 —— 它本来就不属于哪条生成记录的延续 */
+  const src = canvasSource.value
+  const record = await recordFor([{ type: 'b64', data: payload.blob }], {
+    /* 提示词沿来源记录。画布是本地加工,没有发生新的生成 ——
+       编一句像 "cropped" 的提示词塞进去,只会让这条记录以后没法被复用。
+       本地上传的图没有来源,提示词就空着 */
+    prompt: src?.prompt ?? '',
+    size: `${payload.w}x${payload.h}`,
+    model: src?.model,
+    parentId: src?.id,
+    elapsedMs: 0
+  })
+  await persist(record)
+  // 存完把这张撤下:画布回到空态,免得再点一次"保存"重复存出同一条
+  discardCanvas()
+  notice.value = 'Saved to history.'
+}
+
 /* 「拉自某条记录改一个变量重跑」时,这一批的父记录 id。
    use-prompt 会把 fromEntryId 放进来,doGenerate 落盘时写进新记录做 parentId;
    用户手动改输入框后清空 —— 改完就不再是"同一个实验的延续",而是一张新图 */
@@ -187,6 +288,8 @@ const openPanel = ref<PanelKey>('')
 const shownPanel = ref<PanelKey>('')
 watch(openPanel, (v) => {
   if (v) shownPanel.value = v
+  // 面板一收,里面那排头像整块卸载,不会再补一次 mouseleave —— 悬停卡片得在这里收掉
+  else hideCharPeek()
 })
 function togglePanel(p: Exclude<PanelKey, ''>) {
   const same = openPanel.value === p
@@ -476,24 +579,21 @@ onMounted(() => {
 })
 onBeforeUnmount(() => window.removeEventListener('scroll', onScroll))
 
-// —— 顶部导航(分段控件) ——
-// 四个条目是四个平级页面,不是四个动作:滑块停在哪儿就是当前在看哪一页。
-// 视图状态只有 page 一份,navView 只是把它的类型收紧回联合类型
-// (RubberSegment 的 v-model 说的是普通字符串)。
-// 必须放在 page 声明之后:getter 引用了它
-const navItems = [
-  { value: 'home', label: 'Studio' },
-  { value: 'chars', label: 'Characters' },
-  { value: 'lib', label: 'Prompt Library' },
-  { value: 'history', label: 'History' },
-  { value: 'settings', label: 'Settings' }
-]
+/* —— 顶部导航(分段控件) ——
+   条目清单在 lib/nav.ts(导航与字标共用那一份)。这里只留状态:
+   视图状态只有 page 一份,navView 只是把它的类型收紧回联合类型
+   (分段控件的 v-model 说的是普通字符串)。
+   必须放在 page 声明之后:getter 引用了它 */
 const navView = computed({
   get: () => page.value as string,
   set: (v: string) => {
     page.value = v as Page
   }
 })
+/* 字标里跟在 KImage 后面那一截:当前在哪一页。
+   名字取自导航那份清单(lib/nav.ts),不另抄一份 —— 首页那页叫 Studio,
+   于是首页写"KImage Studio",其余页各写各的 */
+const wordmarkSuffix = computed(() => NAV_ITEMS.find((i) => i.value === page.value)?.label ?? '')
 // 切视图后回到顶部:否则在首页滚到一半再切过去,新页面会停在半空
 watch(navView, () => window.scrollTo({ top: 0 }))
 // 全部已保存的接口配置
@@ -629,7 +729,7 @@ onMounted(() => {
   // 作品集目录是同步读的 localStorage,直接落一次
   collections.value = loadCollections()
   // 角色要连 IndexedDB 里的参考图一起取,所以是异步的
-  loadCharacters().then((list) => (characters.value = list))
+  loadCharacters().then((list) => (characters.value = list.map(normalizeChar)))
 })
 
 /* 新建一份配置(进入独立的新增接口表单页)。
@@ -980,6 +1080,43 @@ const activeCharacter = computed(() =>
 /* 当前角色的头像。角色可能只有设定没有参考图,那时返回空串,界面上退回图标 */
 const activeCharSrc = computed(() => coverSrc(activeCharacter.value?.ref))
 
+/* —— 头像悬停预览 ——
+   只在"挑人"的地方出现(角色面板里那排头像):悬停就把正脸整张放出来。
+   选中之后的胶囊不再用它 —— 那时要看的是"怎么把这个角色摘下来"(见 .char-drop)。
+   卡片 fixed 挂在最外层,坐标由这里按被悬停的头像现算 ——
+   角色面板自己会滚、也会裁掉溢出(见 .fold-inner),卡片放在头像里面会被切掉一半。
+   两个尺寸要与 CSS 对齐(图 168 宽、3:4,名字压在图上不额外占高),
+   算"下面够不够放"用它,改一处别忘了另一处 */
+const PEEK_W = 168
+const PEEK_H = 224
+/* 卡片常驻在页面上,切换的只是 .on:节点是挂载当帧就带着 .on 的话,
+   浏览器不会播入场过渡(直接出现)。收起时保留上一次的内容,
+   否则会先空一下再淡出 —— 与 shownPanel 同一个理由 */
+const charPeek = ref({ src: '', name: '', x: 0, y: 0, up: false })
+const peekOn = ref(false)
+
+/** 把某个角色的正脸摆到这颗头像的下方(下面放不下就翻到上方) */
+function showCharPeek(e: Event, c: Character) {
+  const src = coverSrc(viewOf(c.id, 'front')?.data ?? c.ref)
+  // 连主参考图都没有的老角色没什么可看的:把上一张收掉,别留着一张别人的脸
+  if (!src) return hideCharPeek()
+  const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
+  const below = r.bottom + 8 + PEEK_H <= window.innerHeight - 8
+  // 横向也夹回视口内:头像贴着边时卡片不该被切掉半边
+  const half = PEEK_W / 2 + 8
+  charPeek.value = {
+    src,
+    name: c.name,
+    x: Math.min(Math.max(r.left + r.width / 2, half), window.innerWidth - half),
+    y: below ? r.bottom + 8 : r.top - 8 - PEEK_H,
+    up: !below
+  }
+  peekOn.value = true
+}
+function hideCharPeek() {
+  peekOn.value = false
+}
+
 /* 会自动并进提示词的那一段(角色设定) */
 const charSpecPrefix = computed(() =>
   activeCharacter.value ? characterFaceDesc(activeCharacter.value) : ''
@@ -993,6 +1130,14 @@ function composedPrompt(): string {
   const text = prompt.value.trim()
   if (!spec) return prompt.value
   return text ? `${text}, ${spec}` : spec
+}
+
+/** 读进来时校正一下角色记录。
+ *  主视图只能是正面 —— 老数据里可能留着被设成别张的 refKind(那个功能已经去掉),
+ *  清掉即可。ref 不动:它现在是这张角色的封面(正脸),丢了卡片就只剩占位图标 */
+function normalizeChar(c: Character): Character {
+  if (c.refKind && c.refKind !== 'front') delete c.refKind
+  return c
 }
 
 /** 卸下当前角色 */
@@ -1013,6 +1158,14 @@ function createWithCharacter(id: string) {
  *  角色那几张图在发请求时才并进去(见 charRefSrcs) */
 function toggleChar(id: string) {
   activeCharId.value = activeCharId.value === id ? '' : id
+}
+
+/** 面板里点一个头像:选定/取消,顺手把悬停预览收掉。
+ *  光靠 mouseleave 收不干净:点完指针还停在原处,那张正脸会一直压在面板上,
+ *  挡住的正是刚点过的那一排 —— 而这会儿人已经选完了,不需要再看它 */
+function pickChar(id: string) {
+  toggleChar(id)
+  hideCharPeek()
 }
 
 /** 存下一个新角色(角色页交过来的草稿)。名字必填 —— 没名字的卡没法认 */
@@ -1198,15 +1351,27 @@ const charStats = computed<Record<string, CharacterStat>>(() => {
   return m
 })
 
+/* 每个角色名下的作品:历史里带 characterId 的那些图,按记录顺序(新的在前)。
+   与上面的 stats 同一趟口径、同一个出处 —— 角色页上"12 images"和它下面
+   那排图是同一份数据,不会出现数字说有 12 张、点开只找到 3 张 */
+const charWorks = computed<Record<string, CharacterWork[]>>(() => {
+  const m: Record<string, CharacterWork[]> = {}
+  for (const h of history.value) {
+    const id = h.characterId
+    if (!id) continue
+    const list = m[id] || (m[id] = [])
+    h.results.forEach((item, index) =>
+      list.push({ key: `${h.id}:${index}`, entry: h, index, item })
+    )
+  }
+  return m
+})
+
 /* —— 设定图 ——
    五张视图,正脸是锚:其余四张都以正脸为参考图生成 —— 这是"同一张脸"的唯一保证。
    结果只进角色自己的 views,不进历史 —— 它们是中转用的参考料,不是作品 */
 function viewOf(charId: string, kind: CharacterViewKind): CharacterView | undefined {
   return charViews.value[charId]?.find((v) => v.kind === kind)
-}
-
-function kindLabel(kind: CharacterViewKind) {
-  return CHARACTER_VIEWS.find((v) => v.kind === kind)?.label || kind
 }
 
 /* 竖幅的目标比例。全身像用 2:3:站姿人形只有竖框装得下,
@@ -1279,7 +1444,9 @@ async function resultRefBlob(item: ResultItem | undefined): Promise<Blob | undef
 async function genCharView(charId: string, kind: CharacterViewKind): Promise<boolean> {
   const view = CHARACTER_VIEWS.find((v) => v.kind === kind)
   const c = characters.value.find((x) => x.id === charId)
-  if (!view || !c || charViewBusy.value) return false
+  /* 同一张重复点没有意义:第二次请求只会把第一次的结果盖掉。
+     别的张在跑不影响这一张 —— 它们之间没有依赖(正脸未生成时那几格本来就是锁的) */
+  if (!view || !c || charViewBusy.value[charId]?.includes(kind)) return false
   const cfg = config.value
   /* 这里几个报错都走 notice 而不是 fail:这条流水线只有站在角色页才会触发,
      而 fail 写的是 home 那条 .err —— 在角色页触发时它不渲染,等于没提示 */
@@ -1293,8 +1460,13 @@ async function genCharView(charId: string, kind: CharacterViewKind): Promise<boo
     notice.value = 'Generate the front view first — the other views are built from it.'
     return false
   }
-  charViewBusy.value = kind
+  charViewBusy.value = {
+    ...charViewBusy.value,
+    [charId]: [...(charViewBusy.value[charId] || []), kind]
+  }
   error.value = ''
+  const ctl = new AbortController()
+  charViewControllers.set(charViewKey(charId, kind), ctl)
   let ok = false
   try {
     const prompt = [characterDesc(c), view.suffix].filter(Boolean).join(', ')
@@ -1306,7 +1478,8 @@ async function genCharView(charId: string, kind: CharacterViewKind): Promise<boo
         n: 1,
         ...(refSrc ? { images: [refSrc] } : {})
       },
-      cfg
+      cfg,
+      ctl.signal
     )
     const blob = await resultRefBlob(res[0])
     if (!blob) throw new Error('Upstream returned no usable image')
@@ -1316,11 +1489,16 @@ async function genCharView(charId: string, kind: CharacterViewKind): Promise<boo
     await putCharView(c.id, kind, blob)
     const rest = (charViews.value[c.id] || []).filter((v) => v.kind !== kind)
     charViews.value = { ...charViews.value, [c.id]: [...rest, { kind, data: blob }] }
-    /* 重跑的那张正好是主参考图时,主图必须跟着换 ——
-       否则网格显示新的、送出去的参考图还是旧的,一个说新一个说旧 */
-    if (c.refKind === kind) {
+    /* 正脸同时是这张角色的封面与头像,生成成功后就写回主参考图 ——
+       否则卡片上停留的还是那张上传的底图,跟刚生成的脸对不上。
+       底图只为这一步服务一次(此后不再参与任何请求,见 charRefSrcs),
+       所以这里可以放心覆盖;换掉的那张连同它的 object URL 一起放掉 */
+    if (kind === 'front') {
+      const stale = c.ref
       c.ref = blob
       await saveCharacters(characters.value)
+      // 界面已经换成新图,那张旧底图此刻不再被任何地方引用
+      if (stale && stale !== blob) releaseSrc(stale)
     }
     /* 重跑正脸之后,其余四张就是照上一张正脸出的了。提醒一句,但不替用户删 ——
        删是不可逆的,而"要不要重跑"只有他自己知道 */
@@ -1330,11 +1508,29 @@ async function genCharView(charId: string, kind: CharacterViewKind): Promise<boo
     }
     ok = true
   } catch (e: any) {
-    notice.value = e?.message || 'Could not generate this view'
+    /* 用户主动停的不算失败 —— 按报错抛出来会让人以为出了故障 */
+    notice.value = ctl.signal.aborted
+      ? 'Generation stopped.'
+      : e?.message || 'Could not generate this view'
   } finally {
-    charViewBusy.value = ''
+    // 只有还是自己那一个才摘掉:同一张连跑时后一次已经换了新的手柄
+    const key = charViewKey(charId, kind)
+    if (charViewControllers.get(key) === ctl) charViewControllers.delete(key)
+    /* 只摘掉这一张 —— 同一角色可能还有别的张在跑,
+       别的角色的记录更是不能碰(它们与这一次请求无关) */
+    const rest = (charViewBusy.value[charId] || []).filter((k) => k !== kind)
+    const next = { ...charViewBusy.value }
+    if (rest.length) next[charId] = rest
+    else delete next[charId]
+    charViewBusy.value = next
   }
   return ok
+}
+
+/** 停掉正在重跑的那一张设定图,只停它 —— 别张还在跑的自己跑完。
+ *  已经落库的那张不受影响:只有成功写入的那一刻才作数,半路掐断不会留下坏图 */
+function stopCharView(charId: string, kind: CharacterViewKind) {
+  charViewControllers.get(charViewKey(charId, kind))?.abort()
 }
 
 /** 一次补齐五张。串行跑:每张都以前一张为参考图,并行只会互相抢带宽;
@@ -1342,19 +1538,10 @@ async function genCharView(charId: string, kind: CharacterViewKind): Promise<boo
 async function genRemainingViews(charId: string) {
   for (const v of CHARACTER_VIEWS) {
     if (viewOf(charId, v.kind)) continue
+    // 已经自己在跑的那张跳过:这个循环只把"还缺的"补上,不重发一遍
+    if (charViewBusy.value[charId]?.includes(v.kind)) continue
     if (!(await genCharView(charId, v.kind))) return
   }
-}
-
-/** 把某张视图指定成角色的主参考图 —— 送参考图时它排在最前面 */
-async function useViewAsRef(charId: string, kind: CharacterViewKind) {
-  const c = characters.value.find((x) => x.id === charId)
-  const v = viewOf(charId, kind)
-  if (!c || !v) return
-  c.ref = v.data
-  c.refKind = kind
-  await saveCharacters(characters.value)
-  notice.value = `${kindLabel(kind)} is now ${c.name}'s reference image.`
 }
 
 /* 取出某个角色的设定图并缓存。已经取过就不再读 IndexedDB ——
@@ -1381,18 +1568,22 @@ const MAX_CHAR_REFS = 4
 
 /** 当前角色的图 → data URL,发请求时并进参考图。
  *  角色不占表单里的参考图槽 —— 表单上看到的始终是用户自己挑的那张,
- *  角色这几张只在这一刻合进来。主参考图排最前(它就是这张脸),后面按视图顺序补 */
+ *  角色这几张只在这一刻合进来。
+ *  正面固定排最前:它是唯一的主视图,前段权重更高,脸就定在它上面。
+ *  上传的那张底图不在这里:它只为生成正脸服务一次(见 genCharView),
+ *  那之后 c.ref 里存的已经是正脸本身,再送一次就是把同一张图送两遍 */
 async function charRefSrcs(): Promise<string[]> {
   const c = activeCharacter.value
   if (!c) return []
   // 视图是按需加载的,这里先确保取过一次
   await loadCharViews(c.id)
   const out: string[] = []
-  if (c.ref) out.push(await blobToDataURL(c.ref))
+  const front = viewOf(c.id, 'front')
+  if (front) out.push(await blobToDataURL(front.data))
   for (const v of CHARACTER_VIEWS) {
     if (out.length >= MAX_CHAR_REFS) break
-    // 已被指定成主参考图的那张不再重复送
-    if (v.kind === c.refKind) continue
+    // 正面已经送过,别的视图按顺序补
+    if (v.kind === 'front') continue
     const view = viewOf(c.id, v.kind)
     if (view) out.push(await blobToDataURL(view.data))
   }
@@ -2035,44 +2226,22 @@ function createAssignCollection(title: string) {
 <template>
   <div class="shell">
     <!-- 品牌 + 视图切换 + 全局操作 -->
-    <header class="masthead" :class="{ scrolled }">
+    <!-- 顶部横条:字标、导航与主题开关都在最顶层,每一页都在(画布页也不例外),
+         切页时相对位置不动。
+         字标是"KImage + 一截手写体",那截就是当前页名 ——
+         首页写 Studio,其余页写各自的名字,名字取自导航那份清单(lib/nav.ts) -->
+    <header ref="mastEl" class="masthead" :class="{ scrolled }">
       <div class="wordmark">
         <span class="title">
           KImage
-          <span class="title-script">Gallery</span>
+          <span class="title-script">{{ wordmarkSuffix }}</span>
         </span>
       </div>
 
       <!-- 居中的视图切换:滑块位置即当前打开的面板。
            轨道 40px / 内边距 5px,滑块因此留在 30px:
            原来 36/3 时白底只比黑色选中底高 3px,两者看起来一样高 -->
-      <RubberSegment
-        v-model="navView"
-        class="nav-seg"
-        :items="navItems"
-        :radius="999"
-        :height="40"
-        :inset="5"
-        aria-label="Main navigation"
-      >
-        <template #home>
-          <PhHouse class="seg-ico" aria-hidden="true" />
-        </template>
-        <template #chars>
-          <!-- 人形:角色是"同一个人跨图保持一致"的那件事 -->
-          <PhMaskHappy class="seg-ico" aria-hidden="true" />
-        </template>
-        <template #lib>
-          <!-- Phosphor 的 Books:表达"收藏成册的提示词库" -->
-          <PhBooks class="seg-ico" aria-hidden="true" />
-        </template>
-        <template #history>
-          <PhClockCounterClockwise class="seg-ico" aria-hidden="true" />
-        </template>
-        <template #settings>
-          <PhGear class="seg-ico" :class="{ 'is-warn': !configured() }" aria-hidden="true" />
-        </template>
-      </RubberSegment>
+      <NavSegment v-model="navView" :warn="!configured()" />
 
       <nav class="mast-actions">
         <button
@@ -2087,7 +2256,7 @@ function createAssignCollection(title: string) {
       </nav>
     </header>
 
-    <!-- 视图切换:四个页面是平级视图,同时只挂载一个 -->
+    <!-- 视图切换:平级视图同时只挂载一个(画布例外,它是常驻的 v-show) -->
     <main class="frame">
       <!-- 外面这层 Transition 让新旧两页交叉过渡 ——
            原来只做了"新页淡入",旧页瞬间消失,那一下硬切就是生硬的来源 -->
@@ -2139,16 +2308,31 @@ function createAssignCollection(title: string) {
               <!-- 角色:和模型并排 —— 两者是同一层的东西(用谁出图),都该一眼可见。
                    收进「更多」里等于每次用角色都要先展开一次。
                    选中的角色直接露头像,名字进 tooltip:一排参数里放文字名会把行撑长 -->
-              <button
-                class="param-btn"
-                :class="{ on: openPanel === 'chars', filled: !!activeCharId }"
-                :data-tip="activeCharacter ? `Character · ${activeCharacter.name}` : 'Character'"
-                aria-label="Character"
-                @click="togglePanel('chars')"
-              >
-                <img v-if="activeCharSrc" class="param-avatar" :src="activeCharSrc" alt="" />
-                <PhMaskHappy v-else aria-hidden="true" />
-              </button>
+              <!-- 外面这层给"移除"角标当定位基准:角标要探出胶囊一点点 -->
+              <span class="param-char">
+                <button
+                  class="param-btn"
+                  :class="{ on: openPanel === 'chars', filled: !!activeCharId }"
+                  :data-tip="activeCharacter ? `Character · ${activeCharacter.name}` : 'Character'"
+                  :aria-label="activeCharacter ? `Character · ${activeCharacter.name}` : 'Character'"
+                  @click="togglePanel('chars')"
+                >
+                  <img v-if="activeCharSrc" class="param-avatar" :src="activeCharSrc" alt="" />
+                  <PhMaskHappy v-else aria-hidden="true" />
+                </button>
+                <!-- 选中之后悬停露出来的是"摘下来",不再是那张正脸 ——
+                     看清一张脸是挑人的事,挑完了要解决的是另一个问题。
+                     角标压在胶囊右上角,只占一角,不与"点开面板"抢位置 -->
+                <button
+                  v-if="activeCharId"
+                  class="char-drop"
+                  data-tip="Remove character"
+                  aria-label="Remove character"
+                  @click="detachCharacter"
+                >
+                  <PhX aria-hidden="true" />
+                </button>
+              </span>
               <!-- 尺寸/张数/画质/背景/参考图收进这一个入口:参数行只留模型与角色,
                    其余点开就是完整面板,不必挤成一长排。
                    有非默认值就点亮,免得改过的参数在行上不留痕迹 -->
@@ -2232,7 +2416,9 @@ function createAssignCollection(title: string) {
             <!-- 展开面板:用 grid-template-rows 动画高度,收起时连续合拢无跳变 -->
             <div class="fold" ref="panelEl" :class="{ open: !!openPanel }">
               <div class="fold-inner">
-                <div class="param-panel">
+                <!-- 面板滚动时悬停卡片会停在旧坐标上不动了(fixed 不跟着滚),
+                     所以一滚就收掉,等鼠标挪到下一个头像上再出 -->
+                <div class="param-panel" @scroll="hideCharPeek">
                   <!-- 配置 -->
                   <div v-if="shownPanel === 'config'" class="pp-body">
                     <!-- 出图与改写分两组,各自标各自的"当前";空组不渲染 -->
@@ -2289,7 +2475,8 @@ function createAssignCollection(title: string) {
                       <span class="pp-label"><PhMaskHappy class="pp-label-ico" aria-hidden="true" />Character</span>
                       <!-- 头像即标识:名字进 title。面板本身是滚动容器,
                            自绘 tooltip 会被裁掉,所以这里用原生的。
-                           角色卡片的样式在角色页,这里只负责"选谁" -->
+                           悬停看正脸与参数行那颗头像同一套(见 showCharPeek)——
+                           面板里这排只有 40px,选之前更该看清是谁 -->
                       <button
                         v-for="c in characters"
                         :key="c.id"
@@ -2297,7 +2484,9 @@ function createAssignCollection(title: string) {
                         :class="{ on: activeCharId === c.id }"
                         :title="c.name"
                         :aria-label="c.name"
-                        @click="toggleChar(c.id)"
+                        @click="pickChar(c.id)"
+                        @mouseenter="showCharPeek($event, c)"
+                        @mouseleave="hideCharPeek"
                       >
                         <img v-if="c.ref" class="char-pick-img" :src="coverSrc(c.ref)" alt="" />
                         <PhMaskHappy v-else class="char-pick-ph" aria-hidden="true" />
@@ -2475,8 +2664,6 @@ function createAssignCollection(title: string) {
               class="sec-title"
               :label="raceRunning ? 'Comparing' : 'Generating'"
               :font-size="20"
-              :cell-size="6"
-              :gap="2"
             />
             <div class="sec-tools">
               <button v-if="history.length" class="sec-more" @click="page = 'history'">
@@ -2550,6 +2737,7 @@ function createAssignCollection(title: string) {
         :characters="characters"
         :views="charViews"
         :stats="charStats"
+        :works="charWorks"
         :busy="charViewBusy"
         :text-config="textConfig || undefined"
         @save="saveCharFromPage"
@@ -2561,7 +2749,8 @@ function createAssignCollection(title: string) {
         @create="createWithCharacter"
         @generate="genCharView"
         @generate-all="genRemainingViews"
-        @use-ref="useViewAsRef"
+        @stop-view="stopCharView"
+        @preview="openPreview"
       />
 
       <!-- 历史记录 -->
@@ -2571,15 +2760,18 @@ function createAssignCollection(title: string) {
         :collections="collections"
         @open="openPreview"
         @use="usePreviewPrompt"
-        @remove="removeHistoryEntry"
-        @mark="toggleMark"
-        @create-collection="createCollection"
-        @delete-collection="deleteCollection"
+      @remove="removeHistoryEntry"
+      @mark="toggleMark"
+      @edit="openCanvas"
+      @create-collection="createCollection"
+      @delete-collection="deleteCollection"
       />
 
-      <!-- 接口设置 -->
+      <!-- 接口设置。
+           刻意写成 v-else-if 而不是 v-else:画布那一页不在这条链里
+           (它常驻挂载,见文件末尾),漏这一笔会让画布页下面同时铺着设置页 -->
       <SettingsPage
-        v-else
+        v-else-if="page === 'settings'"
         :configs="configs"
         :active-id="activeId"
         :active-text-id="activeTextId"
@@ -2611,6 +2803,7 @@ function createAssignCollection(title: string) {
       @use-prompt="usePreviewPrompt"
       @favorite="favoriteFromPreview"
       @reference="setAsReference"
+      @edit="editFromPreview"
       @remove="removeHistoryItem"
       @mark="toggleMark"
       @assign-collection="assignCollection"
@@ -2637,7 +2830,36 @@ function createAssignCollection(title: string) {
         @expire="commitUndo"
       />
     </Transition>
+
+    <!-- 挑角色时的悬停预览:角色面板里那排头像用(见 showCharPeek)。
+         它是 fixed 定位,挂在这一层是为了不被任何滚动容器裁掉 ——
+         角色面板自己就会滚,卡片放在里面只能看到一半。
+         常驻而不是 v-if:挂载当帧就带 .on 的节点不播入场过渡,那样就成了硬出现 -->
+    <div
+      class="char-peek"
+      :class="{ on: peekOn, up: charPeek.up }"
+      :style="{ left: charPeek.x + 'px', top: charPeek.y + 'px' }"
+      aria-hidden="true"
+    >
+      <span class="char-peek-frame">
+        <img :src="charPeek.src || undefined" alt="" />
+        <b>{{ charPeek.name }}</b>
+      </span>
+    </div>
   </div>
+
+  <!-- 自由画布:整页工作台,刻意放在 .shell 之外 ——
+       它要铺满视口,不能被那根 1080px 的栏宽与内边距框住。
+       它是平级页面,但不跟着上面那条 v-if 链走:常驻挂载、靠 active 开关显隐,
+       理由见组件顶部(切去历史挑张图再切回来,手上那半张裁剪框不该没) -->
+  <CanvasEditor
+    :active="page === 'canvas'"
+    :item="canvasItem"
+    @save="saveEdit"
+    @discard="discardCanvas"
+    @pick="page = 'history'"
+    @upload="openCanvasFile"
+  />
 </template>
 
 <style scoped>
@@ -2691,24 +2913,48 @@ function createAssignCollection(title: string) {
 .wordmark {
   display: flex;
   align-items: center;
+  /* 中间那枚导航的居中靠的是两侧 1fr 等宽,而 1fr 轨道的最小尺寸默认是内容宽度:
+     页面名一长("Prompt Library")文字就会把导航顶偏。放开这一条才压得下去,
+     压不下时也只会裁掉字标尾巴,不会动到导航与主题键 */
+  min-width: 0;
+  overflow: hidden;
+  /* 裁切是按盒子算的,而手写体的字形比同号的几何体高得多:
+     Pacifico 的字面(升部+降部)是 1.756em,24px 就是 42px,
+     比它自己那份 1.2 倍的行盒多出一截 —— 手写体的尾巴就是这么被裁掉的。
+     行高已在 .title-script 上提到装得下字形的 1.8,
+     这里再补 4px 内边距做余量(裁切按内边距盒子算)。
+     同时用 -6px 外边距把那点占位收回来,让它的外框不超过导航那 40px ——
+     横条高度因此仍停在 72px,不因为一个字母的尾巴长高 */
+  padding-block: 4px;
+  margin-block: -6px;
 }
 .title {
-  /* 品牌锁形:几何粗体主打 + 手写体后缀,两者按基线对齐 */
+  /* 品牌锁形:几何粗体主打 + 手写体后缀。
+     两截字上下居中,而不是按基线对齐 —— 两者的字面盒差得太远
+     (Poppins 1.4em、Pacifico 1.756em),按基线对起来手写体整个往上冒 */
   font-family: var(--font-wordmark);
   font-size: 21px; /* 品牌锁形的一部分,随字标字体一起定,不进正文字阶 */
   font-weight: 700;
   letter-spacing: -0.01em;
-  line-height: 1.2;
+  /* 行盒正好等于 Poppins 的字面高度:半个行距为 0,字形盒因此与行盒重合,
+     居中才是真的居中(否则居中的是一个带上下留白的盒子,不是字本身) */
+  line-height: 1.4;
   color: var(--text);
   display: inline-flex;
-  align-items: baseline;
+  align-items: center;
   gap: 7px;
+  white-space: nowrap;
 }
 .title-script {
   font-family: var(--font-script);
   /* 手写体字面小、上下留白多,要放大一档才和左边的字重们等高 */
   font-size: 24px; /* 同上:手写体后缀,品牌锁形的一部分,不进正文字阶 */
   font-weight: 400;
+  /* 行高要装得下这个字体本身:Pacifico 的字面有 1.756em(见其 hhea 表),
+     24px 就是 42px;跟着 .title 那份给几何体定的 1.2 走,行盒只有 28.8px,
+     超出的那截会落到盒外 —— 字标外层是 overflow: hidden,落到外面就被切掉。
+     1.8 够它了(43.2px),这才是有余量的写法,不是拿内边距去凑 */
+  line-height: 1.8;
 }
 .mast-actions {
   display: flex;
@@ -2718,19 +2964,11 @@ function createAssignCollection(title: string) {
      若改成 end 会退回右端,中间的滑块也就不再居中 */
   justify-self: start;
 }
-/* 居中的视图切换。justify-self 兜住 grid 的默认 stretch,避免被拉伸 */
+/* 居中的视图切换。justify-self 兜住 grid 的默认 stretch,避免被拉伸。
+   图标尺寸与齿轮标红那两条跟着组件走了(见 NavSegment)——
+   槽位里的图标是在那个组件的作用域里编译的,写在这里会匹配不上 */
 .nav-seg {
   justify-self: center;
-}
-/* 17px 是照 34px 胶囊定的,导航条加高到 40px 后配套提到 19px,
-   与主题按钮的图标同档,两个控件在一行里视觉重量才对得上 */
-.nav-seg .seg-ico {
-  width: 19px;
-  height: 19px;
-}
-/* 未配置接口时齿轮标红。选中态那层由滑块的反色副本接管,所以排除 .rs-copy */
-.nav-seg :deep(.rs-item:not(.rs-copy)[aria-checked='false'] .is-warn) {
-  color: var(--danger);
 }
 .icob {
   position: relative;
@@ -2987,6 +3225,124 @@ function createAssignCollection(title: string) {
   border-radius: 50%;
   object-fit: cover;
   display: block;
+}
+/* 角色胶囊外面这层只为给"移除"角标当定位基准 ——
+   角标要探出胶囊一点,不包一层就只能被胶囊自己的圆角框住 */
+.param-char {
+  position: relative;
+  display: inline-flex;
+}
+/* 已选中角色的胶囊:悬停时右上角冒出移除钮。
+   这里刻意不做悬停看正脸 —— 那张卡片是"挑人"时用的(见 .char-peek),
+   选完之后要回答的是另一个问题:怎么把它摘下来 */
+.param-char .char-drop {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  /* 压住:角标与胶囊有一小块重叠,得在上面才点得到 */
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 17px;
+  height: 17px;
+  border-radius: 50%;
+  color: var(--cta-text);
+  background: var(--cta);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.28);
+  opacity: 0;
+  /* 收起时不挡点击:它压在胶囊角上,否则那一个角就点不开面板了 */
+  pointer-events: none;
+  transform: scale(0.6);
+  transition: opacity 140ms var(--ease), transform 160ms var(--ease);
+}
+/* 悬停胶囊(或鼠标已经移到角标上)与键盘聚焦时出现。
+   键盘这条路要走 :has(:focus-visible):角标自己拿到焦点时也要留着 */
+.param-char:hover .char-drop,
+.param-char:has(:focus-visible) .char-drop {
+  opacity: 1;
+  pointer-events: auto;
+  transform: scale(1);
+  /* 稍等一拍:鼠标扫过参数行时不该一路闪出摘除钮 */
+  transition-delay: 60ms;
+}
+.param-char .char-drop:hover {
+  background: var(--accent-strong);
+}
+.param-char .char-drop svg {
+  width: 11px;
+  height: 11px;
+}
+/* 头像悬停时展开的那张正脸 —— 只在角色面板里那排头像上用(见 showCharPeek)。
+   它 fixed 挂到最外层,坐标由 JS 按被悬停的头像现算(见 showCharPeek):
+   角色面板自己会滚、也会裁掉溢出,卡片放在头像里面只能看到一半。
+   节点常驻、只切 .on,收起时保留上一次的内容,收起动画才接得上 */
+.char-peek {
+  position: fixed;
+  z-index: 30;
+  width: 168px;
+  opacity: 0;
+  pointer-events: none;
+  /* 收起态:缩小一点、向下错开,像从这颗头像上"长"出来 */
+  transform: translateX(-50%) translateY(6px) scale(0.92);
+  transform-origin: 50% 0;
+  transition: opacity 160ms var(--ease), transform 260ms var(--ease);
+}
+.char-peek.on {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0) scale(1);
+  /* 稍等一下再出现:鼠标横扫过一排头像时不该一张张弹出来 */
+  transition-delay: 120ms;
+}
+/* 下面放不下时翻到头像上方(见 showCharPeek 的 up):原点与入场方向一起翻过来 */
+.char-peek.up {
+  transform: translateX(-50%) translateY(-6px) scale(0.92);
+  transform-origin: 50% 100%;
+}
+.char-peek.up.on {
+  transform: translateX(-50%) translateY(0) scale(1);
+}
+.char-peek-frame {
+  position: relative;
+  display: block;
+  border-radius: 14px;
+  overflow: hidden;
+  background: var(--bg-elev);
+  box-shadow: var(--sh-md);
+}
+.char-peek img {
+  display: block;
+  width: 100%;
+  /* 与角色卡片同一个 3:4 海报比例,同一张脸在两处裁切一致 */
+  aspect-ratio: 3 / 4;
+  object-fit: cover;
+  /* 出场时轻轻收一下:像从远处推近到眼前,而不是整块贴上来 */
+  transform: scale(1.06);
+  transition: transform 460ms var(--ease);
+}
+.char-peek.on img {
+  transform: scale(1);
+  transition-delay: 120ms;
+}
+/* 名字压在图上:一层自下而上的暗幕把它托住(与角色卡片同一套做法) */
+.char-peek b {
+  position: absolute;
+  inset: auto 0 0 0;
+  padding: 18px 10px 8px;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  line-height: 1.3;
+  color: #fff;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+  background: linear-gradient(
+    to top,
+    rgba(24, 24, 22, 0.6) 0%,
+    rgba(24, 24, 22, 0.28) 60%,
+    transparent 100%
+  );
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .param-btn:hover {
   color: var(--text);

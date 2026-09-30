@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   PhHeart,
   PhArrowLineUp,
+  PhPencilSimple,
   PhTrash,
   PhClockCounterClockwise,
   PhDownloadSimple,
@@ -31,6 +32,9 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: 'open', entry: HistoryEntry): void
   (e: 'use', params: ReuseParams): void
+  /* 进自由画布。图块是按张摊平的,所以要连 index 一起给 ——
+     一条记录里改第三张,出去的就该是第三张 */
+  (e: 'edit', entry: HistoryEntry, index: number): void
   (e: 'remove', entry: HistoryEntry): void
   (e: 'mark', entry: HistoryEntry, index: number): void
   (e: 'create-collection', title: string): void
@@ -244,12 +248,11 @@ function fmt(ts: number) {
 <template>
   <section class="lib" aria-label="History">
     <header class="lib-head">
-      <div class="lib-title-wrap">
-        <h1 class="lib-title">History</h1>
-        <p class="lib-sub">
-          {{ items.length }} {{ items.length === 1 ? 'record' : 'records' }} · {{ imageCount }} {{ imageCount === 1 ? 'image' : 'images' }}
-        </p>
-      </div>
+      <!-- 页面名不在这儿写第二遍:顶部横条的字标已经在说"History"。
+           这里留的是只有这一页才有的东西 —— 有多少条记录、多少张图 -->
+      <p class="lib-sub">
+        {{ items.length }} {{ items.length === 1 ? 'record' : 'records' }} · {{ imageCount }} {{ imageCount === 1 ? 'image' : 'images' }}
+      </p>
       <!-- 页级动作:常态是「进入多选」,进了多选就换成那一套动作。
            整个块跟着一起收 —— 空的历史页不该在标题旁留一段空白 -->
       <div v-if="tiles.length || exportMsg || exportErr || exportProgress" class="lib-acts">
@@ -420,6 +423,13 @@ function fmt(ts: number) {
                 <PhArrowLineUp aria-hidden="true" />
               </button>
               <button
+                class="top"
+                :aria-label="`Edit on canvas: ${t.entry.prompt.slice(0, 20)}`"
+                @click.stop="emit('edit', t.entry, t.index)"
+              >
+                <PhPencilSimple aria-hidden="true" />
+              </button>
+              <button
                 class="top top-del"
                 :aria-label="`Delete: ${t.entry.prompt.slice(0, 20)}`"
                 @click.stop="emit('remove', t.entry)"
@@ -474,12 +484,6 @@ function fmt(ts: number) {
   justify-content: space-between;
   gap: var(--sp-4);
   padding-top: var(--sp-2);
-}
-.lib-title {
-  font-family: var(--font-sans);
-  font-size: var(--fs-3xl);
-  font-weight: 700;
-  letter-spacing: var(--ls-tight);
 }
 .lib-sub {
   margin-top: 6px;
@@ -916,12 +920,8 @@ function fmt(ts: number) {
   background: var(--bg-elev);
 }
 
-/* 窄屏:标题收一档,避免与右上角操作按钮挤压 */
+/* 窄屏:选择态下这里有三个按钮,挤不进计数那一行 —— 让它独占据一行,自己再换行 */
 @media (max-width: 640px) {
-  .lib-title {
-    font-size: var(--fs-xl);
-  }
-  /* 选择态下这里有三个按钮,挤不进标题那一行:让它独占据一行,自己再换行 */
   .lib-acts {
     width: 100%;
     justify-content: flex-start;
