@@ -1806,17 +1806,23 @@ onBeforeUnmount(() => {
    图是异步到的,比例写死才不会在它到达时把整段对话顶下去 */
 .msg-photo {
   display: block;
-  /* 缩略图而不是大图:方形上限 224,一张图不会把整段对话撑成一面墙。
-     object-fit 裁掉多余的部分,与文字的节奏保持一致 */
-  width: 224px;
-  max-width: 76%;
-  aspect-ratio: 1;
-  object-fit: cover;
+  /* **比例跟着图自己走**。原来这里写死 1:1 再用 object-fit: cover 裁,
+     等于把一张横构图切成方的 —— 生成时明明是 auto(交给上游定),
+     到显示这一步又被拽回正方形,白拿一个能用的比例。
+     现在只用最大边兜住尺寸,长宽都由图自己决定 */
+  max-width: min(320px, 76%);
+  max-height: 320px;
+  width: auto;
+  height: auto;
   margin-top: 8px;
   border-radius: 12px;
 }
 .msg-photo-skel {
-  aspect-ratio: 1;
+  /* 图还没回来时占个位。**比例只能猜一个中性的** —— 真正的比例要等图到了
+     才知道(auto 的代价就是这个);4:3 比 1:1 更像模型常见的构图 */
+  width: 224px;
+  max-width: 76%;
+  aspect-ratio: 4 / 3;
   background: linear-gradient(100deg, var(--skel-a, #e9e9ee) 30%, var(--skel-b, #f5f5f8) 50%, var(--skel-a, #e9e9ee) 70%);
   background-size: 200% 100%;
   animation: skel-shimmer 1.4s linear infinite;

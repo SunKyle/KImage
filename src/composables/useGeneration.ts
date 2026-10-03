@@ -322,7 +322,9 @@ function undoEnhance() {
       const res = await generate(
         {
           prompt,
-          size: size.value,
+          /* 过一遍 sizeFor:与创作区那条路同一个口径 —— 万一当前尺寸不是
+             这条配置认的档位(中途换过配置),这里会收敛成合法值 */
+          size: sizeFor(deps.config.value),
           n: 1,
           ...(refList.length ? { images: refList } : {}),
           ...extraParams()
