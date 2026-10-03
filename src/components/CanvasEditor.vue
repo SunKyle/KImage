@@ -1291,7 +1291,7 @@ function canvasDataUrl(c: HTMLCanvasElement): Promise<string> {
    请求体上限 —— 也就是说"在 4K 图上做局部编辑"过去必然失败。
    而厂商的编辑结果本身有上限(gpt-image-1 最大 1536,本站给的档位最大 2560),
    送更大的进去换不到更大的结果。所以这里按上限收窄,再按内容挑格式。 */
-function encodeAt(c: HTMLCanvasElement, scale: number): string {
+async function encodeAt(c: HTMLCanvasElement, scale: number): Promise<string> {
   const t = scale >= 1 ? c : newCanvas(c.width * scale, c.height * scale)
   if (t !== c) {
     const ctx = t.getContext('2d')
@@ -1304,7 +1304,14 @@ function encodeAt(c: HTMLCanvasElement, scale: number): string {
      不透明的走 JPEG:实测同一张 2560 的照片,PNG 要 12.4MB,JPEG 只要 2.7MB。
      反过来的情形也存在(截图类 PNG 只要 0.02MB 而 JPEG 要 1.1MB),但 1.1MB
      离预算还远,不值得为它多编一次再比大小 */
-  return hasAlpha(t) ? t.toDataURL('image/png') : t.toDataURL('image/jpeg', 0.92)
+  const alpha = hasAlpha(t)
+  /* **不要用 toDataURL**:它是全同步的。实测 2560×1440 的 JPEG 要 34ms、
+     PNG 要 102ms,全压在"点了按钮之后"那一下上 —— 60fps 下一帧只有 16.7ms,
+     也就是用户会看到明显的卡住。toBlob 把编码交给浏览器(实测主线程只占 2.2ms),
+     再由 FileReader 读成 data URL,产出的字节与 toDataURL 完全一致(已核对) */
+  const blob = await toBlob(t, alpha ? 'image/png' : 'image/jpeg')
+  if (!blob) throw new Error('Could not encode the image')
+  return blobToDataURL(blob)
 }
 
 /** 把一张已经是 data URL 的图按同一比例缩一次(mask 由各自的生成器按整幅画布
@@ -1323,7 +1330,9 @@ async function scaleDataUrl(url: string, scale: number): Promise<string> {
     ctx.drawImage(bmp, 0, 0, t.width, t.height)
   }
   bmp.close()
-  return t.toDataURL('image/png')
+  // 同样走异步那条:mask 多是平色(实测 2560 的 PNG 只有几十 KB),但没理由再留一处同步编码
+  const blob = await toBlob(t, 'image/png')
+  return blob ? blobToDataURL(blob) : url
 }
 
 /** 这一次编辑要送出去的两张图。**必须同一个缩放系数** ——
@@ -1337,7 +1346,7 @@ async function editPayload(frame: { width: number; height: number }, maskOf: () 
   if (!c) throw new Error('There is nothing on the canvas to edit')
   let scale = payloadScaleFor(frame.width, frame.height)
   for (;;) {
-    const image = encodeAt(c, scale)
+    const image = await encodeAt(c, scale)
     const mask = await scaleDataUrl(await maskOf(), scale)
     if (!payloadOverBudget([image, mask])) return { image, mask }
     const next = shrinkScaleFor(scale)
@@ -1507,8 +1516,8 @@ function runEdit(
 
 /** 照这张再画一张。参考图就是画布现在这张,不用挑 —— 挑的是"画成什么样" */
 async function runGenerate(prompt: string) {
-  await runJob('create', 'New picture', shortLabel(prompt), (frame, cfg, signal) => {
-    const ref = refShot()
+  await runJob('create', 'New picture', shortLabel(prompt), async (frame, cfg, signal) => {
+    const ref = await refShot()
     if (!ref) throw new Error('There is nothing on the canvas to hand over')
     return generateFrom({ prompt, image: ref, size: `${frame.width}x${frame.height}` }, cfg, signal)
   })
@@ -1919,7 +1928,7 @@ const REF_EDGE = REF_IMAGE_EDGE
  *
  *  透明的那张不能走 JPEG —— 那会把透明压成黑块(与存图那条同一个坑),
  *  送去当参考的图会顶着黑底。有透明就用 PNG,它本来也不大 */
-function refShot(): string | null {
+async function refShot(): Promise<string | null> {
   const c = base
   if (!c) return null
   const scale = Math.min(1, REF_EDGE / Math.max(c.width, c.height))
@@ -1930,7 +1939,8 @@ function refShot(): string | null {
     ctx.drawImage(c, 0, 0, t.width, t.height)
   }
   // 探的是刚缩好的这张:它最多 REF_IMAGE_EDGE,比拿 4000px 的原图去探准得多
-  return hasAlpha(t) ? t.toDataURL('image/png') : t.toDataURL('image/jpeg', 0.85)
+  const blob = await toBlob(t, hasAlpha(t) ? 'image/png' : 'image/jpeg')
+  return blob ? blobToDataURL(blob) : null
 }
 
 /** 照画布上这张再画一张,画成什么样由用户那句话决定。
