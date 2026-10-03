@@ -116,10 +116,14 @@ const GEMINI: Provider = {
   seed: 'unknown',
   // 原生请求体的 parts 里可以并列多段 inlineData,多张参考图是它本来就认的形态
   multiImage: 'yes',
-  /* 给的都是能干净约分成 Gemini 认的宽高比的档位:
-     1024x1024→1:1、1536x1024→3:2、1024x1536→2:3、1792x1024→16:9、1024x1792→9:16。
-     约不出来的值不发这个参数(见 server 的 geminiRatio),不做隐式近似 */
-  sizes: ['auto', '1024x1024', '1536x1024', '1024x1536', '1792x1024', '1024x1792'],
+  /* 给的都是能干净约分成 Gemini 认的宽高比的档位(见 server 的 GEMINI_RATIOS):
+     1024x1024→1:1、1536x1024→3:2、1024x1536→2:3、1536x864→16:9、864x1536→9:16。
+     约不出来的值不发这个参数,不做隐式近似。
+
+     这里原来是 1792x1024 与 1024x1792,标注说它们是 16:9 与 9:16 ——
+     实际约分是 **7:4 与 4:7**,两者都不在表里,于是"选了宽幅"的结果是
+     这个参数根本不发,Gemini 退回它自己的 16:9 默认值。换掉它们。 */
+  sizes: ['auto', '1024x1024', '1536x1024', '1024x1536', '1536x864', '864x1536'],
   /* 实测:不发宽高比时它自己给 16:9,所以 auto 是实打实的"模型自决",不是空话 */
   autoSize: true,
   /* 这个字段只对 OpenAI 那条路有意义(决定打 /images/edits 还是 /images/generations)。
@@ -226,6 +230,148 @@ export function allowedSizes(vendorId: string | undefined, model: string): strin
       : ['auto', '1024x1024', '1536x1024', '1024x1536']
   }
   return getProvider(vendorId).sizes
+}
+
+/* ===== 尺寸与扩展参数：按能力决定「能不能」与「发什么」 ==================
+   这些判断原来散在主界面里(尺寸候选、默认档、手填尺寸归一、种子、扩展参数、
+   对比出图时逐个厂商校验、角色设定图的取景尺寸),而它们全都是"看厂商能力表
+   说话",与界面无关。收在这里还有一层实际好处:**能直接单测** —— 以前这些
+   分支要开一个浏览器、再配一条对应厂商的接口才碰得到。
+   -------------------------------------------------------------------- */
+
+/** 配置的厂商 id。老配置没有这个字段时按域名回填(见 inferVendor) */
+export function vendorOf(cfg: ApiConfig): string {
+  return cfg.vendor || inferVendor(cfg.baseUrl)
+}
+
+/* 厂商不限尺寸时给的一组常用值。
+   顺序即优先级:不认 auto 的厂商会把 auto 摘掉,剩下的第一项就成了默认尺寸,
+   所以按"最常用"排而不是按尺寸递增 —— 1024x1024 是这类接口的通用默认值,
+   排在 512x512 前面,免得摘掉 auto 之后默认掉到 512 去 */
+export const FREE_SIZES = ['auto', '1024x1024', '1024x1792', '1792x1024', '512x512', '2560x1440']
+
+/** 把手填的尺寸归一成 `1024x1536`:容忍 × ✕ * 与空格;认不出来返回 null
+ *  (不做隐式猜测 —— 猜错等于替用户改了画幅) */
+export function normalizeSize(raw: string): string | null {
+  if (/^auto$/i.test(raw)) return 'auto'
+  const m = raw
+    .replace(/[×✕*]/g, 'x')
+    .replace(/\s+/g, '')
+    .match(/^(\d{1,5})x(\d{1,5})$/i)
+  if (!m) return null
+  const w = Number(m[1])
+  const h = Number(m[2])
+  return w > 0 && h > 0 ? `${w}x${h}` : null
+}
+
+/** 这家厂商在这个模型下到底认哪些尺寸。
+ *  不认 auto 的厂商要把它摘掉:留着它,界面会显示"自动",而请求里根本带不了
+ *  这个参数(带了就 400),于是每次都拿上游的默认尺寸 —— 看起来像"模型没按
+ *  prompt 定比例",其实是我们自己把这一档抹掉了 */
+export function sizeOptionsFor(vendorId: string | undefined, model: string): string[] {
+  const list = allowedSizes(vendorId, model)
+  const base = Array.isArray(list) ? list : FREE_SIZES
+  return getProvider(vendorId, model).autoSize ? base : base.filter((s) => s !== 'auto')
+}
+
+/** 尺寸是否由上游自定(= 界面上开放手填)。固定候选的厂商不开放手填:
+ *  列表里的值已经是全部合法值 */
+export function sizeIsFree(vendorId: string | undefined, model: string): boolean {
+  return allowedSizes(vendorId, model) === 'free'
+}
+
+/**
+ * 套用某个尺寸(从提示词库取用、或复现某条记录时):能用就返回归一后的值,
+ * 不能用返回 null —— 由界面保留当前值。宁可不改,也不塞一个发出去会被拒的档位。
+ *
+ * 两个坑都在这里堵住:
+ * - `auto` 不在尺寸列表里,它是"让上游自己定"这一档**能力**:
+ *   dall-e-3 与豆包都不认它(豆包收到枚举外的值直接 400)
+ * - 不限尺寸的厂商要的是像素值,而历史里存着的可能是 `1536 × 1024` 这种写法
+ */
+export function acceptableSize(cfg: ApiConfig, want: string | undefined): string | null {
+  if (!want) return null
+  const vendor = vendorOf(cfg)
+  const options = sizeOptionsFor(vendor, cfg.model)
+  /* auto 的可用与否只看**档位列表**里有没有它,不看厂商级那个 autoSize 标志:
+     openai 的 autoSize 是 true(那是给 gpt-image-1 的),而 dall-e-3 的档位列表
+     里根本没有 auto —— 这两处要是各判各的,就会放行一个发出去必被拒的值 */
+  if (want === 'auto') return options.includes('auto') ? 'auto' : null
+  if (sizeIsFree(vendor, cfg.model)) return normalizeSize(want)
+  return options.includes(want) ? want : null
+}
+
+/** 默认尺寸:有 auto 档就用 auto,否则用第一档。
+ *  基线不能用字面量 'auto' —— dall-e-3 不开放 auto,初始化会被换成它的第一档,
+ *  拿 'auto' 当基线会让这家厂商一进页面参数行就亮着 */
+export function defaultSizeFor(options: string[]): string {
+  return options.includes('auto') ? 'auto' : options[0] || 'auto'
+}
+
+/**
+ * 在候选里挑比例最接近 wantRatio 的那一档。
+ *
+ * 比的是比例的**对数距离**:1:1 偏到 2:1 和偏到 1:2 该算同样的偏差,
+ * 而直接减差值做不到这一点(0.5 比 2 更靠近 1,于是方图会被判给竖幅)。
+ * 认不出的候选(如 'auto')跳过;一个都挑不出来时返回 ''。
+ */
+export function sizeClosestTo(candidates: string[], wantRatio: number): string {
+  if (!(wantRatio > 0)) return ''
+  let best = ''
+  let gap = Infinity
+  for (const s of candidates) {
+    const m = String(s).match(/^(\d{1,5})x(\d{1,5})$/i)
+    if (!m) continue
+    const w = Number(m[1])
+    const h = Number(m[2])
+    if (!(w > 0 && h > 0)) continue
+    /* 差距量化到 1e-9 再比:对数距离在"横竖对称"的两个候选上只差最后一位
+       (实测 log(1.75) 与 |log(1/1.75)| 差 1.1e-16),不量化的话平手由浮点
+       末位决定 —— 同一组候选换个顺序就换一个结果,而两者本来同样远 */
+    const d = Math.round(Math.abs(Math.log(w / h / wantRatio)) * 1e9) / 1e9
+    if (d < gap) {
+      gap = d
+      best = s
+    }
+  }
+  return best
+}
+
+/**
+ * 某个厂商要用的尺寸:不限尺寸就原样用 want;固定候选的厂商则退回它的第一档
+ * (对比出图时逐个模型校验用 —— 各模型支持的尺寸本来就不完全重合)。
+ * 注意它与 allowedSizeFor 的差别:那个是按比例挑最接近的一档(编辑用,
+ * 因为"保持原画幅"比"必须等于某个值"重要),这里是"不在列表里就退回默认"。
+ */
+export function sizeForVendor(cfg: ApiConfig, want: string): string {
+  const allowed = allowedSizes(vendorOf(cfg), cfg.model)
+  if (allowed === 'free') return want
+  return allowed.includes(want) ? want : allowed[0] || 'auto'
+}
+
+/** 种子:留空、认不出、或厂商明确不支持时返回 undefined(= 交给上游随机)。
+ *  范围按 32 位有符号整数收 —— 各家都在这条线以内,更大的值上游只当非法 */
+export function seedFor(cfg: ApiConfig, raw: string): number | undefined {
+  const t = String(raw ?? '').trim()
+  if (!t) return undefined
+  const v = Math.round(Number(t))
+  if (!Number.isFinite(v) || Math.abs(v) > 2147483647) return undefined
+  return getProvider(vendorOf(cfg), cfg.model).seed === 'no' ? undefined : v
+}
+
+/** 按厂商能力决定携带哪些扩展参数:已知不支持的一律不发。
+ *  默认按当前生效配置算;对比出图时逐个传入 —— 同一次对比里各模型的可用参数
+ *  并不一样(OpenAI 认 quality,豆包不认),不能拿一家的能力套所有家 */
+export function extraParamsFor(
+  cfg: ApiConfig,
+  quality: string,
+  background: string
+): Record<string, string> {
+  const caps = getProvider(vendorOf(cfg), cfg.model)
+  const out: Record<string, string> = {}
+  if (caps.quality !== 'no' && quality !== 'auto') out.quality = quality
+  if (caps.background !== 'no' && background !== 'auto') out.background = background
+  return out
 }
 
 /* ===== 提示词增强的文本模型预设 ======================================
@@ -885,22 +1031,8 @@ export function allowedSizeFor(
   if (allowed === 'free') return want
   const m = String(want).match(/^(\d{1,5})x(\d{1,5})$/i)
   if (!m) return undefined
-  const target = Number(m[1]) / Number(m[2])
-  let best: string | undefined
-  let gap = Infinity
-  for (const s of allowed) {
-    if (s === 'auto') continue
-    const sm = s.match(/^(\d{1,5})x(\d{1,5})$/i)
-    if (!sm) continue
-    /* 比的是比例的对数距离:1:1 偏到 2:1 和偏到 1:2 该算同样的偏差,
-       直接用差值算会把竖图一律判给横图 */
-    const d = Math.abs(Math.log(Number(sm[1]) / Number(sm[2]) / target))
-    if (d < gap) {
-      gap = d
-      best = s
-    }
-  }
-  return best
+  // 挑最接近的那一档(对数距离的取舍见 sizeClosestTo),挑不出来就当"不发这个参数"
+  return sizeClosestTo(allowed, Number(m[1]) / Number(m[2])) || undefined
 }
 
 /**

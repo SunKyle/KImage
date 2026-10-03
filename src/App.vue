@@ -72,8 +72,18 @@ import {
   readCharacterZip,
   CHAT_EXPORT_MSGS,
   getProvider,
-  inferVendor,
+  vendorOf,
   allowedSizes,
+  sizeOptionsFor,
+  sizeIsFree,
+  acceptableSize,
+  defaultSizeFor,
+  sizeClosestTo,
+  sizeForVendor,
+  normalizeSize,
+  seedFor,
+  extraParamsFor,
+  FREE_SIZES,
   imageSrc,
   coverSrc,
   makeThumb,
@@ -544,10 +554,10 @@ function onFeedLoad(key: string, entry: HistoryEntry, e: Event) {
 }
 
 // 当前生效的厂商:配置里没写就按域名猜(兼容加字段之前存的老配置)
+const vendorId = computed(() => vendorOf(config.value))
 const provider = computed<Provider>(() => {
-  const cfg = config.value
   // 带上模型:能力表按 (厂商, 模型) 解析 —— 中转上同一个地址的模型可能走不同协议
-  return getProvider(cfg.vendor || inferVendor(cfg.baseUrl), cfg.model)
+  return getProvider(vendorId.value, config.value.model)
 })
 // 设置页表头那句能力说明:描述的是当前生效的那个接口,不是表单里正在挑的。
 // 界面上的参数门控本来就照生效配置来,说明文字要是跟着草稿走,两者就对不上了
@@ -564,25 +574,11 @@ const capabilityNote = computed(() => {
         : '/images/generations'
   return `Active API: quality ${t(p.quality)} · background ${t(p.background)} · image-to-image via ${i2i}`
 })
-// 尺寸候选随厂商(以及 OpenAI 的模型代次)变化
-const sizeOptions = computed(() => {
-  const list = allowedSizes(provider.value.id, config.value.model)
-  const base = Array.isArray(list) ? list : FREE_SIZES
-  /* 上游没有 auto 档就把这一项摘掉:留着它,界面会显示"自动",而请求里
-     根本带不了这个参数(带了就 400),于是每次都拿上游的默认尺寸 ——
-     看起来像"模型没按 prompt 定比例",其实是我们自己把这一档抹掉了 */
-  return provider.value.autoSize ? base : base.filter((s) => s !== 'auto')
-})
-// 尺寸是否由接口自行决定:固定候选的厂商不开放手填,列表已经是全部合法值
-const sizeFree = computed(() => allowedSizes(provider.value.id, config.value.model) === 'free')
-
-/* 收进「更多」里的参数只要有一项不是默认值,入口就点亮 ——
-   否则改过尺寸之后参数行上一点痕迹都没有,像是丢了。
-   size 的基线不能用字面量 'auto':dall-e-3 不开放 auto,初始化会被换成它的第一档,
-   拿 'auto' 当基线会让这家厂商一进页面就亮着 */
-const defaultSize = computed(() =>
-  sizeOptions.value.includes('auto') ? 'auto' : sizeOptions.value[0] || 'auto'
-)
+/* 尺寸候选、是否开放手填、默认档 —— 判断都在 api.ts(它们只看厂商能力表,
+   与界面无关,收在那儿才测得了;见 sizeOptionsFor / sizeIsFree / defaultSizeFor) */
+const sizeOptions = computed(() => sizeOptionsFor(vendorId.value, config.value.model))
+const sizeFree = computed(() => sizeIsFree(vendorId.value, config.value.model))
+const defaultSize = computed(() => defaultSizeFor(sizeOptions.value))
 const moreCustom = computed(
   () =>
     n.value !== 1 ||
@@ -593,17 +589,9 @@ const moreCustom = computed(
     !!refImage.value
 )
 
-/* 种子的实际取值:空着、或厂商明确不支持就不发。范围按 32 位有符号整数收 ——
-   各家都在这条线以内,再大的值上游只当非法 */
-const seedValue = computed(() => {
-  const raw = seed.value.trim()
-  if (!raw) return undefined
-  const v = Math.round(Number(raw))
-  return Number.isFinite(v) && Math.abs(v) <= 2147483647 ? v : undefined
-})
-function seedFor(cfg: ApiConfig = config.value): number | undefined {
-  const caps = getProvider(cfg.vendor || inferVendor(cfg.baseUrl), cfg.model)
-  return caps.seed === 'no' ? undefined : seedValue.value
+/* 种子的实际取值:留空、认不出、或厂商明确不支持就不发(见 api.ts 的 seedFor) */
+function seedForConfig(cfg: ApiConfig = config.value): number | undefined {
+  return seedFor(cfg, seed.value)
 }
 // 手填种子:失焦/回车时收敛成整数并回写输入框;认不出来就清空(= 交给上游随机)
 function commitSeed(e: Event) {
@@ -622,34 +610,14 @@ function sizeLabel(s: string) {
   return s === 'auto' ? 'Auto' : s.replace(/x/g, '×')
 }
 
-/* 厂商不限尺寸时给的一组常用值。
-   顺序即优先级:不认 auto 的厂商会把 auto 摘掉,剩下的第一项就成了默认尺寸,
-   所以按"最常用"排而不是按尺寸递增 —— 1024x1024 是这类接口的通用默认值,
-   排在 512x512 前面,免得摘掉 auto 之后默认掉到 512 去 */
-const FREE_SIZES = ['auto', '1024x1024', '1024x1792', '1792x1024', '512x512', '2560x1440']
-
-/* 按厂商能力决定携带哪些扩展参数:已知不支持的一律不发。
-   默认按当前生效配置算;对比出图时逐个传入 —— 同一次对比里各模型的
-   可用参数并不一样(OpenAI 认 quality,豆包不认),不能拿一家的能力套所有家 */
+/* 扩展参数与逐模型尺寸也只看能力表(见 api.ts 的 extraParamsFor / sizeForVendor)。
+   对比出图时逐个传入 —— 同一次对比里各模型的可用参数并不一样,
+   不能拿一家的能力套所有家 */
 function extraParams(cfg: ApiConfig = config.value): Record<string, string> {
-  const caps = getProvider(cfg.vendor || inferVendor(cfg.baseUrl), cfg.model)
-  const out: Record<string, string> = {}
-  if (caps.quality !== 'no' && quality.value !== 'auto') out.quality = quality.value
-  if (caps.background !== 'no' && background.value !== 'auto') out.background = background.value
-  return out
+  return extraParamsFor(cfg, quality.value, background.value)
 }
-
-/* 对比出图时按每个模型各自校验尺寸:候选是固定列表的厂商(OpenAI 只认那几档),
-   当前尺寸不在它的列表里就退回它自己的第一档,而不是硬发一个它不认的值。
-   退回是必要的妥协 —— 各模型支持的尺寸本来就不完全重合,
-   并排面板里会把每张实际用的尺寸写出来,所以这个差异是看得见的 */
 function sizeFor(cfg: ApiConfig): string {
-  const allowed = allowedSizes(
-    getProvider(cfg.vendor || inferVendor(cfg.baseUrl), cfg.model).id,
-    cfg.model
-  )
-  if (allowed === 'free') return size.value
-  return allowed.includes(size.value) ? size.value : allowed[0] || 'auto'
+  return sizeForVendor(cfg, size.value)
 }
 
 // 自定义张数:允许手输,失焦/回车时收敛到 1..N_MAX 的整数并回写输入框
@@ -658,16 +626,6 @@ function clampN(e: Event) {
   const v = Math.round(Number(el.value))
   n.value = Number.isFinite(v) && v >= 1 ? Math.min(N_MAX, v) : n.value
   el.value = String(n.value)
-}
-
-// 把手填的尺寸归一成 1024x1536:容忍 × * 大写与空格;认不出来返回 null
-function normalizeSize(raw: string): string | null {
-  if (/^auto$/i.test(raw)) return 'auto'
-  const m = raw.replace(/[×✕*]/g, 'x').replace(/\s+/g, '').match(/^(\d{1,5})x(\d{1,5})$/i)
-  if (!m) return null
-  const w = Number(m[1])
-  const h = Number(m[2])
-  return w > 0 && h > 0 ? `${w}x${h}` : null
 }
 
 // 自定义尺寸:失焦/回车时归一化;认不出来就还原成当前生效值,不做隐式猜测
@@ -1215,11 +1173,13 @@ function configured() {
   return !!config.value.baseUrl
 }
 
-// 套用尺寸:厂商声明 free 就照单全收,给了固定列表的必须命中,否则宁可不改
+/* 套用尺寸(从库取用、或复现某条记录):合不合法由 api.ts 判(见 acceptableSize)。
+   原来这里只查了一遍候选列表,漏掉了"auto 不在列表里、而是单独一档能力"——
+   于是一条存着 auto 的记录套到豆包那种认枚举尺寸的配置上,会把 auto 原样发出去,
+   而它收到枚举外的值直接报 400 */
 function applySize(s?: string) {
-  if (!s) return
-  const list = allowedSizes(provider.value.id, config.value.model)
-  if (list === 'free' || list.includes(s)) size.value = s
+  const next = acceptableSize(config.value, s)
+  if (next) size.value = next
 }
 
 /* 保存提示词库。封面现在写在 IndexedDB(见 api.ts 的 savePrompts),
@@ -1973,17 +1933,10 @@ const PORTRAIT_RATIO = 2 / 3
 function viewSize(framing: 'square' | 'portrait'): string {
   const allowed = allowedSizes(provider.value.id, config.value.model)
   const want = framing === 'square' ? 1 : PORTRAIT_RATIO
-  let best = ''
-  let bestGap = Infinity
-  for (const s of allowed === 'free' ? FREE_SIZES : allowed) {
-    const [w, h] = s.split('x').map(Number)
-    if (!(w > 0 && h > 0)) continue
-    const gap = Math.abs(w / h - want)
-    if (gap < bestGap) {
-      bestGap = gap
-      best = s
-    }
-  }
+  /* 挑最接近的一档。这里原先自己算了一遍(abs(w/h - want)),而编辑那条路
+     用的是对数距离(见 api.ts 的 sizeClosestTo)—— 同一件事两套度量。
+     统一走那一个:对数距离才是比例该有的比法 */
+  const best = sizeClosestTo(allowed === 'free' ? FREE_SIZES : allowed, want)
   // 一档都没挑出来(候选里只有 auto 这类非尺寸值):退回创作区当前尺寸
   return best || size.value
 }
@@ -2058,7 +2011,7 @@ async function genCharView(charId: string, kind: CharacterViewKind): Promise<boo
     }
     /* 不认多图的模型只送正脸:宁可少一张,也不能为了多送一张把整个请求弄失败 ——
        正脸是不可少的那个,四张之间靠它才串成同一个人 */
-    const caps = getProvider(cfg.vendor || inferVendor(cfg.baseUrl), cfg.model)
+    const caps = getProvider(vendorOf(cfg), cfg.model)
     refBlobs = caps.multiImage === 'no' || !source ? [front] : [front, source]
   }
   charViewBusy.value = {
@@ -2752,7 +2705,7 @@ async function doGenerate() {
   // 扩展参数与参考图同样要快照:它们在 await 期间可能被改动
   const extras = extraParams()
   // 种子也是快照的一部分:中途改它不该影响已经发出的这一批
-  const seedNum = seedFor()
+  const seedNum = seedForConfig()
   const refSrc = refImage.value
   /* 参考图可以不止一张:用户自己挑的图 + 角色的那几张一起送 ——
      单张太弱,多视图才锁得住同一张脸。用户那张排最前,它多半就是这次要改的底图 */
@@ -3032,7 +2985,7 @@ async function doRace() {
      而且各模型的合法尺寸/参数本来就不一样,不能拿一家的能力套所有家。
      张数固定 1:对比要看的是"哪个模型更好",不是每个模型各来三张 */
   const slots: GenSlot[] = targets.map((c) => {
-    const s = seedFor(c)
+    const s = seedForConfig(c)
     return {
       id: uid(),
       // 每个模型各自成一条记录:这正是对比的意义
