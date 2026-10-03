@@ -49,6 +49,8 @@ const PROBE_CANVAS = args.includes('--probe-canvas')
 const PROBE_CONFIG = args.includes('--probe-config')
 /* 探历史那一域:删一条 → 撤销把它放回来;再建一个作品集 */
 const PROBE_HISTORY = args.includes('--probe-history')
+/* 探角色那一域:新建一个角色 → 卡片出现 → 拿它开画 */
+const PROBE_CHARS = args.includes('--probe-chars')
 /* 调试端口每轮随机取一个:固定端口会与上一次没退干净的实例撞车,
    而那种撞车表现为"连上了,但连到的是别人",量出来的数看着正常其实全错 */
 const PORT = Number(arg('cdp-port', 0)) || 9300 + Math.floor(Math.random() * 600)
@@ -678,7 +680,21 @@ async function main() {
       } catch (e) {
         twoTabs.error = String(e.message || e)
       } finally {
+        /* 收尾必须**关掉那个标签页并回到前台**:留着它的话,后面探针发给
+           主标签页的鼠标事件会不再生效(连跑时表现成"点了新建角色却什么都没有",
+           单独跑却一路通过 —— 就是被这个坑掉的)。 */
+        try {
+          await other.send('Page.close')
+        } catch {
+          /* 关不掉也不该让测量整体失败 */
+        }
+        try {
+          await send('Page.bringToFront')
+        } catch {
+          /* 同上 */
+        }
         other.close()
+        await sleep(400)
       }
     }
   }
@@ -1030,6 +1046,124 @@ async function main() {
     }
   }
 
+  /* —— 角色域探针 ——
+     新建角色 → 卡片出现 → 拿它开画。这条链穿过 useCharacters 的状态与派生
+     （characters / charStats / activeCharacter / activeCharSrc）,
+     以及留在主界面的写入侧（saveCharFromPage）。 */
+  let charsProbe = null
+  if (PROBE_CHARS) {
+    charsProbe = {}
+    const settle = () => sleep(350)
+    const clickNav = async (label) => {
+      const box = await evaluate((l) => {
+        const b = document.querySelector(`button[aria-label="${l}"]`)
+        if (!b) return null
+        const r = b.getBoundingClientRect()
+        return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
+      }, label)
+      if (!box) return false
+      for (const type of ['mousePressed', 'mouseReleased']) {
+        await send('Input.dispatchMouseEvent', {
+          type,
+          x: box.x,
+          y: box.y,
+          button: 'left',
+          clickCount: 1
+        })
+      }
+      return true
+    }
+    try {
+      charsProbe.nav = await clickNav('Characters')
+      await sleep(700)
+      // 诊断:此刻到底停在哪一页、有哪些页面的根节点还在 DOM 里
+      charsProbe.state = await evaluate(() => {
+        const checked = [...document.querySelectorAll('.rs-item')].find(
+          (b) => b.getAttribute('aria-checked') === 'true'
+        )
+        return {
+          navLabel: checked ? checked.getAttribute('aria-label') : '',
+          pages: [...document.querySelectorAll('main.frame > section')].map((s) => s.className),
+          hasCharsNew: !!document.querySelector('button.chars-new'),
+          hasWizard: !!document.querySelector('.wizard')
+        }
+      })
+      /* 注意:aria-label="New character" 在**向导对话框**上,不在触发键上;
+         触发键是 .chars-new 那个按钮(文本 "New character")。按 aria-label 找
+         会找到 section —— 于是"找到了却不是按钮"(第一版就扑了空) */
+      charsProbe.clickedNew = await evaluate(() => {
+        const b = document.querySelector('button.chars-new')
+        if (!b) return 'missing'
+        b.click()
+        return 'clicked'
+      })
+      await settle()
+      charsProbe.filledName = await evaluate(() => {
+        const input = document.querySelector('input[placeholder="Name this character"]')
+        if (!input) return 'missing'
+        input.value = 'Probe captain'
+        input.dispatchEvent(new Event('input', { bubbles: true }))
+        return 'filled'
+      })
+      /* 性别是必填(Save 的 disabled 同时看名字与性别),它是视觉隐藏的真 radio */
+      charsProbe.pickedGender = await evaluate(() => {
+        const radio = document.querySelector('.wz-sex-opt input')
+        if (!radio) return 'missing'
+        radio.click()
+        return 'clicked'
+      })
+      /* 又是那个坑:Save 的 disabled 绑在 v-model 上,要等下一拍再点 */
+      await settle()
+      charsProbe.saved = await evaluate(() => {
+        const b = [...document.querySelectorAll('button')].find((x) =>
+          /^Save & continue$/.test(x.textContent.trim())
+        )
+        if (!b) return 'missing'
+        if (b.disabled) return 'disabled'
+        b.click()
+        return 'clicked'
+      })
+      await sleep(900)
+      charsProbe.cardAppeared = await evaluate(
+        () => /Probe captain/.test(document.body.textContent || '')
+      )
+      // 关掉向导回列表
+      charsProbe.closed = await evaluate(() => {
+        const b = [...document.querySelectorAll('button')].find((x) =>
+          /^(Close|Cancel)$/.test(x.textContent.trim())
+        )
+        if (!b) return 'missing'
+        b.click()
+        return 'clicked'
+      })
+      await settle()
+      // 拿这个角色开画
+      charsProbe.usedForCreate = await evaluate(() => {
+        const btn = [...document.querySelectorAll('.ctile button')].find((b) =>
+          /Create/.test(b.textContent || '')
+        )
+        if (!btn) return 'missing'
+        btn.click()
+        return 'clicked'
+      })
+      await sleep(700)
+      charsProbe.pillTip = await evaluate(() => {
+        const b = document.querySelector('.param-char button')
+        return (b && (b.getAttribute('data-tip') || '')) || ''
+      })
+      charsProbe.passed =
+        charsProbe.clickedNew === 'clicked' &&
+        charsProbe.filledName === 'filled' &&
+        charsProbe.pickedGender === 'clicked' &&
+        charsProbe.saved === 'clicked' &&
+        charsProbe.cardAppeared === true &&
+        charsProbe.usedForCreate === 'clicked' &&
+        /Probe captain/.test(charsProbe.pillTip)
+    } catch (e) {
+      charsProbe.error = String(e.message || e)
+    }
+  }
+
   const heap = await evaluate(() => {
     const m = performance.memory
     return m ? { usedMB: +(m.usedJSHeapSize / 1048576).toFixed(1) } : null
@@ -1050,6 +1184,7 @@ async function main() {
     canvas,
     config: configProbe,
     historyDomain: historyProbe,
+    chars: charsProbe,
     history,
     heap
   }
@@ -1076,6 +1211,16 @@ async function main() {
       console.log('   ', JSON.stringify(canvas.steps))
       process.exitCode = 1
     }
+  }
+
+  if (charsProbe) {
+    const ok = charsProbe.passed === true
+    console.log(
+      `${ok ? '✅' : '❌'} 角色域(新建 → 卡片出现 → 拿它开画)${
+        ok ? '' : ` — ${JSON.stringify(charsProbe)}`
+      }`
+    )
+    if (!ok) process.exitCode = 1
   }
 
   if (historyProbe) {

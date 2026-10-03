@@ -42,7 +42,6 @@ import {
   characterFaceDesc,
   chatPayloadOf,
   chatStream,
-  coerceCharVoice,
   summarizeChat,
   CHAT_WINDOW,
   CHAT_SUMMARIZE_AFTER,
@@ -54,14 +53,11 @@ import {
   CHAT_EXPORT_MSGS,
   getProvider,
   vendorOf,
-  allowedSizes,
   acceptableSize,
-  sizeClosestTo,
   sizeForVendor,
   normalizeSize,
   seedFor,
   extraParamsFor,
-  FREE_SIZES,
   imageSrc,
   coverSrc,
   makeThumb,
@@ -77,6 +73,7 @@ import { NAV_ITEMS } from './lib/nav'
 import { useFeedback } from './composables/useFeedback'
 import { useConfigs } from './composables/useConfigs'
 import { useHistory } from './composables/useHistory'
+import { useCharacters } from './composables/useCharacters'
 // 另一个标签页改了 localStorage 里的目录时,本页要跟着重载(见 lib/crossTab.ts)
 import {
   openSyncChannel,
@@ -97,7 +94,7 @@ import {
   type Theme
 } from './lib/theme'
 import type { EnhanceMode } from './api'
-import type { ApiConfig, FavoritePayload, HistoryEntry, PromptItem, ResultItem, ReuseParams, Character, CharacterFields, CharacterPersona, CharacterStat, CharacterView, CharacterViewKind, CharacterVoice, CharacterWork, ChatMessage, ChatSummary, ImportedCharacter, ImportedChat } from './types'
+import type { ApiConfig, FavoritePayload, HistoryEntry, PromptItem, ResultItem, ReuseParams, Character, CharacterFields, CharacterPersona, CharacterViewKind, CharacterVoice, ChatMessage, ChatSummary, ImportedCharacter, ImportedChat } from './types'
 
 // —— 状态 ——
 const prompt = ref('')
@@ -248,38 +245,59 @@ const refImage = ref('') // 图生图参考图 (data URL)
    图是 Blob,按 id 存在 IndexedDB(见 api.ts 的 loadCharacters)。
    角色是独立的输入:它不占表单里的参考图槽,只在发请求那一刻并进参考图一起送
    (见 charRefSrcs)。表单上看到的是什么,发出去的参考图就由这里决定 */
-const characters = ref<Character[]>([])
-/* 角色页的组件句柄:第 1 步存完由它把向导推进到下一步
-   (见 saveCharFromPage)。这一页自己管向导的步数,所以"存完该去哪"得由它说了算 */
-const charPageRef = ref<{
-  // 新建存完:角色页据此把向导推进到"主视图"那一步
-  onSaved: (id: string) => void
-  // 编辑存完:角色页据此关掉向导、回到这个角色的详情页
-  onUpdated: (id: string) => void
-} | null>(null)
-/* 这次创作套用的角色 id。空 = 不用角色 */
-const activeCharId = ref('')
-/* 设定图:按角色 id 缓存已取出的视图。只在这个角色被选中时才读 IndexedDB ——
-   启动时不碰,5 张图 × N 个角色全读进来太重 */
-const charViews = ref<Record<string, CharacterView[]>>({})
-/* 各角色正在生成哪几张视图(没有该角色的键 = 空闲)。
-   必须落到角色维度上:同一时间可以跑多张,而且是好几个角色的 ——
-   只记 kind 的话,A 的正脸在跑时切到 B,B 的格子也会显示成"生成中"。
-   同一张重复点会被忽略(见 genCharView) */
-const charViewBusy = ref<Record<string, CharacterViewKind[]>>({})
-/* 重跑设定图的中断手柄,按"角色 + 视图"各存一个:同时跑几张时,
-   停一张不能把别张掐掉;不同角色的同一视图也得分得开 */
-const charViewControllers = new Map<string, AbortController>()
-/** 中断手柄的键。角色 id 与视图名拼一格 —— 两边都可能撞,只有合起来才唯一 */
-function charViewKey(charId: string, kind: CharacterViewKind) {
-  return `${charId}:${kind}`
+/* 角色这一域(目录 / 设定图缓存 / 读取侧原语)收在 composables/useCharacters.ts。
+   写入那一侧(saveCharFromPage / deleteChar / duplicateChar / genCharView /
+   导入导出)暂时留在主界面:它们要么跨到对话域(删角色连带删对话、导出带上记忆),
+   要么要动出图配置与页面切换 —— 归属没定清之前先不搬 */
+const {
+  characters,
+  activeCharId,
+  charViews,
+  charViewBusy,
+  charViewControllers,
+  charPageRef,
+  charViewKey,
+  activeCharacter,
+  activeCharSrc,
+  charStats,
+  charWorks,
+  normalizeChar,
+  detachCharacter,
+  toggleChar,
+  viewOf,
+  viewSize,
+  charImageBlob,
+  resultRefBlob,
+  reBlob,
+  charRefSrcs,
+  stopCharView,
+  loadCharViews,
+  reloadCharViewsFromDb
+} = useCharacters({
+  history,
+  provider,
+  // 挑不出合适档位时退回创作区当前尺寸
+  coverSize: size,
+  // 角色图要给人看,走显示级压缩那条路
+  compressImage
+})
+
+/** 从角色卡直接开画:套上这个角色并切回工作台。
+ *  交给 toggleChar 会变成"再点一次取消",这里要的是明确的选中,所以直接赋值。
+ *  回顶部由 navView 的 watch 统一负责(见 useLibItem 同一条路径) */
+function createWithCharacter(id: string) {
+  activeCharId.value = id
+  page.value = 'home'
 }
 
-/* —— 角色对话 ——
-   与设定图同一套分工:这一页只管展示,消息从哪读、请求怎么发都在主界面。
-   状态也按角色分开,理由与 charViewBusy 那次一模一样:
-   A 在说话时切到 B,B 的界面不该跟着显示"正在输入" */
-/* 当前在看哪个角色的对话。空 = 还没挑(对话页会给一句"挑一个") */
+/** 面板里点一个头像:选定/取消,顺手把悬停预览收掉。
+ *  光靠 mouseleave 收不干净:点完指针还停在原处,那张正脸会一直压在面板上,
+ *  挡住的正是刚点过的那一排 —— 而这会儿人已经选完了,不需要再看它 */
+function pickChar(id: string) {
+  toggleChar(id)
+  hideCharPeek()
+}
+
 const chatCharId = ref('')
 /* 已取到的消息,按角色 id 缓存。进对话页时才读,启动时不碰。
    注意这里装的是**最近一档**(见 idb.ts 的 CHAT_PAGE),不是全部历史 */
@@ -811,18 +829,6 @@ async function handleRemoteSync(batch: SyncMessage[]) {
 /** 重读历史。**合并而不是整份替换**,理由见 api.ts 的 mergeHistory */
 /** 重读某个角色的设定图。缓存那一格本身就是"已加载过"的标记(loader 见到就返回),
  *  所以要先把这一格丢掉再取 */
-async function reloadCharViewsFromDb(id: string) {
-  const before = charViews.value[id]
-  if (before) for (const v of before) releaseSrc(v.data)
-  const rest = { ...charViews.value }
-  delete rest[id]
-  charViews.value = rest
-  /* 角色本身没了的(删角色):不再去读,留个空格就行 ——
-     读它会返回空数组,反而在内存里留一个"加载过"的假标记 */
-  if (!characters.value.some((c) => c.id === id)) return
-  await loadCharViews(id)
-}
-
 /** 重读某个角色的对话。**正在流式说话时跳过**:库里的副本还没有刚落下的这句,
  *  重读会把流式的正文抹掉 —— 那一轮说完还会再广播一次,那时再对齐也不迟 */
 async function reloadChatFromDb(id: string) {
@@ -926,12 +932,6 @@ function clearRef() {
    (见 charRefSrcs),合成后的完整提示词才落进历史。
    于是"这条是照哪个角色出的"在记录上查得到(characterId) */
 /** 当前套用的角色。没有就是 undefined —— 模板与合成提示词都读它 */
-const activeCharacter = computed(() =>
-  characters.value.find((c) => c.id === activeCharId.value)
-)
-/* 当前角色的头像。角色可能只有设定没有参考图,那时返回空串,界面上退回图标 */
-const activeCharSrc = computed(() => coverSrc(activeCharacter.value?.ref))
-
 /* —— 头像悬停预览 ——
    只在"挑人"的地方出现(角色面板里那排头像):悬停就把正脸整张放出来。
    选中之后的胶囊不再用它 —— 那时要看的是"怎么把这个角色摘下来"(见 .char-drop)。
@@ -994,45 +994,6 @@ function composedPrompt(): string {
  *
  *  主视图只能是正面 —— 老数据里可能留着被设成别张的 refKind(那个功能已经去掉),
  *  清掉即可。ref 不动:它是这张角色的封面,丢了卡片就只剩占位图标 */
-function normalizeChar(c: Character): Character {
-  const legacySource = c.refKind ? undefined : c.ref
-  if (c.refKind && c.refKind !== 'front') delete c.refKind
-  if (!c.sourceRef && legacySource) c.sourceRef = legacySource
-  /* 嗓音逐项收一遍:它是从 localStorage 读回来的,可能被手改过、
-     也可能来自更早的版本 —— 形状不对时整个退回"浏览器语音",
-     而不是让一个残缺的对象一路走到合成请求里 */
-  c.voice = coerceCharVoice(c.voice)
-  return c
-}
-
-/** 卸下当前角色 */
-function detachCharacter() {
-  activeCharId.value = ''
-}
-
-/** 从角色卡直接开画:套上这个角色并切回工作台。
- *  交给 toggleChar 会变成"再点一次取消",这里要的是明确的选中,所以直接赋值。
- *  回顶部由 navView 的 watch 统一负责(见 useLibItem 同一条路径) */
-function createWithCharacter(id: string) {
-  activeCharId.value = id
-  page.value = 'home'
-}
-
-/** 选中/取消一个角色卡:再点当前这个即取消。
- *  只动 activeCharId,不碰参考图槽 —— 角色和参考图是两个独立的输入,
- *  角色那几张图在发请求时才并进去(见 charRefSrcs) */
-function toggleChar(id: string) {
-  activeCharId.value = activeCharId.value === id ? '' : id
-}
-
-/** 面板里点一个头像:选定/取消,顺手把悬停预览收掉。
- *  光靠 mouseleave 收不干净:点完指针还停在原处,那张正脸会一直压在面板上,
- *  挡住的正是刚点过的那一排 —— 而这会儿人已经选完了,不需要再看它 */
-function pickChar(id: string) {
-  toggleChar(id)
-  hideCharPeek()
-}
-
 /* 存角色这条链不算快(参考图要压缩、角色要落 IndexedDB),而第 1 步那个按钮
    在等待期间仍可点 —— 连点两下就会建出两个角色,第一个还没有任何界面引用它。
    所以做一次幂等。判定放在这个唯一的写入入口上,而不是角色页那个按钮上 */
@@ -1202,15 +1163,6 @@ function deleteChar(id: string) {
  *  复制角色时必须换实例 —— 两个角色共用同一个 Blob 会共用同一个 object URL,
  *  一边撤销(见 deleteChar 的 purge / releaseSrc)另一边正在显示的图就裂了。
  *  slice 不复制底层字节,只多一个引用 */
-function reBlob(b: Blob): Blob {
-  return b.slice(0, b.size, b.type)
-}
-
-/* 复制一个角色:名字、设定、备注、图全拷一份,插在原件后面。
-   设定图在 IndexedDB 里按角色 id 存,所以得读出来再写到新 id 名下。
-
-   下面三处报错都用 notice 而不是 fail:fail 写的是 home 那条 .err,
-   它只在创作区渲染 —— 用户人在角色页,写过去等于什么都没说 */
 async function duplicateChar(id: string) {
   const at = characters.value.findIndex((c) => c.id === id)
   if (at < 0) return
@@ -1412,63 +1364,9 @@ async function importCharFile(file: File) {
    记录带着 characterId(见 types.ts),这里只做一次聚合,不新增存储。
    角色页靠它把"清单"说成"资产":一个没人用过的角色和一个出过上百张的,
    在列表里应该长得不一样 */
-const charStats = computed<Record<string, CharacterStat>>(() => {
-  const m: Record<string, CharacterStat> = {}
-  for (const h of history.value) {
-    const id = h.characterId
-    if (!id) continue
-    const s = m[id] || (m[id] = { count: 0, lastAt: 0 })
-    s.count += 1
-    if (h.createdAt > s.lastAt) s.lastAt = h.createdAt
-  }
-  return m
-})
-
-/* 每个角色名下的作品:历史里带 characterId 的那些图,按记录顺序(新的在前)。
-   与上面的 stats 同一趟口径、同一个出处 —— 角色页上"12 images"和它下面
-   那排图是同一份数据,不会出现数字说有 12 张、点开只找到 3 张 */
-const charWorks = computed<Record<string, CharacterWork[]>>(() => {
-  const m: Record<string, CharacterWork[]> = {}
-  for (const h of history.value) {
-    const id = h.characterId
-    if (!id) continue
-    const list = m[id] || (m[id] = [])
-    h.results.forEach((item, index) =>
-      list.push({ key: `${h.id}:${index}`, entry: h, index, item })
-    )
-  }
-  return m
-})
-
 /* —— 设定图 ——
    五张视图,正脸是锚:其余四张都以正脸为参考图生成 —— 这是"同一张脸"的唯一保证。
    结果只进角色自己的 views,不进历史 —— 它们是中转用的参考料,不是作品 */
-function viewOf(charId: string, kind: CharacterViewKind): CharacterView | undefined {
-  return charViews.value[charId]?.find((v) => v.kind === kind)
-}
-
-/* 竖幅的目标比例。全身像用 2:3:站姿人形只有竖框装得下,
-   9:16 会把人大幅缩小、面料与配饰的细节跟着丢,3:4 又偏紧、容易切到脚 */
-const PORTRAIT_RATIO = 2 / 3
-
-/* 取景 → 实际尺寸。
-   比例是按视图写死的(见 api.ts 的 framing:正脸 / 3-4 / 细节 / 表情一律方形,
-   只有全身是竖幅),但像素值写不死 —— 各厂商只认自己那几档,
-   所以这里做的是"在它认的档位里挑最接近那个比例的"。
-   厂商不限尺寸时,候选换成应用自己那组常用值:FREE_SIZES 里有 1024x1792 这一档竖幅,
-   全身图才装得下。这里刻意不沿用创作区当前尺寸 —— 那是给作品用的,
-   可能是个宽幅,拿来当全身图的画框会得到一张横过来的人 */
-function viewSize(framing: 'square' | 'portrait'): string {
-  const allowed = allowedSizes(provider.value.id, config.value.model)
-  const want = framing === 'square' ? 1 : PORTRAIT_RATIO
-  /* 挑最接近的一档。这里原先自己算了一遍(abs(w/h - want)),而编辑那条路
-     用的是对数距离(见 api.ts 的 sizeClosestTo)—— 同一件事两套度量。
-     统一走那一个:对数距离才是比例该有的比法 */
-  const best = sizeClosestTo(allowed === 'free' ? FREE_SIZES : allowed, want)
-  // 一档都没挑出来(候选里只有 auto 这类非尺寸值):退回创作区当前尺寸
-  return best || size.value
-}
-
 /* —— 角色身上的图 ——
    角色有两处图:ref(卡面与头像)与 5 张设定图。它们和 record.ref 的用处不同 ——
    后者只是"当时用了哪张参考图"的复现凭据,只喂给模型,压到最长边 512 就够
@@ -1477,29 +1375,6 @@ function viewSize(framing: 'square' | 'portrait'): string {
    512 一到那个尺寸一眼就糊,所以这条路按显示级编:最长边 1280、JPEG q0.88。
    1280 是照着全屏查看器定的(600 CSS px × 2),再大对观感没有增益,
    只是让一套 6 张图多占几 MB */
-const CHAR_IMAGE_MAX = 1280
-async function charImageBlob(src: string): Promise<Blob | undefined> {
-  if (!src) return undefined
-  try {
-    /* 先把字节抓回来再转 data URL:src 可能是上游回的外链,
-       直接塞进 <img> 会让 canvas 被跨域污染,toDataURL 直接抛错 */
-    const raw = await blobToDataURL(await urlToBlob(src))
-    /* force 重编码:模型给的多半是 PNG,原样留下就是 1MB 上下 ——
-       一套六张图好几 MB,画质上却看不出多出来的好处 */
-    const out = await compressImage(raw, CHAR_IMAGE_MAX, 0.88, true)
-    const blob = await urlToBlob(out)
-    return blob.type.startsWith('image/') ? blob : undefined
-  } catch {
-    return undefined
-  }
-}
-
-/** 一张生成结果 → 落进角色设定图的 Blob(显示级,见上面 CHAR_IMAGE_MAX) */
-async function resultRefBlob(item: ResultItem | undefined): Promise<Blob | undefined> {
-  if (!item) return undefined
-  return charImageBlob(imageSrc(item))
-}
-
 /**
  * 生成一张设定图。
  * 正脸:角色有主参考图(上传的 / 从作品提升的 / 上一版正脸)就以它为参考图,
@@ -1614,10 +1489,6 @@ async function genCharView(charId: string, kind: CharacterViewKind): Promise<boo
 
 /** 停掉正在重跑的那一张设定图,只停它 —— 别张还在跑的自己跑完。
  *  已经落库的那张不受影响:只有成功写入的那一刻才作数,半路掐断不会留下坏图 */
-function stopCharView(charId: string, kind: CharacterViewKind) {
-  charViewControllers.get(charViewKey(charId, kind))?.abort()
-}
-
 /** 一次补齐五张。串行跑:每张都以前一张为参考图,并行只会互相抢带宽;
  *  中途失败(多半是配置或配额)就直接停下,免得连错四次 */
 async function genRemainingViews(charId: string) {
@@ -1627,39 +1498,6 @@ async function genRemainingViews(charId: string) {
     if (charViewBusy.value[charId]?.includes(v.kind)) continue
     if (!(await genCharView(charId, v.kind))) return
   }
-}
-
-/* 取出某个角色的设定图并缓存。已经取过就不再读 IndexedDB ——
-   启动时不碰这些图,5 张 × N 个角色全读进来太重 */
-/* 正在路上的读取。同一个 id 可能被两处同时触发(创作区选中角色时的 watch,
-   与角色页的 @open),读两遍 IndexedDB 是白费 */
-const charViewsLoading = new Map<string, Promise<void>>()
-async function loadCharViews(id: string) {
-  if (!id || charViews.value[id]) return
-  const inflight = charViewsLoading.get(id)
-  if (inflight) return inflight
-  const task = (async () => {
-    try {
-      const rows = await getCharViews(id)
-      /* 回来时如果这个角色的图已经有了,就别拿这份快照盖上去:
-         期间多半刚生成完一张,库里那次写入是后发生的,却不一定被这次读看到 ——
-         盖上去的结果是刚出的图从网格上消失,刷新才回来 */
-      if (charViews.value[id]) return
-      const known = new Set<string>(CHARACTER_VIEWS.map((v) => v.kind))
-      /* 存储层只知道"有个 kind 字符串",这里按已知视图清单收窄 ——
-         万一库里留着旧版写下的未知 kind,不该让它混进网格 */
-      charViews.value = {
-        ...charViews.value,
-        [id]: rows
-          .filter((r) => known.has(r.kind))
-          .map((r) => ({ kind: r.kind as CharacterViewKind, data: r.data }))
-      }
-    } finally {
-      charViewsLoading.delete(id)
-    }
-  })()
-  charViewsLoading.set(id, task)
-  return task
 }
 
 // 在创作区选中某个角色时顺手取一次;角色页那边由 @open 触发
@@ -2160,32 +1998,6 @@ watch(
 )
 
 /* 角色最多并进几张参考图。再多上游多半不认,而请求体会迅速变大 */
-const MAX_CHAR_REFS = 4
-
-/** 当前角色的图 → data URL,发请求时并进参考图。
- *  角色不占表单里的参考图槽 —— 表单上看到的始终是用户自己挑的那张,
- *  角色这几张只在这一刻合进来。
- *  正面固定排最前:它是唯一的主视图,前段权重更高,脸就定在它上面。
- *  上传的那张底图不在这里:它只为生成正脸服务一次(见 genCharView),
- *  那之后 c.ref 里存的已经是正脸本身,再送一次就是把同一张图送两遍 */
-async function charRefSrcs(): Promise<string[]> {
-  const c = activeCharacter.value
-  if (!c) return []
-  // 视图是按需加载的,这里先确保取过一次
-  await loadCharViews(c.id)
-  const out: string[] = []
-  const front = viewOf(c.id, 'front')
-  if (front) out.push(await blobToDataURL(front.data))
-  for (const v of CHARACTER_VIEWS) {
-    if (out.length >= MAX_CHAR_REFS) break
-    // 正面已经送过,别的视图按顺序补
-    if (v.kind === 'front') continue
-    const view = viewOf(c.id, v.kind)
-    if (view) out.push(await blobToDataURL(view.data))
-  }
-  return out
-}
-
 // —— 生图 ——
 
 /* 中文输入法里用回车「上屏」也会触发 keydown.enter(keyCode 229,isComposing 为真)。
