@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 import {
   EDIT_PAYLOAD_BUDGET,
   EDIT_PAYLOAD_EDGE,
+  REF_ARCHIVE_EDGE,
+  REF_IMAGE_EDGE,
   dataUrlBytes,
   payloadOverBudget,
   payloadScaleFor,
@@ -91,5 +93,27 @@ describe('payloadOverBudget · 超预算判定', () => {
   it('默认上限就是 2560 与 8MB —— 改动它们要有意识地改', () => {
     expect(EDIT_PAYLOAD_EDGE).toBe(2560)
     expect(EDIT_PAYLOAD_BUDGET).toBe(8 * 1024 * 1024)
+  })
+})
+
+describe('尺寸上限之间的关系 · 别让它们悄悄错位', () => {
+  it('参考图比编辑载荷更省:两者的取舍不同,不能混成一个数', () => {
+    expect(REF_IMAGE_EDGE).toBeLessThan(EDIT_PAYLOAD_EDGE)
+    expect(REF_ARCHIVE_EDGE).toBeLessThanOrEqual(REF_IMAGE_EDGE)
+  })
+
+  it('编辑载荷上限不低于本站给出的最大档(2560×1440)', () => {
+    /* 厂商那边不动手,我们自己收窄就是有损的:如果这个上限被调到比用户
+       能选的档位还小,那"选 2560 出图"就会变成"实际只送了 X 进去" ——
+       结果看起来只是"糊了一点",不会有任何报错。这条把它钉住 */
+    const largestOfferedEdge = 2560
+    expect(EDIT_PAYLOAD_EDGE).toBeGreaterThanOrEqual(largestOfferedEdge)
+  })
+
+  it('三个数都必须是正整数,别写成 0 或 NaN', () => {
+    for (const n of [EDIT_PAYLOAD_EDGE, REF_IMAGE_EDGE, REF_ARCHIVE_EDGE, EDIT_PAYLOAD_BUDGET]) {
+      expect(Number.isInteger(n)).toBe(true)
+      expect(n).toBeGreaterThan(0)
+    }
   })
 })

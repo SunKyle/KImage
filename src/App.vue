@@ -90,6 +90,8 @@ import { stopSpeaking } from './lib/speech'
 import { NAV_ITEMS } from './lib/nav'
 // 另一个标签页改了 localStorage 里的目录时,本页要跟着重载(见 lib/crossTab.ts)
 import { syncTargetsOf } from './lib/crossTab'
+// 图片尺寸上限的唯一来源(参考图 / 存档 / 编辑载荷),别再各写一个字面量
+import { REF_ARCHIVE_EDGE, REF_IMAGE_EDGE } from './lib/payload'
 import {
   applyTheme,
   currentTheme,
@@ -1368,7 +1370,7 @@ function importConfigs(list: ApiConfig[]) {
   }
 }
 
-// —— 图生图:读取本地图片为 data URL(压缩到最长边 1024,避免请求体过大 413) ——
+// —— 图生图:读取本地图片为 data URL(压缩到最长边 REF_IMAGE_EDGE,避免请求体过大 413) ——
 function onPickRef(e: Event) {
   const file = (e.target as HTMLInputElement).files?.[0]
   if (!file) return
@@ -1376,7 +1378,7 @@ function onPickRef(e: Event) {
   const reader = new FileReader()
   reader.onload = () => {
     const url = String(reader.result)
-    compressImage(url, 1024).then((out) => (refImage.value = out))
+    compressImage(url, REF_IMAGE_EDGE).then((out) => (refImage.value = out))
   }
   reader.readAsDataURL(file)
   ;(e.target as HTMLInputElement).value = ''
@@ -1394,7 +1396,7 @@ function pickRef() {
 async function refThumbOf(src: string): Promise<Blob | undefined> {
   if (!src) return undefined
   try {
-    const out = await compressImage(src, 512, 0.72)
+    const out = await compressImage(src, REF_ARCHIVE_EDGE, 0.72)
     return /^data:image\//.test(out) ? await urlToBlob(out) : undefined
   } catch {
     return undefined
@@ -1407,7 +1409,7 @@ async function refThumbOf(src: string): Promise<Blob | undefined> {
    但原图如果是 PNG(模型给的多半是),原样留下就是 1MB 上下,那时才需要 force */
 function compressImage(
   dataUrl: string,
-  maxEdge = 1024,
+  maxEdge = REF_IMAGE_EDGE,
   quality = 0.85,
   force = false
 ): Promise<string> {

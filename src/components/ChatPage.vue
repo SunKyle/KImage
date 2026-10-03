@@ -21,6 +21,8 @@ import {
 import type { ApiConfig, Character, ChatMessage, ChatSummary } from '../types'
 import { CHAT_MAX_CHARS, coverSrc, hasPersona } from '../api'
 import { getChatImage } from '../lib/idb'
+// 喂给模型的图长边上限(与首页、画布、角色识图共用同一个数)
+import { REF_IMAGE_EDGE } from '../lib/payload'
 import { growTextarea, vGrow } from '../lib/grow'
 import { speak, speechSupported, speakingId, speakingLoading, stopSpeaking, warmUpSpeech } from '../lib/speech'
 
@@ -419,13 +421,13 @@ function grow() {
 const tooLong = computed(() => text.value.trim().length > CHAT_MAX_CHARS)
 
 /* ===== 附图 =====
-   用户可以把一张图发给角色看。上限长边 1024:它要作为 data URL 随请求
-   发出去,而一张 4000px 的原图光 base64 就有几 MB —— 模型看的是内容,
-   不是分辨率。压过的这一份同时是"发出去的那份"和"存下来的那份",
-   所以库里不会白白胖一圈。
+   用户可以把一张图发给角色看。上限与其余几处"喂给模型的图"共用同一个常量
+   (见 lib/payload.ts 的 REF_IMAGE_EDGE):它要作为 data URL 随请求发出去,
+   而一张 4000px 的原图光 base64 就有几 MB —— 模型看的是内容,不是分辨率。
+   压过的这一份同时是"发出去的那份"和"存下来的那份",所以库里不会白白胖一圈。
    一次只挂一张:多图对"它在看什么"帮助有限,而每张都是上千 token。
    ------------------------------------------------------------------ */
-const CHAT_IMAGE_MAX = 1024
+const CHAT_IMAGE_MAX = REF_IMAGE_EDGE
 const imgInput = ref<HTMLInputElement | null>(null)
 const attach = ref<{ blob: Blob; url: string } | null>(null)
 

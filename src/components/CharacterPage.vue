@@ -59,6 +59,8 @@ import type {
 } from '../types'
 import { vGrow } from '../lib/grow'
 import { deleteVoiceSample, putVoiceSample } from '../lib/idb'
+// 送去模型的参考图长边上限(与首页、画布共用同一个数)
+import { REF_IMAGE_EDGE } from '../lib/payload'
 import { speak, speakingId, stopSpeaking } from '../lib/speech'
 
 /* 角色:网站的重点页面。
@@ -896,10 +898,11 @@ async function draftWithAI() {
   }
 }
 
-/* 送去识图模型的那一份:最长边压到 1024 的 JPEG。
+/* 送去识图模型的那一份:最长边压到上限的 JPEG。
    上传的原图可能有几十 MB,而请求体上限是 15MB —— 原样发过去会直接 413。
+   上限与其余几处参考图共用同一个常量(见 lib/payload.ts 的 REF_IMAGE_EDGE)。
    存档用的仍是原图(见 submit 那条路),这张副本只给模型看 */
-const VISION_MAX_EDGE = 1024
+const VISION_MAX_EDGE = REF_IMAGE_EDGE
 function visionCopy(dataUrl: string): Promise<string> {
   return new Promise((resolve) => {
     const img = new Image()

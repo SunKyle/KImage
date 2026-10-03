@@ -32,7 +32,12 @@ import {
 } from '@phosphor-icons/vue'
 import { editImage, extOf, generateFrom, imageSrc } from '../api'
 // 编辑载荷的体积控制(收窄到上限、按内容选格式、超预算再退档)。见 lib/payload.ts
-import { payloadOverBudget, payloadScaleFor, shrinkScaleFor } from '../lib/payload'
+import {
+  REF_IMAGE_EDGE,
+  payloadOverBudget,
+  payloadScaleFor,
+  shrinkScaleFor
+} from '../lib/payload'
 import { blobToDataURL } from '../lib/idb'
 import type { ApiConfig, EditMode, ResultItem } from '../types'
 
@@ -1901,9 +1906,9 @@ function toBlob(c: HTMLCanvasElement, type: string): Promise<Blob | null> {
   return new Promise((r) => c.toBlob(r, type, type === 'image/png' ? undefined : 0.92))
 }
 
-/* 参考图的长边上限。与首页把用户上传的图缩到 1024 是同一个数 ——
-   它们进的是同一条请求,尺寸对不上只会在那边白白多背几百 KB */
-const REF_EDGE = 1024
+/* 参考图的长边上限。与首页那条参考图、角色识图共用同一个常量 ——
+   它们进的是同一类请求,各写一份只会在改了其中一处时悄悄不一致 */
+const REF_EDGE = REF_IMAGE_EDGE
 
 /** 当前画面,缩成一张能当参考图送上去的 data URL。没有图时给 null。
  *
@@ -1924,7 +1929,7 @@ function refShot(): string | null {
     ctx.imageSmoothingQuality = 'high'
     ctx.drawImage(c, 0, 0, t.width, t.height)
   }
-  // 探的是刚缩好的这张:它最多 1024,比拿 4000px 的原图去探准得多
+  // 探的是刚缩好的这张:它最多 REF_IMAGE_EDGE,比拿 4000px 的原图去探准得多
   return hasAlpha(t) ? t.toDataURL('image/png') : t.toDataURL('image/jpeg', 0.85)
 }
 
