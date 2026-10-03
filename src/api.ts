@@ -2321,6 +2321,8 @@ export interface ChatStreamResult {
      由服务端剪下来单独送来 —— 正文里读不到它。
      空串 = 这一轮没给(模型没写,或收在半截上被剪掉了) */
   mood: string
+  /* 它这一轮想给你看的画面(场景描述),空串 = 不发图 */
+  photo: string
 }
 
 /* ===== 长期记忆的节奏 =================================================
@@ -2449,6 +2451,8 @@ export async function chatStream(opts: ChatStreamOpts): Promise<ChatStreamResult
   /* 这一轮的情绪。与 finish 同路:服务端在收尾那一帧一起给 ——
      正文里的标签已经被它剪掉了,这里是唯一的来源 */
   let mood = ''
+  /* 这一轮它想给你看的画面(服务端从正文末尾剪下来的场景描述) */
+  let photo = ''
   try {
     for (;;) {
       const { done, value } = await reader.read()
@@ -2459,7 +2463,14 @@ export async function chatStream(opts: ChatStreamOpts): Promise<ChatStreamResult
       for (const line of lines) {
         const text = line.trim()
         if (!text) continue
-        let evt: { delta?: string; done?: boolean; error?: string; finish?: string; mood?: string }
+        let evt: {
+          delta?: string
+          done?: boolean
+          error?: string
+          finish?: string
+          mood?: string
+          photo?: string
+        }
         try {
           evt = JSON.parse(text)
         } catch {
@@ -2469,7 +2480,13 @@ export async function chatStream(opts: ChatStreamOpts): Promise<ChatStreamResult
         if (typeof evt.delta === 'string' && evt.delta) opts.onDelta(evt.delta)
         // 错误放在 delta 之后判:上游可能是"说了一半才断",那半句要留住
         if (evt.error) throw new Error(evt.error)
-        if (evt.done) return { finish: evt.finish || finish, mood: evt.mood || mood }
+        if (evt.done) {
+          return {
+            finish: evt.finish || finish,
+            mood: evt.mood || mood,
+            photo: evt.photo || photo
+          }
+        }
         if (typeof evt.finish === 'string' && evt.finish) finish = evt.finish
         if (typeof evt.mood === 'string' && evt.mood) mood = evt.mood
       }
@@ -2479,7 +2496,7 @@ export async function chatStream(opts: ChatStreamOpts): Promise<ChatStreamResult
        不取消这条读流就悬着。已经读完时取消是空操作 */
     reader.cancel().catch(() => {})
   }
-  return { finish, mood }
+  return { finish, mood, photo }
 }
 
 /* ===== 提示词库(收藏) ===== */

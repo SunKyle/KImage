@@ -59,9 +59,9 @@ import {
   urlToBlob,
   // 这几个仍被留下的流式链路与"删角色连带删对话"用着
   deleteChatMessage,
+  putChatMessage,
   deleteChatOf,
   deleteChatImage,
-  putChatMessage,
   getCharViews,
   putCharView,
   deleteVoiceSample,
@@ -459,6 +459,7 @@ const {
   loading,
   multiModel,
   runLabel,
+  generateChatPhoto,
   recordFor,
   doGenerate,
   stopSlot,
@@ -1430,6 +1431,8 @@ async function runChat(id: string) {
   let finish = ''
   /* 这一轮的情绪,由服务端从正文末尾剪下来单独给 */
   let mood = ''
+  /* 这一轮它想给你看的画面(场景描述)。空串 = 不发图 */
+  let photo = ''
   try {
     const out = await chatStream({
       character: chatPayloadOf(c),
@@ -1446,6 +1449,7 @@ async function runChat(id: string) {
     })
     finish = out.finish
     mood = out.mood
+    photo = out.photo
   } catch (e) {
     if (isAbort(e)) stopped = true
     else failure = e instanceof Error ? e.message : 'Request failed'
@@ -1463,6 +1467,31 @@ async function runChat(id: string) {
   /* 情绪挂在这一条上。收在半截上时多半没有(标签本来就在末尾),
      没有就不写 —— 界面上那枚小药丸宁可不出,也不要显示一个错的 */
   if (mood) reply.mood = mood
+  /* 它想发一张图:**先挂上场景描述**(界面据此立刻占一个骨架位),
+     再在后台画。画不出来就把那个标记清掉,骨架随之消失 —— 正文照旧,
+     一句"我画不出来"比什么都不说更打断对话(见 doc/角色配图设计.md) */
+  if (photo && !stopped) {
+    reply.photo = photo
+    void generateChatPhoto(photo).then(async (blob) => {
+      if (!blob) {
+        /* 这一条可能已经被删了(清空对话):那就别再往上写 */
+        if (chatMessages.value[id]?.some((m) => m.id === reply.id)) reply.photo = ''
+        return
+      }
+      const photoId = uid()
+      try {
+        await putChatImage({ id: photoId, blob, createdAt: Date.now() })
+      } catch {
+        reply.photo = ''
+        return
+      }
+      reply.photoId = photoId
+      /* 落库只是把这条消息补全:图不进历史,所以这里走的不是 persist,
+         而是"把这一条改写回去"。失败也不回滚界面 —— 刷新后少一张图,
+         比当场把它撤掉更不刺眼 */
+      await putChatMessage(toRaw(reply)).catch(() => {})
+    })
+  }
   if (!reply.content.trim() && !stopped) {
     /* 一个字都没收到(上游出错,或它真的什么都没说):
        把这条空壳摘掉,免得消息流里留一个空气泡。

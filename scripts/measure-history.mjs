@@ -1443,21 +1443,47 @@ async function main() {
           r.onsuccess = () => res(r.result)
           r.onerror = () => rej(r.error)
         })
+        // 一张真图(用 canvas 现造,不靠网络)
+        const png = await new Promise((res) => {
+          const c = document.createElement('canvas')
+          c.width = c.height = 32
+          const g = c.getContext('2d')
+          g.fillStyle = '#4a5568'
+          g.fillRect(0, 0, 32, 32)
+          c.toBlob((b) => res(b), 'image/png')
+        })
         const msgs = [
           { role: 'user', content: 'Are you awake?', dt: 3 },
           { role: 'assistant', content: 'Barely. It is early.', dt: 2 },
-          { role: 'user', content: 'Same here.', dt: 1 }
+          { role: 'user', content: 'Same here.', dt: 1 },
+          // 已经画好的那张:photoId 指向 chat_images 里的字节
+          {
+            role: 'assistant',
+            content: 'Here is the window.',
+            dt: 0.5,
+            photo: 'a grey window at dawn',
+            photoId: 'probe-photo-1'
+          },
+          // 还在画的那张:只有场景描述,没有 photoId → 应当是骨架
+          { role: 'assistant', content: 'One second.', dt: 0.2, photo: 'still drawing' }
         ].map((m, i) => ({
           id: `probe-msg-${i}`,
           charId,
           role: m.role,
           content: m.content,
-          createdAt: now - m.dt * 60000
+          createdAt: now - m.dt * 60000,
+          ...(m.photo ? { photo: m.photo } : {}),
+          ...(m.photoId ? { photoId: m.photoId } : {})
         }))
         await new Promise((res, rej) => {
-          const tx = db.transaction(['chat_messages', 'chat_summaries'], 'readwrite')
+          const tx = db.transaction(['chat_messages', 'chat_summaries', 'chat_images'], 'readwrite')
           const store = tx.objectStore('chat_messages')
           for (const m of msgs) store.put(m)
+          tx.objectStore('chat_images').put({
+            id: 'probe-photo-1',
+            blob: png,
+            createdAt: now
+          })
           tx.objectStore('chat_summaries').put({
             charId,
             text: 'They met on a cold morning and agreed to keep it short.',
@@ -1500,11 +1526,31 @@ async function main() {
       await sleep(900)
       chatProbe.rendered = await evaluate(() => {
         const bubbles = document.querySelectorAll('.bubble, .msg, .chat-msg').length
+        /* 配图必须**在文字之后**(垫在下面):比的是两者在气泡里的位置。
+           这是它与用户附图的分界 —— 那张压在文字上面 */
+        const withPhoto = [...document.querySelectorAll('.bubble')].find((b) =>
+          b.querySelector('img.bubble-photo')
+        )
+        const order = withPhoto
+          ? (() => {
+              const nodes = [...withPhoto.childNodes]
+              const textAt = nodes.findIndex(
+                (n) => n.nodeType === 3 && (n.textContent || '').includes('window')
+              )
+              const imgAt = nodes.findIndex(
+                (n) => n.nodeType === 1 && n.classList?.contains('bubble-photo')
+              )
+              return { textAt, imgAt }
+            })()
+          : null
         return {
           bubbles,
           hasMemory: !!document.querySelector('.memory'),
           memoryLabel: document.querySelector('.memory-label')?.textContent?.trim() || '',
-          charInRail: /Probe talker/.test(document.body.textContent || '')
+          charInRail: /Probe talker/.test(document.body.textContent || ''),
+          photoRendered: !!document.querySelector('img.bubble-photo'),
+          photoBelowText: !!order && order.imgAt > order.textAt && order.textAt >= 0,
+          pendingSkeleton: !!document.querySelector('.bubble-photo-skel')
         }
       })
 
@@ -1533,10 +1579,13 @@ async function main() {
       }))
 
       chatProbe.passed =
-        chatProbe.seeded === 3 &&
+        chatProbe.seeded === 5 &&
         chatProbe.rendered?.bubbles >= 3 &&
         chatProbe.rendered?.hasMemory === true &&
         chatProbe.rendered?.charInRail === true &&
+        chatProbe.rendered?.photoRendered === true &&
+        chatProbe.rendered?.photoBelowText === true &&
+        chatProbe.rendered?.pendingSkeleton === true &&
         chatProbe.clickedClear === 'clicked' &&
         chatProbe.afterClear?.bubbles === 0 &&
         chatProbe.afterClear?.memoryGone === true &&

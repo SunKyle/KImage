@@ -6,6 +6,7 @@ import {
   normalizeSize,
   characterFaceDesc,
   generate,
+  imageSrc,
   makeThumb,
   uid,
   seedFor,
@@ -292,6 +293,44 @@ function undoEnhance() {
   preEnhance.value = ''
 }
 
+
+  /* 对话里"角色发一张图"的场景描述上限。与 server/chatTags.js 的
+     PHOTO_SCENE_CHARS 同一口径 —— 那边剪下来时已经截过一次,这里是第二道 */
+  const CHAT_PHOTO_SCENE_CHARS = 120
+
+  /** 对话里现场画一张:只在被要求或确实合适时由那一轮的标签触发。
+   *  **不进历史**(见 doc/角色配图设计.md):图只活在对话里,
+   *  所以这条路刻意不走 persist/recordFor —— 只把 Blob 交给调用方,
+   *  由它塞进 chat_images。角色的设定图当参考图送进去,这是"同一张脸"的保证 */
+  async function generateChatPhoto(scene: string): Promise<Blob | undefined> {
+    const text = String(scene || '').trim().slice(0, CHAT_PHOTO_SCENE_CHARS)
+    if (!text || !deps.configured()) return undefined
+    const spec = charSpecPrefix.value
+    /* 场景在前、角色设定在后(与 composedPrompt 同一顺序):
+       前段权重更高,先说"这一张要画什么" */
+    const prompt = (spec ? `${text}, ${spec}` : text).slice(0, 1200)
+    const refList = await deps.charRefSrcs()
+    const ctrl = new AbortController()
+    try {
+      const res = await generate(
+        {
+          prompt,
+          size: size.value,
+          n: 1,
+          ...(refList.length ? { images: refList } : {}),
+          ...extraParams()
+        },
+        deps.config.value,
+        ctrl.signal
+      )
+      const first = res?.[0]
+      if (!first) return undefined
+      return await urlToBlob(imageSrc(first))
+    } catch {
+      // 画不出来不该影响它说的话(见设计文档:失败不阻断文字)
+      return undefined
+    }
+  }
 
   /** 清掉参考图(与角色无关:角色是另一个输入,见 types.ts 的 characterId 注释) */
   function clearRef() {
@@ -748,6 +787,7 @@ function retry() {
     charSpecPrefix,
     composedPrompt,
     doGenerate,
+    generateChatPhoto,
     recordFor,
     runBatch,
     persistBatch,

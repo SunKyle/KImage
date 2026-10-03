@@ -849,6 +849,20 @@ onBeforeUnmount(() => {
                     alt="Attached image"
                   />
                   {{ r.msg.content }}<span v-if="r.msg.id === cursorId" class="cursor" aria-hidden="true"></span>
+                  <!-- 角色发来的图。**垫在文字下面**:先读它说的话,再看它给你看的东西 ——
+                       与用户那张(压在文字上面,那是这句话的前提)是两种语义。
+                       还没有 photoId = 正在画:占一个方骨架位,免得图到了把气泡顶下去 -->
+                  <img
+                    v-if="r.msg.role === 'assistant' && r.msg.photoId && imgUrl(r.msg.photoId)"
+                    class="bubble-photo"
+                    :src="imgUrl(r.msg.photoId)"
+                    alt="Photo from the character"
+                  />
+                  <span
+                    v-else-if="r.msg.role === 'assistant' && r.msg.photo"
+                    class="bubble-photo bubble-photo-skel"
+                    aria-hidden="true"
+                  ></span>
                   <!-- 朗读。贴着气泡外侧下角,绝对定位 —— 它不该挤占气泡的宽度。
                        只在悬停时浮出来(触屏没有 hover,那时让它常驻,见样式)。
                        正在生成的那条不给:半句话念出来只会更难听 -->
@@ -1782,6 +1796,25 @@ onBeforeUnmount(() => {
   margin-bottom: 8px;
   border-radius: 12px;
   object-fit: cover;
+}
+
+/* 角色发来的那张:占满气泡宽度、垫在文字下方。骨架用同一个方块比例 ——
+   图是异步到的,比例写死才不会在它到达时把整段对话顶下去 */
+.bubble-photo {
+  display: block;
+  width: 100%;
+  margin-top: 8px;
+  border-radius: 12px;
+}
+.bubble-photo-skel {
+  aspect-ratio: 1;
+  background: linear-gradient(100deg, var(--skel-a, #e9e9ee) 30%, var(--skel-b, #f5f5f8) 50%, var(--skel-a, #e9e9ee) 70%);
+  background-size: 200% 100%;
+  animation: skel-shimmer 1.4s linear infinite;
+}
+@keyframes skel-shimmer {
+  from { background-position: 200% 0; }
+  to { background-position: -200% 0; }
 }
 
 .compose-box {
