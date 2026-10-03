@@ -99,6 +99,7 @@ import { blobToDataURL, urlToBlob, getCharViews, putCharView, getChatMessages, p
 import { titleFromPrompt } from './lib/text'
 import { stopSpeaking } from './lib/speech'
 import { NAV_ITEMS } from './lib/nav'
+import { useFeedback } from './composables/useFeedback'
 // 另一个标签页改了 localStorage 里的目录时,本页要跟着重载(见 lib/crossTab.ts)
 import {
   openSyncChannel,
@@ -140,88 +141,25 @@ const background = ref('auto')
    这里空着才是"不传"。上游从不告诉我们它实际用了哪个数,所以这里只能由用户自己填,
    填了才有"同一张图再微调"可言 */
 const seed = ref('')
-const error = ref('')
-// 错误区默认收成一行:上游原文动辄上百字,整段铺开会把输入区顶得很高
-const errorOpen = ref(false)
-// 只有真正发起过生图才谈得上"重试",校验类提示不给这个按钮
-const canRetry = ref(false)
-// 统一的错误出口:顺带把折叠状态收回、标记可否重试
-function fail(msg: string, retryable = false) {
-  error.value = msg
-  canRetry.value = retryable
-  errorOpen.value = false
-}
-// 校验类提示都很短,不值得给「详情」;上游原文通常远长于此
-const errorLong = computed(() => error.value.length > 90)
-// 存储清理的事后告知。它不是错误,所以单独一条通道,中性配色
-const notice = ref('')
+/* 反馈三通道(错误 / 中性提示 / 删除撤销)收在 composables/useFeedback.ts ——
+   它们是每一块业务域都要用的东西,留在主界面里会让后面每抽一个域都反向依赖它 */
+const {
+  error,
+  errorOpen,
+  canRetry,
+  errorLong,
+  fail,
+  notice,
+  clearNotice,
+  holdNotice,
+  releaseNotice,
+  pendingUndo,
+  UNDO_MS,
+  scheduleUndo,
+  commitUndo,
+  runUndo
+} = useFeedback()
 
-/* —— 提示的自动收起 ——
-   它是"说过就算"的中性通知(存好了、空间快满了),不该一直占着画面底部等人来关;
-   但也不能一闪而过:长句得留够读的时间,所以按长度给时长。
-   新提示进来时上一条的计时会被这里重置(同一个 ref,watch 又会跑一遍) */
-let noticeTimer = 0
-/** 读一条提示要多久。短句 4 秒;长的每字再加 60ms ——
- *  "存储快满"那种一句能到一百多字,照 4 秒收掉等于没提示 */
-function noticeMs(msg: string) {
-  return Math.min(9000, 4000 + msg.length * 60)
-}
-function clearNotice() {
-  window.clearTimeout(noticeTimer)
-  notice.value = ''
-}
-/** 把指针停在浮条上时不计时:长一点的提示用户可能正在读,
- *  读到一半整条消失,会让人怀疑自己是不是记错了 */
-function holdNotice() {
-  window.clearTimeout(noticeTimer)
-}
-/** 指针移开,接着计时。整条重新算而不是接着上一段:实现简单,
- *  而且用户等于又看了一遍 —— 多留这几秒不亏 */
-function releaseNotice() {
-  window.clearTimeout(noticeTimer)
-  if (notice.value) noticeTimer = window.setTimeout(clearNotice, noticeMs(notice.value))
-}
-watch(notice, (v) => {
-  window.clearTimeout(noticeTimer)
-  if (v) noticeTimer = window.setTimeout(clearNotice, noticeMs(v))
-})
-onBeforeUnmount(() => window.clearTimeout(noticeTimer))
-
-/* ===== 删除的撤销窗口 ================================================
-   删除不再弹确认框,而是立刻生效、几秒内可撤销(见 components/UndoToast.vue)。
-   关键在于:真正落盘的删除发生在窗口结束时(见 purge),窗口里数据一直还在 ——
-   所以"撤销"只是把它放回列表,不需要从磁盘上把东西搬回来。
-   同一时刻只保留一次待撤销:再来一次删除就把上一次落盘,否则两枚按钮会各烧各的。
-   ------------------------------------------------------------------ */
-interface PendingUndo {
-  /** 换一次删除就换一个 token,撤销条据此重新点燃 */
-  token: string
-  /** 说明删掉了什么 */
-  label: string
-  /** 把东西放回列表,并把恢复后的状态落盘 */
-  undo: () => void
-  /** 窗口结束:真正落盘删除,释放图片地址 */
-  purge: () => void
-}
-const pendingUndo = ref<PendingUndo | null>(null)
-/** 4.5 秒:够看清删了什么、也够反悔,又不至于让这条一直挂在屏幕上 */
-const UNDO_MS = 4500
-
-function scheduleUndo(item: Omit<PendingUndo, 'token'>) {
-  pendingUndo.value?.purge()
-  pendingUndo.value = { ...item, token: uid() }
-}
-// 保险丝烧完 = 用户接受了这次删除
-function commitUndo() {
-  const p = pendingUndo.value
-  pendingUndo.value = null
-  p?.purge()
-}
-function runUndo() {
-  const p = pendingUndo.value
-  pendingUndo.value = null
-  p?.undo()
-}
 const history = ref<HistoryEntry[]>([])
 // 作品集目录(只有标题 + id)。归属关系挂在记录上,这里只存目录
 const collections = ref<Collection[]>([])

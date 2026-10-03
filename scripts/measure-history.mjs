@@ -663,7 +663,14 @@ async function main() {
         // 等广播(收拢窗口 250ms)+ 对面重读
         await sleep(2000)
         twoTabs.markedInB_after = await countMarked()
-        twoTabs.passed = twoTabs.markedInB_after > twoTabs.markedInB_before
+        /* 顺带把"提示条"也验了:同步之后 B 页应当弹一句"从另一个标签页更新"。
+           这条通道(useFeedback)平时没有自动化覆盖,而它每一块业务域都要用 */
+        twoTabs.noticeInB = await other.evaluate(
+          () => document.querySelector('.note')?.textContent?.trim().slice(0, 48) || ''
+        )
+        twoTabs.passed =
+          twoTabs.markedInB_after > twoTabs.markedInB_before &&
+          /another tab/i.test(twoTabs.noticeInB)
       } catch (e) {
         twoTabs.error = String(e.message || e)
       } finally {
