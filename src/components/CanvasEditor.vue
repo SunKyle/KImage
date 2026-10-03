@@ -32,6 +32,24 @@ import {
 } from '@phosphor-icons/vue'
 import { editImage, extOf, generateFrom, imageSrc } from '../api'
 // 编辑载荷的体积控制(收窄到上限、按内容选格式、超预算再退档)。见 lib/payload.ts
+/* 操作序列的栈怎么进退、每一步怎么写、矩形怎么夹进画面 —— 那些都不碰像素,
+   所以收在 lib/canvasOps.ts 里(能单测)。这里只留真正画像素的那一半 */
+import {
+  clampNum,
+  clampRectToImage,
+  describeOp,
+  goToStep,
+  /* 与组件自己的 pushOp 同名会让函数声明遮蔽掉导入(踩过一次),
+     所以这一条改名引入 */
+  pushOp as pushOntoStacks,
+  redoOp,
+  rotatedSize,
+  roundRect,
+  undoOp,
+  type CanvasOp,
+  type CanvasPoint,
+  type CanvasRect
+} from '../lib/canvasOps'
 import {
   REF_IMAGE_EDGE,
   payloadOverBudget,
@@ -53,15 +71,16 @@ import type { ApiConfig, EditMode, ResultItem } from '../types'
    三种操作,坐标都相对"执行到它那一刻的图像"。按顺序重放必然自洽:
    用户是在当时看到的画面上画的裁剪框,重放时看到的也正是同一个画面。
    ------------------------------------------------------------------ */
-type Rect = { x: number; y: number; w: number; h: number }
-type Point = { x: number; y: number }
+/* 这两个别名保留是为了不动组件里几十处用法:形状与引擎里那份完全一样 */
+type Rect = CanvasRect
+type Point = CanvasPoint
 /* 几何操作:坐标相对"执行到它那一刻的图像",重放必然自洽。
    AI 编辑是另一支,见 AiOp */
-type Op =
-  | { k: 'rotate'; deg: number }
-  | { k: 'flip'; axis: 'h' | 'v' }
-  | { k: 'crop'; rect: Rect }
-  | AiOp
+/* 位图由 AI 那一步自己带着(形状与理由见 lib/canvasOps.ts 的 CanvasAiOp)。
+   这里定下具体的位图类型 —— 组件里是 ImageBitmap。
+   存位图而不是 Blob:重放是同步的,而 Blob 得异步解码。
+   这份内存由 resetAll 收口:换图、撤图时统一 close */
+type Op = CanvasOp<ImageBitmap>
 
 /* AI 编辑那一步。它与上面三种有个根本差别:后者的结果是算出来的,
    而"去掉背景之后长什么样"只有上游知道 —— 所以这一支自己带着结果位图,
@@ -70,16 +89,6 @@ type Op =
 
    存位图而不是 Blob:重放是同步的(见 rebuild 与 replayAll),
    而 Blob 得异步解码。这份内存由 resetAll 收口 —— 换图、撤图时统一 close */
-type AiOp = {
-  k: 'ai'
-  /* 这一步做了什么,如 'Background removed'。两行:
-     标题是一句说法,副题补上细节(用户写的那句指令、或者改动幅度)。
-     存下来是因为事后从位图上认不出这一步做了什么 */
-  label: string
-  sub: string
-  bitmap: ImageBitmap
-}
-
 const props = defineProps<{
   /* 这一页是不是当前显示的那一页。画布常驻挂载(v-show 切换),
      这样切去历史挑张图再切回来,手上的裁剪框还在 —— 它是工作台,不是弹窗 */
@@ -462,9 +471,9 @@ function applyOp(cur: HTMLCanvasElement, op: Op): HTMLCanvasElement {
   }
   if (op.k === 'rotate') {
     const deg = ((op.deg % 360) + 360) % 360
-    // 90° / 270° 要交换画布宽高,否则转完会被裁掉一条
-    const swap = deg === 90 || deg === 270
-    const out = newCanvas(swap ? cur.height : cur.width, swap ? cur.width : cur.height)
+    // 90° / 270° 要交换画布宽高,否则转完会被裁掉一条(见引擎的 rotatedSize)
+    const box = rotatedSize(cur.width, cur.height, deg)
+    const out = newCanvas(box.w, box.h)
     const c = out.getContext('2d')!
     c.translate(out.width / 2, out.height / 2)
     c.rotate((deg * Math.PI) / 180)
@@ -578,29 +587,6 @@ function stepShot(c: HTMLCanvasElement): string {
  *  说不清改的是背景还是画幅 —— 这一格补的就是那句话。
  *  尺寸取的是**这一步之后**的画幅:裁剪之后剩多少、转过来多宽,
  *  都是看这一步才用得上的数 */
-function describeOp(op: Op, w: number, h: number): { title: string; sub: string } {
-  const size = `${w} × ${h}`
-  switch (op.k) {
-    case 'rotate':
-      return {
-        title: 'Rotated',
-        sub: Math.abs(op.deg) === 180
-          ? 'Half turn'
-          : op.deg > 0
-            ? 'A quarter turn clockwise'
-            : 'A quarter turn counter-clockwise'
-      }
-    case 'flip':
-      return { title: 'Flipped', sub: op.axis === 'h' ? 'Left to right' : 'Top to bottom' }
-    case 'crop':
-      return { title: 'Cropped', sub: size }
-    default:
-      /* AI 那几步的说法在入栈时就写定了(见 runEdit)——
-         事后从位图上认不出它做过什么 */
-      return { title: op.label, sub: op.sub || size }
-  }
-}
-
 /* 把操作序列重放一遍,顺手把步骤条那排缩略图取出来,交回当前画面。
  *
  *  合成一趟是有意的:步骤条要的缩略图恰好就是重放的中间帧。以前分两趟 ——
@@ -890,13 +876,9 @@ function handlePoints(r: Rect): Array<{ h: Handle; x: number; y: number }> {
   ]
 }
 
-function clampToImage(r: Rect, w: number, h: number): Rect {
-  const x1 = clamp(Math.min(r.x, r.x + r.w), 0, w)
-  const y1 = clamp(Math.min(r.y, r.y + r.h), 0, h)
-  const x2 = clamp(Math.max(r.x, r.x + r.w), 0, w)
-  const y2 = clamp(Math.max(r.y, r.y + r.h), 0, h)
-  return { x: x1, y: y1, w: x2 - x1, h: y2 - y1 }
-}
+/* 夹进画面范围那一套(含"用户可能从右下往左上拖"的规范化)在 lib/canvasOps.ts,
+   那里有单测。名字在这里保持短一点,调用处不必改 */
+const clampToImage = clampRectToImage
 
 /** 夹进图像范围内。套索的点在收进来时就夹好 ——
  *  手可以划出画布,但记录下来的形状不该超出边界 */
@@ -1175,14 +1157,15 @@ function pushOp(op: Op, force = false) {
      中途再改一笔,结果回来就会把那一笔整个盖掉。
      force 只有 runEdit 用 —— 它要落的正是这次在途算出来的结果 */
   if (job.value && !force) return
-  ops.value = [...ops.value, op]
-  /* 新动作走的是新分支,原来的重做链就作废了。
-     清空前把里面的 AI 位图显式放掉:那是全尺寸的图像资源,
+  /* 入栈与"作废旧重做链"的规矩在引擎里(见 canvasOps 的 pushOp);
+     作废掉的那些 AI 步骤各自带着一张全尺寸位图,得由这里显式放掉 ——
      等 GC 不如自己 close(与 resetAll 同一处理) */
-  for (const o of redoOps.value) {
+  const { next, dropped } = pushOntoStacks({ ops: ops.value, redo: redoOps.value }, op)
+  for (const o of dropped) {
     if (o.k === 'ai') o.bitmap.close()
   }
-  redoOps.value = []
+  ops.value = next.ops
+  redoOps.value = next.redo
   rebuild()
 }
 
@@ -1197,10 +1180,7 @@ function applyCrop() {
   const r = cropRect.value
   if (!r || r.w < MIN_CROP || r.h < MIN_CROP) return
   // 取整:裁剪框是像素级操作,留下 0.4 个像素的偏移只会让边缘发灰
-  pushOp({
-    k: 'crop',
-    rect: { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.w), h: Math.round(r.h) }
-  })
+  pushOp({ k: 'crop', rect: roundRect(r) })
 }
 
 /* 下面三个都会改写操作序列,所以同样受 AI 那一步的在途锁约束:
@@ -1209,19 +1189,21 @@ function applyCrop() {
    界面上它们会一起变灰(见步骤条那三个 .sbtn) */
 function undo() {
   if (job.value) return
-  if (!ops.value.length) return
-  const last = ops.value[ops.value.length - 1]
-  ops.value = ops.value.slice(0, -1)
-  redoOps.value = [last, ...redoOps.value]
+  const next = undoOp({ ops: ops.value, redo: redoOps.value })
+  if (next === undefined || next.ops === ops.value) return
+  ops.value = next.ops
+  redoOps.value = next.redo
   rebuild()
 }
 
 function redo() {
   if (job.value) return
-  const [next, ...rest] = redoOps.value
-  if (!next) return
-  redoOps.value = rest
-  ops.value = [...ops.value, next]
+  const before = redoOps.value
+  const next = redoOp({ ops: ops.value, redo: redoOps.value })
+  // 没得重做时引擎原样返回(同一个引用),据此省掉一次重放
+  if (next.redo === before) return
+  ops.value = next.ops
+  redoOps.value = next.redo
   rebuild()
 }
 
@@ -1230,17 +1212,13 @@ function redo() {
  *  复位也走这里,所以在途锁对它同样生效 */
 function goStep(i: number) {
   if (job.value) return
-  const n = ops.value.length
-  if (i === n) return
-  if (i < n) {
-    // 退回去的这几步进重做栈,栈顶放最近的那一步,重做的顺序才接得上
-    redoOps.value = [...ops.value.slice(i), ...redoOps.value]
-    ops.value = ops.value.slice(0, i)
-  } else {
-    const take = i - n
-    ops.value = [...ops.value, ...redoOps.value.slice(0, take)]
-    redoOps.value = redoOps.value.slice(take)
-  }
+  const before = ops.value
+  /* 两个栈怎么对接(往回退的几步按什么顺序进重做栈)在引擎里,
+     那里有单测;这里只管"在途时不许跳"与重放 */
+  const next = goToStep({ ops: ops.value, redo: redoOps.value }, i)
+  if (next.ops === before) return
+  ops.value = next.ops
+  redoOps.value = next.redo
   rebuild()
 }
 
@@ -2111,9 +2089,8 @@ window.addEventListener('keydown', onKeyDown)
 window.addEventListener('keyup', onKeyUp)
 window.addEventListener('blur', onBlur)
 
-function clamp(n: number, lo: number, hi: number) {
-  return Math.min(hi, Math.max(lo, n))
-}
+/* 与引擎里那份是同一个函数:只在组件内部用,名字短一点、十几处调用不必改 */
+const clamp = clampNum
 </script>
 
 <template>

@@ -17,7 +17,8 @@
    -------------------------------------------------------------------- */
 
 import { spawn } from 'node:child_process'
-import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { deflateSync } from 'node:zlib'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { WebSocket } from 'undici'
@@ -42,6 +43,8 @@ const PROBE_ENCODE = args.includes('--probe-encode')
 const PROBE_REOPEN = args.includes('--probe-reopen')
 /* 开第二个标签页,验证跨页同步真的把改动传过去了 */
 const PROBE_TWO_TABS = args.includes('--probe-two-tabs')
+/* 探画布的操作序列:上传一张图,旋转 → 撤销 → 重做 → 跳步,看步骤条对不对 */
+const PROBE_CANVAS = args.includes('--probe-canvas')
 /* 调试端口每轮随机取一个:固定端口会与上一次没退干净的实例撞车,
    而那种撞车表现为"连上了,但连到的是别人",量出来的数看着正常其实全错 */
 const PORT = Number(arg('cdp-port', 0)) || 9300 + Math.floor(Math.random() * 600)
@@ -61,6 +64,58 @@ function defaultChrome() {
 const CHROME = arg('chrome', process.env.CHROME_PATH || defaultChrome())
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+/* 探画布时要塞一个真文件进 <input type=file>:CDP 只能注入磁盘上的路径,
+   所以这里现造一张 PNG。
+   **别用"背下来的 base64"** —— 我第一版就是这么干的,那张图是坏的:
+   解码失败 → source 为 null → rebuild() 直接清空步骤,于是表现为
+   "点了旋转但什么都没发生"。按规范拼一张(CRC 也算对)才是可靠的 */
+const UPLOAD_PNG = join(tmpdir(), `kimage-probe-${process.pid}.png`)
+writeFileSync(UPLOAD_PNG, makePng(64))
+
+function crc32(buf) {
+  let c = ~0
+  for (const b of buf) {
+    c ^= b
+    for (let k = 0; k < 8; k++) c = (c >>> 1) ^ (0xedb88320 & -(c & 1))
+  }
+  return ~c >>> 0
+}
+
+function pngChunk(type, data) {
+  const len = Buffer.alloc(4)
+  len.writeUInt32BE(data.length, 0)
+  const body = Buffer.concat([Buffer.from(type, 'ascii'), data])
+  const crc = Buffer.alloc(4)
+  crc.writeUInt32BE(crc32(body), 0)
+  return Buffer.concat([len, body, crc])
+}
+
+/** 一张 size×size 的 8 位 RGB PNG(渐变 + 每行不同,够画布做旋转/翻转) */
+function makePng(size) {
+  const stride = size * 3 + 1
+  const raw = Buffer.alloc(stride * size)
+  for (let y = 0; y < size; y++) {
+    raw[y * stride] = 0 // 过滤器:None
+    for (let x = 0; x < size; x++) {
+      const i = y * stride + 1 + x * 3
+      raw[i] = (x * 4) % 256
+      raw[i + 1] = (y * 4) % 256
+      raw[i + 2] = 128
+    }
+  }
+  const ihdr = Buffer.alloc(13)
+  ihdr.writeUInt32BE(size, 0)
+  ihdr.writeUInt32BE(size, 4)
+  ihdr[8] = 8 // 位深
+  ihdr[9] = 2 // 颜色类型:真彩
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', deflateSync(raw)),
+    pngChunk('IEND', Buffer.alloc(0))
+  ])
+}
 
 /* —— 启动 Chrome —— */
 const profile = mkdtempSync(join(tmpdir(), 'kimage-perf-'))
@@ -617,6 +672,136 @@ async function main() {
     }
   }
 
+  /* —— 画布操作序列探针 ——
+     撤销/重做/跳步这套栈逻辑刚被搬进 lib/canvasOps.ts,那里有单测;
+     但"组件真的接上了没有"只有真点一遍才知道。步骤条上的 .step 与
+     aria-current 正好把"现在停在第几步、一共有几步"暴露在 DOM 上。 */
+  let canvas = null
+  if (PROBE_CANVAS) {
+    canvas = { steps: [] }
+    const readSteps = () =>
+      evaluate(() => {
+        const all = [...document.querySelectorAll('.step')]
+        const btn = (l) => document.querySelector(`button[aria-label="${l}"]`)
+        /* 按钮不在 DOM 里(比如左栏那组折叠着)时要报出来,而不是被
+           `!undefined` 算成"可用" —— 那种假绿比红更糟 */
+        return {
+          total: all.length,
+          current: all.findIndex((el) => el.getAttribute('aria-current') === 'true'),
+          hasButtons: !!btn('Undo') && !!btn('Rotate right'),
+          canUndo: btn('Undo') ? !btn('Undo').disabled : null,
+          canRedo: btn('Redo') ? !btn('Redo').disabled : null
+        }
+      })
+    /* 点击结果要记下来:找不到按钮、或按钮是 disabled(那时 click 是空操作),
+       这两种"没点动"最容易被当成"点了但功能坏了" */
+    const click = (label) =>
+      evaluate((l) => {
+        const b = document.querySelector(`button[aria-label="${l}"]`)
+        if (!b) return 'missing'
+        if (b.disabled) return 'disabled'
+        b.click()
+        return 'clicked'
+      }, label)
+    const settle = () => sleep(300)
+
+    try {
+      // 进画布页(与历史页同一套:分段控件是 pointerdown 驱动的)
+      const box = await evaluate(() => {
+        const b = document.querySelector('button[aria-label="Canvas"]')
+        if (!b) return null
+        const r = b.getBoundingClientRect()
+        return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
+      })
+      if (!box) throw new Error('找不到画布导航')
+      for (const type of ['mousePressed', 'mouseReleased']) {
+        await send('Input.dispatchMouseEvent', {
+          type,
+          x: box.x,
+          y: box.y,
+          button: 'left',
+          clickCount: 1
+        })
+      }
+      await sleep(600)
+
+      /* 左栏那几组低频工具默认是折着的(showMore=false),Rotate / Flip 都在里面。
+         不展开的话按钮根本不在 DOM 里,而"点不到"会被静默当成"点了没用" */
+      const expanded = await evaluate(() => {
+        const b = document.querySelector('button[aria-label="More tools"]')
+        if (!b) return false
+        b.click()
+        return true
+      })
+      canvas.steps.push(['expanded more tools', expanded])
+      await sleep(400)
+
+      // 把一张真图塞进那个隐藏的 input(用 CDP 的文件注入,不是合成事件)
+      const { root } = await send('DOM.getDocument', { depth: -1 })
+      const { nodeId } = await send('DOM.querySelector', {
+        nodeId: root.nodeId,
+        selector: 'input.cv-file'
+      })
+      if (!nodeId) throw new Error('找不到上传用的 input')
+      await send('DOM.setFileInputFiles', { nodeId, files: [UPLOAD_PNG] })
+      await sleep(1200)
+      canvas.steps.push(['after upload', await readSteps()])
+
+      // 旋转两次、翻转一次
+      canvas.steps.push(['click Rotate right', await click('Rotate right')])
+      await settle()
+      canvas.steps.push(['after rotate', await readSteps()])
+      await click('Rotate right')
+      await settle()
+      await click('Flip horizontal')
+      await settle()
+      canvas.steps.push(['after 3 ops', await readSteps()])
+
+      // 撤销两步
+      canvas.steps.push(['click Undo', await click('Undo')])
+      await settle()
+      await click('Undo')
+      await settle()
+      canvas.steps.push(['after undo x2', await readSteps()])
+
+      // 重做一步
+      canvas.steps.push(['click Redo', await click('Redo')])
+      await settle()
+      canvas.steps.push(['after redo', await readSteps()])
+
+      // 跳回第 1 步(点步骤条上第一张缩略图)
+      canvas.jumped = await evaluate(() => {
+        const target = document.querySelectorAll('.step')[1]
+        if (!target) return 'missing'
+        target.click()
+        return 'clicked'
+      })
+      await settle()
+      canvas.steps.push(['after jump to step 1', await readSteps()])
+
+      // 复位到底
+      canvas.steps.push(['click Back to the original', await click('Back to the original')])
+      await settle()
+      canvas.steps.push(['after reset', await readSteps()])
+
+      const at = (name) => canvas.steps.find(([n]) => n === name)[1]
+      canvas.passed =
+        canvas.jumped === 'clicked' &&
+        // 原图 + 3 步 = 4 格
+        at('after 3 ops').total === 4 &&
+        at('after 3 ops').current === 3 &&
+        at('after undo x2').current === 1 &&
+        at('after undo x2').canRedo === true &&
+        at('after redo').current === 2 &&
+        at('after jump to step 1').current === 1 &&
+        // 复位回到原图,而走过的三步仍留在重做栈里(所以还能点回来)
+        at('after reset').current === 0 &&
+        at('after reset').canRedo === true
+    } catch (e) {
+      canvas.error = String(e.message || e)
+    }
+  }
+
   const heap = await evaluate(() => {
     const m = performance.memory
     return m ? { usedMB: +(m.usedJSHeapSize / 1048576).toFixed(1) } : null
@@ -634,6 +819,7 @@ async function main() {
     encode,
     reopen,
     twoTabs,
+    canvas,
     history,
     heap
   }
@@ -648,6 +834,19 @@ async function main() {
     ['max-ms', arg('max-ms', null), history.msToStable, '历史页铺完耗时(ms)'],
     ['max-heap-mb', arg('max-heap-mb', null), heap?.usedMB ?? 0, 'JS 堆(MB)']
   ].filter(([, limit]) => limit !== null)
+
+  if (canvas) {
+    const ok = canvas.passed === true
+    console.log(
+      `${ok ? '✅' : '❌'} 画布操作序列(上传→3 步→撤销 2 步→重做 1 步→跳步→复位)${
+        canvas.error ? ` — ${canvas.error}` : ''
+      }`
+    )
+    if (!ok) {
+      console.log('   ', JSON.stringify(canvas.steps))
+      process.exitCode = 1
+    }
+  }
 
   if (twoTabs) {
     const ok = twoTabs.passed === true
@@ -680,6 +879,11 @@ main()
     await sleep(500)
     try {
       rmSync(profile, { recursive: true, force: true })
+    } catch {
+      /* ignore */
+    }
+    try {
+      rmSync(UPLOAD_PNG, { force: true })
     } catch {
       /* ignore */
     }
