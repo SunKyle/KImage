@@ -4002,7 +4002,10 @@ textarea.wz-idea {
 .viewer-img {
   display: block;
   max-width: 100%;
+  /* 上下两块控制条 + 一点余量。dvh 那一行是必须的:移动端的 100vh 指的是
+     地址栏收起时那个更大的高度,照它算,图的下半截会伸到地址栏底下 */
   max-height: calc(100vh - 210px);
+  max-height: calc(100dvh - 210px);
   object-fit: contain;
   border-radius: var(--r-lg);
   background: var(--stage-bg);
@@ -4095,6 +4098,66 @@ textarea.wz-idea {
 }
 
 @media (max-width: 720px) {
+  /* 手机上把这一排的触控目标抬到 40px —— 站内对触屏的底线
+     (见 App.vue 里 .param-btn / .clear-icon 那几条)。桌面维持原尺寸:
+     那边有鼠标,把它撑大只会让版面变松 */
+  .chars-new,
+  .chars-import,
+  .ctile-cta {
+    min-height: 40px;
+  }
+  /* 步骤条那三枚是这一页唯一的"跳步"入口,28px 太窄 */
+  .wz-step {
+    min-height: 40px;
+  }
+
+  /* 这一页上所有的实心/描边按钮(向导的进退、详情的 Edit/Export、
+     嗓音那两排选项)桌面都是 36px。手机上一律抬到 40px ——
+     它们在同一屏里成排出现,只抬一半会显得一高一低,手指也更容易点错 */
+  .ed-btn,
+  .voice-seg button {
+    min-height: 40px;
+  }
+  /* 手机上这张浮卡改成一整屏的页:**上下两条边都钉住**,高度不再由 vh/dvh 算。
+
+     为什么非改不可:卡片是 position:fixed 的,高度一旦超过可视区,
+     多出来的那一截**没有任何办法滚到** —— 底下那排进退按钮就"看不到"了。
+     而"可视高度"在手机上恰恰是最不稳的一个数:地址栏收放会实时改它,
+     软键盘弹起时布局视口甚至可以完全不动(那时 dvh 算出来的仍是原值),
+     个别 webview 里 dvh 还会退回 vh —— 而移动端的 vh 指的是**地址栏收起时**
+     那个更大的高度,按它算出来的卡,底边正好压在地址栏底下。
+     钉住 top/bottom 之后,高度只由这两条边决定,与上面这些全不相干。
+
+     桌面端不这么改:那边浮卡的高度由内容决定是优点(第 2 步短、
+     第 1 步长,卡跟着变),而手机上内容本来就满屏,没有这个取舍 */
+  .wizard {
+    top: 0;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    transform: none;
+    width: auto;
+    /* 双保险:上下两条边已经把它框住了,这里再用 dvh 兜一道 ——
+       个别 webview 里 fixed 的包含块比真正看得见的那一块大(Android 上
+       地址栏是浮在页面上方的,布局视口并不跟着缩),那种环境下 bottom:0
+       会落在那条地址栏底下,而 max-height 认得 dvh,仍然卡得住 */
+    max-height: calc(100dvh - 2 * var(--sp-2));
+    /* 高度已经由上下两条边定死,再留 min-height 只会在矮屏上把它顶出去 */
+    min-height: 0;
+    /* 刘海与底部横条:浏览器没开 viewport-fit=cover 时这两个值是 0,
+       那时视口本身已经被系统让开了,不影响 */
+    padding-top: max(var(--sp-2), env(safe-area-inset-top));
+    padding-bottom: max(var(--sp-2), env(safe-area-inset-bottom));
+    padding-left: var(--sp-2);
+    padding-right: var(--sp-2);
+    gap: var(--sp-2);
+  }
+  /* 页脚离屏幕底边再让开一段:这一排是手机上唯一要按的东西,
+     贴着边缘不好按,也容易被系统的横条压住 */
+  .wz-foot {
+    padding-bottom: max(12px, env(safe-area-inset-bottom));
+  }
+
   /* 窄屏时标签左、值右会挤不下(88 + 12 + 值那一列就顶到边了):
      标签回到值上面,行变成上下两段 */
   .wz-fields > .wz-field,
@@ -4140,14 +4203,6 @@ textarea.wz-idea {
   .wz-steps {
     gap: 6px;
     padding: 12px var(--sp-4);
-  }
-  /* 三张卡之间、以及卡与屏幕边之间的留白都收一档:
-     视口本来就窄,给表单多留一点宽度 */
-  .wizard {
-    gap: var(--sp-3);
-    padding: var(--sp-3);
-    width: calc(100% - 2 * var(--sp-3));
-    max-height: calc(100vh - 2 * var(--sp-3));
   }
   .wz-line {
     flex: 0 0 10px;

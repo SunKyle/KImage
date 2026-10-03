@@ -3912,6 +3912,25 @@ function createAssignCollection(title: string) {
 
 /* 窄屏不用再专门收窄列数了:定宽多列会自己退成一列 */
 @media (max-width: 640px) {
+  /* 手机上把这一排的触控目标抬到 40px —— 站内对触屏的底线
+     (见 App.vue 里 .param-btn / .clear-icon 那几条)。桌面维持原尺寸:
+     那边有鼠标,把它撑大只会让版面变松 */
+  .enhance-btn,
+  .enhance-mode {
+    height: 40px;
+  }
+  /* 提示条上那枚 ×:22px 是桌面尺寸,手指按不准 ——
+     它就是这条提示唯一的出口,点不中就只剩等它自己消失 */
+  .note-close {
+    width: 40px;
+    height: 40px;
+    margin: -9px -9px -9px 0;
+  }
+  .note-close svg {
+    width: 15px;
+    height: 15px;
+  }
+
   .feed-grid {
     column-gap: var(--sp-2);
   }

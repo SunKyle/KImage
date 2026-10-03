@@ -1321,6 +1321,18 @@ function fmt(ts: number) {
 
 /* 窄屏:选择态下这里有三个按钮,挤不进计数那一行 —— 让它独占据一行,自己再换行 */
 @media (max-width: 640px) {
+  /* 手机上把这一排的触控目标抬到 40px —— 站内对触屏的底线
+     (见 App.vue 里 .param-btn / .clear-icon 那几条)。桌面维持原尺寸:
+     那边有鼠标,把它撑大只会让版面变松 */
+  .chip {
+    min-height: 40px;
+  }
+
+  /* 搜索框 <16px 时,iOS Safari 一聚焦就把整页放大(站内硬约束,
+     见 style.css 的 --fs-lg)。这是这一页上唯一的输入框,单独提一档即可 */
+  .search-input {
+    font-size: var(--fs-lg);
+  }
   .lib-acts {
     width: 100%;
     justify-content: flex-start;

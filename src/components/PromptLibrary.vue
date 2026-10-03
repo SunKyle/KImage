@@ -1480,6 +1480,14 @@ function onImportFile(e: Event) {
   }
 }
 @media (max-width: 720px) {
+  /* 手机上把这一排的触控目标抬到 40px —— 站内对触屏的底线
+     (见 App.vue 里 .param-btn / .clear-icon 那几条)。桌面维持原尺寸:
+     那边有鼠标,把它撑大只会让版面变松 */
+  .none-action,
+  .icon-ghost {
+    min-height: 40px;
+  }
+
   .lib-tools {
     flex-wrap: wrap;
   }

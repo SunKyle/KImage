@@ -1710,6 +1710,14 @@ function onImportFile(e: Event) {
 
 /* 窄屏:输入框提到 16px,防止 iOS Safari 聚焦时放大整页 */
 @media (max-width: 640px) {
+  /* 手机上把这一排的触控目标抬到 40px —— 站内对触屏的底线
+     (见 App.vue 里 .param-btn / .clear-icon 那几条)。桌面维持原尺寸:
+     那边有鼠标,把它撑大只会让版面变松 */
+  .pg-new,
+  .icon-ghost {
+    min-height: 40px;
+  }
+
   .field input {
     font-size: var(--fs-lg);
   }

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { onBeforeUnmount, ref } from 'vue'
 import {
   PhHouse,
   PhMaskHappy,
@@ -27,6 +28,20 @@ defineProps<{
   /* 未配置接口时把设置那枚齿轮标红 */
   warn?: boolean
 }>()
+
+/* 窄屏把整条导航抬高一档。
+   为什么不能只靠 CSS:条目高度 = 轨道高 - 上下 inset,而这两个数是由
+   RubberSegment 的 props 写进内联样式的 —— 滑块的位置又是它按每一条的
+   实际矩形量出来的(见那边的 measure)。只改 CSS 的话轨道变了、滑块还是旧几何;
+   改 props 则会被 watch 接到,量一遍就对齐了。
+   40 → 48:手机上的触控目标,这一条是每一页都要点的那一个控件,
+   30px 的条目(40 − 上下各 5)在拇指下确实容易点错 */
+const narrow = ref(false)
+const mq = window.matchMedia('(max-width: 720px)')
+const sync = () => (narrow.value = mq.matches)
+sync()
+mq.addEventListener('change', sync)
+onBeforeUnmount(() => mq.removeEventListener('change', sync))
 </script>
 
 <template>
@@ -35,8 +50,8 @@ defineProps<{
     class="nav-seg"
     :items="NAV_ITEMS"
     :radius="999"
-    :height="40"
-    :inset="5"
+    :height="narrow ? 48 : 40"
+    :inset="narrow ? 4 : 5"
     aria-label="Main navigation"
   >
     <template #home>

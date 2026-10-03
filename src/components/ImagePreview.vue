@@ -677,7 +677,9 @@ watch(collAdding, async (v) => {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: clamp(12px, 4vw, 40px);
+  /* 收成一个变量:卡片的高度上限要用同一个数(见 .preview 的 max-height) */
+  --pv-pad: clamp(12px, 4vw, 40px);
+  padding: var(--pv-pad);
 }
 .preview {
   /* 出图比例(--ratio)与是否有缩略图行(--rail,0/1)由组件按当前这张图注入 */
@@ -704,6 +706,16 @@ watch(collAdding, async (v) => {
         ) * var(--ratio, 1) + 2 * var(--stage-pad) + var(--side-w)
     )
   );
+  /* 高度上限由蒙层给:蒙层是 fixed + inset:0 + 内边距,
+     它的 content box 就是"此刻看得见的那一块"。这一条是必须的 ——
+     --prev-h 用的是 92vh,而移动端的 vh 指地址栏收起时的高度,
+     比可视区大;卡片又是在蒙层里居中的,一旦高过可视区,
+     上下两头一起被切,底下那排动作(下载 / 用作参考)正好压在地址栏底下,
+     而蒙层自己不滚 —— 够不到,也没有任何办法滚过去。
+     第二行是双保险:个别 webview 里 fixed 的包含块比可视区大,
+     那时 100% 也跟着偏大,而 dvh 认得当前可视高度 */
+  max-height: 100%;
+  max-height: calc(100dvh - 2 * var(--pv-pad));
   background: var(--bg);
   border: 1px solid var(--line);
   border-radius: var(--r-lg);
@@ -1313,9 +1325,37 @@ watch(collAdding, async (v) => {
 }
 
 @media (max-width: 720px) {
+  .mask {
+    /* 手机上不再垂直居中:卡片几乎占满整屏,居中只会让它在
+       "包含块比可视区大"的那种浏览器里整体下沉、下沿出屏。
+       贴顶之后,底边只由卡片自己的高度决定 */
+    align-items: flex-start;
+  }
   .preview {
     /* 竖排后侧栏在下方,按比例推出来的宽度不再成立,直接铺满可用宽度 */
     width: 100%;
+    /* 高度也一并交给可视区(92vh 在手机上靠不住,见上面 max-height 那条)。
+       卡片于是正好占满"看得见的那一块",里面 .body 自己滚 */
+    height: 100%;
+  }
+  /* 底部那三枚(Reuse / As reference / Edit on canvas)在竖排之后排在最下面,
+     而这一屏的高度大半给了图片 —— 不吸底的话,一打开就只看得见图,
+     要先在卡里滚一段才够得到它们,而"卡里还能滚"这件事本身没有提示。
+     吸在滚动区下沿之后,无论滚到哪儿它们都在拇指这一侧。
+     左右用负外边距补回 .side 的 16px,让这条横贯卡片整宽 */
+  .side-actions {
+    position: sticky;
+    bottom: 0;
+    z-index: 1;
+    margin: 0 calc(-1 * var(--sp-4));
+    padding: var(--sp-3) var(--sp-4);
+    background: var(--bg);
+    /* 上沿一道极淡的影:说明它下面是滚过去的内容,而不是到此为止 */
+    box-shadow: 0 -10px 18px -14px rgba(0, 0, 0, 0.35);
+  }
+  /* 吸底之后那 24px 的收尾留白成了重复的一截 */
+  .side {
+    padding-bottom: var(--sp-3);
   }
   .body {
     grid-template-columns: 1fr;

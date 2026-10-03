@@ -3972,6 +3972,17 @@ const clamp = clampNum
 /* 窄屏:工具条从竖排改成横排,把宽度还给图片 —— 竖着一条在手机上
    占的是真正的作画区域。文字标签也收掉:横排七项带字会顶到屏幕外 */
 @media (max-width: 720px) {
+  /* 这一页整块是 fixed 的,左下角那条步骤条又钉在它的下沿上。
+     而 fixed 的包含块在部分浏览器里比真正看得见的那一块大
+     (Android 上地址栏是浮在页面上方的,布局视口不跟着缩),
+     照 inset:0 铺满,那条步骤条正好沉到地址栏底下 —— 点不到。
+     用 dvh 把高度卡住:它是当前可视高度,与地址栏收放同步。
+     高度一写死,bottom:0 就成了多余的那一项,自动让位。 */
+  .canvas-page {
+    bottom: auto;
+    height: 100dvh;
+    max-height: 100dvh;
+  }
   /* 窄屏:工具条横过来,依旧浮在画布上,只是改成贴着上沿 */
   .cv-rail {
     flex-direction: row;
@@ -3982,6 +3993,15 @@ const clamp = clampNum
     padding: var(--sp-1) var(--sp-2);
     /* 八九项横排,极窄的机器上宁可横向滑,也不让它被裁掉 */
     overflow-x: auto;
+    /* 左右两条边都钉住 —— 这一条是必须的,不是收边距。
+       只写 width:auto 时,这条工具条的宽度由**内容**决定(十几项排下来 568px),
+       于是它自己就比屏幕宽,overflow-x:auto 永远没有可滚的余量,
+       右边那几枚(Crop / More tools …)直接被 .canvas-page 的 overflow:hidden 裁掉 ——
+       手指够不到,也没有任何办法滚过去。
+       两边一钉,宽度改由视口定,里面那截才真的滚得起来。
+       right 让开助手面板那 300px,与 .cv-status 同一个算法 */
+    left: var(--sp-3);
+    right: calc(var(--assist-w, 0px) + var(--sp-3));
   }
   /* 横排时名字与组标题一律收掉 —— 一行十几项带字会顶到屏幕外,
      而在手机上这条要的是"一眼看全有哪几个工具",不是把每个都说清。
