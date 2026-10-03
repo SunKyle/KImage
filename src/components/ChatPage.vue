@@ -834,35 +834,21 @@ onBeforeUnmount(() => {
             <template v-for="r in rows" :key="r.key">
               <p v-if="r.kind === 'sep'" class="sep">{{ r.label }}</p>
               <div v-else class="msg" :class="r.msg.role">
+                <!-- 用户附的图。**独立一块,不放进气泡**(文字有文字的框,图有图的位置)。
+                     压在文字上面是因为它是那句话的前提:先看图,再读字 -->
+                <img
+                  v-if="r.msg.role === 'user' && r.msg.imageId && imgUrl(r.msg.imageId)"
+                  class="msg-img"
+                  :src="imgUrl(r.msg.imageId)"
+                  alt="Attached image"
+                />
                 <div class="bubble">
                   <!-- 说了谁说的。左右对齐和底色是给眼睛的,
                        读屏读不出这两种区别,不补一句就只剩一堆光秃秃的句子 -->
                   <span class="sr-only">
                     {{ r.msg.role === 'user' ? 'You said: ' : `${current.name} said: ` }}
                   </span>
-                  <!-- 用户附的图。压在文字上面:那张图是这句话的前提,
-                       先看图再读字才顺。图还没从库里读回来时先不画(见 imgUrl) -->
-                  <img
-                    v-if="r.msg.imageId && imgUrl(r.msg.imageId)"
-                    class="bubble-img"
-                    :src="imgUrl(r.msg.imageId)"
-                    alt="Attached image"
-                  />
                   {{ r.msg.content }}<span v-if="r.msg.id === cursorId" class="cursor" aria-hidden="true"></span>
-                  <!-- 角色发来的图。**垫在文字下面**:先读它说的话,再看它给你看的东西 ——
-                       与用户那张(压在文字上面,那是这句话的前提)是两种语义。
-                       还没有 photoId = 正在画:占一个方骨架位,免得图到了把气泡顶下去 -->
-                  <img
-                    v-if="r.msg.role === 'assistant' && r.msg.photoId && imgUrl(r.msg.photoId)"
-                    class="bubble-photo"
-                    :src="imgUrl(r.msg.photoId)"
-                    alt="Photo from the character"
-                  />
-                  <span
-                    v-else-if="r.msg.role === 'assistant' && r.msg.photo"
-                    class="bubble-photo bubble-photo-skel"
-                    aria-hidden="true"
-                  ></span>
                   <!-- 朗读。贴着气泡外侧下角,绝对定位 —— 它不该挤占气泡的宽度。
                        只在悬停时浮出来(触屏没有 hover,那时让它常驻,见样式)。
                        正在生成的那条不给:半句话念出来只会更难听 -->
@@ -886,6 +872,20 @@ onBeforeUnmount(() => {
                     <PhSpeakerHigh v-else aria-hidden="true" />
                   </button>
                 </div>
+                <!-- 角色发来的图。**也在气泡外面**,垫在它说的话下面:
+                     先读它说什么,再看它给你看什么。还没有 photoId = 正在画,
+                     占一个同尺寸的方骨架位,免得图到了把整段对话顶下去 -->
+                <img
+                  v-if="r.msg.role === 'assistant' && r.msg.photoId && imgUrl(r.msg.photoId)"
+                  class="msg-photo"
+                  :src="imgUrl(r.msg.photoId)"
+                  alt="Photo from the character"
+                />
+                <span
+                  v-else-if="r.msg.role === 'assistant' && r.msg.photo"
+                  class="msg-photo msg-photo-skel"
+                  aria-hidden="true"
+                ></span>
                 <!-- 上游撞上 max_tokens 停下。不标这一句的话,
                      它和"正常说完"在界面上长得一模一样 ——
                      用户会以为角色话说一半是它自己的风格 -->
@@ -1789,9 +1789,13 @@ onBeforeUnmount(() => {
   height: 19px;
 }
 /* 气泡里的图。圆角比气泡小一档,压在文字上方 */
-.bubble-img {
+/* 消息里的图**不放进气泡**:文字有文字的框,图有图的位置。
+   整条 .msg 本来就是竖排 flex(user 靠右 / assistant 靠左),
+   所以图只要当兄弟节点,就自动落在正确的一边。
+   宽度跟着 .bubble 的 76% 走,免得图比气泡还宽、把节奏拉开 */
+.msg-img {
   display: block;
-  max-width: 100%;
+  max-width: 76%;
   max-height: 320px;
   margin-bottom: 8px;
   border-radius: 12px;
@@ -1800,18 +1804,18 @@ onBeforeUnmount(() => {
 
 /* 角色发来的那张:占满气泡宽度、垫在文字下方。骨架用同一个方块比例 ——
    图是异步到的,比例写死才不会在它到达时把整段对话顶下去 */
-.bubble-photo {
+.msg-photo {
   display: block;
-  /* 缩略图而不是大图:方形上限 224,气泡不会被一张图撑成一面墙。
-     object-fit 裁掉多余的部分,让它与文字的节奏保持一致 */
+  /* 缩略图而不是大图:方形上限 224,一张图不会把整段对话撑成一面墙。
+     object-fit 裁掉多余的部分,与文字的节奏保持一致 */
   width: 224px;
-  max-width: 100%;
+  max-width: 76%;
   aspect-ratio: 1;
   object-fit: cover;
   margin-top: 8px;
   border-radius: 12px;
 }
-.bubble-photo-skel {
+.msg-photo-skel {
   aspect-ratio: 1;
   background: linear-gradient(100deg, var(--skel-a, #e9e9ee) 30%, var(--skel-b, #f5f5f8) 50%, var(--skel-a, #e9e9ee) 70%);
   background-size: 200% 100%;

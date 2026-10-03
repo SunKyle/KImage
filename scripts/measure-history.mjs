@@ -1528,19 +1528,18 @@ async function main() {
         const bubbles = document.querySelectorAll('.bubble, .msg, .chat-msg').length
         /* 配图必须**在文字之后**(垫在下面):比的是两者在气泡里的位置。
            这是它与用户附图的分界 —— 那张压在文字上面 */
-        const withPhoto = [...document.querySelectorAll('.bubble')].find((b) =>
-          b.querySelector('img.bubble-photo')
+        /* 图现在**在气泡外面**(要求:文字与图不要挤在一个框里),
+           所以比的是 .msg 这一层里"气泡"与"图"的先后,并确认图不在气泡里 */
+        const withPhoto = [...document.querySelectorAll('.msg')].find((m) =>
+          m.querySelector('img.msg-photo')
         )
         const order = withPhoto
           ? (() => {
-              const nodes = [...withPhoto.childNodes]
-              const textAt = nodes.findIndex(
-                (n) => n.nodeType === 3 && (n.textContent || '').includes('window')
-              )
-              const imgAt = nodes.findIndex(
-                (n) => n.nodeType === 1 && n.classList?.contains('bubble-photo')
-              )
-              return { textAt, imgAt }
+              const nodes = [...withPhoto.children]
+              const textAt = nodes.findIndex((n) => n.classList?.contains('bubble'))
+              const imgAt = nodes.findIndex((n) => n.classList?.contains('msg-photo'))
+              const inBubble = !!withPhoto.querySelector('.bubble')?.querySelector('.msg-photo')
+              return { textAt, imgAt, inBubble }
             })()
           : null
         return {
@@ -1548,12 +1547,13 @@ async function main() {
           hasMemory: !!document.querySelector('.memory'),
           memoryLabel: document.querySelector('.memory-label')?.textContent?.trim() || '',
           charInRail: /Probe talker/.test(document.body.textContent || ''),
-          photoRendered: !!document.querySelector('img.bubble-photo'),
+          photoRendered: !!document.querySelector('img.msg-photo'),
           photoBelowText: !!order && order.imgAt > order.textAt && order.textAt >= 0,
-          pendingSkeleton: !!document.querySelector('.bubble-photo-skel'),
+          pendingSkeleton: !!document.querySelector('.msg-photo-skel'),
+          photoOutsideBubble: !!order && order.inBubble === false,
           /* 实测反馈:"聊天记录里图片太大"。钉住它是个缩略图而不是一面墙 */
           photoWidth: Math.round(
-            document.querySelector('img.bubble-photo')?.getBoundingClientRect().width || 0
+            document.querySelector('img.msg-photo')?.getBoundingClientRect().width || 0
           )
         }
       })
@@ -1590,6 +1590,7 @@ async function main() {
         chatProbe.rendered?.photoRendered === true &&
         chatProbe.rendered?.photoBelowText === true &&
         chatProbe.rendered?.pendingSkeleton === true &&
+        chatProbe.rendered?.photoOutsideBubble === true &&
         chatProbe.rendered?.photoWidth > 0 &&
         chatProbe.rendered?.photoWidth <= 240 &&
         chatProbe.clickedClear === 'clicked' &&
