@@ -5,6 +5,7 @@ import {
   configKindOf,
   defaultSizeFor,
   extraParamsFor,
+  mergeHistory,
   normalizeSize,
   pickActiveByKind,
   seedFor,
@@ -347,5 +348,49 @@ describe('shouldProcessNow · 空闲回调的余量判断', () => {
   it('阈值可覆盖', () => {
     expect(shouldProcessNow(5, false, 8)).toBe(false)
     expect(shouldProcessNow(9, false, 8)).toBe(true)
+  })
+})
+
+describe('mergeHistory · 另一页改了历史之后怎么合', () => {
+  function rec(id: string, createdAt: number, over: Partial<HistoryEntry> = {}): HistoryEntry {
+    return { id, prompt: id, size: '1024x1024', createdAt, results: [], ...over } as HistoryEntry
+  }
+
+  it('库里有的以库为准(库是正本)', () => {
+    const db = [rec('a', 3, { prompt: 'from db' })]
+    const mem = [rec('a', 3, { prompt: 'stale in memory' })]
+    expect(mergeHistory(db, mem, new Set()).map((h) => h.prompt)).toEqual(['from db'])
+  })
+
+  /* 这条是"幽灵条目"的关卡:库里没有、也不在写 = 别的标签页删了它 */
+  it('库里没有、也没在写的丢掉(别处删了它)', () => {
+    const db = [rec('a', 3)]
+    const mem = [rec('a', 3), rec('gone', 2)]
+    expect(mergeHistory(db, mem, new Set()).map((h) => h.id)).toEqual(['a'])
+  })
+
+  /* 这条是"刚落盘还没落地"的关卡:整份替换会把界面上这一条抹掉 */
+  it('库里没有、但正在写的保住', () => {
+    const db = [rec('a', 3)]
+    const mem = [rec('a', 3), rec('in-flight', 5)]
+    const out = mergeHistory(db, mem, new Set(['in-flight']))
+    expect(out.map((h) => h.id)).toEqual(['in-flight', 'a'])
+  })
+
+  it('结果按时间倒序 —— 与 loadHistory 的顺序一致', () => {
+    const db = [rec('a', 1), rec('b', 9), rec('c', 5)]
+    expect(mergeHistory(db, [], new Set()).map((h) => h.id)).toEqual(['b', 'c', 'a'])
+  })
+
+  it('两边都空就是空', () => {
+    expect(mergeHistory([], [], new Set())).toEqual([])
+  })
+
+  it('不改动传入的数组', () => {
+    const db = [rec('a', 1)]
+    const mem = [rec('b', 2)]
+    mergeHistory(db, mem, new Set(['b']))
+    expect(db.map((h) => h.id)).toEqual(['a'])
+    expect(mem.map((h) => h.id)).toEqual(['b'])
   })
 })

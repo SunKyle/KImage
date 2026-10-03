@@ -1816,6 +1816,29 @@ export async function loadHistory() {
     return []
   }
 }
+
+/**
+ * 把「库里的历史」与「本页内存里的历史」合起来。用于另一个标签页改了历史之后的重读。
+ *
+ * 这里**不能整份替换**:本页可能正好有一条刚落盘、或落盘失败只剩内存的记录,
+ * 替换会把它从界面上抹掉(而它其实还在)。也**不能把「内存有、库里没有」的一律留下** ——
+ * 那恰恰是「另一个标签页删掉了它」的形状,留着就永远是一块点开是空图的幽灵。
+ *
+ * 所以用 `writing`(正在写盘的 id 集合)区分这两种情况:
+ * - 库里没有、但正在写 → 保住内存那份(写入还没落地)
+ * - 库里没有、也不在写 → 别处删了它,丢掉
+ *
+ * 库里有的以库为准(库是这一份数据的正本),最后按时间倒序 —— 与 loadHistory 一致。
+ */
+export function mergeHistory(
+  fromDb: HistoryEntry[],
+  memory: HistoryEntry[],
+  writing: ReadonlySet<string>
+): HistoryEntry[] {
+  const inDb = new Set(fromDb.map((h) => h.id))
+  const stillWriting = memory.filter((h) => !inDb.has(h.id) && writing.has(h.id))
+  return [...stillWriting, ...fromDb].sort((a, b) => b.createdAt - a.createdAt)
+}
 /**
  * 写入一条历史,并在空间吃紧时清理最旧的一批。
  * 返回 PruneResult 表示"确实清了",交由界面告知用户;空间宽裕时返回 null。

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { SYNC_KEYS, syncTargetsOf } from './crossTab'
+import { SYNC_KEYS, coalesceSync, syncTargetsOf } from './crossTab'
 import {
   CHAR_KEY,
   COLL_KEY,
@@ -114,5 +114,45 @@ describe('同步范围 · 与源码里的写入点保持一致', () => {
         expect(covered.has(known.key), `${token} 声明要同步,但不在 SYNC_KEYS 里`).toBe(true)
       }
     }
+  })
+})
+
+describe('coalesceSync · 一批广播怎么收拢', () => {
+  it('同类同角色只留一条', () => {
+    expect(
+      coalesceSync([
+        { kind: 'history' },
+        { kind: 'history' },
+        { kind: 'history' }
+      ])
+    ).toEqual([{ kind: 'history' }])
+  })
+
+  it('不同角色分开留 —— 那是两个角色各自的对话', () => {
+    const out = coalesceSync([
+      { kind: 'chat', charId: 'a' },
+      { kind: 'chat', charId: 'b' },
+      { kind: 'chat', charId: 'a' }
+    ])
+    expect(out).toEqual([
+      { kind: 'chat', charId: 'a' },
+      { kind: 'chat', charId: 'b' }
+    ])
+  })
+
+  it('不同类分开留', () => {
+    expect(coalesceSync([{ kind: 'history' }, { kind: 'library' }])).toHaveLength(2)
+  })
+
+  it('带 charId 与不带的算两条(后者表示"整类都变了")', () => {
+    expect(coalesceSync([{ kind: 'charViews', charId: 'a' }, { kind: 'charViews' }])).toHaveLength(2)
+  })
+
+  it('顺序按首次出现,空批次给空数组', () => {
+    expect(coalesceSync([{ kind: 'library' }, { kind: 'history' }]).map((m) => m.kind)).toEqual([
+      'library',
+      'history'
+    ])
+    expect(coalesceSync([])).toEqual([])
   })
 })

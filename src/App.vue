@@ -49,6 +49,7 @@ import {
   loadActiveTtsId,
   saveActiveTtsId,
   loadHistory,
+  mergeHistory,
   addHistoryRecord,
   removeHistoryRecord,
   saveHistoryRecord,
@@ -99,7 +100,13 @@ import { titleFromPrompt } from './lib/text'
 import { stopSpeaking } from './lib/speech'
 import { NAV_ITEMS } from './lib/nav'
 // 另一个标签页改了 localStorage 里的目录时,本页要跟着重载(见 lib/crossTab.ts)
-import { syncTargetsOf } from './lib/crossTab'
+import {
+  openSyncChannel,
+  syncTargetsOf,
+  type SyncChannel,
+  type SyncKind,
+  type SyncMessage
+} from './lib/crossTab'
 // 图片尺寸上限的唯一来源(参考图 / 存档 / 编辑载荷),别再各写一个字面量
 import { REF_ARCHIVE_EDGE, REF_IMAGE_EDGE } from './lib/payload'
 // 浮层的公共行为(点外收起 / Esc 逐层退)
@@ -668,6 +675,7 @@ onMounted(() => {
 })
 onBeforeUnmount(() => window.removeEventListener('scroll', onScroll))
 onBeforeUnmount(() => window.removeEventListener('storage', onStorageSync))
+onBeforeUnmount(() => syncChannel?.close())
 
 /* —— 顶部导航(分段控件) ——
    条目清单在 lib/nav.ts(导航与字标共用那一份)。这里只留状态:
@@ -878,7 +886,22 @@ onMounted(() => {
     void loadChatLast()
   })
   window.addEventListener('storage', onStorageSync)
+  /* 记录与字节那一侧走广播(BroadcastChannel)。它与上面的 storage 事件
+     互不重复:那个管被整份覆盖写的目录,这个管 IndexedDB 里的记录 */
+  syncChannel = openSyncChannel((batch) => void handleRemoteSync(batch))
 })
+
+/* 跨标签页广播:另一页改了 IndexedDB 里的东西(历史/设定图/对话)时,
+   本页把受影响的那一类重读一遍。localStorage 那条(storage 事件)只管目录,
+   改记录与字节不会触发它 —— 见 lib/crossTab.ts 的说明 */
+let syncChannel: SyncChannel | null = null
+/* 正在写盘的那些记录 id。重读历史时要靠它区分两种情况:
+   库里没有是"别的标签页删了它"(丢掉)还是"本页刚写、还没落地"(保住) */
+const writingIds = new Set<string>()
+/** 告诉其他标签页:这一类变了 */
+function announce(kind: SyncKind, charId?: string) {
+  syncChannel?.post(charId ? { kind, charId } : { kind })
+}
 
 /* —— 跨标签页同步 ——
    localStorage 里的目录都是整份覆盖写的(见 api.ts 的 save* 那几个)。
@@ -925,6 +948,85 @@ function onStorageSync(e: StorageEvent) {
   /* 说一声。不说的话用户只会觉得"我明明没动,列表却变了" ——
      这是同步本身带来的观感问题,不是噪音 */
   notice.value = `Updated from another tab — reloaded ${labels.join(' and ')}.`
+}
+
+/* —— 另一页改了 IndexedDB 里的东西 ——
+   粒度是"哪一类变了",收到就把那一类重读一遍。重读是幂等的,所以消息即使
+   合并、乱序或重复也不会让两端对不上 —— 代价只是多读几条记录 */
+async function handleRemoteSync(batch: SyncMessage[]) {
+  const labels: string[] = []
+
+  if (batch.some((m) => m.kind === 'history')) {
+    await reloadHistoryFromDb()
+    labels.push('history')
+  }
+
+  const viewIds = batch.filter((m) => m.kind === 'charViews').map((m) => m.charId)
+  if (viewIds.length) {
+    /* 没带 charId 的(删角色)就把已缓存的都过一遍 —— 反正只动内存里已有的那几格 */
+    const ids = viewIds.some((id) => !id) ? Object.keys(charViews.value) : (viewIds as string[])
+    for (const id of ids) await reloadCharViewsFromDb(id)
+    labels.push('characters')
+  }
+
+  const chatIds = batch.filter((m) => m.kind === 'chat').map((m) => m.charId).filter(Boolean) as string[]
+  if (chatIds.length) {
+    for (const id of chatIds) await reloadChatFromDb(id)
+    labels.push('conversations')
+  }
+
+  if (batch.some((m) => m.kind === 'library')) {
+    libItems.value = await loadPrompts()
+    labels.push('prompt library')
+  }
+
+  if (labels.length) {
+    notice.value = `Updated from another tab — reloaded ${[...new Set(labels)].join(' and ')}.`
+  }
+}
+
+/** 重读历史。**合并而不是整份替换**,理由见 api.ts 的 mergeHistory */
+async function reloadHistoryFromDb() {
+  const fromDb = await loadHistory()
+  const next = mergeHistory(fromDb, history.value, writingIds)
+  const keep = new Set(next.map((h) => h.id))
+  const gone = history.value.filter((h) => !keep.has(h.id))
+  history.value = next
+  // 这些图不会再展示了:撤掉 object URL,让 Blob 能被回收(与清理那条路同一个理由)
+  gone.forEach(releaseEntryMedia)
+}
+
+/** 重读某个角色的设定图。缓存那一格本身就是"已加载过"的标记(loader 见到就返回),
+ *  所以要先把这一格丢掉再取 */
+async function reloadCharViewsFromDb(id: string) {
+  const before = charViews.value[id]
+  if (before) for (const v of before) releaseSrc(v.data)
+  const rest = { ...charViews.value }
+  delete rest[id]
+  charViews.value = rest
+  /* 角色本身没了的(删角色):不再去读,留个空格就行 ——
+     读它会返回空数组,反而在内存里留一个"加载过"的假标记 */
+  if (!characters.value.some((c) => c.id === id)) return
+  await loadCharViews(id)
+}
+
+/** 重读某个角色的对话。**正在流式说话时跳过**:库里的副本还没有刚落下的这句,
+ *  重读会把流式的正文抹掉 —— 那一轮说完还会再广播一次,那时再对齐也不迟 */
+async function reloadChatFromDb(id: string) {
+  if (chatBusy.value[id]) return
+  const drop = <T>(rec: Record<string, T>) => {
+    const next = { ...rec }
+    delete next[id]
+    return next
+  }
+  chatMessages.value = drop(chatMessages.value)
+  chatHasMore.value = drop(chatHasMore.value)
+  /* 记忆也要先摘掉:loadChatMessages 只在"库里有"时才写回这一格,
+     另一页刚点了"忘记"的话,留着旧的那份会让本页继续拿旧记忆说话 */
+  chatSummary.value = drop(chatSummary.value)
+  await loadChatMessages(id)
+  // 左栏那行"最后说了什么"同样要跟上
+  await loadChatLast()
 }
 
 /* 新建一份配置(进入独立的新增接口表单页)。
@@ -1199,6 +1301,7 @@ async function useLibItem(item: PromptItem) {
      "我到底在用哪些提示词" —— 不记的话,一年后翻库只能靠感觉 */
   item.uses = (item.uses || 0) + 1
   await persistLib()
+  announce('library')
   // 关掉库页就等于切回首页;回顶部由 navView 的 watch 统一负责,这里不必再来一次
   page.value = 'home'
 }
@@ -1220,6 +1323,7 @@ function removeLibItem(id: string) {
          不撤就回收不了 —— 但窗口里撤销回来还要用它渲染,提前撤就是裂图 */
       releaseSrc(gone.cover)
       persistLib()
+      announce('library')
     }
   })
 }
@@ -1230,6 +1334,9 @@ async function saveLibItem(item: PromptItem) {
   if (idx >= 0) libItems.value[idx] = item
   else libItems.value = [item, ...libItems.value]
   await persistLib()
+  /* 封面存在 IndexedDB 里,改它不会触发 localStorage 的 storage 事件 ——
+     这一条得单独广播,否则另一页翻到这条时封面还是旧的(或干脆没有) */
+  announce('library')
 }
 async function importLibItems(items: PromptItem[]) {
   /* 内容是外部文件,逐条规整:缺 prompt 的记录会让列表渲染崩掉,必须在入口拦掉。
@@ -1645,6 +1752,9 @@ function deleteChar(id: string) {
       const rest = { ...charViews.value }
       delete rest[id]
       charViews.value = rest
+      // 别的标签页若缓存着这个角色的设定图或对话,也要把它们放掉
+      announce('charViews', id)
+      announce('chat', id)
       /* 对话跟着角色一起走:人没了,跟他聊的那一段留着也没有对象了。
          放在这一步(真正落盘)而不是点删除那一刻 —— 撤销回来时对话还得在 */
       chatControllers.get(id)?.abort()
@@ -1715,7 +1825,10 @@ async function duplicateChar(id: string) {
      设定图当成"已经不在的角色名下的"删掉(见 idb.ts 的 putCharRefs) */
   try {
     for (const r of await getCharViews(id)) {
-      if (known.has(r.kind)) await putCharView(copy.id, r.kind, reBlob(r.data))
+      if (known.has(r.kind)) {
+        await putCharView(copy.id, r.kind, reBlob(r.data))
+        announce('charViews', copy.id)
+      }
     }
     characters.value = [
       ...characters.value.slice(0, at + 1),
@@ -1852,6 +1965,7 @@ async function importCharFile(file: File) {
       }
       // 与 duplicateChar 同一条顺序要求:图先写,再交给 saveCharacters 落盘
       for (const v of imp.views) await putCharView(c.id, v.kind, v.data)
+      if (imp.views.length) announce('charViews', c.id)
       /* 对话跟着角色一起落库。顺序也是要紧的:先得有这个角色 id,
          而记忆的游标要指着已经写进去的最后一条消息 */
       if (imp.chat) {
@@ -2042,6 +2156,8 @@ async function genCharView(charId: string, kind: CharacterViewKind): Promise<boo
        反复重跑同一格,否则每次都在内存里留一张全尺寸图 */
     releaseSrc(viewOf(c.id, kind)?.data)
     await putCharView(c.id, kind, blob)
+    // 另一页若正开着这个角色的详情/向导,它该看到这张新图
+    announce('charViews', c.id)
     const rest = (charViews.value[c.id] || []).filter((v) => v.kind !== kind)
     charViews.value = { ...charViews.value, [c.id]: [...rest, { kind, data: blob }] }
     /* 正脸同时是这张角色的封面与头像,生成成功后就写回 ref ——
@@ -2298,6 +2414,8 @@ async function editChatSummary(id: string, text: string) {
   const next: ChatSummary = { ...cur, text, updatedAt: Date.now() }
   chatSummary.value = { ...chatSummary.value, [id]: next }
   await putChatSummary(next)
+  // 另一个标签页里的这个角色也该按新记忆说话
+  announce('chat', id)
 }
 
 /** 忘掉这段记忆。**消息一条都不删** —— "角色不再记得"和"这事发生过"是两回事,
@@ -2332,6 +2450,8 @@ async function forgetChatSummary(id: string) {
   /* 与"清空对话"不同,这一步**立刻落盘**:忘掉就该马上生效,
      而且只有一条记录,写它不心疼。撤销再把老的那版写回去 */
   await putChatSummary(next)
+  // 另一页里的这个角色不该再提起刚被忘掉的那一段
+  announce('chat', id)
   scheduleUndo({
     label: 'Memory forgotten',
     undo: () => {
@@ -2478,6 +2598,8 @@ async function runChat(id: string) {
   } else {
     // 落盘要交原始对象:reactive 代理进不了 IndexedDB 的 structuredClone
     await putChatMessage({ ...toRaw(reply) })
+    // 另一页的左栏与消息流都要跟上(它可能正开着这个角色)
+    announce('chat', id)
     setChatLast(id, { ...toRaw(reply) })
   }
   if (stopped) notice.value = 'Stopped.'
@@ -2516,6 +2638,7 @@ async function sendChat(id: string, body: string, image?: Blob) {
   if (!mine.content.trim() && !mine.imageId) return
   pushChatMessage(id, mine)
   await putChatMessage(mine)
+  announce('chat', id)
   // 左栏那行摘要跟着这一句走 —— 不必为此重读一遍库
   setChatLast(id, mine)
   await runChat(id)
@@ -2568,6 +2691,10 @@ function clearChat(id: string) {
   const hadMore = !!chatHasMore.value[id]
   chatMessages.value = { ...chatMessages.value, [id]: [] }
   chatHasMore.value = { ...chatHasMore.value, [id]: false }
+  /* 屏幕上是立刻空的,但库里要等撤销窗口结束才真清(见下面的 purge),
+     所以广播放在 purge 里 —— 提前广播的话,另一页会在我们还能撤销时
+     就把这段对话当成不存在了 */
+
   /* 记忆必须跟着一起清 —— 消息没了而记忆还留着,下一句开口就会提起
      一段用户刚刚清掉的旧事,那比失忆更糟 */
   const sumRest = { ...chatSummary.value }
@@ -2597,6 +2724,8 @@ function clearChat(id: string) {
         if (m.imageId) void deleteChatImage(m.imageId)
       }
       void deleteChatOf(id)
+      // 到这里这一整段对话才算真的没了 —— 撤销窗口里它还在,另一页不该先清掉
+      announce('chat', id)
     }
   })
 }
@@ -2934,8 +3063,13 @@ async function recordFor(
    生成与对比出图的每条结果都走它 */
 async function persist(record: HistoryEntry) {
   history.value = [record, ...history.value]
+  /* 记下"正在写"的那个 id:另一页的广播可能在这一笔落地之前到达,
+     重读历史时靠它保住这一条(见 api.ts 的 mergeHistory) */
+  writingIds.add(record.id)
   try {
     const pruned = await addHistoryRecord(record)
+    // 别的标签页也要知道:它们的内存里没有这一条
+    announce('history')
     if (pruned) {
       // 磁盘上已经删掉了,内存里也要同步,否则界面还留着早已不存在的记录
       const goneIds = new Set(pruned.removedIds)
@@ -2957,6 +3091,9 @@ async function persist(record: HistoryEntry) {
     // 生成是成功的,失败的只是"存进本地":记录先留在内存里(本次会话仍可见),
     // 但必须如实告知刷新会丢 —— 不能混进"生成失败"的提示里
     notice.value = 'Image generated, but not saved locally. It will be lost on refresh — download it first.'
+  } finally {
+    // 落盘成功与否都要摘掉:失败的那条只活在本页内存里,不该因为"正在写"被永久保住
+    writingIds.delete(record.id)
   }
 }
 
@@ -3296,6 +3433,8 @@ function removeHistoryEntry(entry: HistoryEntry) {
     },
     purge: () => {
       removeHistoryRecord(entry.id)
+      // 真正删掉才广播:撤销窗口里它还在,别的标签页不该先把它抹掉
+      announce('history')
       /* 地址到这时才释放:窗口里撤销回来还要渲染它。
          也只在这里释放 —— 预览开着时撤地址会让图裂掉 */
       releaseEntryMedia(entry)
@@ -3309,6 +3448,7 @@ async function toggleMark(entry: HistoryEntry, index: number) {
   if (!item) return
   item.marked = !item.marked
   await saveHistoryRecord(toRaw(entry))
+  announce('history')
 }
 
 /* —— 作品集(Collection) ——
@@ -3373,6 +3513,7 @@ function assignCollection(collectionId: string) {
   if (collectionId) entry.collectionId = collectionId
   else delete entry.collectionId
   saveHistoryRecord(toRaw(entry))
+  announce('history')
 }
 
 /** 预览里「新建作品集并纳入当前这条」:连建带挂一次做完,

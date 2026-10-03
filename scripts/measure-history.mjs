@@ -40,6 +40,8 @@ const SETTLE_MS = Number(arg('settle-ms', 4000))
 const PROBE_ENCODE = args.includes('--probe-encode')
 /* 探一下存储层的让位与重开:另一个连接要删库时,应用必须让开并且能重新开起来 */
 const PROBE_REOPEN = args.includes('--probe-reopen')
+/* 开第二个标签页,验证跨页同步真的把改动传过去了 */
+const PROBE_TWO_TABS = args.includes('--probe-two-tabs')
 /* 调试端口每轮随机取一个:固定端口会与上一次没退干净的实例撞车,
    而那种撞车表现为"连上了,但连到的是别人",量出来的数看着正常其实全错 */
 const PORT = Number(arg('cdp-port', 0)) || 9300 + Math.floor(Math.random() * 600)
@@ -107,6 +109,82 @@ async function evaluate(fn, ...fnArgs) {
   })
   if (exceptionDetails) throw new Error(exceptionDetails.exception?.description || '页面脚本抛错')
   return result.value
+}
+
+/* 再连一个页面 target(第二个标签页要单独一条通道) */
+async function connectTarget(wsUrl) {
+  const sock = new WebSocket(wsUrl)
+  const pend = new Map()
+  let n = 0
+  sock.addEventListener('message', (ev) => {
+    const m = JSON.parse(ev.data)
+    const f = m.id && pend.get(m.id)
+    if (f) {
+      pend.delete(m.id)
+      f(m)
+    }
+  })
+  await new Promise((r) => sock.addEventListener('open', r, { once: true }))
+  const sendTo = (method, params = {}) =>
+    new Promise((res, rej) => {
+      const id = ++n
+      const timer = setTimeout(() => {
+        pend.delete(id)
+        rej(new Error(`CDP 超时(第二页): ${method}`))
+      }, 30_000)
+      pend.set(id, (m) => {
+        clearTimeout(timer)
+        if (m.error) rej(new Error(m.error.message))
+        else res(m.result)
+      })
+      sock.send(JSON.stringify({ id, method, params }))
+    })
+  const runOn = async (fn, ...a) => {
+    const { result, exceptionDetails } = await sendTo('Runtime.evaluate', {
+      expression: `(${fn.toString()})(${a.map((x) => JSON.stringify(x)).join(', ')})`,
+      awaitPromise: true,
+      returnByValue: true
+    })
+    if (exceptionDetails) throw new Error(exceptionDetails.exception?.description || '第二页脚本抛错')
+    return result.value
+  }
+  return { send: sendTo, evaluate: runOn, close: () => sock.close() }
+}
+
+/** 让另一个标签页切到历史页。
+ *  用真实鼠标事件:分段控件是 @pointerdown 驱动的,合成 click 不生效 */
+async function gotoHistory(client) {
+  await client.send('Runtime.enable')
+  await client.send('Page.enable')
+  // 应用挂载完才有导航按钮(新标签页要等它加载)
+  for (let i = 0; i < 60; i++) {
+    if (await client.evaluate(() => !!document.querySelector('button[aria-label="History"]')))
+      break
+    await sleep(250)
+  }
+  const box = await client.evaluate(() => {
+    const b = document.querySelector('button[aria-label="History"]')
+    if (!b) return null
+    const r = b.getBoundingClientRect()
+    return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
+  })
+  if (!box) throw new Error('另一个标签页找不到导航按钮')
+  for (const type of ['mousePressed', 'mouseReleased']) {
+    await client.send('Input.dispatchMouseEvent', {
+      type,
+      x: box.x,
+      y: box.y,
+      button: 'left',
+      clickCount: 1
+    })
+  }
+  // 等图块铺出来
+  for (let i = 0; i < 80; i++) {
+    const n = await client.evaluate(() => document.querySelectorAll('section.lib .tile').length)
+    if (n > 0) return n
+    await sleep(100)
+  }
+  return 0
 }
 
 /* 等某个 CDP 事件到达(只在需要时挂一次监听) */
@@ -479,6 +557,49 @@ async function main() {
       })
     : null
 
+  /* —— 跨标签页同步探针 ——
+     同一个 Chrome profile 下的两个标签页共享 IndexedDB 与 BroadcastChannel。
+     在 A 页标记一张图,看 B 页(已经开着历史页)会不会跟着亮出标记角标。
+     这是 A2 唯一的真实验证方式:纯函数单测只能证明"合并逻辑对",
+     证明不了"广播真的送到了、而且对面真的重读了"。 */
+  let twoTabs = null
+  if (PROBE_TWO_TABS) {
+    twoTabs = { steps: [] }
+    const created = await fetch(
+      `http://127.0.0.1:${PORT}/json/new?${encodeURIComponent(URL_)}`,
+      { method: 'PUT' }
+    ).then((r) => (r.ok ? r.json() : null))
+    if (!created?.webSocketDebuggerUrl) {
+      twoTabs.error = '开不了第二个标签页'
+    } else {
+      const other = await connectTarget(created.webSocketDebuggerUrl)
+      try {
+        twoTabs.tilesInB = await gotoHistory(other)
+        const countMarked = () =>
+          other.evaluate(() => document.querySelectorAll('section.lib .tile-mark').length)
+        twoTabs.markedInB_before = await countMarked()
+
+        // 在 A 页标记第一张(点的是真实按钮,走的是应用自己的落库与广播)
+        twoTabs.clickedInA = await evaluate(() => {
+          const b = [...document.querySelectorAll('button')].find((x) =>
+            (x.getAttribute('aria-label') || '').startsWith('Mark image')
+          )
+          if (!b) return false
+          b.click()
+          return true
+        })
+        // 等广播(收拢窗口 250ms)+ 对面重读
+        await sleep(2000)
+        twoTabs.markedInB_after = await countMarked()
+        twoTabs.passed = twoTabs.markedInB_after > twoTabs.markedInB_before
+      } catch (e) {
+        twoTabs.error = String(e.message || e)
+      } finally {
+        other.close()
+      }
+    }
+  }
+
   const heap = await evaluate(() => {
     const m = performance.memory
     return m ? { usedMB: +(m.usedJSHeapSize / 1048576).toFixed(1) } : null
@@ -495,6 +616,7 @@ async function main() {
     background,
     encode,
     reopen,
+    twoTabs,
     history,
     heap
   }
@@ -509,6 +631,12 @@ async function main() {
     ['max-ms', arg('max-ms', null), history.msToStable, '历史页铺完耗时(ms)'],
     ['max-heap-mb', arg('max-heap-mb', null), heap?.usedMB ?? 0, 'JS 堆(MB)']
   ].filter(([, limit]) => limit !== null)
+
+  if (twoTabs) {
+    const ok = twoTabs.passed === true
+    console.log(`${ok ? '✅' : '❌'} 跨标签页同步:标记在另一页可见 (${twoTabs.markedInB_before} → ${twoTabs.markedInB_after})${twoTabs.error ? ` — ${twoTabs.error}` : ''}`)
+    if (!ok) process.exitCode = 1
+  }
 
   let breached = 0
   for (const [flag, limit, actual, label] of budgets) {
