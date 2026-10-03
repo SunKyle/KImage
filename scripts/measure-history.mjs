@@ -53,6 +53,8 @@ const PROBE_HISTORY = args.includes('--probe-history')
 const PROBE_CHARS = args.includes('--probe-chars')
 /* 探对话那一域:播种一段对话与记忆 → 渲染 → 清空 */
 const PROBE_CHAT = args.includes('--probe-chat')
+/* 探出图参数那一层:尺寸档位、参考图上传与清除 */
+const PROBE_PARAMS = args.includes('--probe-params')
 /* 调试端口每轮随机取一个:固定端口会与上一次没退干净的实例撞车,
    而那种撞车表现为"连上了,但连到的是别人",量出来的数看着正常其实全错 */
 const PORT = Number(arg('cdp-port', 0)) || 9300 + Math.floor(Math.random() * 600)
@@ -1166,6 +1168,108 @@ async function main() {
     }
   }
 
+  /* —— 出图参数层探针 ——
+     这一层(尺寸 / 张数 / 画质 / 种子 / 参考图)每一格都受能力表约束,
+     而能力表是配置域算出来的 —— 单测覆盖不到"点下去界面认不认"。 */
+  let paramsProbe = null
+  if (PROBE_PARAMS) {
+    paramsProbe = {}
+    const settle = () => sleep(400)
+    try {
+      // 回创作区
+      const navBox = await evaluate(() => {
+        const b = document.querySelector('button[aria-label="Studio"]')
+        if (!b) return null
+        const r = b.getBoundingClientRect()
+        return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
+      })
+      if (navBox) {
+        for (const type of ['mousePressed', 'mouseReleased']) {
+          await send('Input.dispatchMouseEvent', {
+            type,
+            x: navBox.x,
+            y: navBox.y,
+            button: 'left',
+            clickCount: 1
+          })
+        }
+        await sleep(700)
+      }
+
+      // ① 打开「更多参数」
+      paramsProbe.openedMore = await evaluate(() => {
+        const b = document.querySelector('button[aria-label="More parameters"]')
+        if (!b) return 'missing'
+        b.click()
+        return 'clicked'
+      })
+      await settle()
+      paramsProbe.panels = await evaluate(() => ({
+        bodies: document.querySelectorAll('.pp-body').length,
+        sizeChips: [...document.querySelectorAll('.pp-body .preset')].filter((b) =>
+          /^(Auto|\d+×\d+)$/.test(b.textContent.trim())
+        ).length
+      }))
+
+      // ② 点一个具体尺寸档(不是 auto 的那一个)
+      paramsProbe.clickedSize = await evaluate(() => {
+        const chip = [...document.querySelectorAll('.pp-body .preset')].find((b) =>
+          /^\d+×\d+$/.test(b.textContent.trim())
+        )
+        if (!chip) return 'missing'
+        chip.click()
+        return chip.textContent.trim()
+      })
+      await settle()
+      /* 别去"找那个带着 on 的":张数那几个胶囊也是 .preset,第一版就抓成了
+         "1 image"。按文本精确对上刚点的那一档才算数 */
+      paramsProbe.sizeOn = await evaluate((want) => {
+        const chip = [...document.querySelectorAll('.pp-body .preset')].find(
+          (b) => b.textContent.trim() === want
+        )
+        if (!chip) return 'missing'
+        return chip.className.includes('on')
+      }, paramsProbe.clickedSize)
+
+      // ③ 参考图:塞一张真图进隐藏 input,再点 Remove
+      await evaluate(() => {
+        const input = document.querySelector('#ref-file')
+        return !!input
+      })
+      await send('DOM.enable')
+      const doc = await send('DOM.getDocument', { depth: -1 })
+      const node = await send('DOM.querySelector', {
+        nodeId: doc.root.nodeId,
+        selector: '#ref-file'
+      })
+      if (node.nodeId) {
+        await send('DOM.setFileInputFiles', { nodeId: node.nodeId, files: [UPLOAD_PNG] })
+      }
+      await sleep(900)
+      paramsProbe.refThumb = await evaluate(() => !!document.querySelector('img.pp-thumb'))
+      paramsProbe.removed = await evaluate(() => {
+        const b = [...document.querySelectorAll('.pp-action')].find((x) =>
+          /^Remove$/.test(x.textContent.trim())
+        )
+        if (!b) return 'missing'
+        b.click()
+        return 'clicked'
+      })
+      await settle()
+      paramsProbe.refThumbAfterRemove = await evaluate(() => !!document.querySelector('img.pp-thumb'))
+
+      paramsProbe.passed =
+        paramsProbe.panels?.sizeChips >= 2 &&
+        /×/.test(paramsProbe.clickedSize || '') &&
+        paramsProbe.sizeOn === true &&
+        paramsProbe.refThumb === true &&
+        paramsProbe.removed === 'clicked' &&
+        paramsProbe.refThumbAfterRemove === false
+    } catch (e) {
+      paramsProbe.error = String(e.message || e)
+    }
+  }
+
   /* —— 对话域探针 ——
      真聊一句需要能用的文本模型(要联网、要密钥),这里做不到;但搬走的那一半
      (读取 / 记忆 / 清空)完全可以验证:把一段对话与一条记忆直接播进库,
@@ -1321,6 +1425,7 @@ async function main() {
     historyDomain: historyProbe,
     chars: charsProbe,
     chat: chatProbe,
+    params: paramsProbe,
     history,
     heap
   }
@@ -1347,6 +1452,16 @@ async function main() {
       console.log('   ', JSON.stringify(canvas.steps))
       process.exitCode = 1
     }
+  }
+
+  if (paramsProbe) {
+    const ok = paramsProbe.passed === true
+    console.log(
+      `${ok ? '✅' : '❌'} 出图参数层(尺寸档位 → 参考图上传 → 清除)${
+        ok ? '' : ` — ${JSON.stringify(paramsProbe)}`
+      }`
+    )
+    if (!ok) process.exitCode = 1
   }
 
   if (chatProbe) {
