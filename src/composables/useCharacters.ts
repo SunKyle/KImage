@@ -195,8 +195,11 @@ export function useCharacters(deps: CharacterDeps) {
    *  正面固定排最前:它是唯一的主视图,前段权重更高,脸就定在它上面。
    *  上传的那张底图不在这里:它只为生成正脸服务一次(见 genCharView),
    *  那之后 c.ref 里存的已经是正脸本身,再送一次就是把同一张图送两遍 */
-  async function charRefSrcs(): Promise<string[]> {
-    const c = activeCharacter.value
+  /** 某个角色的图 → data URL。**按 id 取,不认"当前选中"** ——
+   *  对话页可能正跟另一个角色说话,拿创作区那个角色的脸去画,
+   *  画出来当然不像(这是实测反馈里最要紧的一条) */
+  async function charRefSrcsOf(charId: string): Promise<string[]> {
+    const c = characters.value.find((x) => x.id === charId)
     if (!c) return []
     // 视图是按需加载的,这里先确保取过一次
     await loadCharViews(c.id)
@@ -211,6 +214,11 @@ export function useCharacters(deps: CharacterDeps) {
       if (view) out.push(await blobToDataURL(view.data))
     }
     return out
+  }
+
+  /** 创作区当前选中的那个角色(出图面板用) */
+  async function charRefSrcs(): Promise<string[]> {
+    return activeCharId.value ? charRefSrcsOf(activeCharId.value) : []
   }
 
   function stopCharView(charId: string, kind: CharacterViewKind) {
@@ -288,6 +296,7 @@ export function useCharacters(deps: CharacterDeps) {
     reBlob,
     MAX_CHAR_REFS,
     charRefSrcs,
+    charRefSrcsOf,
     stopCharView,
     loadCharViews,
     reloadCharViewsFromDb

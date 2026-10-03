@@ -49,8 +49,12 @@ export interface GenerationDeps {
   persist: (record: HistoryEntry) => Promise<void>
   /** 当前角色的图 → data URL,发请求时并进参考图(见 useCharacters) */
   charRefSrcs: () => Promise<string[]>
+  /** 按 id 取某个角色的图(对话发图要走它,不能认创作区选中的那个) */
+  charRefSrcsOf: (charId: string) => Promise<string[]>
   /** 当前角色:它决定自动并进提示词的那段设定 */
   activeCharacter: ComputedRef<Character | undefined>
+  /** 全部角色:对话里发图要按**对话中那个角色**取设定与参考图 */
+  characters: Ref<Character[]>
   /** 这次要跑哪几个模型(见 useConfigs) */
   selectedConfigs: ComputedRef<ApiConfig[]>
   /** 参数面板的开合:发起生成时要把它收掉 */
@@ -302,14 +306,17 @@ function undoEnhance() {
    *  **不进历史**(见 doc/角色配图设计.md):图只活在对话里,
    *  所以这条路刻意不走 persist/recordFor —— 只把 Blob 交给调用方,
    *  由它塞进 chat_images。角色的设定图当参考图送进去,这是"同一张脸"的保证 */
-  async function generateChatPhoto(scene: string): Promise<Blob | undefined> {
+  async function generateChatPhoto(charId: string, scene: string): Promise<Blob | undefined> {
     const text = String(scene || '').trim().slice(0, CHAT_PHOTO_SCENE_CHARS)
     if (!text || !deps.configured()) return undefined
-    const spec = charSpecPrefix.value
+    /* **认对话里那个角色**,不认创作区选中的那个:设定与参考图都按 charId 取。
+       这一点错了就会"一点不像" —— 参考图是空的,等于纯文生图 */
+    const who = deps.characters.value.find((c) => c.id === charId)
+    const spec = who ? characterFaceDesc(who) : ''
     /* 场景在前、角色设定在后(与 composedPrompt 同一顺序):
        前段权重更高,先说"这一张要画什么" */
     const prompt = (spec ? `${text}, ${spec}` : text).slice(0, 1200)
-    const refList = await deps.charRefSrcs()
+    const refList = await deps.charRefSrcsOf(charId)
     const ctrl = new AbortController()
     try {
       const res = await generate(

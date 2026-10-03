@@ -254,6 +254,7 @@ const {
   resultRefBlob,
   reBlob,
   charRefSrcs,
+  charRefSrcsOf,
   stopCharView,
   loadCharViews,
   reloadCharViewsFromDb
@@ -475,6 +476,8 @@ const {
   notice,
   persist,
   charRefSrcs,
+  charRefSrcsOf,
+  characters,
   activeCharacter,
   selectedConfigs,
   openPanel,
@@ -1472,7 +1475,7 @@ async function runChat(id: string) {
      一句"我画不出来"比什么都不说更打断对话(见 doc/角色配图设计.md) */
   if (photo && !stopped) {
     reply.photo = photo
-    void generateChatPhoto(photo).then(async (blob) => {
+    void generateChatPhoto(id, photo).then(async (blob) => {
       if (!blob) {
         /* 这一条可能已经被删了(清空对话):那就别再往上写 */
         if (chatMessages.value[id]?.some((m) => m.id === reply.id)) reply.photo = ''

@@ -1550,7 +1550,11 @@ async function main() {
           charInRail: /Probe talker/.test(document.body.textContent || ''),
           photoRendered: !!document.querySelector('img.bubble-photo'),
           photoBelowText: !!order && order.imgAt > order.textAt && order.textAt >= 0,
-          pendingSkeleton: !!document.querySelector('.bubble-photo-skel')
+          pendingSkeleton: !!document.querySelector('.bubble-photo-skel'),
+          /* 实测反馈:"聊天记录里图片太大"。钉住它是个缩略图而不是一面墙 */
+          photoWidth: Math.round(
+            document.querySelector('img.bubble-photo')?.getBoundingClientRect().width || 0
+          )
         }
       })
 
@@ -1586,6 +1590,8 @@ async function main() {
         chatProbe.rendered?.photoRendered === true &&
         chatProbe.rendered?.photoBelowText === true &&
         chatProbe.rendered?.pendingSkeleton === true &&
+        chatProbe.rendered?.photoWidth > 0 &&
+        chatProbe.rendered?.photoWidth <= 240 &&
         chatProbe.clickedClear === 'clicked' &&
         chatProbe.afterClear?.bubbles === 0 &&
         chatProbe.afterClear?.memoryGone === true &&

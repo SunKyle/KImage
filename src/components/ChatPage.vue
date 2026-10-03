@@ -1802,7 +1802,12 @@ onBeforeUnmount(() => {
    图是异步到的,比例写死才不会在它到达时把整段对话顶下去 */
 .bubble-photo {
   display: block;
-  width: 100%;
+  /* 缩略图而不是大图:方形上限 224,气泡不会被一张图撑成一面墙。
+     object-fit 裁掉多余的部分,让它与文字的节奏保持一致 */
+  width: 224px;
+  max-width: 100%;
+  aspect-ratio: 1;
+  object-fit: cover;
   margin-top: 8px;
   border-radius: 12px;
 }
