@@ -12,8 +12,8 @@ import {
   PhEyeSlash
 } from '@phosphor-icons/vue'
 import BrandIcon from './BrandIcon.vue'
-import { PROVIDERS, TEXT_PROVIDERS, VISION_PROVIDERS, TTS_GENERATIONS, TTS_MODELS, ttsGenerationOf, getProvider, inferVendor, testConnection } from '../api'
-import type { Provider, TextProvider, TestResult } from '../api'
+import { PROVIDERS, TEXT_PROVIDERS, VISION_PROVIDERS, TTS_GENERATIONS, TTS_MODELS, configKindOf, ttsGenerationOf, getProvider, inferVendor, testConnection } from '../api'
+import type { ConfigKind, Provider, TextProvider, TestResult } from '../api'
 import type { ApiConfig } from '../types'
 // 浮层的公共行为(点外收起)
 import { isInside, isInsideSelector } from '../lib/ui'
@@ -30,9 +30,12 @@ const props = defineProps<{
   /* 提示词增强类别里当前生效那条的 id。与 activeId 各自独立:
      两类配置同在一个列表里,但「当前」是分开记的 */
   activeTextId: string
-  /* 识图类别里当前生效那条的 id。同理 —— 三类各记各的当前值 */
+  /* 角色对话类别里当前生效那条的 id。它可能是空串 —— 没专配过对话模型时,
+     对话借用改写那条(所以这一组在列表里也可能压根不出现) */
+  activeChatId: string
+  /* 识图类别里当前生效那条的 id。同理 —— 各类各记各的当前值 */
   activeVisionId: string
-  /* 朗读类别里当前生效那条的 id。四类各记各的 */
+  /* 朗读类别里当前生效那条的 id。五类各记各的 */
   activeTtsId: string
   mode: 'list' | 'form'
   /* 编辑/复制的来源;null 表示新增空白 */
@@ -45,6 +48,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: 'activate', c: ApiConfig): void
   (e: 'activateText', c: ApiConfig): void
+  (e: 'activateChat', c: ApiConfig): void
   (e: 'activateVision', c: ApiConfig): void
   (e: 'activateTts', c: ApiConfig): void
   (e: 'edit', c: ApiConfig): void
@@ -135,33 +139,57 @@ watch(
 )
 
 /* 草稿当前用途:老配置没有 kind 时按出图算。
-   四类共用一个 kind 字段,所以先把"认不出来的"收成 'image',后面各处只认这四个值 */
-type Purpose = 'image' | 'text' | 'vision' | 'tts'
-const purpose = computed<Purpose>(() =>
-  draft.value.kind === 'text'
-    ? 'text'
-    : draft.value.kind === 'vision'
-      ? 'vision'
-      : draft.value.kind === 'tts'
-        ? 'tts'
-        : 'image'
-)
+   判断收到 api.ts 的 configKindOf 一处 —— 五类之后那串嵌套三元已经要数着缩进读,
+   而"认不出来的算哪一类"本来就只该有一个答案 */
+const purpose = computed<ConfigKind>(() => configKindOf(draft.value))
 
-/* 切换用途:只切 kind 并换掉下面的预设行。
-   已填的 baseUrl / apiKey 保留 —— 地址与密钥常常同源,用户可能刚填好,不该被清掉;
-   但 model 一定要清空:图像模型名拿去打 /chat/completions 必错,反过来也一样,
-   留着只会让人以为还能用。 */
-function setPurpose(kind: Purpose) {
-  if (draft.value.kind === kind) return
-  draft.value.kind = kind
-  draft.value.model = ''
+/* 模型名的归属:用途之间存在**同一条命名空间** ——
+   改写 / 对话 / 识图都要一个能走 /chat/completions 的模型,同一个名字在这三者之间
+   至少是个候选;而出图要的是图像模型名、朗读要的是固定的两个枚举值,
+   跨过去必然是错的。所以"要不要清空模型"看的是这一层,不是用途本身。 */
+function modelSpace(kind: ConfigKind): 'image' | 'chat' | 'tts' {
+  return kind === 'image' ? 'image' : kind === 'tts' ? 'tts' : 'chat'
 }
 
-/* 文本预设:地址照写(高亮比的就是地址,它在这里是身份),模型只补空 ——
+/* 切换用途:只切 kind 并换掉下面的预设行。
+   已填的 baseUrl / apiKey 保留 —— 地址与密钥常常同源,用户可能刚填好,不该被清掉。
+
+   模型名**只在换了命名空间时才清**:图像模型名拿去打 /chat/completions 必错,
+   反过来也一样,留着只会让人以为还能用;而改写 ↔ 对话 ↔ 识图之间要填的是同一种东西,
+   清掉它净是坑 —— 想"给对话单独配一条"的人,很自然的动作就是打开原来那条改写配置、
+   把用途改成 Role chat,那时模型名被悄悄抹掉的话,存下来就是一条发不出请求的配置,
+   而它在列表里照样顶着「Current」(报错还要等下一次开口才看得见)。
+   跨了界就照旧清空:那种名字留在那儿才是真的误导 */
+function setPurpose(kind: ConfigKind) {
+  if (draft.value.kind === kind) return
+  const from = modelSpace(purpose.value)
+  draft.value.kind = kind
+  if (modelSpace(kind) !== from) draft.value.model = ''
+}
+
+/* Provider 下面那一句说明。每一类打的端点不一样,而这是用户唯一能一眼看到
+   "它会走哪条路"的地方,所以逐类写清楚。收成一处而不是模板里那串嵌套三元 ——
+   五类之后那串已经要数着缩进读,而 capabilityNote 是父级按生效配置算好的 */
+const purposeNote = computed(() => {
+  switch (purpose.value) {
+    case 'image':
+      return props.capabilityNote
+    case 'chat':
+      return 'Chat models are called through /chat/completions — for the replies and for compressing long-term memory. For Bailian, pick the compatible-mode address.'
+    case 'vision':
+      return 'Vision models are called through /chat/completions with the image attached. For Bailian, pick the compatible-mode address.'
+    case 'tts':
+      return 'Speech is called through /api/v3/tts/… with an X-Api-Key header. It is billed per character, so the app caches every line it synthesises.'
+    default:
+      return 'Text models are called through /chat/completions. For Bailian, pick the compatible-mode address.'
+  }
+})
+
+/* 对话模型预设:地址照写(高亮比的就是地址,它在这里是身份),模型只补空 ——
    已填的模型名常常是对着某家中转写的别名,不该被预设冲掉。
    vendor 也要写下去:它本来只在出图那条路上被写,于是文本配置的 vendor 一直
    是 add() 给的 'custom',从 DeepSeek 换成 OpenAI 也照样顶着「接线」图标。
-   识图那类与文本同构,共用这一个函数(预设行不同,填法一样) */
+   改写、对话、识图三类同构,共用这一个函数(预设行不同,填法一样) */
 function applyTextProvider(p: TextProvider) {
   draft.value.vendor = p.id
   draft.value.baseUrl = p.baseUrl
@@ -349,8 +377,9 @@ function vendorId(c: ApiConfig) {
   return c.vendor || inferVendor(c.baseUrl)
 }
 
-/* 厂商名。预设是三份表 —— 出图的 PROVIDERS、文本的 TEXT_PROVIDERS 与识图的
-   VISION_PROVIDERS,DeepSeek 只做对话所以不进第一份。
+/* 厂商名。预设是三份表 —— 出图的 PROVIDERS、对话的 TEXT_PROVIDERS(改写与
+   角色对话共用,两者要的就是同一种模型)与识图的 VISION_PROVIDERS,
+   DeepSeek 只做对话所以不进第一份。
    三边都查一遍,再退回能力表兜底 */
 function providerLabel(id: string) {
   const p =
@@ -365,9 +394,14 @@ function vendorLabel(c: ApiConfig) {
 
 /* 模型在前、厂商在后合成一句。
    顺序有讲究:截断只会发生在末尾,所以把更重要的放前面 ——
-   模型是这条配置真正发出去的东西,厂商从模型名和地址基本能看出来 */
+   模型是这条配置真正发出去的东西,厂商从模型名和地址基本能看出来。
+
+   模型名空着时**把这件事写出来**(tts 例外:它那一档本来就是可选的 Auto)。
+   不写的话这一行会只剩下厂商名,看上去和"配好了"没有区别 ——
+   而"我明明配了,它却说没配"正是从这里开始的 */
 function identLine(c: ApiConfig) {
-  return [c.model, vendorLabel(c)].filter(Boolean).join(' · ')
+  const missing = !c.model.trim() && configKindOf(c) !== 'tts'
+  return [missing ? 'No model name' : c.model, vendorLabel(c)].filter(Boolean).join(' · ')
 }
 
 /* 地址只显示主机名 + 路径:https:// 这种前缀在窄行里最先被吃掉,
@@ -382,36 +416,49 @@ function endpointLine(url: string) {
   }
 }
 
-/* 列表按用途分四组渲染:各组各自判「当前」(出图比 activeId,改写比 activeTextId,
-   识图比 activeVisionId,朗读比 activeTtsId),所以把组连同判据一起列成数据,
-   模板里只写一份行。空组直接滤掉,不渲染 */
+/* 列表按用途分五组渲染:各组各自判「当前」(出图比 activeId,改写比 activeTextId,
+   对话比 activeChatId,识图比 activeVisionId,朗读比 activeTtsId),所以把组连同
+   判据一起列成数据,模板里只写一份行。空组直接滤掉,不渲染。
+   分组按用途正面认(configKindOf),不再写成一串 `!== ...` —— 那种写法每加一类
+   就要补一笔,而漏掉的那一类会被并入出图那一组(tts 就这么漏过一次) */
 const groups = computed(() =>
   [
     {
       key: 'image',
       label: 'Image generation',
-      items: props.configs.filter(
-        (c) => c.kind !== 'text' && c.kind !== 'vision' && c.kind !== 'tts'
-      ),
-      activeId: props.activeId
+      items: props.configs.filter((c) => configKindOf(c) === 'image'),
+      activeId: props.activeId,
+      on: (c: ApiConfig) => emit('activate', c)
+    },
+    /* 对话排在出图之后:它是这一站的第二条主线(造一个角色,然后跟它说话),
+       而改写与识图都是围着出图转的辅助 */
+    {
+      key: 'chat',
+      label: 'Role chat',
+      items: props.configs.filter((c) => configKindOf(c) === 'chat'),
+      activeId: props.activeChatId,
+      on: (c: ApiConfig) => emit('activateChat', c)
     },
     {
       key: 'text',
       label: 'Prompt enhancing',
-      items: props.configs.filter((c) => c.kind === 'text'),
-      activeId: props.activeTextId
+      items: props.configs.filter((c) => configKindOf(c) === 'text'),
+      activeId: props.activeTextId,
+      on: (c: ApiConfig) => emit('activateText', c)
     },
     {
       key: 'vision',
       label: 'Image recognition',
-      items: props.configs.filter((c) => c.kind === 'vision'),
-      activeId: props.activeVisionId
+      items: props.configs.filter((c) => configKindOf(c) === 'vision'),
+      activeId: props.activeVisionId,
+      on: (c: ApiConfig) => emit('activateVision', c)
     },
     {
       key: 'tts',
       label: 'Voice',
-      items: props.configs.filter((c) => c.kind === 'tts'),
-      activeId: props.activeTtsId
+      items: props.configs.filter((c) => configKindOf(c) === 'tts'),
+      activeId: props.activeTtsId,
+      on: (c: ApiConfig) => emit('activateTts', c)
     }
   ].filter((g) => g.items.length)
 )
@@ -540,21 +587,14 @@ function onImportFile(e: Event) {
                 class="row"
                 :class="{ 'is-current': c.id === g.activeId, 'is-open': openRow === c.id }"
               >
-                <!-- 行本体是 <button>:整行可点 = 把这条设为该类别的当前生效
-                     (出图走 activate,改写走 activateText,识图走 activateVision)。
+                <!-- 行本体是 <button>:整行可点 = 把这条设为该类别的当前生效。
+                     动作随组带着走(见 groups),不在这里按 key 再分一次类 ——
+                     五类之后那串嵌套三元已经读不出谁是谁。
                      状态列定宽,于是所有行的名字都从同一条竖线起排 -->
                 <button
                   class="row-main-btn"
                   :aria-current="c.id === g.activeId ? 'true' : undefined"
-                  @click="
-                    g.key === 'text'
-                      ? emit('activateText', c)
-                      : g.key === 'vision'
-                        ? emit('activateVision', c)
-                        : g.key === 'tts'
-                          ? emit('activateTts', c)
-                          : emit('activate', c)
-                  "
+                  @click="g.on(c)"
                 >
                   <span class="dot-col">
                     <span v-if="c.id === g.activeId" class="pill-current"><i aria-hidden="true"></i>Current</span>
@@ -675,8 +715,8 @@ function onImportFile(e: Event) {
 
         <div class="form-body">
           <div class="block">
-            <!-- 用途:这条配置用来出图、改写提示词还是识图。它决定后面所有字段的含义,
-                 所以给几行带说明的选项,而不是一排只有名字的胶囊 -->
+            <!-- 用途:这条配置用来出图、跟角色对话、改写提示词还是识图。它决定后面所有
+                 字段的含义,所以给几行带说明的选项,而不是一排只有名字的胶囊 -->
             <span class="block-label">What is this config for?</span>
             <div class="purpose" role="radiogroup" aria-label="Config purpose">
               <label class="purpose-opt">
@@ -689,6 +729,22 @@ function onImportFile(e: Event) {
                 <span class="pm">
                   <b>Image generation</b>
                   <span>Used when you press Generate. Fill in an image model.</span>
+                </span>
+                <span class="tick" aria-hidden="true"><PhCheck /></span>
+              </label>
+              <!-- 对话与改写用的是同一种模型(都走 /chat/completions),但**要分开配**:
+                   改写那个是"怎么把一句话写得这家模型爱看",对话那个是"聊起来像不像个人",
+                   两个诉求不同,合在一格就得彼此迁就。所以给这一条独立的用途 -->
+              <label class="purpose-opt">
+                <input
+                  type="radio"
+                  name="purpose"
+                  :checked="purpose === 'chat'"
+                  @change="setPurpose('chat')"
+                />
+                <span class="pm">
+                  <b>Role chat</b>
+                  <span>How characters reply, and how long-term memory gets compressed.</span>
                 </span>
                 <span class="tick" aria-hidden="true"><PhCheck /></span>
               </label>
@@ -736,8 +792,9 @@ function onImportFile(e: Event) {
 
           <div class="block">
             <span class="block-label">Provider</span>
-            <!-- 预设随用途切换数据源:出图用图像模型预设,改写用对话模型预设,
-                 识图用视觉模型预设(后两份都是 /chat/completions,只是模型要求不同) -->
+            <!-- 预设随用途切换数据源:出图用图像模型预设,对话与改写共用对话模型预设
+                 (两者要的就是同一种模型),识图用视觉模型预设(后三份都是
+                 /chat/completions,只是模型要求不同) -->
             <div class="presets" role="group" aria-label="Select provider">
               <template v-if="purpose === 'image'">
                 <button
@@ -792,17 +849,7 @@ function onImportFile(e: Event) {
                 </button>
               </template>
             </div>
-            <p class="note">
-              {{
-                purpose === 'image'
-                  ? capabilityNote
-                  : purpose === 'vision'
-                    ? 'Vision models are called through /chat/completions with the image attached. For Bailian, pick the compatible-mode address.'
-                    : purpose === 'tts'
-                      ? 'Speech is called through /api/v3/tts/… with an X-Api-Key header. It is billed per character, so the app caches every line it synthesises.'
-                      : 'Text models are called through /chat/completions. For Bailian, pick the compatible-mode address.'
-              }}
-            </p>
+            <p class="note">{{ purposeNote }}</p>
 
             <label class="field">
               <span class="flabel">Name <em>— optional</em></span>
@@ -931,7 +978,15 @@ function onImportFile(e: Event) {
                   spellcheck="false"
                 />
               </span>
-              <span class="note">
+              <!-- 空着模型名时**当场说清后果**。它仍然可以存(本地服务或自建中转
+                   未必用得上这个名字,所以不拦提交),但存下去等于存了一条发不出请求的
+                   配置 —— 而它在列表里照样顶着「Current」,用户要到下次开口问它才撞上。
+                   那一下撞出来的还是上游/服务端的一句话,跟"是我这儿填漏了"对不上号 -->
+              <span v-if="!draft.model.trim()" class="field-warn">
+                Without a model name this config cannot send anything — paste the model ID
+                your provider gave you.
+              </span>
+              <span v-else class="note">
                 The model ID your API expects — for some providers this is an endpoint ID like ep-2024….
               </span>
             </label>
@@ -1596,6 +1651,16 @@ function onImportFile(e: Event) {
   display: block;
   margin-top: 6px;
   font-size: var(--fs-xs);
+  color: var(--danger);
+}
+/* 填漏了的后果提示。与 .field-err 同一档颜色:它虽然**不拦提交**
+   (本地服务或自建中转未必看这个字段,所以不越权替用户判定),
+   但存下去就是一条发不出请求的配置 —— 该和"地址写错了"一样显眼 */
+.field-warn {
+  display: block;
+  margin-top: 6px;
+  font-size: var(--fs-xs);
+  line-height: 1.6;
   color: var(--danger);
 }
 .reveal {

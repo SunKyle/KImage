@@ -31,8 +31,10 @@ import type { ApiConfig, Character, ChatMessage, ChatSummary, ImportedChat } fro
 
 export interface ChatDeps {
   characters: { value: Character[] }
-  /** 当前生效的文本模型:压缩记忆要用它 */
-  textConfig: { value: ApiConfig | null }
+  /* 当前生效的对话模型(kind = 'chat';没专配时是借来的改写那条)。
+     压缩记忆要用它 —— 记忆是"这段对话的延续",它该和回话用同一个脑子:
+     换个模型压出来的摘要,措辞与取舍都跟正文不是一路 */
+  chatConfig: { value: ApiConfig | null }
   notice: { value: string }
   announce: (kind: 'chat', charId?: string) => void
   scheduleUndo: (item: { label: string; undo: () => void; purge: () => void }) => void
@@ -84,10 +86,17 @@ async function readChatForExport(id: string): Promise<ImportedChat> {
     ...(m.mood ? { mood: m.mood } : {}),
     ...(m.imageId ? { imageId: m.imageId } : {}),
     /* 角色发的那张也要带走。**两条都要**:漏了 photo 这枚标记,
-       导进来的记录会少一张图;漏了 photoId 就只剩一句"我给你看个东西" */
-    ...(m.photo ? { photo: m.photo } : {}),
-    ...(m.photoId ? { photoId: m.photoId } : {}),
-    ...(m.photoSelf ? { photoSelf: true } : {})
+       导进来的记录会少一张图;漏了 photoId 就只剩一句"我给你看个东西"。
+       **没有 photoId 就一条都不带** —— 那说明这一张还在画、或已经画失败
+       (见 ChatMessage.photoFailed):包里带一个没有图的场景描述过去,
+       对方读到的是一条永远转下去的骨架,而"失败"这个状态不在包的结构里 */
+    ...(m.photoId
+      ? {
+          photoId: m.photoId,
+          ...(m.photo ? { photo: m.photo } : {}),
+          ...(m.photoSelf ? { photoSelf: true } : {})
+        }
+      : {})
   }))
   /* 附图一起带走。**缺了它们,对方拿到的是一串"不知道在说什么的回复"** ——
      消息在,而消息指着的那张图不在。读不回来的那张跳过:
@@ -160,6 +169,23 @@ function dropChatLast(id: string) {
   chatLast.value = next
 }
 
+/**
+ * 从库里读回来的一条消息,要把"没画完的图"收成"画没画出来"。
+ *
+ * 库里那条带着 photo 却没有 photoId,只有两种可能 —— 还在画、或没画出来。
+ * 而**还在画的那种不可能被读回来**:出图只活在当前这一份内存里,一次读取发生在
+ * 页面刚打开(或往前翻)的时候,没有任何出图在跑。
+ * 所以站在这条边界上它只可能是没画出来 —— 落成 photoFailed,界面据此给的
+ * 那一行提示与重试键才对。不收的话它会顶着一个永远转下去的骨架:
+ * 生成是随页面一起没的,库里那条再没人会去补全(见 App 的 drawChatPhoto)。
+ *
+ * 只在**读取**这一侧收:内存里那份不能碰 —— 那里面 photo 加 photoId 缺席
+ * 也可能真的是"正在画",界面正靠它占着骨架位。
+ */
+function settlePhoto(m: ChatMessage): ChatMessage {
+  return m.photo && !m.photoId ? { ...m, photoFailed: true } : m
+}
+
 /** 取某个角色的对话。与 loadCharViews 同一套懒加载 + 去重:
  *  同一个 id 可能被选角色的 watch 与角色页的入口同时触发 */
 async function loadChatMessages(id: string) {
@@ -171,7 +197,7 @@ async function loadChatMessages(id: string) {
       /* 消息与记忆一起取:两者是同一屏的两半,
          分两趟只会让记忆晚一拍出现 */
       const [page, sum] = await Promise.all([getChatMessages(id, CHAT_PAGE), getChatSummary(id)])
-      chatMessages.value = { ...chatMessages.value, [id]: page.list }
+      chatMessages.value = { ...chatMessages.value, [id]: page.list.map(settlePhoto) }
       chatHasMore.value = { ...chatHasMore.value, [id]: page.hasMore }
       if (sum) chatSummary.value = { ...chatSummary.value, [id]: sum }
     } finally {
@@ -200,9 +226,13 @@ async function loadEarlierChat(id: string) {
     try {
       const { list, hasMore } = await getChatMessages(id, cur.length + CHAT_PAGE)
       const seen = new Set(list.map((m) => m.id))
+      /* 只在**这一档新读出来的**那些上收口:重叠的那几条留在内存里的那份更新
+         (可能正有一张图在画),而库里那份照旧盖在上面,不受这一步影响 */
+      const have = new Set(cur.map((m) => m.id))
+      const fresh = list.map((m) => (have.has(m.id) ? m : settlePhoto(m)))
       chatMessages.value = {
         ...chatMessages.value,
-        [id]: [...list, ...cur.filter((m) => !seen.has(m.id))].sort(
+        [id]: [...fresh, ...cur.filter((m) => !seen.has(m.id))].sort(
           (a, b) => a.createdAt - b.createdAt
         )
       }
@@ -226,8 +256,11 @@ async function loadEarlierChat(id: string) {
  * 下一轮再试 —— 不弹提示,也不会因此丢东西。
  */
 async function maybeSummarize(id: string) {
-  const cfg = deps.textConfig.value
+  const cfg = deps.chatConfig.value
   if (!cfg || chatSummarizing.has(id)) return
+  /* 模型名空着就整条路都发不出去 —— 提前收手,别拿一次注定失败的调用去撞。
+     它本来也是静默的:失败不提示、下一轮再试,于是会变成每一轮白花一次请求 */
+  if (!cfg.model.trim() || !cfg.baseUrl.trim()) return
   chatSummarizing.add(id)
   const seq = chatSeq.get(id) || 0
   try {
@@ -369,9 +402,13 @@ function clearChat(id: string) {
       chatHasMore.value = { ...chatHasMore.value, [id]: hadMore }
       if (beforeSummary) chatSummary.value = { ...chatSummary.value, [id]: beforeSummary }
       if (beforeLast) setChatLast(id, beforeLast)
-      /* 撤销要立刻落盘:窗口里别的操作可能已经把"它是空的"写进去了 */
+      /* 撤销要立刻落盘 —— 但**只能往库里加,不能先清一遍**。
+         这里从前先调了一次 deleteChatOf 再写回消息,而它现在会连消息指着的
+         附图一起收(见 idb.ts):那条路上消息一条条写回来了,**字节却已经跟着走了**,
+         于是每一张图都成了空引用 —— 角色发的那张永远停在骨架上。
+         顺带,清库还会带走比内存里这一档更早的那些消息(内存只装着最近一档,
+         撤销本来就只放得回这一档),而这次删除压根还没落盘,一条都不该少 */
       void (async () => {
-        await deleteChatOf(id)
         for (const m of before) await putChatMessage(m)
         if (beforeSummary) await putChatSummary(beforeSummary)
       })()

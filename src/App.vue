@@ -41,6 +41,7 @@ import {
   chatPayloadOf,
   CHAT_WINDOW,
   chatStream,
+  configKindOf,
   loadCharacters,
   saveCharacters,
   exportCharacter,
@@ -119,7 +120,7 @@ const {
   runUndo
 } = useFeedback()
 
-/* 接口配置这一域(列表 / 四类当前生效 / 能力派生 / 增删改与导入导出)收在
+/* 接口配置这一域(列表 / 五类当前生效 / 能力派生 / 增删改与导入导出)收在
    composables/useConfigs.ts —— 它只依赖「删除的撤销窗口」与「怎么进设置页」两件事 */
 const {
   configs,
@@ -127,6 +128,9 @@ const {
   activeId,
   textConfig,
   activeTextId,
+  chatConfig,
+  chatBorrowed,
+  activeChatId,
   visionConfig,
   activeVisionId,
   ttsConfig,
@@ -139,6 +143,7 @@ const {
   activeTextName,
   imageConfigs,
   textConfigs,
+  chatConfigs,
   visionConfigs,
   provider,
   capabilityNote,
@@ -151,10 +156,12 @@ const {
   initConfigs,
   repickActiveImage,
   repickActiveText,
+  repickActiveChat,
   repickActiveVision,
   repickActiveTts,
   activateConfig,
   activateTextConfig,
+  activateChatConfig,
   activateVisionConfig,
   activateTtsConfig,
   newConfig,
@@ -307,7 +314,7 @@ const {
   readChatForExport,
   writeImportedChat,
   clearChat
-} = useChat({ characters, textConfig, notice, announce, scheduleUndo })
+} = useChat({ characters, chatConfig, notice, announce, scheduleUndo })
 
 type Page = 'home' | 'chars' | 'chat' | 'canvas' | 'lib' | 'history' | 'settings'
 const page = ref<Page>('home')
@@ -709,9 +716,10 @@ function onStorageSync(e: StorageEvent) {
 
   if (targets.includes('configs')) {
     configs.value = loadConfigs()
-    // 重挑四类的「当前生效」:另一个标签页可能把当前那条删了或改了用途
+    // 重挑五类的「当前生效」:另一个标签页可能把当前那条删了或改了用途
     repickActiveImage()
     repickActiveText()
+    repickActiveChat()
     repickActiveVision()
     repickActiveTts()
     /* 对比出图的选择集合可能指向已消失的配置。单选是常态,所以过滤后
@@ -1397,6 +1405,18 @@ function isAbort(e: unknown): boolean {
   return !!e && typeof e === 'object' && (e as { name?: string }).name === 'AbortError'
 }
 
+/** 一条配置缺了哪一样(空串 = 配全了)。
+ *
+ *  这类配置**差一个字段就一个请求都发不出去**,而界面上它处处像是配好了 ——
+ *  列表里顶着「Current」、药丸上写着名字。所以"缺哪一样"要能单独问出来:
+ *  它既是"这一轮发不发得出去"的判据,也是那句话里必须点名的那一格
+ *  (明明只是地址空着,却说成"没有模型名",只会让人更糊涂)。 */
+function configGap(cfg: ApiConfig): string {
+  if (!cfg.model.trim()) return 'model name'
+  if (!cfg.baseUrl.trim()) return 'Base URL'
+  return ''
+}
+
 /**
  * 发一轮,一边收一边长。
  *
@@ -1406,10 +1426,22 @@ function isAbort(e: unknown): boolean {
  */
 async function runChat(id: string) {
   const c = characters.value.find((x) => x.id === id)
-  const cfg = textConfig.value
+  /* 对话模型:专配的那条优先,没配就是借来的改写那条(见 useConfigs 的 chatConfig)。
+     两条都没有才是真的发不出去 —— 那句话里说的也是"配一条对话模型" */
+  const cfg = chatConfig.value
   if (!c || chatBusy.value[id]) return
   if (!cfg) {
-    notice.value = 'Add a text model in API settings before chatting.'
+    notice.value = 'Add a chat model in API settings before chatting.'
+    return
+  }
+  /* **有配置 ≠ 配全了**。少了模型名就是一条发不出请求的配置 ——
+     而它在设置页里照样顶着「Current」,界面这边也一直是可用的样子。
+     不拦的话请求会一路走到服务端,由它回一句 "Set a text model in API settings first":
+     那句话既没说是哪条配置,也和用户看到的界面矛盾(他明明配了一条)。
+     所以在这里就说清楚是**哪一条**、缺的是**哪一样**(与对话页那块提示同一件事) */
+  const gap = configGap(cfg)
+  if (gap) {
+    notice.value = `"${cfg.name || 'The chat model'}" is missing its ${gap} — set it in API settings.`
     return
   }
 
@@ -1426,14 +1458,22 @@ async function runChat(id: string) {
   if (!context.length || context[context.length - 1].role !== 'user') return
 
   /* 用户这一轮带没带图。带了要另说两件事:
-     1. 请求改用识图那条配置 —— **看图得有看图的模型**,文本模型多半不支持,
-        而它回的那句参数错用户看不出"该换个模型了";没配识图就照旧用文本配置
+     1. 请求改用识图那条配置 —— **看图得有看图的模型**,对话模型多半不支持,
+        而它回的那句参数错用户看不出"该换个模型了";没配识图就照旧用对话配置
         (会报错,但那是实情,如实转述给用户);
      2. 把那张图读回来转成 data URL 一起发 —— 库里存的是 Blob,
         发出去要的是字符。**只带当前这一条**:历史里的图不重发(一张上千 token)。 */
   const lastSent = (chatMessages.value[id] || []).slice(-1)[0]
   const picId = lastSent?.imageId || ''
   const useCfg = picId ? visionConfig.value || cfg : cfg
+  /* 带了图 ⇒ 这一轮走的是识图那条配置,它同样可能缺字段 —— 而这一处更容易漏:
+     用户多半是刚建好一条识图配置、还没填模型就先丢一张图进来试。
+     上面那道闸只管对话那条,这里是第二条 */
+  const visionGap = configGap(useCfg)
+  if (visionGap) {
+    notice.value = `The vision model "${useCfg.name || 'untitled'}" is missing its ${visionGap} — set it in API settings.`
+    return
+  }
   let images: string[] | undefined
   if (picId) {
     const rec = await getChatImage(picId)
@@ -1506,32 +1546,13 @@ async function runChat(id: string) {
      没有就不写 —— 界面上那枚小药丸宁可不出,也不要显示一个错的 */
   if (mood) reply.mood = mood
   /* 它想发一张图:**先挂上场景描述**(界面据此立刻占一个骨架位),
-     再在后台画。画不出来就把那个标记清掉,骨架随之消失 —— 正文照旧,
-     一句"我画不出来"比什么都不说更打断对话(见 doc/角色配图设计.md) */
+     再交给 drawChatPhoto 后台画。正文照旧 —— 图失败不该拖住它说的话 */
   if (photo && !stopped) {
     reply.photo = photo
     /* 意图一起落在这条消息上:导出这段对话时,对方若想重画这一张,
        依据该是同一个(是自拍还是只拍了个景) */
     if (photoSelf) reply.photoSelf = true
-    void generateChatPhoto(id, photo, photoSelf).then(async (blob) => {
-      if (!blob) {
-        /* 这一条可能已经被删了(清空对话):那就别再往上写 */
-        if (chatMessages.value[id]?.some((m) => m.id === reply.id)) reply.photo = ''
-        return
-      }
-      const photoId = uid()
-      try {
-        await putChatImage({ id: photoId, blob, createdAt: Date.now() })
-      } catch {
-        reply.photo = ''
-        return
-      }
-      reply.photoId = photoId
-      /* 落库只是把这条消息补全:图不进历史,所以这里走的不是 persist,
-         而是"把这一条改写回去"。失败也不回滚界面 —— 刷新后少一张图,
-         比当场把它撤掉更不刺眼 */
-      await putChatMessage(toRaw(reply)).catch(() => {})
-    })
+    drawChatPhoto(id, reply)
   }
   if (!reply.content.trim() && !stopped) {
     /* 一个字都没收到(上游出错,或它真的什么都没说):
@@ -1557,6 +1578,56 @@ async function runChat(id: string) {
   /* 收尾之后顺手看一眼要不要压记忆。放在最末是有意的:
      它是后台整理,不该挡在用户看到回复之前,也不该挤进上面那两句提示 */
   void maybeSummarize(id)
+}
+
+/**
+ * 画这条消息里"它想给你看的那张图",画完挂上 photoId。
+ *
+ *  **失败要留痕**:从前画不出来只是把 photo 清掉,于是"没收到图"和
+ *  "本来就没打算发图"在界面上长得一模一样 —— 用户既不知道为什么没有图,
+ *  也没有地方让它再来一次。现在失败改成在消息上记一个 photoFailed,
+ *  场景描述**保留**(它是重试要用的全部依据),界面据此给一行说明 + 重试。
+ *
+ *  正文不受影响:一句"我画不出来"比什么都不说更打断对话
+ *  (见 doc/角色配图设计.md 的"失败不阻断文字")。
+ */
+function drawChatPhoto(id: string, reply: ChatMessage) {
+  const scene = reply.photo || ''
+  if (!scene) return
+  // 重试时从失败态翻回"正在画":界面据此把提示换回骨架
+  reply.photoFailed = false
+  void generateChatPhoto(id, scene, !!reply.photoSelf).then(async (blob) => {
+    /* 这一条可能已经被删了(清空对话、或单独删掉它):那就别再往上写 */
+    if (!chatMessages.value[id]?.some((m) => m.id === reply.id)) return
+    if (!blob) {
+      reply.photoFailed = true
+      // 落盘:**刷新之后那行提示与重试键还在**,否则又变回一个永远转的骨架
+      await putChatMessage(toRaw(reply)).catch(() => {})
+      return
+    }
+    const photoId = uid()
+    try {
+      await putChatImage({ id: photoId, blob, createdAt: Date.now() })
+    } catch {
+      reply.photoFailed = true
+      await putChatMessage(toRaw(reply)).catch(() => {})
+      return
+    }
+    reply.photoId = photoId
+    /* 落库只是把这条消息补全:图不进历史,所以这里走的不是 persist,
+       而是"把这一条改写回去"。失败也不回滚界面 —— 失败那一路见上,
+       成功的这一路写不进去也不该把已经画好的图从界面上撤掉 */
+    await putChatMessage(toRaw(reply)).catch(() => {})
+  })
+}
+
+/** 重画某一条消息里的图。与"重新生成"不同:文字一条都不动,
+ *  只是把那张没画出来的图再画一次 —— 依据(场景描述 + 是不是自拍)
+ *  本来就在消息上,不必重新问模型一遍 */
+function retryChatPhoto(id: string, msgId: string) {
+  const msg = (chatMessages.value[id] || []).find((m) => m.id === msgId)
+  if (!msg || !msg.photo) return
+  drawChatPhoto(id, msg)
 }
 
 /** 发一句。先把用户那句落进去,再连同它一起发 ——
@@ -1600,12 +1671,20 @@ async function regenerateChat(id: string) {
   if (chatBusy.value[id]) return
   /* 先确认这一轮真的发得出去,**再**删旧回复。反过来的话,下面 runChat
      的每一条提前返回都变成一次静默的数据丢失:旧回复已经删了,新的又没发 ——
-     最容易撞上的是"文本模型被删掉/换设备后还没配",那时界面上还留着
+     最容易撞上的是"对话模型被删掉/换设备后还没配",那时界面上还留着
      Regenerate(消息流不受 compose 的门控),点一下就永久丢一条(没有撤销窗口) */
   const c = characters.value.find((x) => x.id === id)
   if (!c) return
-  if (!textConfig.value) {
-    notice.value = 'Add a text model in API settings before chatting.'
+  const cfg = chatConfig.value
+  if (!cfg) {
+    notice.value = 'Add a chat model in API settings before chatting.'
+    return
+  }
+  /* 与 runChat 同一道闸:缺字段的配置发不出请求,而这条路上后果更重 ——
+     旧回复已经被删了,补不回来(见上面那段的取舍) */
+  const gap = configGap(cfg)
+  if (gap) {
+    notice.value = `"${cfg.name || 'The chat model'}" is missing its ${gap} — set it in API settings.`
     return
   }
   const list = chatMessages.value[id] || []
@@ -1635,6 +1714,33 @@ async function regenerateChat(id: string) {
 
 function stopChat(id: string) {
   chatControllers.get(id)?.abort()
+}
+
+/**
+ * 从对话页那枚模型药丸(或开不了口时那块提示)进设置页。
+ *
+ * 三种情况,三种落点 —— **落点要对上用户此刻的问题**:
+ * - **在用的一条没配全**(典型是缺模型名)→ 直接开**它**的编辑表单。
+ *   这时"去看列表"只会让他再找一遍:他手里那条就顶着 Current,而问题就在那一格里;
+ * - 已经有专配的对话配置 → 去看列表(点它多半是想换一条);
+ * - 还没有(用药丸上那句 `from enhancing` 认出来)→ 直接开一张「用途 = 对话」的空表单。
+ *   这才是这条路最常见的用法:用户点它的动机就是"配一条自己的"。
+ *
+ * 空表单给的是空白草稿而不是某家预设:填哪家只有用户知道,
+ * 而用途那一步已经替他选好了(见设置页的 setPurpose)。
+ */
+function openChatConfigSettings() {
+  const cfg = chatConfig.value
+  if (cfg && (!cfg.model.trim() || !cfg.baseUrl.trim())) {
+    editConfig(cfg)
+  } else if (chatConfigs.value.length) {
+    cfgSeed.value = null
+    cfgView.value = 'list'
+  } else {
+    newConfig({ id: '', name: '', baseUrl: '', apiKey: '', model: '', vendor: 'custom', kind: 'chat' })
+  }
+  page.value = 'settings'
+  openPanel.value = ''
 }
 
 /**
@@ -1780,7 +1886,9 @@ function usePreviewPrompt(p: ReuseParams) {
      不还原它,重跑用的其实是当前生效的那个:换了模型却以为是在同一张图上微调。
      配置已被删掉时保持当前这条,但要说一声,别让人以为还原成了 */
   if (p.configId && p.configId !== config.value.id) {
-    const c = configs.value.find((x) => x.id === p.configId && x.kind !== 'text' && x.kind !== 'vision')
+    /* 按用途正面认:原来那串"不是 text 也不是 vision"在加了对话、朗读两类之后
+       会把它们也算成出图配置 —— 拿一条对话模型去还原配方,等于还原成一个发不出图的 */
+    const c = configs.value.find((x) => x.id === p.configId && configKindOf(x) === 'image')
     if (c) activateConfig(c)
     else notice.value = 'The model this image used is no longer in your configs — using the current one.'
   }
@@ -2477,13 +2585,15 @@ function createAssignCollection(title: string) {
         :active="chatCharId"
         :has-more="!!chatHasMore[chatCharId]"
         :summary="chatSummary[chatCharId]"
-        :text-config="textConfig || undefined"
+        :chat-config="chatConfig || undefined"
+        :chat-borrowed="chatBorrowed"
         :vision-config="visionConfig || undefined"
         :tts-config="ttsConfig || undefined"
         @select="chatCharId = $event"
         @send="sendChat"
         @stop="stopChat"
         @regenerate="regenerateChat"
+        @retry-photo="retryChatPhoto"
         @delete-message="deleteChatMessageFromPage"
         @pin="togglePinChar"
         @edit-summary="editChatSummary"
@@ -2492,7 +2602,7 @@ function createAssignCollection(title: string) {
         @clear="clearChat"
         @load-earlier="loadEarlierChat"
         @goto-chars="page = 'chars'"
-        @goto-settings="page = 'settings'"
+        @configure-chat-model="openChatConfigSettings"
       />
 
       <!-- 历史记录 -->
@@ -2518,6 +2628,7 @@ function createAssignCollection(title: string) {
         :configs="configs"
         :active-id="activeId"
         :active-text-id="activeTextId"
+        :active-chat-id="activeChatId"
         :active-vision-id="activeVisionId"
         :active-tts-id="activeTtsId"
         :mode="cfgView"
@@ -2525,6 +2636,7 @@ function createAssignCollection(title: string) {
         :capability-note="capabilityNote"
         @activate="activateConfig"
         @activate-text="activateTextConfig"
+        @activate-chat="activateChatConfig"
         @activate-vision="activateVisionConfig"
         @activate-tts="activateTtsConfig"
         @edit="editConfig"

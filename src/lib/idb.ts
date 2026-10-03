@@ -828,8 +828,16 @@ export async function deleteVoiceSample(id: string): Promise<void> {
 /* ===== 聊天里的附图 =====
    存的是用户附的那张原图。它**不是派生物**:消息上那个 imageId 指着它,
    删了之后那条消息就只剩一句话 —— 所以清缓存那套不许碰它 */
+
+/* 最近一次写聊天附图是什么时候(见 pruneChatImages 顶部那段)。
+   放在模块级而不是入参:这件事是"这个库刚被写过",与是哪一次写入无关 */
+let lastChatImageWriteAt = 0
+/** 写过图之后这段时间内不做附图体检。见 pruneChatImages */
+const CHAT_IMAGE_QUIET_MS = 30_000
 export async function putChatImage(rec: ChatImage): Promise<void> {
   const db = await openDB()
+  // 记一笔"刚写过图":pruneChatImages 靠它避开下面那一段时间差
+  lastChatImageWriteAt = Date.now()
   await new Promise<void>((resolve, reject) => {
     const tx = db.transaction(CHAT_IMAGE_STORE, 'readwrite')
     tx.objectStore(CHAT_IMAGE_STORE).put(rec)
@@ -914,6 +922,13 @@ export function orphanChatImages(
  * 往往就够压回水位线以下(调用处见 pruneHistory)。
  */
 export async function pruneChatImages(): Promise<number> {
+  /* 刚写过图就先别体检。**它挡的是一类静默的坏数据**:
+     putChatImage 与"把 photoId / imageId 挂到消息上"是**两个事务**,
+     中间那一瞬字节已经在库里、却还没有任何消息指着它 —— 而下面判孤儿的
+     唯一依据正是"库里有没有消息指着它"。撞进那个窗口,一张刚画好的图会被
+     当成垃圾收掉;之后消息带着 photoId 写回来,就成了谁也显示不出来的空引用。
+     代价只是那一档孤儿晚 30 秒再收,而收错了是用户的一张图没了 */
+  if (Date.now() - lastChatImageWriteAt < CHAT_IMAGE_QUIET_MS) return 0
   return retryOnDeadConnection(openDB, resetDB, (db) =>
     new Promise<number>((resolve, reject) => {
       const tx = db.transaction([CHAT_STORE, CHAT_IMAGE_STORE], 'readwrite')

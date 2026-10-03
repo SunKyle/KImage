@@ -9,6 +9,7 @@ import {
   PhDotsThree,
   PhEraser,
   PhImage,
+  PhImageBroken,
   PhMaskHappy,
   PhPencilSimple,
   PhPushPin,
@@ -53,11 +54,16 @@ const props = defineProps<{
      有它就得让用户看得见 —— 它是模型"记得什么"的全部依据,
      藏起来就没法解释"它为什么会突然提起那件很久以前的事" */
   summary?: ChatSummary
-  /** 对话要用的文本模型配置。没配就走不了,但历史照常能看 */
-  textConfig?: ApiConfig
-  /* 发图那一轮改用它。**看图得有看图的模型** —— 文本模型多半不支持,
+  /** 对话要用的模型配置(kind = 'chat',或没专配时借来的改写那条)。
+   *  没配就走不了,但历史照常能看 */
+  chatConfig?: ApiConfig
+  /* 这条是不是从"提示词改写"借来的。**必须说清** —— 这一页头部那枚药丸显示的
+     就是它,而"我到底在跟哪个模型说话"正是这次把对话配置独立出来的原因;
+     含糊过去等于白改。true 时药丸上带一句来源,点一下直接去配一条专属的 */
+  chatBorrowed?: boolean
+  /* 发图那一轮改用它。**看图得有看图的模型** —— 对话模型多半不支持,
      而上游的拒绝只是一句参数错,用户看不出"该换个模型了"。
-     配了识图那条就优先用它;没配就照旧用文本配置(会报错,但那是实情) */
+     配了识图那条就优先用它;没配就照旧用对话配置(会报错,但那是实情) */
   visionConfig?: ApiConfig
   /* 朗读要用的合成配置。没配就退回浏览器自带的语音(见 lib/speech)——
      它是"能用就行"与"这个角色自己的嗓子"之间的那条分界线 */
@@ -71,6 +77,9 @@ const emit = defineEmits<{
   (e: 'send', charId: string, text: string, image?: Blob): void
   (e: 'stop', charId: string): void
   (e: 'regenerate', charId: string): void
+  /* 重画这一条里的图。文字一条都不动 —— 它只是"那张图没画出来,
+     再来一次",不该顺带把角色说的话也重写一遍(与 regenerate 分开) */
+  (e: 'retryPhoto', charId: string, messageId: string): void
   /* 删掉单独一条消息。**只交意图** —— 内存与 IndexedDB 两边怎么删、
      撤销窗口怎么给、附图什么时候收,全归主界面(与清空对话同一条分工) */
   (e: 'deleteMessage', charId: string, messageId: string): void
@@ -90,7 +99,9 @@ const emit = defineEmits<{
      那件事必须说出来,否则用户会以为音色配置生效了、只是"听起来不对" */
   (e: 'notice', text: string): void
   (e: 'gotoChars'): void
-  (e: 'gotoSettings'): void
+  /* 去配那条对话模型。**只交意图**:是回列表还是直接开一张新表单,
+     由主界面定(它才知道现在有没有专配的对话配置)—— 见 App 的 openChatConfigSettings */
+  (e: 'configureChatModel'): void
 }>()
 
 /* ===== 取用的那一份 =================================================
@@ -135,6 +146,42 @@ function lastLine(c: Character): string {
   if (!t) return m.stopped ? '…' : 'Empty message'
   return (m.role === 'user' ? 'You: ' : '') + t
 }
+
+/* ===== 头部的模型药丸 ===============================================
+   头像旁边那一枚回答的是"现在是谁在说话" —— 这一页原来答不上来:
+   用的是哪条配置只在设置页(而且是混在别的用途里的)才看得到。
+   名字优先、没起名字退回模型名,与设置页的 identLine、参数栏的胶囊同一套;
+   借来的那一条还要带上来处,不然用户会以为它已经独立配过了 */
+const chatModelName = computed(() => {
+  const c = props.chatConfig
+  if (!c) return 'No model'
+  return c.name || c.model || 'Untitled config'
+})
+/* 这条配置**缺了哪一样**。有配置 ≠ 配全了:缺了它就是一条发不出请求的配置,
+   而它在界面各处都像是配好了(药丸写着名字、设置页顶着「Current」)。
+   两样分开说 —— 实测里缺模型名是常态(切换用途时被清掉过一次),但地址也可能是空的
+   (手改过 localStorage、或从别处导进来),把后者说成"没有模型名"只会更糊涂 */
+const chatMissing = computed(() => {
+  const c = props.chatConfig
+  if (!c) return ''
+  if (!c.model.trim()) return 'model name'
+  if (!c.baseUrl.trim()) return 'Base URL'
+  return ''
+})
+/* 能不能真的开口。门控与措辞都从这一处来 —— 少写一处就会出现
+   "按钮亮着、话发不出去"这种最费解的状态 */
+const chatReady = computed(() => !!props.chatConfig && !chatMissing.value)
+/* 借来的那枚药丸点开的是"配一条专属的",而不是"看列表" —— 它的问题本来就是
+   还没有专属配置;已经有专属配置时点它才只是回列表切一条 */
+const chatChipTip = computed(() =>
+  !props.chatConfig
+    ? 'No chat model yet — add one in API settings'
+    : !chatReady.value
+      ? `${chatModelName.value} is missing its ${chatMissing.value} — click to fix it in API settings`
+      : props.chatBorrowed
+        ? `Using the Prompt enhancing model (${chatModelName.value}) — click to add a dedicated one`
+        : `${chatModelName.value} — click to change it in API settings`
+)
 
 /* ===== 消息流的时间分隔 =============================================
    不逐条显示时间戳 —— 那是噪声。只在跨天、或两条之间隔得够久时插一条:
@@ -206,10 +253,10 @@ const cursorId = computed(() => {
 /* 重新生成:删掉最后那条助手消息、用同样的上文重发。
    用户那条不动。按过 Stop 的那条不提供 —— 它是"说到这儿够了",
    重发等于把用户的选择覆盖掉。
-   **没配文本模型时不给这枚入口**:消息流不受输入区的门控,而这个动作
+   **没配对话模型时不给这枚入口**:消息流不受输入区的门控,而这个动作
    要先删掉旧回复;发不出去的时候点它等于白丢一条(见主界面的 regenerateChat) */
 const canRegenerate = computed(() => {
-  if (streaming.value || !props.textConfig) return false
+  if (streaming.value || !chatReady.value) return false
   const last = msgs.value[msgs.value.length - 1]
   return !!last && last.role === 'assistant' && !last.stopped
 })
@@ -219,7 +266,7 @@ const canRegenerate = computed(() => {
    与 Regenerate 共用同一个入口,只是文案不同 —— 同一次动作,
    在"想换个说法"和"刚才没发出去"两种情境下该叫不同的名字 */
 const canRetry = computed(() => {
-  if (streaming.value || !props.textConfig) return false
+  if (streaming.value || !chatReady.value) return false
   const last = msgs.value[msgs.value.length - 1]
   return !!last && last.role === 'user'
 })
@@ -588,7 +635,7 @@ function send() {
   const id = props.active
   const pic = attach.value
   /* 只有图没有字也放行 —— "看看这个"本身就是一句话 */
-  if ((!t && !pic) || !id || streaming.value || !props.textConfig || tooLong.value) return
+  if ((!t && !pic) || !id || streaming.value || !chatReady.value || tooLong.value) return
   const blob = pic?.blob
   text.value = ''
   clearAttach()
@@ -829,24 +876,41 @@ onBeforeUnmount(() => {
             </span>
           </span>
 
-          <!-- 头部右侧:记忆入口 + ⋮ 菜单。
-               两者一起靠右收在 head-acts 里,窄屏把名字挤省略号时才不会错位 -->
+          <!-- 头部右侧:模型入口 + 记忆入口 + ⋮ 菜单。
+               三者一起靠右收在 head-acts 里,窄屏把名字挤省略号时才不会错位 -->
           <div class="head-acts">
+            <!-- 现在用的是哪个模型。**这一页自己的配置入口** ——
+                 以前它只在生图那页的参数面板里能改(而且是和改写混在一排里),
+                 于是"跟角色说话"用哪个模型,只能在画图那一侧动。
+                 点一下直达设置页:还没专配过就直接开一张对话配置的表单,
+                 已经有专属配置时回列表切一条 -->
+            <button
+              class="head-chip model-chip"
+              :title="chatChipTip"
+              @click="emit('configureChatModel')"
+            >
+              <PhSlidersHorizontal aria-hidden="true" />
+              <span class="chip-name">{{ chatModelName }}</span>
+              <!-- 借来的那一条要带上来处。不说的话,用户会以为它已经独立配过了 ——
+                   而"它到底走的哪个模型"正是这次要解决的问题本身 -->
+              <span v-if="chatBorrowed" class="chip-note">from enhancing</span>
+            </button>
+
             <!-- 记忆的常驻入口。它在头部而不再在消息流顶上 ——
                  那是"它为什么还记得那件事"的解释,却要往上翻几百条才够得着。
                  只在真有记忆时出现:空着的一枚药丸点开是一片空 -->
             <button
               v-if="memory"
               ref="memoryChip"
-              class="mem-chip"
+              class="head-chip mem-chip"
               :class="{ on: memoryOpen }"
               aria-haspopup="dialog"
               :aria-expanded="memoryOpen"
               @click="toggleMemoryCard"
             >
               <PhBrain aria-hidden="true" />
-              <span class="mem-chip-text">Memory</span>
-              <span class="mem-chip-when">{{ memoryWhen }}</span>
+              <span class="chip-label">Memory</span>
+              <span class="chip-when">{{ memoryWhen }}</span>
             </button>
 
             <div ref="menuWrap" class="chat-menu-wrap">
@@ -1074,6 +1138,27 @@ onBeforeUnmount(() => {
                     alt="Photo from the character"
                   />
                 </button>
+                <!-- 这一张没画出来。**必须说出来** —— 从前它只是把骨架悄悄撤掉,
+                     于是"没收到图"和"本来就没打算发图"在界面上长得一模一样:
+                     用户既不知道为什么没有图,也没有地方让它再来一次。
+                     场景描述还在消息上,所以重试不必再问模型一遍 -->
+                <div
+                  v-else-if="r.msg.role === 'assistant' && r.msg.photo && r.msg.photoFailed"
+                  class="photo-fail"
+                  role="status"
+                >
+                  <PhImageBroken aria-hidden="true" />
+                  <span>Couldn’t generate that image.</span>
+                  <button
+                    type="button"
+                    class="photo-retry"
+                    :aria-label="`Try generating ${current.name}’s image again`"
+                    @click="emit('retryPhoto', current.id, r.msg.id)"
+                  >
+                    <PhArrowsClockwise aria-hidden="true" />
+                    Try again
+                  </button>
+                </div>
                 <span
                   v-else-if="r.msg.role === 'assistant' && r.msg.photo"
                   class="msg-photo msg-photo-skel"
@@ -1108,10 +1193,28 @@ onBeforeUnmount(() => {
               {{ pendingNew ? `${pendingNew} new` : 'Latest' }}
             </button>
           </div>
-          <div v-if="!textConfig" class="compose-off">
+          <!-- 开不了口时占住整块输入区。**分两种**,因为这是两件事:
+               一条都没有("去配一条")、以及配了但没填模型名("去补上那一个")。
+               合成一句"请检查设置"会把后者说成前者,而用户手里明明有一条标着
+               Current 的配置 —— 那正是他上一次被那句服务端报错绕进去的地方 -->
+          <div v-if="!chatReady" class="compose-off">
             <PhSlidersHorizontal aria-hidden="true" />
-            <span>Add a text model in API settings to start talking.</span>
-            <button class="ed-btn" @click="emit('gotoSettings')">Open settings</button>
+            <template v-if="!chatConfig">
+              <span>Add a chat model in API settings to start talking.</span>
+              <!-- 点它直接开一张"用途 = 对话"的表单,不是先落到一串别的用途里挑 ——
+                   这句话说的就是"去配一条对话模型",那就该一步到位 -->
+              <button class="ed-btn" @click="emit('configureChatModel')">Add a chat model</button>
+            </template>
+            <template v-else>
+              <span>
+                <b>{{ chatModelName }}</b> is missing its {{ chatMissing }} — set it in API
+                settings to start talking.
+              </span>
+              <!-- 这一条就是"改那一份":主界面会把它的表单直接开出来,不用用户再去列表里找 -->
+              <button class="ed-btn" @click="emit('configureChatModel')">
+                Set the {{ chatMissing }}
+              </button>
+            </template>
           </div>
           <!-- 超长当场说清:文案里带上限,免得用户去猜是多少。
                包一层 template 是因为它和下面那张卡片是一组 v-if / v-else ——
@@ -1430,8 +1533,8 @@ onBeforeUnmount(() => {
      这样头部换行变高时卡片跟着下移,不会盖住第一条消息 */
   position: relative;
 }
-/* 头部右侧那一组:记忆入口 + ⋮。靠右由这一层统一负责,
-   两枚各自再写 margin-left:auto 会把间距算乱 */
+/* 头部右侧那一组:模型入口 + 记忆入口 + ⋮。靠右由这一层统一负责,
+   几枚各自再写 margin-left:auto 会把间距算乱 */
 .head-acts {
   display: flex;
   align-items: center;
@@ -1439,9 +1542,10 @@ onBeforeUnmount(() => {
   flex: none;
   margin-left: auto;
 }
-/* 记忆入口:一枚安静的药丸,与情绪那枚同一个语言(小字 + 圆角底色),
-   但它是可点的 —— 所以悬停、展开态都要有反馈 */
-.mem-chip {
+/* 头部那两枚安静的药丸(模型 / 记忆):与情绪那枚同一个语言(小字 + 圆角底色),
+   但它们可点 —— 所以悬停、展开态都要有反馈。
+   两者共用一套皮,只有内容不同:一个是"现在谁在说话",一个是"它记得什么" */
+.head-chip {
   display: inline-flex;
   align-items: center;
   gap: 5px;
@@ -1456,22 +1560,38 @@ onBeforeUnmount(() => {
   cursor: pointer;
   transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
 }
-.mem-chip > svg {
+.head-chip > svg {
   font-size: 13px;
 }
-.mem-chip:hover,
-.mem-chip.on {
+.head-chip:hover,
+.head-chip.on {
   background: var(--accent-soft);
   color: var(--text-2);
 }
-.mem-chip-when {
+/* 药丸里那句补充说明(记忆的"多久没动过"、模型的"借来的")一律压暗一档:
+   它们是同一枚药丸里的次要信息,不该和主词争同样的分量 */
+.chip-when,
+.chip-note {
   color: var(--text-4);
   font-weight: 400;
 }
-/* 窄屏只留图标与时间:名字与身份已经占满了那一行 */
+/* 模型名可能很长(中转上自己写的别名),给它一档上限再省略 ——
+   不封顶的话它会一路把角色名字挤没,而这一页首先要认得出在跟谁说话 */
+.model-chip .chip-name {
+  max-width: 18ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 窄屏:记忆那枚只留图标与时间,模型那枚收窄名字、去掉来源说明 ——
+   名字与身份已经占满了那一行,而这两条补充信息都能在展开/进入设置后看到 */
 @media (max-width: 560px) {
-  .mem-chip-text {
+  .mem-chip .chip-label,
+  .model-chip .chip-note {
     display: none;
+  }
+  .model-chip .chip-name {
+    max-width: 10ch;
   }
 }
 /* 宽屏用不可点的 head-solo,窄屏才换成可点的 head-pick ——
@@ -2291,6 +2411,50 @@ onBeforeUnmount(() => {
 @keyframes skel-shimmer {
   from { background-position: 200% 0; }
   to { background-position: -200% 0; }
+}
+/* 那一张没画出来。做成一行安静的小字 + 一枚细字重试键 ——
+   它是"这一条消息的附注",不该和角色说的话争视线(与 .cut 同一分寸)。
+   整排靠左:它说的是助手那条消息,与角色那一侧的气泡同一条边 */
+.photo-fail {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  /* 触控目标 ≥40px:这一行本身只是提示,撑高的是里面那枚键 */
+  min-height: 40px;
+  font-size: var(--fs-xs);
+  color: var(--text-4);
+}
+.photo-fail > svg {
+  font-size: 14px;
+}
+/* 重试是这一行里唯一可点的东西,给它一枚极淡的圆角底(与 .jump-btn 同一语言),
+   免得一行小字里的按钮既看不出来也按不着 */
+.photo-retry {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--bg-elev);
+  color: var(--text-2);
+  font: inherit;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color var(--dur) var(--ease), color var(--dur) var(--ease),
+    background var(--dur) var(--ease);
+}
+.photo-retry:hover {
+  border-color: var(--line-strong);
+  color: var(--text);
+  background: var(--surface-hover);
+}
+.photo-retry svg {
+  font-size: 13px;
 }
 
 .compose-box {

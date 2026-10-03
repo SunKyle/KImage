@@ -1,14 +1,17 @@
 import { computed, ref } from 'vue'
 import {
+  asConfigKind,
   configKindOf,
   defaultSizeFor,
   getProvider,
+  loadActiveChatId,
   loadActiveId,
   loadActiveTextId,
   loadActiveTtsId,
   loadActiveVisionId,
   loadConfigs,
   pickActiveByKind,
+  saveActiveChatId,
   saveActiveId,
   saveActiveTextId,
   saveActiveTtsId,
@@ -22,13 +25,18 @@ import {
 import type { Cap, Provider } from '../api'
 import type { ApiConfig } from '../types'
 
-/* ===== 接口配置:四类用途共用一份列表,各自记一个「当前生效」 ==========
-   出图 / 改写(文本) / 识图 / 朗读四类配置放在同一个列表里,因为地址与密钥
-   常常同源;但它们的「当前」是分开记的,而且**挑法必须是同一套** ——
+/* ===== 接口配置:五类用途共用一份列表,各自记一个「当前生效」 ==========
+   出图 / 改写(文本) / 对话 / 识图 / 朗读五类配置放在同一个列表里,因为地址
+   与密钥常常同源;但它们的「当前」是分开记的,而且**挑法必须是同一套** ——
    原来这段挑选散在主界面八处,其中出图那条写成 `kind !== 'text'`,
    漏掉了 tts:只配了一条朗读配置时,朗读那条会被当成出图配置。
 
    所以这里只有一条规则(见 api.ts 的 pickActiveByKind),八处调用都走它。
+
+   对话那一类多一层:**没单独配时就借用改写那条**(chatConfig 是 computed,
+   不是与 textConfig 并列的 ref)。这么定是因为"对话用哪个模型"与
+   "改写用哪个模型"在升级之前本来就是一件事,直接断开会让所有存量用户
+   一进对话页就被拦住;而借用是活的 —— 那边换了模型,这边立刻跟着换。
    -------------------------------------------------------------------- */
 
 export interface ConfigDeps {
@@ -44,6 +52,11 @@ export function useConfigs(deps: ConfigDeps) {
   const activeId = ref('')
   const textConfig = ref<ApiConfig | null>(null)
   const activeTextId = ref(loadActiveTextId())
+  /* 对话这一类的"当前"是**两截**:own 是用户专门配的那条(kind = 'chat'),
+     没有它时 chatConfig 退到 textConfig。界面要判"现在用的是不是借来的",
+     所以两截都留着 —— 只留合成后的那一份就分不出这件事了 */
+  const chatOwnConfig = ref<ApiConfig | null>(null)
+  const activeChatId = ref(loadActiveChatId())
   const visionConfig = ref<ApiConfig | null>(null)
   const activeVisionId = ref(loadActiveVisionId())
   const ttsConfig = ref<ApiConfig | null>(null)
@@ -72,12 +85,23 @@ export function useConfigs(deps: ConfigDeps) {
 
   /* 参数面板按用途分开列出:出图、改写、识图与朗读各有各的"当前",混在一排里点谁生效说不清,
      而且文本/识图配置被 activateConfig 选中会顶掉出图用的接口。
-     出图那条要排掉另外三类 —— 它们也走配置列表,但打的是对话端点或语音端点,拿来出图必错 */
-  const imageConfigs = computed(() =>
-    configs.value.filter((c) => c.kind !== 'text' && c.kind !== 'vision' && c.kind !== 'tts')
-  )
-  const textConfigs = computed(() => configs.value.filter((c) => c.kind === 'text'))
-  const visionConfigs = computed(() => configs.value.filter((c) => c.kind === 'vision'))
+     出图那条按用途**正面认**(configKindOf === 'image'),不再写成一串
+     `!== 'text' && !== 'vision' && …` —— 那种写法每加一类就要补一笔,
+     漏了就把新那类当成出图配置(tts 就这么漏过一次) */
+  const imageConfigs = computed(() => configs.value.filter((c) => configKindOf(c) === 'image'))
+  const textConfigs = computed(() => configs.value.filter((c) => configKindOf(c) === 'text'))
+  /* 专门配的对话模型。它进不了生图那页的参数面板 —— 那正是这次要分开的东西:
+     对话用哪个模型,只该在设置页与对话页里改 */
+  const chatConfigs = computed(() => configs.value.filter((c) => configKindOf(c) === 'chat'))
+  const visionConfigs = computed(() => configs.value.filter((c) => configKindOf(c) === 'vision'))
+
+  /* 对话实际要发出去的那一条:专配的优先,没有就借改写那条(见文件头)。
+     取 computed 而不是在挑选时拷一份,是为了让"借"这件事一直跟着 textConfig 走 ——
+     用户在设置页把改写换了个模型,对话这边不必再挑一次就跟着变了 */
+  const chatConfig = computed(() => chatOwnConfig.value ?? textConfig.value)
+  /* 现在用的是不是借来的。对话页据此在那枚模型药丸上说清来源 ——
+     "它到底走的哪个模型"是这次改动要解决的问题本身,含糊过去等于没解决 */
+  const chatBorrowed = computed(() => !chatOwnConfig.value && !!textConfig.value)
 
   // 当前生效的厂商:配置里没写就按域名猜(兼容加字段之前存的老配置)
   const vendorId = computed(() => vendorOf(config.value))
@@ -115,8 +139,9 @@ export function useConfigs(deps: ConfigDeps) {
   }
 
   /* —— 挑「当前生效」 ——
-     四类各挑各的。挑法统一在 api.ts 的 pickActiveByKind:认「id 对得上且用途
-     仍是这一类」,落空退到同类第一条 —— 一条都没有时,出图那侧清空、其余置 null */
+     五类各挑各的。挑法统一在 api.ts 的 pickActiveByKind:认「id 对得上且用途
+     仍是这一类」,落空退到同类第一条 —— 一条都没有时,出图那侧清空、其余置 null
+     (对话那边例外:它退到"借改写那条",见上面的 chatConfig) */
   function repickActiveImage() {
     const next = pickActiveByKind(configs.value, 'image', activeId.value)
     if (next) {
@@ -149,6 +174,19 @@ export function useConfigs(deps: ConfigDeps) {
       saveActiveVisionId('')
     }
   }
+  /* 对话侧。**它挑不到时不是置空,而是回到"借改写那条"** ——
+     一条对话配置都没有是绝大多数存量用户的现状,那是正常态、不是缺配置。
+     所以这里只清掉"专配的那一条",chatConfig 随即退回 textConfig;
+     两边都没有时它自然是 null,对话页再提示去配一条 */
+  function repickActiveChat() {
+    const next = pickActiveByKind(configs.value, 'chat', activeChatId.value)
+    if (next) activateChatConfig(next)
+    else {
+      chatOwnConfig.value = null
+      activeChatId.value = ''
+      saveActiveChatId('')
+    }
+  }
   /* 朗读侧同理。**它与上面三条有一处不同**:ttsConfig 为 null 不是错误态 ——
      朗读会自动走浏览器自带的语音,只是听起来不是这个角色自己的嗓子 */
   function repickActiveTts() {
@@ -172,6 +210,13 @@ export function useConfigs(deps: ConfigDeps) {
     textConfig.value = { ...c }
     activeTextId.value = c.id
     saveActiveTextId(c.id)
+  }
+  /* 设某条对话配置为当前生效。写的是 own 那一截 —— 从这一刻起它不再借改写那条,
+     即使之后改写换了模型,对话也不再跟着变(这正是"独立开"的落点) */
+  function activateChatConfig(c: ApiConfig) {
+    chatOwnConfig.value = { ...c }
+    activeChatId.value = c.id
+    saveActiveChatId(c.id)
   }
   // 设某条识图配置为当前生效(同上,走识图那条通道)
   function activateVisionConfig(c: ApiConfig) {
@@ -209,6 +254,17 @@ export function useConfigs(deps: ConfigDeps) {
       if (activeTextId.value !== activeText.id) {
         activeTextId.value = activeText.id
         saveActiveTextId(activeText.id)
+      }
+    }
+    /* 对话配置:挑不到就什么都不做 —— chatConfig 会自己退回改写那条。
+       这里**不能**像别类那样写一句"没有就置空":置空的是"专配的那一条",
+       而借用的那一截跟着 textConfig 走,上面刚挑完 */
+    const activeChat = pickActiveByKind(configs.value, 'chat', activeChatId.value)
+    if (activeChat) {
+      chatOwnConfig.value = { ...activeChat }
+      if (activeChatId.value !== activeChat.id) {
+        activeChatId.value = activeChat.id
+        saveActiveChatId(activeChat.id)
       }
     }
     const activeVision = pickActiveByKind(configs.value, 'vision', activeVisionId.value)
@@ -284,6 +340,11 @@ export function useConfigs(deps: ConfigDeps) {
     if (prevKind && prevKind !== kind) {
       if (prevKind === 'text') {
         if (activeTextId.value === cfg.id) repickActiveText()
+      } else if (prevKind === 'chat') {
+        /* 它原来是"专配的对话模型",现在改成了别的用途:对话随即退回借改写那条。
+           不这么做的话,对话那一侧还留着这份快照 —— 界面显示着一个已经不是对话
+           配置的模型,而它下一轮就会被发去聊天 */
+        if (activeChatId.value === cfg.id) repickActiveChat()
       } else if (prevKind === 'vision') {
         if (activeVisionId.value === cfg.id) repickActiveVision()
       } else if (prevKind === 'tts') {
@@ -296,12 +357,14 @@ export function useConfigs(deps: ConfigDeps) {
       }
     }
 
-    /* 按用途分派到各自的「当前生效」:四类各自独立,存一条不该把别类的当前项顶掉
+    /* 按用途分派到各自的「当前生效」:五类各自独立,存一条不该把别类的当前项顶掉
        (反之亦然)。同步成副本而不是直接用 cfg —— 之后改表单草稿不能再牵动生效值。 */
     if (kind === 'text') {
       textConfig.value = { ...cfg }
       activeTextId.value = cfg.id
       saveActiveTextId(cfg.id)
+    } else if (kind === 'chat') {
+      activateChatConfig(cfg)
     } else if (kind === 'vision') {
       visionConfig.value = { ...cfg }
       activeVisionId.value = cfg.id
@@ -338,6 +401,7 @@ export function useConfigs(deps: ConfigDeps) {
     if (at < 0) return
     const wasActive = activeId.value === c.id
     const wasActiveText = activeTextId.value === c.id
+    const wasActiveChat = activeChatId.value === c.id
     const wasActiveVision = activeVisionId.value === c.id
     const wasActiveTts = activeTtsId.value === c.id
     const wasSelected = selectedIds.value.includes(c.id)
@@ -347,6 +411,7 @@ export function useConfigs(deps: ConfigDeps) {
     configs.value = configs.value.filter((x) => x.id !== c.id)
     // 占着各自「当前生效」的那条被删掉时,同样要按用途重新挑一条,免得生效值悬空
     if (wasActiveText) repickActiveText()
+    if (wasActiveChat) repickActiveChat()
     if (wasActiveVision) repickActiveVision()
     if (wasActiveTts) repickActiveTts()
     if (wasActive) repickActiveImage()
@@ -374,6 +439,11 @@ export function useConfigs(deps: ConfigDeps) {
           textConfig.value = { ...c }
           activeTextId.value = c.id
           saveActiveTextId(c.id)
+        }
+        if (wasActiveChat) {
+          chatOwnConfig.value = { ...c }
+          activeChatId.value = c.id
+          saveActiveChatId(c.id)
         }
         if (wasActiveVision) {
           visionConfig.value = { ...c }
@@ -410,15 +480,8 @@ export function useConfigs(deps: ConfigDeps) {
           apiKey: typeof c.apiKey === 'string' ? c.apiKey : '',
           model: typeof c.model === 'string' ? c.model : '',
           vendor: typeof c.vendor === 'string' ? c.vendor : 'custom',
-          // 外部文件的脏数据不该让配置错类:只认得出 text / vision / tts,其余一律当出图
-          kind:
-            c.kind === 'text'
-              ? ('text' as const)
-              : c.kind === 'vision'
-                ? ('vision' as const)
-                : c.kind === 'tts'
-                  ? ('tts' as const)
-                  : ('image' as const),
+          // 外部文件的脏数据不该让配置错类:只认得出那五种用途,其余一律当出图
+          kind: asConfigKind(c.kind),
           /* 朗读那条的资源标识。丢掉它的话,导入进来的朗读配置会变成
              "地址与密钥都对、但每次请求都被上游拒掉(access denied)",
              而原因藏在一格看不见的字段里 */
@@ -434,9 +497,7 @@ export function useConfigs(deps: ConfigDeps) {
     /* 原本一条都没配(生成会被拦下来)时,顺手把导入里第一条出图配置设为当前,
        不然导完照样发不出请求 */
     if (!configured()) {
-      const first = configs.value.find(
-        (c) => c.kind !== 'text' && c.kind !== 'vision' && c.kind !== 'tts'
-      )
+      const first = configs.value.find((c) => configKindOf(c) === 'image')
       if (first) {
         config.value = { ...first }
         activeId.value = first.id
@@ -445,12 +506,19 @@ export function useConfigs(deps: ConfigDeps) {
     }
     // 文本那边同理:还没有当前生效的文本配置时,取导入进来(或现有)的第一条文本配置
     if (!textConfig.value) {
-      const nextText = configs.value.find((c) => c.kind === 'text')
+      const nextText = configs.value.find((c) => configKindOf(c) === 'text')
       if (nextText) activateTextConfig(nextText)
     }
-    // 识图那边同理 —— 三类「当前」互不隶属,缺哪一条就补哪一条
+    /* 对话那边:只在**导入里真有**一条对话配置、而本地还没专配过时才认一条。
+       不能拿"chatConfig 为空"判断 —— 它借了改写那条,永远不为空;
+       而借用状态下随手去认一条现成的,等于把用户自己挑的模型换掉 */
+    if (!chatOwnConfig.value) {
+      const nextChat = configs.value.find((c) => configKindOf(c) === 'chat')
+      if (nextChat) activateChatConfig(nextChat)
+    }
+    // 识图那边同理 —— 各类的「当前」互不隶属,缺哪一条就补哪一条
     if (!visionConfig.value) {
-      const nextVision = configs.value.find((c) => c.kind === 'vision')
+      const nextVision = configs.value.find((c) => configKindOf(c) === 'vision')
       if (nextVision) activateVisionConfig(nextVision)
     }
   }
@@ -462,6 +530,9 @@ export function useConfigs(deps: ConfigDeps) {
     activeId,
     textConfig,
     activeTextId,
+    chatConfig,
+    chatBorrowed,
+    activeChatId,
     visionConfig,
     activeVisionId,
     ttsConfig,
@@ -475,6 +546,7 @@ export function useConfigs(deps: ConfigDeps) {
     activeTextName,
     imageConfigs,
     textConfigs,
+    chatConfigs,
     visionConfigs,
     vendorId,
     provider,
@@ -490,10 +562,12 @@ export function useConfigs(deps: ConfigDeps) {
     initConfigs,
     repickActiveImage,
     repickActiveText,
+    repickActiveChat,
     repickActiveVision,
     repickActiveTts,
     activateConfig,
     activateTextConfig,
+    activateChatConfig,
     activateVisionConfig,
     activateTtsConfig,
     // 增删改

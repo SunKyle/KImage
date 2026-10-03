@@ -1,4 +1,5 @@
 import {
+  CHAT_ACTIVE_KEY,
   CHAR_KEY,
   COLL_KEY,
   CONFIG_ACTIVE_KEY,
@@ -29,11 +30,12 @@ export type SyncTarget = 'configs' | 'characters' | 'collections' | 'prompts'
 /* 键常量一律从 api.ts 取,不在这里重抄一遍字符串 ——
    抄一份的后果是"哪天改了键名,同步就悄悄不工作了",而且不报错 */
 export const SYNC_KEYS: Record<SyncTarget, readonly string[]> = {
-  // 四类用途的「当前生效」也一起看着:另一个标签页换了当前配置,本页要跟上
+  // 五类用途的「当前生效」也一起看着:另一个标签页换了当前配置,本页要跟上
   configs: [
     CONFIG_KEY,
     CONFIG_ACTIVE_KEY,
     TEXT_ACTIVE_KEY,
+    CHAT_ACTIVE_KEY,
     VISION_ACTIVE_KEY,
     TTS_ACTIVE_KEY
   ],

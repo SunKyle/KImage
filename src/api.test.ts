@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   FREE_SIZES,
   acceptableSize,
+  asConfigKind,
   configKindOf,
   defaultSizeFor,
   extraParamsFor,
@@ -28,10 +29,22 @@ describe('configKindOf · 用途归一', () => {
     expect(configKindOf(cfg('a'))).toBe('image')
   })
 
-  it('四类原样返回', () => {
-    for (const k of ['image', 'text', 'vision', 'tts'] as const) {
+  it('五类原样返回', () => {
+    for (const k of ['image', 'text', 'chat', 'vision', 'tts'] as const) {
       expect(configKindOf(cfg('a', k))).toBe(k)
     }
+  })
+
+  /* 用途从四处长到五处时,那串嵌套三元收成了这一张白名单 */
+  it('认得出的原样返回,认不出的(脏数据 / 缺字段)一律出图', () => {
+    for (const k of ['image', 'text', 'chat', 'vision', 'tts'] as const) {
+      expect(asConfigKind(k)).toBe(k)
+    }
+    expect(asConfigKind(undefined)).toBe('image')
+    expect(asConfigKind('')).toBe('image')
+    // 外部文件里可能出现别的写法:不该让它错类,更不该让它消失
+    expect(asConfigKind('Chat')).toBe('image')
+    expect(asConfigKind('audio')).toBe('image')
   })
 })
 
@@ -54,12 +67,14 @@ describe('pickActiveByKind · 按用途挑当前生效的那条', () => {
 
   /* 这一组是本次修复的核心:原来的谓词写作 `kind !== 'text'`,
      于是只配了朗读配置时,朗读那条会被挑成"当前出图配置" */
-  it('出图只认 kind === image,不会把 tts / vision 配置挑进来', () => {
+  it('出图只认 kind === image,不会把 tts / vision / chat 配置挑进来', () => {
     expect(pickActiveByKind([cfg('a', 'tts')], 'image', 'a')).toBeUndefined()
     expect(pickActiveByKind([cfg('a', 'vision')], 'image', 'a')).toBeUndefined()
     expect(pickActiveByKind([cfg('a', 'text')], 'image', 'a')).toBeUndefined()
-    // 混在一起时挑到的是真正的出图那条,而不是排在前面的朗读
-    const mixed = [cfg('t', 'tts'), cfg('v', 'vision'), cfg('i', 'image')]
+    // 对话配置尤其不能:它也是个对话模型,拿它出图必错(它排在列表里也最常见)
+    expect(pickActiveByKind([cfg('a', 'chat')], 'image', 'a')).toBeUndefined()
+    // 混在一起时挑到的是真正的出图那条,而不是排在前面那些
+    const mixed = [cfg('t', 'tts'), cfg('c', 'chat'), cfg('v', 'vision'), cfg('i', 'image')]
     expect(pickActiveByKind(mixed, 'image', '')?.id).toBe('i')
   })
 
@@ -69,11 +84,28 @@ describe('pickActiveByKind · 按用途挑当前生效的那条', () => {
   })
 
   it('每一类各自挑各自的,互不串台', () => {
-    const list = [cfg('i', 'image'), cfg('x', 'text'), cfg('v', 'vision'), cfg('s', 'tts')]
+    const list = [
+      cfg('i', 'image'),
+      cfg('x', 'text'),
+      cfg('c', 'chat'),
+      cfg('v', 'vision'),
+      cfg('s', 'tts')
+    ]
     expect(pickActiveByKind(list, 'image', '')?.id).toBe('i')
     expect(pickActiveByKind(list, 'text', '')?.id).toBe('x')
+    /* 对话与改写都在列表里时,专配的对话那条要被认出来 ——
+       "借用改写那条"是 useConfigs 里的兜底,不是这一层的退让:
+       这里若挑错,借来的配置会把专配的那条顶掉 */
+    expect(pickActiveByKind(list, 'chat', '')?.id).toBe('c')
     expect(pickActiveByKind(list, 'vision', '')?.id).toBe('v')
     expect(pickActiveByKind(list, 'tts', '')?.id).toBe('s')
+  })
+
+  it('没有对话配置时这一类挑不出来(借用由上层决定,不在这里假装有)', () => {
+    const list = [cfg('i', 'image'), cfg('x', 'text')]
+    expect(pickActiveByKind(list, 'chat', '')).toBeUndefined()
+    // 存着的对话 id 指向一条已改成改写的配置时,同样挑不出来
+    expect(pickActiveByKind([cfg('x', 'text')], 'chat', 'x')).toBeUndefined()
   })
 
   it('列表为空、或这一类一条都没有时返回 undefined', () => {

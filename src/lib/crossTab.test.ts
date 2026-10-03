@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { SYNC_KEYS, coalesceSync, syncTargetsOf } from './crossTab'
 import {
+  CHAT_ACTIVE_KEY,
   CHAR_KEY,
   COLL_KEY,
   CONFIG_ACTIVE_KEY,
@@ -12,11 +13,12 @@ import {
 } from '../api'
 
 describe('syncTargetsOf · 哪个键该触发哪份目录重载', () => {
-  it('配置列表与四类「当前生效」都归到 configs', () => {
+  it('配置列表与五类「当前生效」都归到 configs', () => {
     for (const k of [
       CONFIG_KEY,
       CONFIG_ACTIVE_KEY,
       TEXT_ACTIVE_KEY,
+      CHAT_ACTIVE_KEY,
       VISION_ACTIVE_KEY,
       TTS_ACTIVE_KEY
     ]) {
@@ -67,6 +69,7 @@ describe('同步范围 · 与源码里的写入点保持一致', () => {
     CONFIG_KEY: { key: CONFIG_KEY, synced: true },
     CONFIG_ACTIVE_KEY: { key: CONFIG_ACTIVE_KEY, synced: true },
     TEXT_ACTIVE_KEY: { key: TEXT_ACTIVE_KEY, synced: true },
+    CHAT_ACTIVE_KEY: { key: CHAT_ACTIVE_KEY, synced: true },
     VISION_ACTIVE_KEY: { key: VISION_ACTIVE_KEY, synced: true },
     TTS_ACTIVE_KEY: { key: TTS_ACTIVE_KEY, synced: true },
     COLL_KEY: { key: COLL_KEY, synced: true },

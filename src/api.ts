@@ -28,6 +28,11 @@ export const CONFIG_KEY = 'kimage.apiConfigs'
 export const CONFIG_ACTIVE_KEY = 'kimage.apiActive'
 // 「当前生效的文本配置」记录的 id:文本类别也有自己的当前项,与出图那条各自独立
 export const TEXT_ACTIVE_KEY = 'kimage.apiActiveText'
+/* 「当前生效的对话配置」记录的 id。角色对话有自己的模型 —— 它和提示词改写
+   要填的东西长得一样(都是一个对话模型),但**用途不同、该分开记**:
+   改写的模型按"哪家出的图更好看"挑,对话的模型按"聊起来像不像个人"挑,
+   把两者绑在一块等于让任一边的选择迁就另一边 */
+export const CHAT_ACTIVE_KEY = 'kimage.apiActiveChat'
 // 「当前生效的识图配置」记录的 id:识图同样是独立的一类
 export const VISION_ACTIVE_KEY = 'kimage.apiActiveVision'
 // 「当前生效的朗读配置」记录的 id:朗读也是独立的一类(它连协议都不是 OpenAI 兼容那套)
@@ -381,10 +386,13 @@ export function extraParamsFor(
   return out
 }
 
-/* ===== 提示词增强的文本模型预设 ======================================
-   服务于表单里「用途 = text」时的预设行。与出图的 PROVIDERS 分开:
+/* ===== 对话模型预设(提示词增强 + 角色对话) ==========================
+   服务于表单里「用途 = text / chat」时的预设行。与出图的 PROVIDERS 分开:
    两者要填的模型不是一回事(出图填图像模型,这里填对话模型),
    共用一份预设会互相误导。
+   改写与对话共用同一份,是因为**它们要的就是同一种东西** ——
+   一个能走 /chat/completions 的对话模型,地址也同源;分成两张一样的表
+   只会让同一条地址抄两遍,改一处漏一处。
    地址与出图厂商同源,但百炼要单独列一条 —— 它的 /api/v1 是原生协议,
    对话得走 /compatible-mode/v1,填错会直接 404。
    -------------------------------------------------------------------- */
@@ -429,7 +437,7 @@ export const TEXT_PROVIDERS: TextProvider[] = [
 
 /* ===== 识图(把参考图读成角色设定)的模型预设 ==========================
    与上面两表又不同:这里要的是"能看图的对话模型"。
-   识图与改写走同一条路(/chat/completions + 一条 user 消息),差别只在
+   识图与改写、对话走同一条路(/chat/completions + 一条 user 消息),差别只在
    消息的 content 里多带一张图 —— 所以地址格式与 TEXT_PROVIDERS 完全一致,
    百炼同样要列 compatible-mode 那条(原生 /api/v1 是另一套协议)。
    出图那侧的图像模型帮不上忙:能画图的未必能看图。
@@ -536,14 +544,7 @@ function normalizeConfig(c: ApiConfig): ApiConfig {
     apiKey: (c.apiKey || '').trim(),
     model: (c.model || '').trim(),
     vendor: c.vendor || inferVendor(c.baseUrl),
-    kind:
-      c.kind === 'text'
-        ? 'text'
-        : c.kind === 'vision'
-          ? 'vision'
-          : c.kind === 'tts'
-            ? 'tts'
-            : 'image'
+    kind: asConfigKind(c.kind)
   }
 }
 
@@ -552,7 +553,7 @@ export function saveConfigs(list: ApiConfig[]) {
 }
 
 /* ===== 按用途挑「当前生效」的那条 ====================================
-   四类用途(出图/改写/识图/朗读)共用同一个配置列表,但各自记一个当前值。
+   五类用途(出图/改写/对话/识图/朗读)共用同一个配置列表,但各自记一个当前值。
    挑选规则只有一条,抽在这里是因为主界面有六处要用它:启动时挑一遍,
    删掉一条、改了用途、以及另一个标签页动了配置之后都要重挑 ——
    六处各写一份 find 迟早会写歪(事实上已经写歪过:出图那条用的是
@@ -561,6 +562,16 @@ export function saveConfigs(list: ApiConfig[]) {
 
 /** 配置的用途。normalizeConfig 保证这个字段一定有值,缺省是 image */
 export type ConfigKind = NonNullable<ApiConfig['kind']>
+
+/* 认得出的用途。这张表就是白名单 —— 五种以外的一律按出图算
+   (加 kind 之前存下来的都是出图配置,而外部文件里的脏数据不该让配置错类)。
+   用途从四处长到五处之后,原来那串嵌套三元已经要数着缩进读,收成一处:
+   读入口(normalizeConfig)与导入入口(importConfigs)走同一个判断 */
+const KNOWN_KINDS = ['image', 'text', 'chat', 'vision', 'tts'] as const
+
+export function asConfigKind(v: unknown): ConfigKind {
+  return KNOWN_KINDS.includes(v as ConfigKind) ? (v as ConfigKind) : 'image'
+}
 
 export function configKindOf(c: ApiConfig): ConfigKind {
   return c.kind ?? 'image'
@@ -600,7 +611,18 @@ export function saveActiveTextId(id: string) {
   localStorage.setItem(TEXT_ACTIVE_KEY, id)
 }
 
-// 识图类别的当前生效配置 id:三类各记各的,配一条识图不该顶掉出图或改写
+/* 对话类别的当前生效配置 id。**它可能一直是空串** —— 没有单独配一条对话模型时,
+   角色对话会借用改写那条(见 composables/useConfigs.ts 的 chatConfig),
+   所以空着不是"没配",只是"还没分开" */
+export function loadActiveChatId(): string {
+  return localStorage.getItem(CHAT_ACTIVE_KEY) || ''
+}
+
+export function saveActiveChatId(id: string) {
+  localStorage.setItem(CHAT_ACTIVE_KEY, id)
+}
+
+// 识图类别的当前生效配置 id:各记各的,配一条识图不该顶掉出图或改写
 export function loadActiveVisionId(): string {
   return localStorage.getItem(VISION_ACTIVE_KEY) || ''
 }
@@ -867,9 +889,10 @@ export async function testConnection(config: ApiConfig): Promise<TestResult> {
         apiKey: config.apiKey,
         model: config.model,
         protocol: getProvider(config.vendor || inferVendor(config.baseUrl), config.model).protocol,
-        /* 探活要打真实端点:出图打 /images/generations,改写与识图都是对话模型,
-           探 /chat/completions(识图那类也走它,只是消息里多带一张图) */
-        kind: config.kind === 'image' || !config.kind ? 'image' : 'text'
+        /* 探活要打真实端点:出图打 /images/generations,改写 / 对话 / 识图都是对话模型,
+           探 /chat/completions(识图那类也走它,只是消息里多带一张图)。
+           所以只有出图那一直走图像端点,其余一律按对话探 */
+        kind: configKindOf(config) === 'image' ? 'image' : 'text'
       })
     })
     const data = await resp.json().catch(() => null)
