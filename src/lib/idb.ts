@@ -70,8 +70,17 @@ export interface PruneResult {
    ------------------------------------------------------------------ */
 const DB_VERSION = 11
 
+/* 连接只开一次。
+   indexedDB.open 是一次异步握手,而原实现每次读写都重开一遍 ——
+   落盘一条记录、读一屏消息、量一次缩略图,全都要重新握手一次;
+   一个连接本来就可以被任意多的事务复用,没必要每次重来。
+   失败的 promise 不缓存:版本过低、隐私模式下被拒都可能是"这一次"的事,
+   缓存住会让整个会话再也连不上。 */
+let dbPromise: Promise<IDBDatabase> | null = null
+
 function openDB(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
+  if (dbPromise) return dbPromise
+  const opening = new Promise<IDBDatabase>((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION)
     req.onupgradeneeded = () => {
       const db = req.result
@@ -146,7 +155,17 @@ function openDB(): Promise<IDBDatabase> {
         db.createObjectStore(CHAT_IMAGE_STORE, { keyPath: 'id' })
       }
     }
-    req.onsuccess = () => resolve(req.result)
+    req.onsuccess = () => {
+      const db = req.result
+      /* 另一个标签页要升级(或删库)时必须让开,否则它会一直卡在 blocked,
+         用户看到的是"另一个页面打不开"。让开的同时清掉缓存,
+         下一次调用会重新开、拿到新版本 */
+      db.onversionchange = () => {
+        db.close()
+        if (dbPromise === opening) dbPromise = null
+      }
+      resolve(db)
+    }
     req.onerror = () => {
       /* 版本号低于库里那个时会被直接拒掉。这种失败会顺着每一处 catch
          变成"什么都没读到",界面上看就是"数据全没了" ——
@@ -155,6 +174,11 @@ function openDB(): Promise<IDBDatabase> {
       reject(req.error)
     }
   })
+  dbPromise = opening
+  opening.catch(() => {
+    if (dbPromise === opening) dbPromise = null
+  })
+  return opening
 }
 
 /* 申请持久化存储。不申请的话,浏览器在磁盘吃紧时可以把整个 origin 的数据清掉,
@@ -845,6 +869,39 @@ export function planPrune(all: PruneCandidate[], count: number): PrunePlan {
   return { removedIds, keptMarked }
 }
 
+/** 两次存储体检之间至少隔这么久 */
+const PRUNE_MIN_INTERVAL_MS = 30_000
+/** 或者攒够这么多条新记录就提前体检一次 */
+const PRUNE_MIN_WRITES = 20
+
+/**
+ * 这一次写入要不要顺带做存储体检。
+ *
+ * 为什么需要它:体检本身要先问一次 navigator.storage.estimate()。写入是高频动作
+ * (并发出图时三条一起落盘),每次都问一遍既没必要,也会让"超出水位线"那一刻
+ * 出现多个并发的全表扫描。
+ *
+ * 口径:本会话第一次写入必查(否则第一个 80% 只有等下次写入才发现);
+ * 之后要么攒够 minWrites 条,要么距上次已过 minIntervalMs ——
+ * 于是体检频率被夹在「每 20 条」与「每 30 秒」之间,取更快的那一档。
+ */
+export function shouldCheckStorage(
+  now: number,
+  lastCheckAt: number,
+  writesSinceCheck: number,
+  minIntervalMs = PRUNE_MIN_INTERVAL_MS,
+  minWrites = PRUNE_MIN_WRITES
+): boolean {
+  if (lastCheckAt === 0) return true
+  if (writesSinceCheck >= minWrites) return true
+  return now - lastCheckAt >= minIntervalMs
+}
+
+/* 体检节奏的状态。放在模块级而不是调用方 —— 它是"这个库被写得有多频繁",
+   与具体是哪一次写入无关 */
+let pruneCheckedAt = 0
+let pruneWrites = 0
+
 /**
  * 空间吃紧时清掉最旧的一批历史;还宽裕就原样返回 null。
  * 替代了原来的「按固定条数淘汰」——那个会在空间充裕时就静默删记录。
@@ -858,6 +915,15 @@ export function planPrune(all: PruneCandidate[], count: number): PrunePlan {
  * 返回清了多少条,交由界面告知用户。
  */
 export async function pruneHistory(): Promise<PruneResult | null> {
+  /* 先问"要不要体检",再决定要不要连库 —— 节流的意义就在于被跳过时
+     连 openDB 与 estimate() 都不发生 */
+  const now = Date.now()
+  const due = shouldCheckStorage(now, pruneCheckedAt, pruneWrites)
+  pruneWrites += 1
+  if (!due) return null
+  pruneCheckedAt = now
+  pruneWrites = 0
+
   const db = await openDB()
 
   const est = await storageUsage()

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { planPrune, type PruneCandidate } from './idb'
+import { planPrune, shouldCheckStorage, type PruneCandidate } from './idb'
 
 /* 造一条候选记录。id 用时间戳序号,u 开头便于在断言里看清"
    第几条"—— createdAt 决定清理顺序,所以测试里两者保持一致 */
@@ -87,5 +87,34 @@ describe('planPrune · 该清哪些历史', () => {
     const before = all.map((r) => r.id)
     planPrune(all, 1)
     expect(all.map((r) => r.id)).toEqual(before)
+  })
+})
+
+describe('shouldCheckStorage · 体检节奏', () => {
+  it('本会话第一次写入必查', () => {
+    expect(shouldCheckStorage(1_000, 0, 0)).toBe(true)
+  })
+
+  it('刚查过、又没攒够条数就不查', () => {
+    // 距上次 1 秒,才写了 3 条
+    expect(shouldCheckStorage(1_000, 0 + 1_000, 3)).toBe(false)
+  })
+
+  it('攒够 20 条就提前查(不必等满 30 秒)', () => {
+    expect(shouldCheckStorage(1_000, 1_000, 20)).toBe(true)
+  })
+
+  it('隔满 30 秒就查(哪怕只写了 1 条)', () => {
+    expect(shouldCheckStorage(31_000, 1_000, 1)).toBe(true)
+  })
+
+  it('边界:差 1 毫秒不查,正好到点就查', () => {
+    expect(shouldCheckStorage(1_000 + 29_999, 1_000, 1)).toBe(false)
+    expect(shouldCheckStorage(1_000 + 30_000, 1_000, 1)).toBe(true)
+  })
+
+  it('节流参数可覆盖(便于将来按场景调整)', () => {
+    expect(shouldCheckStorage(2_000, 1_000, 5, 1_000, 5)).toBe(true)
+    expect(shouldCheckStorage(1_500, 1_000, 4, 1_000, 5)).toBe(false)
   })
 })
