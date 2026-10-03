@@ -36,6 +36,12 @@
      只换色相的话扫过去几乎就是单色 */
   --ai-from: #EC4899;
   --ai-to: #6D28D9;
+  /* "AI 正在写"那圈呼吸光晕的金色(见 .halo-breathe)。
+     与上面那套粉紫渐变不是一回事,也刻意不去统一:那套标的是"入口"
+     (画布上那几颗 AI 键长什么样),这个报的是"正在跑" ——
+     一个是身份,一个是状态,各管一头。
+     金只出现在这一处:强调永远是墨色,金只是"机器在动"的信号 */
+  --ai-halo: #D3A32A;
 
   /* —— 字体 ——
      正文与标题都用系统无衬线:本站的基调是克制与系统感,而 SF Pro(macOS/iOS)、
@@ -76,7 +82,7 @@
   --font-wordmark: "Poppins", "Avenir Next", "Futura", "Century Gothic", sans-serif;
   --font-script: "Pacifico", "Snell Roundhand", "Brush Script MT", cursive;
 
-  /* —— 间距:8px Grid —— */
+  /* —— 间距:4px 为基准,常用的几档凑成 8px 网格 —— */
   --sp-1: 4px;
   --sp-2: 8px;
   --sp-3: 12px;
@@ -107,8 +113,11 @@
   color-scheme: light;
 }
 
-/* 深色主题 Dark Theme */
-[data-theme="dark"] {
+/* 深色主题 Dark Theme。
+   带上 html 前缀是有意的:它与上面的 :root 是同一份特异性(都是 0,1,0),
+   谁生效全看书写顺序 —— 加上元素名之后这条稳定胜出,
+   中间插入别的同名规则也不会让它静默失效 */
+html[data-theme="dark"] {
   --bg: #0F0F11;
   --bg-elev: #1E1E21;
   --surface: #171719;
@@ -132,6 +141,8 @@
      走过来的明度落差照旧留着 */
   --ai-from: #F472B6;
   --ai-to: #A855F7;
+  /* 金色同理:暗底上不提亮就往褐里走,金色一脏就不再是金了 */
+  --ai-halo: #F1C64B;
 
   --sh-sm: 0 8px 30px rgba(0, 0, 0, 0.4);
   --sh-md: 0 20px 60px rgba(0, 0, 0, 0.5);
@@ -167,6 +178,23 @@ html::-webkit-scrollbar {
 }
 .no-bar::-webkit-scrollbar {
   display: none;
+}
+
+/* 只给读屏的文本:视觉上不可见,但仍然留在无障碍树里。
+   用 clip 而不是 display:none / visibility:hidden —— 后两者会把它
+   从无障碍树里摘掉,那就白写了。
+   注意 clip 与 clip-path 都需要 position: absolute 才生效。 */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
 /* ============================================================
@@ -279,6 +307,57 @@ html::-webkit-scrollbar {
   transition-delay: 250ms;
 }
 
+/* ============================================================
+   等待态的呼吸光晕
+   改写提示词、AI 起稿这类"模型正在往回写字"的等待,原先只有按钮上的字变了,
+   输入框本身一动不动 —— 盯着看也说不清它到底在不在跑。
+   给框沿加一圈会呼吸的柔光就是补这件事。
+
+   用色是金色(--ai-halo),不是墨色也不是画布那套 AI 渐变的粉紫:
+   这套界面里"强调"一直是墨色,再多一个色相会跟它抢着说话;
+   而"机器正在动"本来就不是强调,是另一种信息 —— 交给金色单独去说,
+   扫一眼就知道不是"选中了"或"这里是重点",而是"它在跑"。
+   全站也只有这一处用金。
+
+   画在 ::after 而不是直接动 box-shadow,有两个理由:
+   一是各处沿用自己原有的圆角(inherit),不必把整串阴影抄两遍;
+   二是只动画一个 opacity,和聚焦态那套漫反射光晕叠在一起也互不覆盖。
+   光晕只画在边框以外(盒子自身透明),所以它压在内容上也不挡任何东西。
+   ============================================================ */
+.halo-breathe::after {
+  content: '';
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  pointer-events: none;
+  /* 三层弥散,一层比一层散,没有实线:
+     光晕要的是"往外渗",而贴着边那道 1px 亮线读起来就是给框加了个边 */
+  box-shadow:
+    0 0 14px -2px color-mix(in oklch, var(--ai-halo) 44%, transparent),
+    0 0 30px -8px color-mix(in oklch, var(--ai-halo) 52%, transparent),
+    0 0 60px -18px color-mix(in oklch, var(--ai-halo) 58%, transparent);
+  opacity: 0;
+  /* 一呼一吸 2.4s:比心跳还慢些,读起来是"稳着在做一件事",而不是催进度 */
+  animation: halo-breathe 2.4s ease-in-out infinite;
+}
+@keyframes halo-breathe {
+  0%,
+  100% {
+    opacity: 0.32;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+/* 动效被关掉之后,呼吸会停在某一帧上 —— 可能正好停在最淡的那帧。
+   这里直接给最亮那一帧,把"它正在忙"这件事原样留下来 */
+@media (prefers-reduced-motion: reduce) {
+  .halo-breathe::after {
+    animation: none;
+    opacity: 1;
+  }
+}
+
 body {
   /* 背景图:极简山水,平铺全屏,随视口缩放;亮/暗主题各一张。
      用 WebP:原 PNG 是未优化的编码(1.4MB),转 WebP 后仅 30KB 左右。
@@ -291,8 +370,25 @@ body {
   font-family: var(--font-sans);
   line-height: 1.6;                    /* Body 1.6 */
   min-height: 100vh;
+  /* 移动端地址栏收放时 100vh 是不动的那个值,页面会跟着跳一下;dvh 才是"当前可视高度"。
+     写两行:老浏览器认不得 dvh,退回上面那行 */
+  min-height: 100dvh;
   -webkit-font-smoothing: antialiased;
-  transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+  /* 只过渡颜色,不过渡 background 简写 —— 简写里含 background-image,
+     而两张主题图是两个不同的 URL,本身插值不了:那次过渡只会白跑一遍
+     整页重绘,主题切换看起来还是一下硬切 */
+  transition: background-color var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+
+/* 移动端 Safari 上 background-attachment: fixed 是出了名的掉帧
+   (滚动时整张底图反复重绘),有时干脆不渲染。窄屏就退回随页面滚动的普通背景 */
+@media (max-width: 720px) {
+  body {
+    background-attachment: scroll;
+  }
+  [data-theme="dark"] body {
+    background-attachment: scroll;
+  }
 }
 
 button {
@@ -342,9 +438,24 @@ select {
   }
 }
 
-/* 聚焦可见性:全站不画键盘焦点描边。
-   键盘导航时元素自身的边框/光晕已足够表达聚焦位置 */
+/* 聚焦可见性:给全站一个兜底的可聚焦描边。
+   以前这里是 outline: none,指望"元素自身的边框/光晕已足够" ——
+   那是约定而不是保证:任何漏补光晕的按钮或链接,键盘用户都完全看不出焦点在哪。
+   描边的写法与画布页自己那套一致(见 CanvasEditor 的 .canvas-page :focus-visible)。
+   组件里需要更贴合自身形态的,仍在自己那条 :focus-visible 里覆盖 ——
+   类选择器的权重大于这里,覆盖得住。
+
+   表单控件不在此列:输入框与文本域即使鼠标点进去也会命中
+   :focus-visible,而"点进输入框就被画一圈"不是这套设计要的样子。
+   它们本来就各有各的 :focus 边框/光晕(见各页的 .ed-input / .field input / .search …),
+   这里把描边还回 off,保持原样 */
 :focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
   outline: none;
 }
 

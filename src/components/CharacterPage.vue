@@ -1,7 +1,9 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, type Component } from 'vue'
 import {
   PhMaskHappy,
+  PhTextAa,
+  PhSquaresFour,
   PhPlus,
   PhCalendar,
   PhClockCounterClockwise,
@@ -21,20 +23,43 @@ import {
   PhEye,
   PhImage,
   PhLockSimple,
-  PhX
+  PhPencilSimple,
+  PhSpeakerHigh,
+  PhStopCircle,
+  PhX,
+  PhChatCircleDots
 } from '@phosphor-icons/vue'
-import { CHARACTER_VIEWS, coverSrc, draftCharacterFields, emptyCharFields, imageSrc } from '../api'
+import {
+  CHARACTER_VIEWS,
+  cloneVoice,
+  coverSrc,
+  draftCharacterFields,
+  draftCharacterFromImage,
+  emptyCharFields,
+  emptyCharPersona,
+  emptyCharVoice,
+  hasPersona,
+  imageSrc,
+  newVoiceId,
+  TTS_AUDITION_TEXT
+} from '../api'
 import LatticeLoader from './LatticeLoader.vue'
 import type {
   ApiConfig,
   Character,
+  CharacterDraft,
   CharacterFields,
+  CharacterPersona,
   CharacterStat,
   CharacterView,
   CharacterViewKind,
+  CharacterVoice,
   CharacterWork,
   HistoryEntry
 } from '../types'
+import { vGrow } from '../lib/grow'
+import { deleteVoiceSample, putVoiceSample } from '../lib/idb'
+import { speak, speakingId, stopSpeaking } from '../lib/speech'
 
 /* 角色:网站的重点页面。
    一个角色 = 一组设定图 + 一段结构化设定。设定图是它的骨架 ——
@@ -58,14 +83,40 @@ const props = defineProps<{
   busy: Record<string, CharacterViewKind[]>
   // 起稿要用的文本模型配置。没配就走不了 AI 起稿,但手填照常
   textConfig?: ApiConfig
+  /* 识图要用的视觉模型配置。上传参考图后就是它在读这张图 ——
+     没配也不拦着上传:图本身当参考照常用得着,只是不会反填设定 */
+  visionConfig?: ApiConfig
+  /* 朗读要用的合成配置。没配时音色区会提示去配一条,而朗读会退回浏览器自带的语音 ——
+     "能出声"和"是这个角色自己的嗓子"之间的分界线就在这一条配置上 */
+  ttsConfig?: ApiConfig
 }>()
 
 /** 表单草稿:设定拆成五项,参考图先收成 data URL ——
- *  压小成 Blob 是主界面的事(与参考图存档同一档参数) */
-type DraftForm = { name: string; fields: CharacterFields; desc: string; ref: string }
+ *  压小成 Blob 是主界面的事(与参考图存档同一档参数)。
+ *  编辑已有角色时 ref 为空表示"没换参考图",那一边就不动库里那张 */
+type DraftForm = {
+  name: string
+  fields: CharacterFields
+  /* 人格设定。与 fields 一起编辑,但存的时候分开走(见 types 的 CharacterPersona)——
+     它只服务对话,混进 fields 会被拼进每一张出图的提示词 */
+  persona: CharacterPersona
+  /* 嗓音(朗读时听起来什么样)。与 persona 同为"只服务对话"的一类,同样分开存 */
+  voice: CharacterVoice
+  desc: string
+  ref: string
+}
 
 const emit = defineEmits<{
-  (e: 'save', payload: { name: string; fields: CharacterFields; desc: string; refData: string }): void
+  /* 带 id 是改这一条,不带是新建 —— 落盘由主界面按这个分支走 */
+  (e: 'save', payload: {
+    id?: string
+    name: string
+    fields: CharacterFields
+    persona: CharacterPersona
+    voice: CharacterVoice
+    desc: string
+    refData: string
+  }): void
   (e: 'remove', id: string): void
   // 复制:目录与图都由主界面拷一份(这一页不碰字节)
   (e: 'duplicate', id: string): void
@@ -79,6 +130,8 @@ const emit = defineEmits<{
   (e: 'preview', entry: HistoryEntry): void
   // 拿这个角色去开画:套上角色并切回工作台,由主界面负责跳转
   (e: 'create', id: string): void
+  // 跟这个角色说话:跳到对话页并选中它,由主界面负责跳转
+  (e: 'chat', id: string): void
   (e: 'generate', charId: string, kind: CharacterViewKind): void
   (e: 'generateAll', charId: string): void
   // 停掉某个角色正在跑的那一张设定图(只停它)。中断手柄在主界面(请求从那里发出)
@@ -144,6 +197,12 @@ function onDocPointerDown(e: PointerEvent) {
 
 /* 三个动作各自包一层:先收起菜单再交出去。
    菜单留着不关会盖住卡片,而这三个动作都会让主界面改 props、重渲染这张卡 */
+function editFromCard(id: string) {
+  closeCardMenu()
+  // 找不到就是这一条正好被删了:startEdit() 不带角色会当成新建,不能那样兜底
+  const c = props.characters.find((x) => x.id === id)
+  if (c) startEdit(c)
+}
 function duplicateFromCard(id: string) {
   closeCardMenu()
   emit('duplicate', id)
@@ -165,44 +224,111 @@ const detailId = ref('')
 const viewer = ref<CharacterViewKind | ''>('')
 // 正在编辑(新建)的表单
 const editing = ref(false)
-const draft = ref<DraftForm>({ name: '', fields: emptyCharFields(), desc: '', ref: '' })
+/* 这一轮向导改的是哪个已保存角色(空 = 新建)。
+   刻意不和 wizardId 合并:wizardId 是"向导进行中的角色",新建时第 1 步存完才有,
+   而它同时是第 2、3 步的解锁条件(stepUnlocked)—— 编辑一条已有的角色时
+   这两步不该解锁,那一轮只做第 1 步 */
+const editingId = ref('')
+const isEditing = computed(() => !!editingId.value)
+const editingChar = computed(() => props.characters.find((c) => c.id === editingId.value))
+/* 编辑态下参考图的预览地址:draft.ref 只在"换了新图"时才有值,
+   没换的时候要显示库里那张。这一页不碰字节,地址交给 coverSrc */
+const editRefSrc = computed(() => (isEditing.value ? coverSrc(editingChar.value?.sourceRef) : ''))
+const draft = ref<DraftForm>({
+  name: '',
+  fields: emptyCharFields(),
+  persona: emptyCharPersona(),
+  voice: emptyCharVoice(),
+  desc: '',
+  ref: ''
+})
 // 起稿:一句话 + 请求状态 + 它自己的报错(不占用生图那套错误出口)
 const idea = ref('')
 const drafting = ref(false)
 const draftError = ref('')
+/* 起稿请求的代次。等待中关掉向导、或重新开一轮时,上一次的结果回来后
+   会把新表单里刚写的东西整个盖掉 —— 加一条代次,对不上就整份丢弃 */
+let draftSeq = 0
+/** 作废在途的起稿请求。只加代次不够:drafting 得一起松开,
+ *  否则下一轮起稿键会一直点不动 */
+function cancelDraft() {
+  draftSeq++
+  drafting.value = false
+}
 
 /* 起稿填过、而用户还没动过的字段。
    校对要有个落点 —— 提示写着 "check what it got wrong",但看不出哪几项是
    模型编的:模型给的值和人手写的值在界面上长得一模一样。
-   改一下那一项就抹掉标记(见 markEdited),扫一眼就知道还剩哪几处没看过 */
-const aiFilled = ref<Partial<Record<keyof CharacterFields, boolean>>>({})
+   改一下那一项就抹掉标记(见 markEdited),扫一眼就知道还剩哪几处没看过。
+
+   键是长相与人格两套字段的并集。两套的键不重合,所以标在同一份里不会打架 ——
+   而图例说的是"这枚点是模型写的",本来就该把两套一起算 */
+type DraftFieldKey = keyof CharacterFields | keyof CharacterPersona
+const aiFilled = ref<Partial<Record<DraftFieldKey, boolean>>>({})
 // 有标记 ⇒ 组说明换成那条图例,不然用户不知道这枚点是什么意思
 const hasAiFilled = computed(() => Object.values(aiFilled.value).some(Boolean))
-// 已经填过内容 ⇒ 起稿按钮变成 Re-draft(不然想重来一次只能手动清一遍)
-const hasSpec = computed(() => Object.values(draft.value.fields).some((s) => (s || '').trim()))
+/* 已经填过内容 ⇒ 起稿键变成 "Draft again"。
+   人格也算:它同样是起稿会覆盖的东西 */
+const hasSpec = computed(
+  () =>
+    Object.values(draft.value.fields).some((s) => (s || '').trim()) ||
+    hasPersona(draft.value.persona)
+)
 
-function markEdited(key: keyof CharacterFields) {
+function markEdited(key: DraftFieldKey) {
   if (aiFilled.value[key]) aiFilled.value[key] = false
+}
+
+/* —— 识图:把上传的参考图读成设定 ——
+   与上面那条"一句话起稿"是并行的两个入口,共用同一份回填规矩(applyDraft)。
+   状态与报错也自成一套:draftError 那块在起稿框里,而这里出错的地方在参考图旁边 */
+const visionBusy = ref(false)
+const visionError = ref('')
+// 这张图已经读过至少一次了 ⇒ 按钮从 "Read the spec" 变成 "Read again"
+const visionRead = ref(false)
+/* 这一行要不要摆取景框:没跑过(也没失败过)时它只是一句提示,
+   摆一个不动的取景框反而像坏了。跑过之后才把结果留在原地 */
+const visionRan = computed(() => visionBusy.value || !!visionError.value || visionRead.value)
+/** 取景框的状态:busy 之外只有"刚读完"和"刚失败"两种收尾 */
+const visionLoader = computed<'working' | 'done' | 'error'>(() =>
+  visionBusy.value ? 'working' : visionError.value ? 'error' : 'done'
+)
+/* 代次:和起稿同一个理由 —— 等待中换了一张图、关掉向导,上一次的结果回来时
+   不能落到新表单里 */
+let visionSeq = 0
+/** 作废在途的识图请求,并把 loading 松开(只加代次的话按钮会一直点不动) */
+function cancelVision() {
+  visionSeq++
+  visionBusy.value = false
+}
+
+/* 一次起稿的结果落进表单。文字起稿与识图共用 —— 两条路拿到的是同一份
+   「名字 + 结构化设定」,回填的规矩就该一模一样 */
+function applyDraft(d: CharacterDraft) {
+  /* 名字只在还空着的时候补:它是这张卡的标题,用户自己敲进去的那个
+     不该被一次起稿顶掉。想换成模型起的名字,先清空再点一次 */
+  if (!draft.value.name.trim() && d.name) draft.value.name = d.name
+  draft.value.fields = d.fields
+  /* 人格只有模型真写出来了才覆盖。这里与 fields 不同,是有意的 ——
+     那十二行是必答项,而这四行是后加的:一次回不来时
+     把用户自己写好的人格抹成空,比"这次没更新"糟得多 */
+  if (hasPersona(d.persona)) draft.value.persona = { ...d.persona }
+  /* 记下这一趟哪些栏是模型填的。空着的那些不标 —— 标了反而像在说
+     "这里有什么要看",而它们本来就该留空(见 server 那条提示) */
+  const marks: Partial<Record<DraftFieldKey, boolean>> = {}
+  for (const k of Object.keys(d.fields) as Array<keyof CharacterFields>) {
+    if (d.fields[k].trim()) marks[k] = true
+  }
+  for (const k of Object.keys(d.persona) as Array<keyof CharacterPersona>) {
+    if (d.persona[k].trim()) marks[k] = true
+  }
+  aiFilled.value = marks
 }
 
 /* 规格字段是 textarea,随内容长高。
    为什么不用 <input>:字段值上限 12 个词(约 70 字符),两列之后每栏只有 338px,
    在 13px 下约 55 字符 —— 边界值会被截在视野外,只能靠方向键摸。
    封顶三行、再多内部滚(见样式),不然一栏长起来会把整行拉高 */
-const vGrow = {
-  mounted(el: HTMLTextAreaElement) {
-    grow(el)
-  },
-  updated(el: HTMLTextAreaElement) {
-    grow(el)
-  }
-}
-function grow(el: HTMLTextAreaElement) {
-  // 先归零再量:不归零的话 scrollHeight 只会越量越大,永远缩不回去
-  el.style.height = 'auto'
-  el.style.height = `${el.scrollHeight}px`
-}
-
 const detailChar = computed(() => props.characters.find((c) => c.id === detailId.value))
 
 function viewOf(charId: string, kind: CharacterViewKind): CharacterView | undefined {
@@ -316,10 +442,24 @@ function busyKinds(charId: string): CharacterViewKind[] {
 function isBusy(charId: string, kind: string) {
   return busyKinds(charId).includes(kind as CharacterViewKind)
 }
+/* 正脸有没有在跑。它是其余四张的参考图 —— 在重跑正脸的窗口里开始生成别的张,
+   那几张拿到的会是上一版正脸,"同一张脸"这个前提就破了。
+   所以这个窗口里要停用的只是"非正脸"那些入口;正脸自己不依赖任何视图。
+   其余时候几张就该能同时跑:它们之间没有依赖(见 App 的 genCharView),
+   整片灰着不让点,顺手把"一次多发几张"这件事也挡掉了 */
+function frontBusy(charId: string) {
+  return busyKinds(charId).includes('front')
+}
+/** 这一格(或这个入口)现在要不要停用。不含"还没有正脸"那种锁 —— 那个是 isLocked */
+function viewBlocked(charId: string, kind: CharacterViewKind) {
+  return kind !== 'front' && frontBusy(charId)
+}
 
 /** 详情页这个角色在生成的那几张。文案与进度条只提它自己的 ——
  *  把别的角色的进度报到这一页上,看着就像这一页自己卡住了 */
 const detailBusy = computed(() => busyKinds(detailId.value))
+/** 大图里那个 Regenerate 能不能点:非正面的视图在正脸重跑期间要等一等 */
+const viewerRegenBlocked = computed(() => viewer.value !== 'front' && frontBusy(detailId.value))
 /** 正在生成的这一批叫什么。按钮与进度条上都用它,所以直接给能读的短语;
  *  同时跑几张时不列名字,报个数就够 —— 哪几格在转,网格上一眼看得见 */
 const busyLabel = computed(() => {
@@ -387,11 +527,15 @@ function closeViewer() {
 }
 /** 把一个浮层里的 Tab 圈在它自己内部。不用 inert 关掉整个应用 —— 那要动主界面,
  *  而浮层里的控件就那么几个,一个循环就够了。
- *  大图里只有按钮,向导里还有输入框,所以两者都收 */
+ *  大图里只有按钮,向导里还有起稿框与规格字段的 textarea —— 都得收进来:
+ *  漏掉的那些会让焦点落到圈外,被下面的兜底逻辑拽回第一个控件,
+ *  于是从 textarea 往后怎么按 Tab 都出不去 */
 function trapTab(box: HTMLElement | null, e: KeyboardEvent) {
   if (!box) return
   const items = Array.from(
-    box.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled])')
+    box.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled])'
+    )
   )
   if (!items.length) return
   const first = items[0]
@@ -454,16 +598,55 @@ onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKey)
   document.removeEventListener('pointerdown', onDocPointerDown)
   window.clearTimeout(menuLeaveTimer)
+  /* 离开这一页就把嘴闭上:试听不属于"后台也该继续"的那类东西 */
+  stopSpeaking()
 })
 
-function startEdit() {
-  draft.value = { name: '', fields: emptyCharFields(), desc: '', ref: '' }
+/** 开向导。不带角色是新建,带角色是改它 ——
+ *  两种都从第 1 步那张表单开始,差别只在预填与"存下去是新的一条还是改这一条" */
+function startEdit(c?: Character) {
+  // 上一轮可能在等起稿或识图结果:整份作废,免得它回来盖掉这次打开的表单
+  cancelDraft()
+  cancelVision()
+  // 参考图那一块的状态也跟着清:上一轮读过的图不该在新表单里留着"已读"的痕迹
+  visionError.value = ''
+  visionRead.value = false
   idea.value = ''
   draftError.value = ''
-  // 向导从头开始:上一次留下的 id、步数与起稿标记必须清掉,否则会直接跳进旧角色的第 3 步
+  editingId.value = c?.id || ''
+  /* 这条角色**已经记着**的那段样本算是"有主"的。开一轮新表单时先认下来,
+     否则编辑一个已克隆过的角色、什么都不动就退出,会把它的样本删掉 */
+  committedSampleId = c?.voice?.sampleId || ''
+  draft.value = c
+    ? {
+        name: c.name,
+        fields: c.fields ? { ...c.fields } : emptyCharFields(),
+        /* 老角色没有 persona(loadCharacters 会补一份空的,这里再兜一层):
+           与 fields 分开拷一份,表单被继续改动时才不会牵动已经存下的那份 */
+        persona: { ...emptyCharPersona(), ...(c.persona || {}) },
+        /* 嗓音同样兜一层:老角色没有这一项。深拷一份 —— 表单里改音色时
+           不该牵动已经存下的那份 */
+        voice: { ...emptyCharVoice(), ...(c.voice || {}) },
+        desc: c.desc || '',
+        // 预填页面上那张图由 editRefSrc 负责,这里只表示"还没换"
+        ref: ''
+      }
+    : {
+        name: '',
+        fields: emptyCharFields(),
+        persona: emptyCharPersona(),
+        voice: emptyCharVoice(),
+        desc: '',
+        ref: ''
+      }
+  /* 向导从头开始:上一次留下的 id、步数与起稿标记必须清掉,否则会直接跳进旧角色的第 3 步。
+     编辑态也归零 —— 那一轮只做第 1 步,第 2、3 步锁着不动 */
   step.value = 1
   wizardId.value = ''
   aiFilled.value = {}
+  /* 上一轮的"存完跳到哪一步"不能留到这一轮:上一次若存失败,标记还在,
+     这次随便存点什么都跳到第 3 步去了 */
+  afterSaveStep = 0
   editing.value = true
   /* 向导是漂浮卡,相当于开了一层模态:焦点得收进卡里。
      落点选卡片本身而不是第一个输入框 —— 先让读屏念出这张卡是什么,
@@ -482,10 +665,21 @@ function startEdit() {
    留着可编辑的表单只会让人再点一次保存,多出一个副本 */
 type WizardStep = 1 | 2 | 3
 
-const STEPS: Array<{ n: WizardStep; label: string }> = [
-  { n: 1, label: 'Basics' },
-  { n: 2, label: 'Main view' },
-  { n: 3, label: 'Other views' }
+/* 三步各配一枚图标,给步骤条上那个圆点用(见模板里的 .wz-dot)。
+   挑的是"这一步在做什么",不是"它的序号是几":
+     Basics  填名字、性别与那份设定 —— 收的全是字
+     Voice   这个角色的嗓子:用系统的,还是自己配一把
+     Views   先出一张正脸,再以它为参考出其余四张 —— 同一张脸的保证
+
+   为什么把"声音"从第 1 步里分出来:那一屏原本同时回答"这个人是谁"与
+   "它听起来什么样",而后半比前半复杂得多(两层选择 + 输入 + 试听),
+   堆在一屏会让信息量翻倍 —— 而它其实与设定、参考图之间没有任何先后依赖。
+   原来的第 2、3 步则合成一步:正脸与其余四张本来就是**同一件事的两轮**
+   (先定基准、再照它长),而合成一屏之后"先出正脸"这句话只要说一次 */
+const STEPS: Array<{ n: WizardStep; label: string; icon: Component }> = [
+  { n: 1, label: 'Basics', icon: PhTextAa },
+  { n: 2, label: 'Voice', icon: PhSpeakerHigh },
+  { n: 3, label: 'Views', icon: PhSquaresFour }
 ]
 
 const step = ref<WizardStep>(1)
@@ -528,9 +722,14 @@ const restLabel = computed(() =>
    于是"一句话起稿 → 逐栏校对"这条路上右栏一直是活的,
    而不必等到保存之后才出现 */
 function railFields(): CharacterFields {
+  /* 编辑态读手上的草稿:用户正在改的就是它,右栏得跟着动才叫摘要。
+     新建态第 1 步还没存,读的也是草稿;只有"已存下、正在走出图那两步"才读库里的那份 */
+  if (isEditing.value) return draft.value.fields
   return wizardChar.value?.fields || draft.value.fields
 }
-const railName = computed(() => (wizardChar.value?.name || draft.value.name).trim())
+const railName = computed(() =>
+  (isEditing.value ? draft.value.name : wizardChar.value?.name || draft.value.name).trim()
+)
 /* 身份那项提出来当副标题(名字底下写"这是谁"),所以不在下面的清单里重复。
    空着就空着 —— 不摆一句 "No spec yet",那和没填是一个意思 */
 const railSub = computed(() => (railFields().identity || '').trim())
@@ -540,17 +739,20 @@ const railRows = computed(() =>
     .filter((r) => r.value)
 )
 
-/** 这一步能不能进。第 2 步要有角色,第 3 步要有主视图 ——
- *  前置没做完的那一步直接锁住,点不动,顺序就不必靠弹错来教 */
+/** 这一步能不能进。声音与设定图都挂在角色上,所以后两步的前提是同一个:
+ *  角色已经在库里(第 1 步存过)。
+ *  **第 3 步不再要求先有正脸** —— 正脸现在就在那一屏里,是它的第一件事 */
 function stepUnlocked(n: WizardStep): boolean {
   if (n === 1) return true
-  if (n === 2) return !!wizardId.value
-  return !!wizardFront.value
+  return !!wizardId.value
 }
 /** 这一步做完没有。做完的在步骤条上打勾,和"正在这一步"区分开 */
 function stepDone(n: WizardStep): boolean {
-  if (n === 1) return !!wizardId.value
-  if (n === 2) return !!wizardFront.value
+  /* 第 1、2 步同一个条件:声音没有"做完"这回事 —— 不配就是系统自带的那把嗓子,
+     同样是一种选好的状态。角色存下来了,这两步就都算走过。
+     (曾把第 2 步写成"配了自定义音色才算",可那样保持默认的人会在步骤条上
+     看到一个永远不打勾的第 2 步,像是漏了什么,回头去看又没什么可填的) */
+  if (n === 1 || n === 2) return !!wizardId.value
   return false
 }
 function goStep(n: WizardStep) {
@@ -578,12 +780,57 @@ function onSaved(id: string) {
   step.value = 2
   // 后两步要读这个角色的图:取图由上面的 watch 负责,拿到 id 就会去取
 }
-defineExpose({ onSaved })
+
+/** 存完之后要跳到哪一步。0 = 不跳(收尾回详情)。
+ *
+ *  为什么需要它:父组件只知道"存好了",不知道这一轮是**从详情页进来改设定**
+ *  还是**在向导里改声音** —— 前者要收尾,后者要接着往下走。
+ *  而"存完该去哪"本来就归这一页管(步数在这里),所以这个标记也留在这里 */
+let afterSaveStep = 0
+
+/** 改完一条已有角色,由父组件回调。
+ *  默认收尾:关掉向导回到详情页 —— 从详情页进来那一轮到此为止。
+ *  但向导中途的保存(第 2 步存声音)不算收尾,接着往下走 */
+function onUpdated(id: string) {
+  /* -1:向导已经关了(用户在声音那一步直接按了 Close,我们顺手把改动存了)——
+     存完什么都不做。不拦这一下的话,他会从当前页面被拽去这个角色的详情页 */
+  if (afterSaveStep === -1) {
+    afterSaveStep = 0
+    return
+  }
+  if (afterSaveStep) {
+    step.value = afterSaveStep as WizardStep
+    afterSaveStep = 0
+    return
+  }
+  /* 与 finishWizard 一样是"换页"而不是"关浮层":列表里那个按钮已经不在,
+     焦点还回去只会掉在 body 上 */
+  restoreWizardFocus = null
+  editing.value = false
+  editingId.value = ''
+  draftError.value = ''
+  openDetail(id)
+}
+defineExpose({ onSaved, onUpdated })
 
 /** 退出向导。第 1 步还没存,退了就当没发生;
  *  存过之后角色已经在库里,退了它自己会出现在列表里 */
 function closeWizard() {
+  // 关掉这一轮就把在途的起稿与识图一并作废:它们的结果不该落到下一次打开的表单里
+  cancelDraft()
+  cancelVision()
+  /* 声音那一步的改动还没提交就走人 —— 顺手把它存了。
+     那一步只有一个"Save & continue"的提交入口,而按 Close 的意图是"结束",
+     不该因为没点那个按钮就把刚配好的嗓子丢掉(见 saveFromVoiceStep 的 -1)。
+     **必须排在 dropOrphanVoiceSample 之前**:保存会把 sampleId 记成"有主",
+     那之后清理才不会把刚认领的样本删掉 */
+  if (step.value === 2 && wizardId.value) saveFromVoiceStep(-1)
+  /* 正念着的试听也停掉,并把这一轮建出来、却没人认领的那段克隆录音清掉 ——
+     它是用户的录音,留着既没用又该清 */
+  stopSpeaking()
+  void dropOrphanVoiceSample()
   editing.value = false
+  editingId.value = ''
   step.value = 1
   wizardId.value = ''
   draftError.value = ''
@@ -627,39 +874,130 @@ async function draftWithAI() {
   }
   drafting.value = true
   draftError.value = ''
+  const seq = ++draftSeq
   try {
     const d = await draftCharacterFields(cfg, text)
+    /* 回来时表单可能已经换了一轮(关掉向导又重开、或去编辑了别的角色):
+       这一趟属于上一轮,整份丢掉 —— 否则会把用户刚写的内容覆盖掉 */
+    if (seq !== draftSeq) return
     // 一项都没解出来 = 模型没按那个格式回。如实说,别假装已经填好了
     if (!Object.values(d.fields).some((s) => s.trim())) {
       draftError.value =
         'The model did not return a usable spec. Fill the fields by hand, or try another text model.'
       return
     }
-    /* 名字只在还空着的时候补:它是这张卡的标题,用户自己敲进去的那个
-       不该被一次起稿顶掉。想换成模型起的名字,先清空再点一次 */
-    if (!draft.value.name.trim() && d.name) draft.value.name = d.name
-    draft.value.fields = d.fields
-    /* 记下这一趟哪些栏是模型填的。空着的那些不标 —— 标了反而像在说
-       "这里有什么要看",而它们本来就该留空(见 server 那条提示) */
-    const marks: Partial<Record<keyof CharacterFields, boolean>> = {}
-    for (const k of Object.keys(d.fields) as Array<keyof CharacterFields>) {
-      if (d.fields[k].trim()) marks[k] = true
-    }
-    aiFilled.value = marks
+    applyDraft(d)
   } catch (e: any) {
+    if (seq !== draftSeq) return
     draftError.value = e?.message || 'Could not draft the character'
   } finally {
-    drafting.value = false
+    // 只有还是自己那一次才复位:新一轮已经在跑时,别把它的 loading 关掉
+    if (seq === draftSeq) drafting.value = false
   }
 }
 
+/* 送去识图模型的那一份:最长边压到 1024 的 JPEG。
+   上传的原图可能有几十 MB,而请求体上限是 15MB —— 原样发过去会直接 413。
+   存档用的仍是原图(见 submit 那条路),这张副本只给模型看 */
+const VISION_MAX_EDGE = 1024
+function visionCopy(dataUrl: string): Promise<string> {
+  return new Promise((resolve) => {
+    const img = new Image()
+    img.onload = () => {
+      const scale = Math.min(1, VISION_MAX_EDGE / Math.max(img.width, img.height))
+      if (scale >= 1) return resolve(dataUrl) // 本来就小,原样发
+      const c = document.createElement('canvas')
+      c.width = Math.max(1, Math.round(img.width * scale))
+      c.height = Math.max(1, Math.round(img.height * scale))
+      const ctx = c.getContext('2d')
+      if (!ctx) return resolve(dataUrl)
+      // 透明 PNG 转 JPEG 会变黑底,先铺一层白
+      ctx.fillStyle = '#fff'
+      ctx.fillRect(0, 0, c.width, c.height)
+      ctx.drawImage(img, 0, 0, c.width, c.height)
+      resolve(c.toDataURL('image/jpeg', 0.85))
+    }
+    img.onerror = () => resolve(dataUrl)
+    img.src = dataUrl
+  })
+}
+
+/* 识图:把这张参考图交给视觉模型,读成同一份「名字 + 结构化设定」。
+   上传完自动跑一次(见 onPickRef)——"传张图上去"的意图本来就是照着它填,
+   再让用户找一下按钮是多余的一步;旁边那个按钮留着是为了重读与改配置后重试 */
+async function draftFromImage() {
+  const src = draft.value.ref
+  if (!src || visionBusy.value) return
+  const cfg = props.visionConfig
+  if (!cfg || !cfg.model || !cfg.baseUrl) {
+    visionError.value = 'Set up an image-recognition config in API settings first.'
+    return
+  }
+  visionBusy.value = true
+  visionError.value = ''
+  const seq = ++visionSeq
+  try {
+    const d = await draftCharacterFromImage(cfg, await visionCopy(src))
+    /* 回来时可能已经换了一张图、或关掉了向导:这一趟属于上一轮,整份丢掉 */
+    if (seq !== visionSeq) return
+    if (!Object.values(d.fields).some((s) => s.trim())) {
+      visionError.value =
+        'The model did not return a usable spec. Fill the fields by hand, or try another vision model.'
+      return
+    }
+    applyDraft(d)
+    visionRead.value = true
+  } catch (e: any) {
+    if (seq !== visionSeq) return
+    visionError.value = e?.message || 'Could not read this image'
+  } finally {
+    // 只有还是自己那一次才复位:重新挑过图时别把新一轮的 loading 关掉
+    if (seq === visionSeq) visionBusy.value = false
+  }
+}
+
+/* 参考图的上限。FileReader 会把整张读成 data URL 进内存,几百 MB 能把标签页顶掉;
+   而这张图随后还要进 localStorage / IndexedDB 的队列,不是"随便传多大的都行" */
+const MAX_REF_BYTES = 32 * 1024 * 1024
+
 function onPickRef(e: Event) {
-  const file = (e.target as HTMLInputElement).files?.[0]
+  const el = e.target as HTMLInputElement
+  const file = el.files?.[0]
+  // 清空 input:同一个文件选第二次也要能触发 change
+  el.value = ''
   if (!file) return
+  /* 下面两条以前没有:accept 只是选择器上的过滤,用户能强制改选任意文件,
+     真把上百 MB 的东西塞进来的话是这一页自己先卡住 */
+  if (!file.type.startsWith('image/')) {
+    draftError.value = 'That file is not an image.'
+    return
+  }
+  if (file.size > MAX_REF_BYTES) {
+    draftError.value = 'That image is too large to use as a reference.'
+    return
+  }
+  draftError.value = ''
   const reader = new FileReader()
-  reader.onload = () => (draft.value.ref = String(reader.result))
+  reader.onload = () => {
+    // 换了一张图 ⇒ 上一张的读取结论与在途请求一起作废
+    cancelVision()
+    visionError.value = ''
+    visionRead.value = false
+    draft.value.ref = String(reader.result)
+    /* 传完顺手读一次:这个动作的意图本来就是"照着这张图填设定"。
+       没配识图接口时不报错 —— 图当参考照常用,只在那一行里说明怎么开。
+       编辑态不读:用户是来换参考图的,不是让模型把他校对过的那份设定重写一遍 */
+    if (props.visionConfig && !isEditing.value) void draftFromImage()
+  }
   reader.readAsDataURL(file)
-  ;(e.target as HTMLInputElement).value = ''
+}
+
+/* 撤掉参考图:连它读出来的那些状态一起清掉 —— 留着"已读"会像是这张图还在 */
+function clearRef() {
+  cancelVision()
+  draft.value.ref = ''
+  visionError.value = ''
+  visionRead.value = false
 }
 
 /* 导入:只把文件交出去。zip 要解包、图要落 IndexedDB —— 那是主界面的活,
@@ -675,37 +1013,79 @@ function submit() {
   const d = draft.value
   // 姓名与性别是仅有的两条必填:一个给卡片当标题,一个给模型定这张脸
   if (!d.name.trim() || !d.fields.gender.trim()) return
-  // 字段与参考图各拷一份交出去,免得表单被继续改动时牵动已经发出的这次保存
-  emit('save', { name: d.name, fields: { ...d.fields }, desc: d.desc, refData: d.ref })
+  /* 字段与参考图各拷一份交出去,免得表单被继续改动时牵动已经发出的这次保存。
+     编辑态带上 id:主界面据此改这一条,而不是多存一个副本;
+     refData 为空则表示"没换参考图",那一边不会去动库里那张 */
+  emit('save', {
+    ...(editingId.value ? { id: editingId.value } : {}),
+    name: d.name,
+    fields: { ...d.fields },
+    persona: { ...d.persona },
+    // 嗓音浅拷一份就够:它底下的值全是字符串与数字,没有嵌套
+    voice: { ...d.voice },
+    desc: d.desc,
+    refData: d.ref
+  })
+  /* 这一次交出去的嗓音里如果带着一段克隆样本,它就是**有主**的了 ——
+     下面那次取消不该把它删掉(见 dropOrphanVoiceSample)。
+     存失败时这里会偏保守地留着它:宁可多留一段录音,也不能删掉一个角色正指着的样本 */
+  committedSampleId = d.voice.sampleId || ''
   /* 这里不推进也不关表单:存完由父组件回调 onSaved 推向导走下一步 ——
      save 是异步的,现在改步数会在角色还没进列表时先跳到"主视图",
      那一格既没有 id 也没有图。存失败时表单留着,改完可以直接再点一次 */
 }
 
-/** 设定的摘要:挑最能认出这个人的几项连起来当副标题。
- *  不是全部规格 —— 完整的规格表就在下面那个面板里,副标题再抄一遍只是噪声 */
-function summary(c: Character) {
-  const f = c.fields
-  if (!f) return c.desc || 'No spec yet'
-  return [f.identity, f.face, f.hair, f.eyes, f.outfit]
-    .map((s) => (s || '').trim())
-    .filter(Boolean)
-    .join(' · ')
+/** 第 2 步(声音)的保存。
+ *
+ *  **不能直接复用 submit**:那个按 editingId 判断"改这一条还是新建",
+ *  而走出向导的新建流程里 editingId 一直是空的 —— 角色是第 1 步存下的,
+ *  它不是"正在编辑的对象"。照那个判断会把同一个角色再存出一条副本。
+ *  所以这里显式带上 wizardId,并交代"存完跳到第 3 步"。
+ *
+ *  它同时把整份草稿交出去(名字、设定、参考图都一样)—— 不只是声音:
+ *  这一屏能改的其实只有声音,但交一份残缺的表单反而要父组件去猜哪几项没动 */
+function saveFromVoiceStep(nextStep: number) {
+  const id = wizardId.value
+  if (!id) return
+  const d = draft.value
+  /* 存完去哪由调用方定:从"Save & continue"来的是 3(接着去出图),
+     从关闭按钮来的是 -1(向导已经关了,存完什么都别做 ——
+     否则父组件的收尾会把人从当前页拽到这个角色的详情页去) */
+  afterSaveStep = nextStep
+  emit('save', {
+    id,
+    name: d.name,
+    fields: { ...d.fields },
+    persona: { ...d.persona },
+    voice: { ...d.voice },
+    desc: d.desc,
+    refData: d.ref
+  })
+  committedSampleId = d.voice.sampleId || ''
+}
+
+/** 身份区的副标题:只用"身份"这一句 */
+function heroSub(c: Character) {
+  /* 只取"身份"这一项。原来是把 identity · face · hair · eyes · outfit
+     五段用 · 连成一行 —— 那读起来是一行字段清单,"这一页像表单"有一半是它给的。
+     而这一页该先回答的只有一句"这是谁";其余的字段下面那张规格表里都有,
+     在这里再抄一遍只是噪声 */
+  return (c.fields?.identity || '').trim()
 }
 
 /* —— 表单里的字段 ——
-   键、标签、占位示例、能否留空,集中在这里。分两组的原因与 api.ts 一致:
+   键、标签、占位示例,集中在这里。分两组的原因与 api.ts 一致:
    面貌特征会跟着每一张成品走,后两项只塑造设定图。
    表单、详情页的规格表都由这张表生成,所以标签不会两处走样。
 
-   optional 只影响界面上那个 Optional 标记 —— 起稿时谁必须编、谁可以留空,
-   由 server 那条提示决定(那里才说得出"编出来会不会改变人物") */
+   这里没有"可选"这一项:全表只有姓名与性别必填(它们不在这张表里,
+   由模板单独渲染),其余一律可留空 —— 所以"不标星号"已经说完了这件事,
+   不必再反过来给每一栏挂一枚 Optional */
 type FieldSpec = {
   key: keyof CharacterFields
   label: string
   // 占位示例:写具体值而不是"请输入",它同时是这一栏该写什么的示范
   hint: string
-  optional?: boolean
 }
 
 /* 性别不进 FACE_FIELDS —— 它不是一个填文字的栏位,而是一排按钮,
@@ -725,12 +1105,12 @@ const FACE_FIELDS: FieldSpec[] = [
   { key: 'eyes', label: 'Eyes', hint: 'glowing blue optics' },
   { key: 'noseMouth', label: 'Nose & mouth', hint: 'narrow straight nose, full lips' },
   { key: 'facialHair', label: 'Facial hair', hint: 'clean-shaven' },
-  { key: 'faceMarks', label: 'Face marks', hint: 'scar over left brow', optional: true }
+  { key: 'faceMarks', label: 'Face marks', hint: 'scar over left brow' }
 ]
 
 const SHEET_FIELDS: FieldSpec[] = [
   { key: 'outfit', label: 'Outfit', hint: 'armored jacket, neon trim' },
-  { key: 'marks', label: 'Marks', hint: 'chrome right arm, engraved dog tags', optional: true }
+  { key: 'marks', label: 'Marks', hint: 'chrome right arm, engraved dog tags' }
 ]
 
 /* 全部规格的完整顺序 —— 详情页的规格表、右栏摘要都按它排。
@@ -776,6 +1156,28 @@ const FORM_GROUPS: FormGroup[] = [
   }
 ]
 
+/* —— 人格四项 ——
+   只有对话用得上,与上面两组是**完全分开**的一件事:那两组管"它长什么样",
+   这一组管"它是个什么样的人"。刻意不进 AI 起稿的十二行,也不并进
+   Spec 的字段顺序 —— 它不影响任何一张图,混进去只会让那条界线变糊。
+
+   为什么 traits 与 voice 要分成两栏:写在同一栏里模型会把两者平均掉,
+   结果是性格写了、说话方式被稀释成通用口吻 —— 而"像人"主要靠后者。
+
+   **"Voice" 这个词归嗓音(听得到的那个),这里不让它出现。**
+   这一组讲的是"这个人是个什么样的人、话怎么说出来",所以组名是 Personality;
+   第二个字段管"话怎么说出来",叫 Speech style。
+   把音频音色那一档功能加进来之后,一个叫 Voice 的文字栏会和它彻底混淆 ——
+   用户会以为在这里写字就能改变角色听起来的声音 */
+type PersonaSpec = { key: keyof CharacterPersona; label: string; hint: string }
+
+const PERSONA_FIELDS: PersonaSpec[] = [
+  { key: 'traits', label: 'Traits', hint: 'guarded, dry humor, slow to trust' },
+  { key: 'voice', label: 'Speech style', hint: 'short clipped sentences, rarely asks questions' },
+  { key: 'address', label: 'Address', hint: "calls you 'kid', an old partner" },
+  { key: 'boundaries', label: 'Boundaries', hint: 'never breaks character, never mentions AI' }
+]
+
 /* 详情页的规格表:固定的那几项按顺序排,再做一条可选的备注 */
 const SPEC_LABELS: Array<[keyof CharacterFields, string]> = ALL_FIELDS.map((f) => [f.key, f.label])
 function specRows(c: Character) {
@@ -785,6 +1187,234 @@ function specRows(c: Character) {
   // 备注是自由文本,回看时占满整行
   if (notes) rows.push({ label: 'Notes', value: notes, wide: true })
   return rows
+}
+
+/** 人格那一段的读法。与 specRows 同一形状,但单独成表 ——
+ *  它回答的是"这个人怎么说话",不是"这个人长什么样" */
+function personaRows(c: Character) {
+  const p = { ...emptyCharPersona(), ...(c.persona || {}) }
+  return PERSONA_FIELDS.map((f) => ({ label: f.label, value: (p[f.key] || '').trim() }))
+}
+
+/* ===== 嗓音 =====
+   这一块管"朗读时它听起来什么样",与上面那组人格字段是两件事:
+   那边是**文字**(话怎么说出来),这里是**声音本身**。
+
+   三种来源只在"voice 从哪来"上不同,合成请求的形状是一样的(见 api.ts 的
+   synthesizeSpeech)。所以界面上的分叉也只有那三行输入,底下走的是同一条路 */
+/* 三档的 hint 就是**选它之后要做什么** —— 用户站在这一排前面的问题只有一个:
+   "我该选哪个、然后填什么"。所以每句都写成一句可执行的指路,不描述概念 */
+const VOICE_SOURCES = [
+  {
+    id: 'preset' as const,
+    label: 'Built-in',
+    hint: 'A stock voice from your provider. Paste its voice ID below — copy one from your provider’s voice library.'
+  },
+  {
+    id: 'describe' as const,
+    label: 'Describe',
+    hint: 'No ID and no recording — write a line describing how it sounds and the model invents the voice. Nothing to prepare.'
+  },
+  {
+    id: 'clone' as const,
+    label: 'Clone',
+    hint: 'A voice you made from a recording. Already have its ID? Paste it below. Don’t? Upload a recording instead.'
+  }
+]
+type VoiceSource = (typeof VOICE_SOURCES)[number]['id']
+
+function voiceSource(): VoiceSource {
+  return draft.value.voice.source || 'preset'
+}
+/* 当前那一档的指路语。以前这三个 hint 写好了却没接到界面上(见上面的注释) */
+const voiceSourceHint = computed(
+  () => VOICE_SOURCES.find((s) => s.id === voiceSource())?.hint || ''
+)
+function setVoiceSource(s: VoiceSource) {
+  draft.value.voice.source = s
+}
+/* 换引擎时把鉴权性质的那几个字段留着(改回来时不用重填),
+   但**不自动建号**:该不该花钱是用户按下去的那一刻决定的,不是切一下开关就定的 */
+
+/* —— 试听 ——
+   用的是**固定短句**(见 api.ts 的 TTS_AUDITION_TEXT)。用户每改一次描述都会点一次它,
+   而每一次都是真请求 —— 同一句话配同一个音色在缓存里必然命中,所以从第二次起试听不花钱。
+   这一条是整个功能里唯一能"边调边听"的入口,没有它音色就没法调 */
+const AUDITION_ID = 'voice-audition'
+const auditioning = computed(() => speakingId.value === AUDITION_ID)
+const voiceError = ref('')
+
+async function auditionVoice() {
+  if (auditioning.value) {
+    stopSpeaking()
+    return
+  }
+  if (voiceSource() === 'preset' && !draft.value.voice.vendorVoice?.trim()) {
+    voiceError.value = 'Paste a voice ID from your provider console first.'
+    return
+  }
+  /* 描述那一档只要一段描述 —— **不需要底子音色**(见模板里那段注释) */
+  if (voiceSource() === 'describe' && !draft.value.voice.describe?.trim()) {
+    voiceError.value = 'Describe the voice first — that description is the whole voice.'
+    return
+  }
+  if (voiceSource() === 'clone' && !draft.value.voice.vendorVoice) {
+    voiceError.value = 'Paste a cloned voice ID, or upload a recording to build one.'
+    return
+  }
+  voiceError.value = ''
+  const said = await speak(
+    TTS_AUDITION_TEXT,
+    // 没保存过的新角色拿一个临时的 charId:浏览器那条路要它来挑固定的嗓子
+    { charId: editingId.value || 'preview', voice: draft.value.voice, cfg: props.ttsConfig },
+    AUDITION_ID
+  )
+  // 退回浏览器声音是有原因的(没配、被拒、超时),那件事得说出来
+  if (said) voiceError.value = said
+}
+
+/* —— 克隆 ——
+   选一段录音,**顺手就把号建了**。为什么不拖到"保存"那一步:
+   建号要几秒、还会被上游按套餐拒掉,放在保存里就变成"保存按钮卡几秒然后整份失败"。
+   而按下文件那一刻建号,用户马上就能试听 —— 这才叫试。
+
+   代价是"建了号又反悔":那段录音会留在库里没人认领(见 closeWizard 的清理)。
+   上游那个号留着不花钱 —— 上游是**首次拿它合成**才收音色槽位费 */
+const cloneBusy = ref(false)
+const cloneError = ref('')
+
+function readAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result))
+    reader.onerror = () => reject(new Error('Could not read that file'))
+    reader.readAsDataURL(file)
+  })
+}
+
+/* 样本上限与上游一致(10MB),这里收到 8MB。上限是对着 base64 定的 ——
+   整份要过服务端那道 15mb 的 JSON 闸,而 base64 会涨到约 1.34 倍 */
+const MAX_SAMPLE_BYTES = 8 * 1024 * 1024
+
+async function onVoiceSample(e: Event) {
+  const el = e.target as HTMLInputElement
+  const file = el.files?.[0]
+  // 清空 input:同一个文件选第二次也要能触发 change
+  el.value = ''
+  if (!file) return
+  if (!file.type.startsWith('audio/')) {
+    cloneError.value = 'That file is not audio.'
+    return
+  }
+  if (file.size > MAX_SAMPLE_BYTES) {
+    cloneError.value = 'That recording is too large (max 8MB).'
+    return
+  }
+  const cfg = props.ttsConfig
+  if (!cfg) {
+    cloneError.value = 'Add a Voice config in Settings first.'
+    return
+  }
+  cloneBusy.value = true
+  cloneError.value = ''
+  try {
+    const data = await readAsDataUrl(file)
+    const id = newVoiceId()
+    const out = await cloneVoice(cfg, data, id, file.name)
+    /* 样本先落库、号后写进表单:号指着样本,反过来写的话,
+       中途失败会留下一个指向不存在样本的号 */
+    await putVoiceSample({
+      id,
+      name: file.name,
+      blob: file,
+      bytes: file.size,
+      createdAt: Date.now()
+    })
+    const v = draft.value.voice
+    v.source = 'clone'
+    v.vendorVoice = out.vendorVoice
+    v.sampleId = id
+    v.sampleName = file.name
+  } catch (err) {
+    cloneError.value = err instanceof Error ? err.message : 'Could not clone that voice'
+  } finally {
+    cloneBusy.value = false
+  }
+}
+
+/* 这一轮里**已经存下去过**的样本 id。克隆是按下文件那一刻就落库的,
+   所以"取消"必须分清两件事:这一段录音已经属于某个角色了,还是只是个草稿。
+   光看 editingId 不够 —— 新建流程第一步存完之后 editingId 仍是空的 */
+let committedSampleId = ''
+
+/** 丢掉这一轮建出来、却没人认领的那段录音。
+ *  留着它没有任何用处,而它是**用户的录音**,更该清掉 */
+async function dropOrphanVoiceSample() {
+  const staged = draft.value.voice.sampleId
+  if (!staged || staged === committedSampleId) return
+  draft.value.voice.sampleId = undefined
+  draft.value.voice.sampleName = undefined
+  await deleteVoiceSample(staged)
+}
+
+/** 手动改 Voice ID = 这个号是用户自己带进来的,与刚才可能上传过的那段录音无关。
+ *  所以把指向样本的那两样撤掉:名字留着会显示成"这个号来自那段录音"(不实),
+ *  而样本本身也没人认领了 —— 那是用户的录音,比占空间更该清掉。
+ *
+ *  已经保存过的样本不动(committedSampleId):编辑一个现有角色时,
+ *  那份样本仍是它自己的,撤引用可以,删掉就越界了 */
+function onCloneIdTyped() {
+  const v = draft.value.voice
+  if (!v.sampleId) return
+  const stale = v.sampleId
+  v.sampleId = undefined
+  v.sampleName = undefined
+  if (stale !== committedSampleId) void deleteVoiceSample(stale)
+}
+
+/** 详情页那份只读的嗓音摘要。空字段不摆出来 ——
+ *  与 personaRows 同一条规矩,没填就是没填,不占一行 */
+function voiceRows(c: Character) {
+  const v = { ...emptyCharVoice(), ...(c.voice || {}) }
+  if (v.engine !== 'tts') return [{ label: 'Engine', value: 'Browser voice' }]
+  const rows = [
+    { label: 'Engine', value: 'Custom voice' },
+    {
+      label: 'Source',
+      value:
+        v.source === 'clone'
+          ? v.sampleName
+            ? 'Cloned from a recording'
+            : 'Cloned voice'
+          : v.source === 'describe'
+            ? 'Described in words'
+            : 'Built-in voice'
+    }
+  ]
+  if (v.source === 'clone') {
+    rows.push({ label: 'Voice ID', value: v.vendorVoice || '' })
+    if (v.sampleName) rows.push({ label: 'Sample', value: v.sampleName })
+  } else if (v.source === 'describe') {
+    rows.push({ label: 'Description', value: v.describe || '' })
+  } else {
+    rows.push({ label: 'Voice ID', value: v.vendorVoice || '' })
+  }
+  return rows.filter((r) => r.value.trim())
+}
+
+/* 详情页也能试听:刚建好的角色,第一件想做的事就是听听它什么嗓子 */
+async function auditionChar(c: Character) {
+  const id = `audition:${c.id}`
+  if (speakingId.value === id) {
+    stopSpeaking()
+    return
+  }
+  const said = await speak(
+    TTS_AUDITION_TEXT,
+    { charId: c.id, voice: c.voice, cfg: props.ttsConfig },
+    id
+  )
+  if (said) voiceError.value = said
 }
 </script>
 
@@ -806,14 +1436,21 @@ function specRows(c: Character) {
             <PhUploadSimple aria-hidden="true" />
             Import
           </button>
-          <button class="chars-new" @click="startEdit">
+          <button class="chars-new" @click="startEdit()">
             <PhPlus aria-hidden="true" />
             New character
           </button>
         </div>
       </header>
 
-      <!-- —— 新建向导:漂浮卡 ——
+    </template>
+
+    <!-- 浮层**不能待在列表那个分支里**:它要在两个地方都能开 —— 列表页的
+         "New character" 和详情页的 "Edit"。原先它嵌在 `v-if="!detailChar"`
+         的列表分支内,于是从详情页点 Edit 时它根本不在 DOM 里(点了没反应)。
+         所以这里把列表分支切成两段,让浮层落在中间、两个分支之外 -->
+
+    <!-- —— 新建向导:漂浮卡 ——
            创建是一条独立流程,不该插进列表里把页面顶开 —— 它是盖在这一页之上的一层,
            关掉就回到原样。三步摊成一张卡:步骤条在头上,内容在中间,进退在脚下;
            没做到的那一步在条上是锁的,点不动 —— 顺序靠结构说,不靠报错说。
@@ -825,10 +1462,19 @@ function specRows(c: Character) {
         class="wizard"
         role="dialog"
         aria-modal="true"
-        aria-label="New character"
+        :aria-label="isEditing ? 'Edit character' : 'New character'"
         tabindex="-1"
       >
-        <nav class="wz-steps" aria-label="Creation steps">
+        <!-- 编辑态没有三步可走:设定改完就回详情,出图那两步是另一件事。
+             摆一条点不动的步骤条只会让人以为还要走下去 -->
+        <div v-if="isEditing" class="wz-edit-head">
+          <h3 class="wz-edit-title">Edit {{ editingChar?.name }}</h3>
+          <p class="wz-edit-sub">
+            The spec is what every image of this character is built from — the reference views
+            stay as they are.
+          </p>
+        </div>
+        <nav v-else class="wz-steps" aria-label="Creation steps">
           <template v-for="s in STEPS" :key="s.n">
             <span
               v-if="s.n > 1"
@@ -847,9 +1493,14 @@ function specRows(c: Character) {
               :aria-current="step === s.n ? 'step' : undefined"
               @click="goStep(s.n)"
             >
+              <!-- 圆点里放这一步的图标,不写序号:
+                   旁边就是这一步的名字,一枚图标比一个数字更早被认出来,
+                   而三枚图标本身也把"从哪儿走到哪儿"画出来了。
+                   做完的那枚换成对勾(图标的位置留给"已经过站"这件事)。
+                   两枚都 aria-hidden —— 这一步叫什么,由旁边的 .wz-name 说 -->
               <span class="wz-dot">
                 <PhCheck v-if="stepDone(s.n) && step !== s.n" weight="bold" aria-hidden="true" />
-                <template v-else>{{ s.n }}</template>
+                <component :is="s.icon" v-else weight="bold" aria-hidden="true" />
               </span>
               <span class="wz-name">{{ s.label }}</span>
             </button>
@@ -891,18 +1542,24 @@ function specRows(c: Character) {
             </p>
           </aside>
 
-          <!-- 第 1 步:基础信息 / 参考图。存下之前是可填的表单,
-               存下之后换成只读摘要(角色已经落库,再点一次保存只会多一个副本) -->
-          <div v-if="step === 1" class="wz-pane wz-form">
-            <template v-if="!wizardId">
+          <!-- 第 1、2 步共用这一屏。第 1 步是"这个人是谁"(存下之前是可填的表单,
+               存下之后换成只读摘要 —— 角色已经落库,再点一次只会多一个副本);
+               第 2 步是"它听起来什么样",整组声音字段见下面那个 step === 2 -->
+          <div v-if="step === 1 || step === 2" class="wz-pane wz-form">
+            <template v-if="step === 1 && !wizardId">
               <!-- 起稿块是这一页的重点:大多数人是一句话起稿、再逐栏校对,
                    而不是从空白一栏栏手填。所以它拿的是整张卡上唯一一块"区域"待遇,
                    并且自带标题与引导语 —— 标题问的是人,不是这个工具;
                    引导语只说"一句话就能开工、出来的东西还能改",
                    不描述机器在背后做什么(原来那句 "Fills the name and the spec —
                    check what it got wrong" 就是后一种,读起来像说明书)。
-                   报错与状态仍旧留在这块里,离触发它的按钮最近 -->
-              <div class="wz-draft">
+                   报错与状态仍旧留在这块里,离触发它的按钮最近。
+                   起稿中整块走等待态光晕:光晕只能画在能放伪元素的元素上,
+                   而 textarea 是替换元素、::after 不生效,所以挂在这块上 ——
+                   它正是这次起稿要交付的那一件东西 -->
+              <!-- 起稿块只在新建时给:编辑是"改几栏",不是"让模型重编一份" ——
+                   摆在这里会变成一个大号的"覆盖我刚写的东西" -->
+              <div v-if="!isEditing" class="wz-draft" :class="{ 'halo-breathe': drafting }">
                 <div class="wz-draft-head">
                   <h3 class="wz-draft-title">Who are you creating?</h3>
                   <p class="wz-draft-sub">
@@ -911,7 +1568,8 @@ function specRows(c: Character) {
                   </p>
                 </div>
                 <!-- 这一栏收的是"一个人的样子",不是一个词,所以给的是一个 textarea:
-                     两行起步、随内容长高(见 vGrow),写满一句不用横向滚动 -->
+                     两行起步、随内容长高(见 vGrow),写满一句不用横向滚动;
+                     长到 6 行封顶,再多转内部滚动(见 textarea.wz-idea) -->
                 <textarea
                   v-model="idea"
                   v-grow
@@ -942,45 +1600,67 @@ function specRows(c: Character) {
                 </div>
               </div>
 
-              <!-- 姓名与性别裹成一层:它们是全表仅有的两条必填,而且都是
-                   "这个人是谁"的一部分 —— 姓名是给这张卡的,性别是给模型定脸
-                   的第一道条件。两者之间按组内的 8px,与下面各组的 24px 拉开。
+              <!-- 基础信息:全表仅有的两条必填,而且都是"这个人是谁"的一部分 ——
+                   姓名是给这张卡的,性别是给模型定脸的第一道条件。
+                   它们和下面的 Spec / Reference sheet only 是平级的一组,
+                   所以同样有组标题。
+
+                   必填靠字段名后面那枚星号,不写 "Required" 这个词:
+                   "Required" 有八九个字符,挂在 88px 的标签列里会把
+                   放得下的行和放不下的行推成两种版式,而且一路念下来,
+                   到第二行它就不再是信息、只是噪音了(见 .wz-mark)。
+                   星号给读屏留了 aria-hidden,必填这件事由控件自己的
+                   aria-required 说 —— 语义不走装饰
 
                    性别给按钮而不是输入框:模型只认 female / male 这两个词,
                    留一栏自由文字等于又把这件事交回给它去猜 -->
-              <div class="wz-basics">
-                <label class="wz-field">
-                  <span class="wz-label">
-                    Name
-                    <span class="wz-mark is-required">Required</span>
+              <div class="wz-group">
+                <div class="wz-group-head">
+                  <h4 class="wz-group-title">Basics</h4>
+                  <span class="wz-group-hint">
+                    The name on the card, and the word the model uses to place a face.
                   </span>
-                  <input
-                    v-model="draft.name"
-                    class="ed-input"
-                    placeholder="Name this character"
-                    aria-required="true"
-                  />
-                </label>
+                </div>
 
-                <div class="wz-field" role="radiogroup" aria-label="Gender">
-                  <span class="wz-label">
-                    Gender
-                    <span class="wz-mark is-required">Required</span>
-                    <template v-if="aiFilled.gender">
-                      <span class="wz-ai" aria-hidden="true"></span>
-                      <span class="wz-sr">drafted by the model</span>
-                    </template>
-                  </span>
-                  <div class="wz-sex">
-                    <label v-for="g in genderOptions" :key="g" class="wz-sex-opt">
-                      <input
-                        type="radio"
-                        name="char-gender"
-                        :checked="draft.fields.gender.trim() === g"
-                        @change="pickGender(g)"
-                      />
-                      <span class="wz-sex-cap">{{ g }}</span>
-                    </label>
+                <div class="wz-basics">
+                  <label class="wz-field">
+                    <span class="wz-label">
+                      Name
+                      <span class="wz-mark" aria-hidden="true">*</span>
+                    </span>
+                    <input
+                      v-model="draft.name"
+                      class="ed-input"
+                      placeholder="Name this character"
+                      aria-required="true"
+                    />
+                  </label>
+
+                  <div
+                    class="wz-field"
+                    role="radiogroup"
+                    aria-label="Gender"
+                    aria-required="true"
+                  >
+                    <span class="wz-label">
+                      Gender
+                      <span class="wz-mark" aria-hidden="true">*</span>
+                      <template v-if="aiFilled.gender">
+                        <span class="wz-ai" aria-hidden="true"></span>
+                        <span class="sr-only">drafted by the model</span>
+                      </template>
+                    </span>
+                    <div class="wz-sex">
+                      <label v-for="g in genderOptions" :key="g" class="wz-sex-opt">
+                        <input
+                          type="radio"
+                          name="char-gender"
+                          :checked="draft.fields.gender.trim() === g"
+                          @change="pickGender(g)"
+                        />
+                        <span class="wz-sex-cap">{{ g }}</span>
+                      </label>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -998,12 +1678,13 @@ function specRows(c: Character) {
 
                 <div class="wz-fields">
                   <label v-for="f in g.fields" :key="f.key" class="wz-field">
+                    <!-- 不标星号 = 可选。全表只有姓名与性别要标,
+                         所以"可选"不必再写一遍(见 .wz-mark 那条注释) -->
                     <span class="wz-label">
                       {{ f.label }}
-                      <span v-if="f.optional" class="wz-mark">Optional</span>
                       <template v-if="aiFilled[f.key]">
                         <span class="wz-ai" aria-hidden="true"></span>
-                        <span class="wz-sr">drafted by the model</span>
+                        <span class="sr-only">drafted by the model</span>
                       </template>
                     </span>
                     <textarea
@@ -1031,23 +1712,292 @@ function specRows(c: Character) {
                 </div>
               </div>
 
+              <!-- 人格:第三组,但它与前两组不是一类东西 ——
+                   那两组决定每张图长什么样,这一组只在对话里起作用。
+                   所以标题不叫 "Spec",也点明它不会进出图提示词。
+                   标题用 Personality 而不是 Voice:Voice 归嗓音(听得到的那个),
+                   见 PERSONA_FIELDS 上面的注释 -->
+              <div class="wz-group">
+                <div class="wz-group-head">
+                  <h4 class="wz-group-title">Personality</h4>
+                  <span class="wz-group-hint">
+                    Who they are and how they talk. Used in Chat only — never in your prompts.
+                  </span>
+                </div>
+
+                <div class="wz-fields">
+                  <label v-for="f in PERSONA_FIELDS" :key="f.key" class="wz-field">
+                    <span class="wz-label">
+                      {{ f.label }}
+                      <!-- 起稿也会填这四栏,所以这里的标记规矩与前两组一致 -->
+                      <template v-if="aiFilled[f.key]">
+                        <span class="wz-ai" aria-hidden="true"></span>
+                        <span class="sr-only">drafted by the model</span>
+                      </template>
+                    </span>
+                    <textarea
+                      v-grow
+                      rows="1"
+                      v-model="draft.persona[f.key]"
+                      class="ed-input"
+                      :placeholder="f.hint"
+                      @input="markEdited(f.key)"
+                    ></textarea>
+                  </label>
+                </div>
+              </div>
+
+            </template>
+
+            <!-- 第 2 步:声音。它自成一屏 —— 上面那些字段回答"这个人是谁",
+                 这一组回答"它听起来什么样"。两者没有先后依赖,
+                 但堆在同一屏里会让信息量翻倍,而这一组本身就比别的组复杂
+                 (两层选择 + 输入 + 试听)。
+                 代码留在原地、只在这里切一刀:整块挪走的话,那 170 行的
+                 缩进与顺序全要重排,而它本来就在这儿不需要动 -->
+            <template v-if="step === 2">
+              <!-- 嗓音:朗读时它听起来什么样。与上面那组人格字段是两件事 ——
+                   那边是**文字**(话怎么说出来),这里是**声音本身** -->
+              <div class="wz-group">
+                <div class="wz-group-head">
+                  <h4 class="wz-group-title">Voice</h4>
+                  <span class="wz-group-hint">
+                    How it sounds when read aloud. Used in Chat only — never in your prompts.
+                  </span>
+                </div>
+
+                <!-- 这一组的东西比别处多(两层选择 + 输入 + 动作),而且形状和
+                     上面那些"行"完全不是一回事。直接铺在表单里就会和它们糊成
+                     一片 —— 给它一块自己的底,是这里唯一的边界手段 -->
+                <div class="voice-panel">
+                  <div class="voice-block">
+                    <span class="voice-cap">Engine</span>
+                    <div class="voice-seg" role="group" aria-label="Voice engine">
+                      <button
+                        type="button"
+                        :class="{ on: draft.voice.engine === 'browser' }"
+                        :aria-pressed="draft.voice.engine === 'browser' ? 'true' : 'false'"
+                        @click="draft.voice.engine = 'browser'"
+                      >
+                        Browser voice
+                      </button>
+                      <button
+                        type="button"
+                        :class="{ on: draft.voice.engine === 'tts' }"
+                        :aria-pressed="draft.voice.engine === 'tts' ? 'true' : 'false'"
+                        @click="draft.voice.engine = 'tts'"
+                      >
+                        Custom voice
+                      </button>
+                    </div>
+                    <p class="voice-note">
+                      {{
+                        draft.voice.engine === 'browser'
+                          ? 'Played by your system’s own voices. Free and instant — different characters just get different voices.'
+                          : !ttsConfig
+                            ? 'Needs a config first: open Interface Settings, add one with the purpose “Voice”. Base URL, API key and Resource ID all live there.'
+                            : 'Synthesised by your voice provider. Slower and billed per character, but this is the character’s own voice.'
+                      }}
+                    </p>
+                  </div>
+
+                  <template v-if="draft.voice.engine === 'tts'">
+                    <div class="voice-block">
+                      <span class="voice-cap">Voice source</span>
+                      <div class="voice-seg" role="group" aria-label="Voice source">
+                        <button
+                          v-for="s in VOICE_SOURCES"
+                          :key="s.id"
+                          type="button"
+                          :class="{ on: voiceSource() === s.id }"
+                          :aria-pressed="voiceSource() === s.id ? 'true' : 'false'"
+                          @click="setVoiceSource(s.id)"
+                        >
+                          {{ s.label }}
+                        </button>
+                      </div>
+                      <!-- 选完这一档接着要做什么,就写在这排键底下 —— 三档的入口
+                           长得一样(都是一个输入框),差别全在这句话里 -->
+                      <p class="voice-note">{{ voiceSourceHint }}</p>
+                    </div>
+
+                    <!-- 要填的那一格。上面全是灰字与胶囊,这里画了整组唯一的框 ——
+                         "哪些是要填的"由这个框说,不再靠一句提示 -->
+                    <div class="voice-block">
+                      <label v-if="voiceSource() === 'preset'" class="voice-field">
+                        <span class="voice-label">Voice ID</span>
+                        <span class="voice-control">
+                          <input
+                            v-model="draft.voice.vendorVoice"
+                            class="ed-input"
+                            spellcheck="false"
+                            placeholder="e.g. zh_female_vv_uranus_bigtts"
+                          />
+                        </span>
+                        <span class="voice-hint">
+                          The ID, not the display name. If it looks like <em>S_xxxxxxxx</em>
+                          or a custom name, that is a cloned voice — use the Clone slot.
+                        </span>
+                      </label>
+
+                      <label v-else-if="voiceSource() === 'describe'" class="voice-field">
+                        <!-- 这一档**不需要底子音色**。上游那条"音频生成"的纯文本模式
+                             什么都不用给 —— 一段描述就是全部输入(见 server 的 ttsDesignPrompt)。
+                             曾经误按"音色设计"那条端点实现过,那条要一个买过的底子音色,
+                             界面上因此多出过一格 Voice ID,已经撤掉 -->
+                        <span class="voice-label">Description</span>
+                        <span class="voice-control">
+                          <textarea
+                            v-grow
+                            rows="2"
+                            v-model="draft.voice.describe"
+                            class="ed-input"
+                            placeholder="e.g. young male, bright and a little hoarse, fast, big pitch swings"
+                          ></textarea>
+                        </span>
+                        <span class="voice-hint">
+                          Sound words only — age, pitch, pace, texture, mood.
+                          <em>This description is the voice.</em>
+                        </span>
+                      </label>
+
+                      <template v-else>
+                        <!-- 复刻音色有两条来路,而它们是**并列**的,不是二选一:
+                             号已经在手(控制台自己复刻过)就直接填;没有就上传一段录音当场建。
+                             上传建完会把号回填到下面这一格,所以两条路的终点是同一个字段 -->
+                        <label class="voice-field">
+                          <span class="voice-label">Voice ID</span>
+                          <span class="voice-control">
+                            <input
+                              v-model="draft.voice.vendorVoice"
+                              class="ed-input"
+                              spellcheck="false"
+                              placeholder="e.g. S_xxxxxxxx"
+                              @input="onCloneIdTyped"
+                            />
+                          </span>
+                          <span class="voice-hint">
+                            A cloned ID looks like <em>S_xxxxxxxx</em> or a custom name. If it
+                            looks like <em>zh_female_…_bigtts</em>, that is a built-in voice —
+                            use the Built-in slot.
+                          </span>
+                        </label>
+
+                        <div class="voice-field">
+                          <span class="voice-label">Recording</span>
+                          <div class="voice-clone">
+                            <label class="ed-btn file">
+                              <PhUploadSimple aria-hidden="true" />
+                              {{ cloneBusy ? 'Cloning…' : 'Choose a recording' }}
+                              <input
+                                type="file"
+                                accept="audio/*"
+                                hidden
+                                :disabled="cloneBusy"
+                                @change="onVoiceSample"
+                              />
+                            </label>
+                            <span v-if="draft.voice.sampleName" class="voice-sample">
+                              {{ draft.voice.sampleName }}
+                            </span>
+                          </div>
+                          <span v-if="cloneError" class="voice-err" role="alert">{{ cloneError }}</span>
+                          <span v-else class="voice-hint">
+                            10–60s, one speaker, no music. Registering is free — billing only starts
+                            when you first speak with it.
+                          </span>
+                        </div>
+                      </template>
+
+                      <div class="voice-audition">
+                        <button type="button" class="ed-btn" @click="auditionVoice">
+                          <PhStopCircle v-if="auditioning" aria-hidden="true" />
+                          <PhSpeakerHigh v-else aria-hidden="true" />
+                          {{ auditioning ? 'Stop' : 'Hear it' }}
+                        </button>
+                      </div>
+                      <p v-if="voiceError" class="voice-err" role="alert">{{ voiceError }}</p>
+                    </div>
+                  </template>
+                </div>
+              </div>
+
+            </template>
+
+            <template v-if="step === 1 && !wizardId">
               <!-- 参考图:比文字更能定形状,但是可选的,所以放在最后 -->
               <div class="wz-group">
                 <div class="wz-group-head">
-                  <h4 class="wz-group-title">
-                    Reference image
-                    <span class="wz-mark">Optional</span>
-                  </h4>
+                  <h4 class="wz-group-title">Reference image</h4>
                 </div>
 
-                <!-- 空态与有图态占同样的高度:挑完图不该整块往上跳一下 -->
-                <div v-if="draft.ref" class="wz-ref">
-                  <img class="wz-ref-thumb" :src="draft.ref" alt="Reference image" />
-                  <span class="wz-ref-body">
-                    <span class="wz-ref-main">Reference image</span>
-                    <span class="wz-ref-hint">Applied on top of the spec when generating</span>
-                  </span>
-                  <button class="ed-btn" @click="draft.ref = ''">Remove</button>
+                <!-- 空态与有图态占同样的高度:挑完图不该整块往上跳一下。
+                     编辑态一来就有图(库里那张),所以判条件要把 editRefSrc 也算上 -->
+                <div v-if="draft.ref || editRefSrc" class="wz-ref-wrap">
+                  <!-- 读取中整行走那圈金色呼吸光晕(与起稿块同一套):
+                       机器在动这件事,靠"框外的光"说出来,框本身不动。
+                       光晕的定位基准就是这一行(见样式里的 position: relative) -->
+                  <div class="wz-ref" :class="{ 'halo-breathe': visionBusy }">
+                    <img
+                      class="wz-ref-thumb"
+                      :src="draft.ref || editRefSrc"
+                      alt="Reference image"
+                    />
+                    <span class="wz-ref-body">
+                      <span class="wz-ref-main">Reference image</span>
+                      <span class="wz-ref-hint">
+                        {{
+                          isEditing
+                            ? 'The starting point for this character’s faces'
+                            : 'Applied on top of the spec when generating'
+                        }}
+                      </span>
+                    </span>
+                    <!-- 编辑态只能换、不能删:底图是其余四张设定图的一张参考资料,
+                         删掉它那些图就失去了"原本是什么样子"这一半信息。
+                         移除有它自己的场合(还没出过图时),那种场合在新建那一步 -->
+                    <label v-if="isEditing" class="ed-btn" for="cp-file">Replace</label>
+                    <button v-else class="ed-btn" @click="clearRef">Remove</button>
+                  </div>
+
+                  <!-- 识图那一行:图与上面那份设定之间的桥。
+                       在跑 / 跑过 / 跑失败都用取景框 + 秒表 ——
+                       与出图、起稿两处的等待态是同一样东西,只是换了个动词。
+                       没配识图接口时不说"失败",而是给出下一步 ——
+                       图本身当参考照常用得着,只是不会反填 -->
+                  <div v-if="!isEditing" class="wz-scan">
+                    <div class="wz-scan-main">
+                      <LatticeLoader
+                        v-if="visionRan"
+                        :label="'Reading the image'"
+                        :done-label="'Read in'"
+                        :error-label="'Failed after'"
+                        :status="visionLoader"
+                        :font-size="12"
+                      />
+                      <p v-else-if="!visionConfig" class="wz-scan-hint">
+                        Add an image-recognition config in API settings to read the spec from this image.
+                      </p>
+                      <p v-else class="wz-scan-hint">
+                        Read the spec straight from this image — the fields above fill in from it.
+                      </p>
+                      <!-- 填完得说清"上面变了":这一行在表单最底下,
+                           用户未必回头看一眼那两组输入框 -->
+                      <p v-if="visionRead && !visionBusy && !visionError" class="wz-scan-hint">
+                        Filled the spec above — the dots mark what it read.
+                      </p>
+                      <p v-if="visionError" class="wz-scan-err" role="alert">{{ visionError }}</p>
+                    </div>
+                    <button
+                      v-if="visionConfig && !visionBusy"
+                      class="ed-btn"
+                      type="button"
+                      @click="draftFromImage"
+                    >
+                      <PhSparkle aria-hidden="true" />
+                      {{ visionRead ? 'Read again' : 'Read the spec' }}
+                    </button>
+                  </div>
                 </div>
                 <label v-else class="wz-ref wz-ref-pick" for="cp-file">
                   <PhImage aria-hidden="true" />
@@ -1059,7 +2009,10 @@ function specRows(c: Character) {
               </div>
             </template>
 
-            <template v-else-if="wizardChar">
+            <!-- 条件里必须带 step === 1:上面那三个 v-if 是各自独立的,
+                 少了它,走到第 2 步时这里会当作"第 1 步的另一半"一起渲染,
+                 于是声音那一屏下面会多出一块第 1 步的只读摘要 -->
+            <template v-else-if="step === 1 && wizardChar">
               <!-- 存下之后这一步就没有可填的了(再点一次保存只会多一个副本),
                    所以不再重复名字与那份设定 —— 右栏就在同一屏上,列两遍是同一份东西。
                    这里只剩一句交接:设定从这一刻起归右栏,而下一步会拿什么当输入 -->
@@ -1082,12 +2035,15 @@ function specRows(c: Character) {
                左图右事:空态、生成中、已有图共用同一个框,所以点下去之后画面不跳。
                右边那一栏回答两件这一屏最该说清的事 ——
                它会拿哪张图当参考,以及"接下来该点哪里" -->
-          <div v-else-if="step === 2" class="wz-pane">
+          <!-- 第 3 步:设定图。一屏两轮 —— 先出正脸(它是基准),再出其余四张。
+               原来这是两步,而它们本来就是同一件事的两半:"先定基准、再照它长"
+               那句话说了两遍,中间还隔着一次点按 -->
+          <div v-else class="wz-pane">
             <div class="wz-lead">
-              <h3 class="wz-h">Main view</h3>
+              <h3 class="wz-h">Views</h3>
               <p class="wz-p">
-                The anchor every other view is built from — so it pays to get this one right before
-                moving on.
+                Two rounds. The main view comes first — it is the anchor every other view is built
+                from, so it pays to get it right before moving on.
               </p>
             </div>
 
@@ -1163,26 +2119,23 @@ function specRows(c: Character) {
                 </button>
               </div>
             </div>
-          </div>
 
-          <!-- 第 3 步:其余四张。一律以主视图为参考图 —— 这就是"同一张脸"的保证 -->
-          <div v-else class="wz-pane">
-            <div class="wz-lead">
-              <div class="wz-lead-row">
-                <h3 class="wz-h">Other views</h3>
-                <button
-                  class="ed-btn"
-                  :disabled="!restMissing"
-                  @click="emit('generateAll', wizardId)"
-                >
-                  <PhSparkle aria-hidden="true" />
-                  {{ restLabel }}
-                </button>
-              </div>
+            <!-- 四张那一排:说明与"一次补齐"并排 —— 它们讲的是同一件事,
+                 这批图从主视图长出来,而且可以一次全出。
+                 主视图还没出时按钮点不动:没有基准,那四张就没有依据 -->
+            <div class="wz-lead-row">
               <p class="wz-p">
                 Each of these is built from the main view. Generate them one at a time, or all at
                 once — failing early stops the run instead of burning four more calls.
               </p>
+              <button
+                class="ed-btn"
+                :disabled="!restMissing || frontBusy(wizardId) || !wizardFront"
+                @click="emit('generateAll', wizardId)"
+              >
+                <PhSparkle aria-hidden="true" />
+                {{ restLabel }}
+              </button>
             </div>
 
             <div class="wz-grid">
@@ -1208,6 +2161,7 @@ function specRows(c: Character) {
                 <button
                   v-else-if="cell.view"
                   class="cell-img has-img"
+                  :disabled="viewBlocked(wizardId, cell.kind)"
                   :aria-label="`Regenerate the ${cell.label} view`"
                   @click="emit('generate', wizardId, cell.kind)"
                 >
@@ -1217,6 +2171,7 @@ function specRows(c: Character) {
                 <button
                   v-else
                   class="cell-img"
+                  :disabled="viewBlocked(wizardId, cell.kind)"
                   :aria-label="`Generate the ${cell.label} view`"
                   @click="emit('generate', wizardId, cell.kind)"
                 >
@@ -1237,24 +2192,24 @@ function specRows(c: Character) {
             :disabled="!draft.name.trim() || !draft.fields.gender.trim()"
             @click="submit"
           >
-            Save &amp; continue
+            {{ isEditing ? 'Save' : 'Save & continue' }}
           </button>
           <button v-else-if="step === 1" class="ed-btn primary" @click="goStep(2)">
-            Next: main view
+            Next: voice
           </button>
-          <!-- 主按钮永远只该有一个:第 2 步还没有正脸时,主按钮是卡身里那个
-               "Generate main view";出了正脸才轮到这里的 Next(见卡身的条件 class)。
-               两个都涂黑会让"下一步做什么"变得含糊 -->
-          <button
-            v-else-if="step === 2"
-            class="ed-btn"
-            :class="{ primary: !!wizardFront }"
-            :disabled="!wizardFront"
-            @click="goStep(3)"
-          >
-            Next: other views
+          <!-- 声音那一步没有非填不可的东西(不配就是系统自带的嗓子),所以这里的
+               按钮一直是主按钮。但它**必须存一下**:嗓音是随角色存在库里的,
+               不存就白填了 —— 而进到这一步时角色早就在库里(第 1 步存的),
+               所以这是一次"更新",得走 saveFromVoiceStep(见那边的说明) -->
+          <button v-else-if="step === 2" class="ed-btn primary" @click="saveFromVoiceStep(3)">
+            Save & continue
           </button>
-          <button v-else class="ed-btn primary" @click="finishWizard">Done</button>
+          <!-- 最后一步的收尾。主按钮永远只该有一个:还没有正脸时,主按钮是卡身里
+               那个"Generate main view"(见那边的条件 class),Done 退一档;
+               出了正脸才轮到它。两个都涂黑会让"接下来做什么"变得含糊 -->
+          <button v-else class="ed-btn" :class="{ primary: !!wizardFront }" @click="finishWizard">
+            Done
+          </button>
 
           <button v-if="step > 1" class="ed-btn" @click="backStep">Back</button>
           <button class="ed-btn" @click="closeWizard">
@@ -1262,6 +2217,9 @@ function specRows(c: Character) {
           </button>
         </div>
       </section>
+
+      <!-- 列表接着上面被切开的那一段继续(见浮层之前那段说明) -->
+      <template v-if="!detailChar">
 
       <!-- 列表:角色海报卡。顶图全出血铺满整张卡,底部渐变暗幕托起白字;
            无边框、靠阴影浮起,圆角加大到 24px。
@@ -1363,6 +2321,9 @@ function specRows(c: Character) {
               <PhDotsThreeVertical aria-hidden="true" />
             </button>
             <div v-if="openCardMenu === c.id" class="menu" :class="{ up: cardMenuUp }" role="menu">
+              <button class="mitem" role="menuitem" @click.stop="editFromCard(c.id)">
+                <PhPencilSimple aria-hidden="true" />Edit
+              </button>
               <button class="mitem" role="menuitem" @click.stop="duplicateFromCard(c.id)">
                 <PhCopy aria-hidden="true" />Duplicate
               </button>
@@ -1384,7 +2345,7 @@ function specRows(c: Character) {
           Describe one in a line and let the model draft the spec, or fill the fields by hand.
           Then generate a reference sheet to keep the same face everywhere.
         </p>
-        <button class="ed-btn primary" @click="startEdit">Create a character</button>
+        <button class="ed-btn primary" @click="startEdit()">Create a character</button>
       </div>
     </template>
 
@@ -1398,6 +2359,11 @@ function specRows(c: Character) {
         <!-- 三个动作都收在这一行:复制(改一个变体)、导出(带走)、删除(破坏性)。
              删除仍然压成静默的字、悬停才亮红 —— 三个都是同样的份量会读不出主次 -->
         <div class="dt-acts">
+          <!-- 编辑排在最前:改一个已有的比复制一个更常做,而它也是进向导的唯一入口 -->
+          <button class="dt-act" @click="startEdit(detailChar)">
+            <PhPencilSimple aria-hidden="true" />
+            Edit
+          </button>
           <button class="dt-act" @click="emit('duplicate', detailChar.id)">
             <PhCopy aria-hidden="true" />
             Duplicate
@@ -1413,15 +2379,19 @@ function specRows(c: Character) {
         </div>
       </div>
 
-      <!-- 身份区:头像用正脸,名字和设定一眼看全,进度与参考图作为标签摆在下面 -->
+      <!-- 身份区:一张卡把"这是谁、进行到哪、能做什么"说全。
+           主视觉用**正脸那张大图**,而不是一枚小圆头像 —— 88px 的圆是
+           "通讯录条目"的形状,而这一页要看起来像一个人。
+           3:4 与列表里的角色卡同一个比例:这一页就是那张卡"打开之后"的样子,
+           同一个人该是同一个形状,只是尺寸大了一档 -->
       <header class="hero">
-        <span class="hero-avatar">
+        <div class="hero-shot">
           <img v-if="avatarSrc" :src="avatarSrc" alt="" />
           <PhMaskHappy v-else aria-hidden="true" />
-        </span>
+        </div>
         <div class="hero-body">
           <h2 class="hero-name">{{ detailChar.name }}</h2>
-          <p class="hero-sub">{{ summary(detailChar) }}</p>
+          <p v-if="heroSub(detailChar)" class="hero-sub">{{ heroSub(detailChar) }}</p>
           <!-- 用量:这个角色到底干了多少活。放在设定摘要下面、标签上面 ——
                它比"几张图"更像这个角色的成绩单 -->
           <p class="hero-meta">
@@ -1435,16 +2405,26 @@ function specRows(c: Character) {
             </span>
             <span v-else class="tag">No main view yet</span>
           </div>
+
+          <div class="hero-actions">
+          <!-- 跟这个人说话。它比"补齐设定图"更常点,但这一页的主动作仍是补齐
+               (那件事只有在这儿能做),所以这一枚用描边样式 —— 同一时刻
+               只该有一个涂黑的主按钮,否则"下一步做什么"就含糊了 -->
+          <button class="ed-btn hero-chat" @click="emit('chat', detailChar.id)">
+            <PhChatCircleDots aria-hidden="true" />
+            Chat
+          </button>
+          <!-- 生成中按钮自己也要说出来:它是刚才被点的那个,状态留在原地最容易被看到 -->
+          <button
+            class="ed-btn primary hero-cta"
+            :disabled="!missingCount || frontBusy(detailChar.id)"
+            @click="emit('generateAll', detailChar.id)"
+          >
+            <PhSparkle v-if="!detailBusy.length" aria-hidden="true" />
+            {{ detailBusy.length ? `Generating ${busyLabel}…` : generateAllLabel }}
+          </button>
+          </div>
         </div>
-        <!-- 生成中按钮自己也要说出来:它是刚才被点的那个,状态留在原地最容易被看到 -->
-        <button
-          class="ed-btn primary hero-cta"
-          :disabled="!missingCount"
-          @click="emit('generateAll', detailChar.id)"
-        >
-          <PhSparkle v-if="!detailBusy.length" aria-hidden="true" />
-          {{ detailBusy.length ? `Generating ${busyLabel}…` : generateAllLabel }}
-        </button>
       </header>
 
       <section class="panel">
@@ -1509,11 +2489,13 @@ function specRows(c: Character) {
               v-else
               class="cell-img"
               :class="{ locked: isLocked(cell.kind), start: cell.kind === 'front' }"
-              :disabled="isLocked(cell.kind)"
+              :disabled="isLocked(cell.kind) || viewBlocked(detailId, cell.kind)"
               :aria-label="
                 isLocked(cell.kind)
                   ? `${cell.label} view — generate the front view first`
-                  : `Generate ${cell.label} view`
+                  : viewBlocked(detailId, cell.kind)
+                    ? `${cell.label} view — waiting for the main view`
+                    : `Generate ${cell.label} view`
               "
               @click="emit('generate', detailChar.id, cell.kind)"
             >
@@ -1555,8 +2537,14 @@ function specRows(c: Character) {
         <p v-if="worksRest" class="works-more">{{ worksRest }} more in History.</p>
       </section>
 
+      <!-- 三张资料表并排成一段"附录"(见 .dt-facts 的说明)。
+           它们同等次要,所以每一张都得是个完整的卡:标题 + 一句话(说明它管哪一头) -->
+      <div class="dt-facts">
       <section class="panel">
-        <h3 class="panel-title">Spec</h3>
+        <div class="panel-head">
+          <h3 class="panel-title">Spec</h3>
+          <span class="panel-note">Merged into every image you make.</span>
+        </div>
         <dl class="spec">
           <template v-for="r in specRows(detailChar)" :key="r.label">
             <dt class="spec-k">{{ r.label }}</dt>
@@ -1564,6 +2552,45 @@ function specRows(c: Character) {
           </template>
         </dl>
       </section>
+
+      <!-- 人格单独一段:上面那张表里的每一项都会进你每一张成品,
+           这一段一项都不会 —— 它只在对话里起作用。混在同一张表里,
+           用户会以为改"说话方式"也会改变出图。
+           标题同向导那边:用 Personality,把 Voice 让给嗓音 -->
+      <section class="panel">
+        <div class="panel-head">
+          <h3 class="panel-title">Personality</h3>
+          <span class="panel-note">Used in Chat only — never merged into your prompts.</span>
+        </div>
+        <dl class="spec">
+          <template v-for="r in personaRows(detailChar)" :key="r.label">
+            <dt class="spec-k">{{ r.label }}</dt>
+            <dd class="spec-v" :class="{ dim: !r.value }">{{ r.value || '—' }}</dd>
+          </template>
+        </dl>
+      </section>
+
+      <!-- 嗓音:与上面那段同一条理由(只在对话里起作用),
+           但它比人格多一件事 —— 可以直接听。刚建好的角色,
+           第一件想做的事就是听听它什么嗓子,所以这里给一枚试听键 -->
+      <section class="panel">
+        <div class="panel-head">
+          <h3 class="panel-title">Voice</h3>
+          <button type="button" class="ed-btn" @click="auditionChar(detailChar)">
+            <PhStopCircle v-if="speakingId === `audition:${detailChar.id}`" aria-hidden="true" />
+            <PhSpeakerHigh v-else aria-hidden="true" />
+            {{ speakingId === `audition:${detailChar.id}` ? 'Stop' : 'Hear it' }}
+          </button>
+        </div>
+        <dl class="spec">
+          <template v-for="r in voiceRows(detailChar)" :key="r.label">
+            <dt class="spec-k">{{ r.label }}</dt>
+            <dd class="spec-v" :class="{ dim: !r.value }">{{ r.value || '—' }}</dd>
+          </template>
+        </dl>
+        <p v-if="voiceError" class="voice-err" role="alert">{{ voiceError }}</p>
+      </section>
+      </div>
     </template>
 
     <!-- 看大图:同一张图上顺手做决定 —— 重新生成、设为主参考图,以及左右翻 -->
@@ -1620,7 +2647,12 @@ function specRows(c: Character) {
             <span class="ed-stop" aria-hidden="true"></span>
             Stop
           </button>
-          <button v-else class="ed-btn" @click="regenerateViewer">
+          <button
+            v-else
+            class="ed-btn"
+            :disabled="viewerRegenBlocked"
+            @click="regenerateViewer"
+          >
             <PhArrowsClockwise aria-hidden="true" />
             Regenerate
           </button>
@@ -1727,8 +2759,15 @@ function specRows(c: Character) {
 /* —— 新建向导:漂浮卡 ——
    创建是一条独立流程,不该插进列表里把页面顶开 —— 它是盖在这一页之上的一层,
    关掉就回到原样。与全屏看大图(viewer)同一套模态语言:暗幕 + 模糊 + 居中的卡。
-   一张卡分三层:卡头步骤条 / 卡身当前步 / 卡脚进退。
-   overflow:hidden 让卡头卡脚的底色被圆角切齐,不然会顶出四个直角 */
+   这里是三张平级的卡,不是一张套三张:
+     卡头  流程引导 —— 三步走到哪儿
+     卡身  下方信息区域 —— 左边要填的表单 + 右边这个角色"是什么"(一张卡)
+     卡脚  进退动作
+   所以 .wizard 这一层自己不再是卡(无底色、无描边、无圆角、无影子),
+   只是给这三张卡排版的一画布:三张卡之间、以及与视口之间,都隔 16px。
+   原先是一张大卡包住三块 —— 那等于把"这是一层壳"和"这是三件事"
+   同时说了,四道圆角一层层套下去还会越看越像弹窗套弹窗 */
+
 
 /* 暗幕。与卡片是平级的两个 fixed 元素,而不是"卡包在暗幕里":
    卡片要 overflow:hidden 来切圆角,一旦套进暗幕里,那层 overflow
@@ -1754,15 +2793,14 @@ function specRows(c: Character) {
      不把卡放宽,两列字段每栏就只剩 230px 上下,一行放不下几个词 */
   display: flex;
   flex-direction: column;
+  /* 三张卡之间 16px、外圈也是 16px —— 同一个档 */
+  gap: var(--sp-4);
+  padding: var(--sp-4);
   width: min(960px, calc(100% - 2 * var(--sp-4)));
   max-height: calc(100vh - 2 * var(--sp-4));
-  border: 1px solid var(--line);
-  border-radius: var(--r);
-  background: var(--surface);
-  box-shadow: var(--sh-md);
-  /* 卡片自己不滚 —— 只有卡身里那两块各自滚(见 .wz-pane / .wz-rail)。
-     卡头卡脚于是天然钉在原地:滚动的是卡身,它们根本不在那个滚动容器里 */
-  overflow: hidden;
+  /* 这一层不再是卡:没有底色、描边、圆角、影子。
+     它只是一块排版用的画布 —— 三张卡各自"浮"在这上面 */
+  background: none;
 }
 /* 卡身:信息区在左、右栏在右,两块各自滚。
    这一层用 flex 而不是 grid:卡片高度是内容决定的(auto + max-height),
@@ -1776,26 +2814,64 @@ function specRows(c: Character) {
   min-height: 0;
   display: flex;
   flex-direction: row-reverse;
+  /* 第二张卡:下方信息区域。左边是此刻要填的东西,右边是这个角色"是什么" ——
+     两块合成一张卡,而不是并排两张:它们是同一件事的两面
+     (填进去的,与填成什么样了),拆成两张卡反而要读者自己把它们对起来 */
+  border-radius: var(--r);
+  background: var(--surface);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05), var(--sh-sm);
+  /* 右栏那层 --bg 与两块的滚动内容都要被这张卡的圆角切齐 */
+  overflow: hidden;
 }
 /* 步骤条:横向三步,中间用短线连起来。
    线点亮 = 前一步做完了 —— 进度不必靠读文字,余光扫一眼就知道走到哪 */
+/* 编辑态的卡头:这一趟只有一步,摆一条点不动的步骤条只会让人以为还要走下去,
+   所以换成一行字说清"在改谁"。占的是同一个位置,也同样是那张独立的卡 */
+.wz-edit-head {
+  flex: none;
+  padding: 13px var(--sp-4);
+  border-radius: var(--r);
+  background: var(--surface);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05), var(--sh-sm);
+}
+.wz-edit-title {
+  font-size: var(--fs-md);
+  font-weight: 600;
+  letter-spacing: var(--ls-tight);
+  color: var(--text);
+}
+.wz-edit-sub {
+  margin-top: 2px;
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+  color: var(--text-3);
+}
+
+/* 第一张卡:流程引导。间距全部由 .wizard 的 padding 与 gap 给,
+   这儿不再自己写 margin —— 卡与卡的距离只该有一处定义 */
 .wz-steps {
   flex: none;
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 11px var(--sp-4);
-  border-bottom: 1px solid var(--line);
-  background: var(--bg);
+  gap: 10px;
+  padding: 10px var(--sp-4);
+  border-radius: var(--r);
+  background: var(--surface);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05), var(--sh-sm);
 }
+/* 连接线:走过的那一段整条转成墨色 —— 它和左边那枚墨色圆点连成一段实心的墨,
+   于是"走到哪儿了"不用读文字,一条深浅就看出来了。
+   高度给到 2px 并做圆头:1px 的线在视网膜屏上几乎是一条影子,
+   而这一条正是进度唯一的读数 */
 .wz-line {
   flex: 1;
-  height: 1px;
+  height: 2px;
+  border-radius: 2px;
   background: var(--line);
   transition: background var(--dur) var(--ease);
 }
 .wz-line.is-done {
-  background: color-mix(in oklch, var(--accent) 55%, var(--line));
+  background: var(--accent);
 }
 .wz-step {
   display: inline-flex;
@@ -1813,38 +2889,52 @@ function specRows(c: Character) {
 .wz-step.is-locked {
   opacity: 0.5;
 }
+/* 三态各占一档色深:当前(满墨)> 走过(--text-2)> 未到(--text-3) */
 .wz-step.is-active {
   color: var(--text);
 }
-.wz-step:not(.is-active):not(:disabled):hover {
+.wz-step.is-done {
   color: var(--text-2);
 }
-/* 序号圆点:当前步实心 accent,做完的转成勾,没到的只有一圈描边 */
+.wz-step:not(.is-active):not(:disabled):hover {
+  color: var(--text);
+}
+.wz-step:not(.is-active):not(:disabled):hover .wz-dot {
+  border-color: var(--text-3);
+}
+/* 圆点里装的是这一步的图标(见模板)。当前那枚实心墨 + 一圈淡墨晕;
+   走过的收成一枚淡墨底的对勾;未到的只留一圈细描边 ——
+   三样排在一起,顺序本身就看得出 */
 .wz-dot {
   flex: none;
-  width: 22px;
-  height: 22px;
+  width: 24px;
+  height: 24px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   border: 1px solid var(--line-strong);
   border-radius: 50%;
-  font-size: var(--fs-micro);
-  font-variant-numeric: tabular-nums;
+  color: var(--text-3);
+  transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease),
+    box-shadow var(--dur) var(--ease), color var(--dur) var(--ease);
 }
+/* 14px:图标要在 24px 的圆里留得出边距,又要认得清是什么 */
 .wz-dot svg {
-  width: 12px;
-  height: 12px;
+  width: 14px;
+  height: 14px;
 }
+/* 当前这一步。只把它涂黑还不够 —— 三步并排时"现在在这儿"要有别的东西托着,
+   所以在圆点外补一圈 accent-soft 的晕:它是这条线上唯一带光的东西 */
 .wz-step.is-active .wz-dot {
   border-color: var(--accent);
   background: var(--accent);
   color: var(--accent-contrast);
+  box-shadow: 0 0 0 4px var(--accent-soft);
 }
 .wz-step.is-done .wz-dot {
-  border-color: color-mix(in oklch, var(--accent) 35%, var(--line));
+  border-color: transparent;
   background: var(--accent-soft);
-  color: var(--accent-strong);
+  color: var(--text-2);
 }
 .wz-name {
   font-size: var(--fs-sm);
@@ -1856,10 +2946,12 @@ function specRows(c: Character) {
 }
 
 /* 信息区:当前这一步的内容,间距 10px 一档。
-   它就是那个滚动区 —— 卡片不滚,滚的是这一层(见 .wizard)。
-   这份表单加两组标题装不下时只有中间这段滑动,卡头卡脚不动,
+   它就是那个滚动区 —— 卡自己不滚,滚的是这一层(见 .wz-body)。
+   这一步的内容装不下时只有中间这段滑动,卡头卡脚不动,
    这才是"信息区域滚动"该有的样子。
-   min-height:0 是关键:少了它 flex 子项不肯缩,滚动条根本出不来 */
+   min-height:0 是关键:少了它 flex 子项不肯缩,滚动条根本出不来。
+   内边距 12px 一档:下面每一行自己还有 12px 横向内边距,
+   两层加起来 24px,正好是卡里那一档留白 */
 .wz-pane {
   flex: 1;
   min-width: 0;
@@ -1870,7 +2962,7 @@ function specRows(c: Character) {
   display: flex;
   flex-direction: column;
   gap: 10px;
-  padding: var(--sp-4);
+  padding: var(--sp-3);
 }
 
 /* —— 右栏 ——
@@ -1886,7 +2978,8 @@ function specRows(c: Character) {
   display: flex;
   flex-direction: column;
   gap: var(--sp-3);
-  padding: var(--sp-4);
+  /* 与信息区同档 12px:两块合在一张卡里,左右两边那一圈留白得一样宽 */
+  padding: var(--sp-3);
   border-left: 1px solid var(--line);
   background: var(--bg);
 }
@@ -1923,9 +3016,9 @@ function specRows(c: Character) {
   overflow-wrap: anywhere;
 }
 .wz-rail-sub {
-  font-size: var(--fs-xs);
+  font-size: var(--fs-sm);
   line-height: 1.5;
-  color: var(--text-3);
+  color: var(--text-2);
 }
 /* 清单与信息区里的字段同一套字号:标签 12 灰、值 13 满墨。
    这里是窄栏,标签压在值上面(详情页的规格表是 84px 的两列,塞不进 216px) */
@@ -1943,15 +3036,15 @@ function specRows(c: Character) {
   color: var(--text-3);
 }
 .wz-rail-v {
-  font-size: var(--fs-sm);
+  font-size: var(--fs-base);
   line-height: 1.6;
   color: var(--text);
   overflow-wrap: anywhere;
 }
 .wz-rail-none {
-  font-size: var(--fs-xs);
-  line-height: 1.7;
-  color: var(--text-3);
+  font-size: var(--fs-sm);
+  line-height: 1.6;
+  color: var(--text-2);
 }
 /* 每步开头的一段说明:标题 + 一句人话。
    向导里这行不是装饰 —— 它替用户回答"这一步在干嘛、为什么有顺序" */
@@ -2036,7 +3129,7 @@ function specRows(c: Character) {
   color: var(--text-3);
 }
 .wz-facts-v {
-  font-size: var(--fs-sm);
+  font-size: var(--fs-base);
   color: var(--text);
 }
 /* 其余四张:一排四格,与详情页的设定图同一套格子语言 */
@@ -2046,7 +3139,8 @@ function specRows(c: Character) {
   gap: var(--sp-3);
 }
 
-/* 卡脚:主操作在左,回退与退出紧跟其后(与表单里一贯的主次排法一致)。
+/* 第三张卡:进退动作。主操作在左,回退与退出紧跟其后
+   (与表单里一贯的主次排法一致)。
    它不在滚动区里,所以滚动的永远是卡身,它自己不动 */
 .wz-foot {
   flex: none;
@@ -2055,47 +3149,78 @@ function specRows(c: Character) {
   gap: 8px;
   flex-wrap: wrap;
   padding: 10px var(--sp-4);
-  border-top: 1px solid var(--line);
-  background: var(--bg);
+  border-radius: var(--r);
+  background: var(--surface);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05), var(--sh-sm);
 }
 
 /* —— 第 1 步的表单 ——
-   这一页曾经是"一行行控件同一个间距、同一种输入框、同一个视觉重量":
-   角色名和 "Marks" 长得一模一样,看不出从哪儿下手,也看不出哪些是一段。
+   整屏内容装在**一张**卡里(见 .wz-body),卡内再分成几段:
+   起稿 / 基础信息 / Spec / Reference sheet only / 参考图。
+   段与段靠留白和段标题分层,不再是"一段一张卡" ——
+   卡本身已经说了"这一整块是一件事",里面再切四张,
+   边界就把同一句话说四遍,而这里真正要区分的是"段"。
 
-   现在分三档,每一档用不同的手段区分(面积 / 字号 / 颜色),不靠装饰:
-     1 入口   起稿块   —— 淡墨底 + 描边,整张卡唯一一块"区域",重点在这
-     2 分区   组标题   —— 15/600 满墨 + 下压一条横线
-     3 字段   标签/提示 —— 12/500 灰、12/400 更灰,输入框一律 13px
-   姓名与性别不在三档里:两条必填的"基础信息",一栏是普通字段、一栏换成了按钮组,
-   分量都还是字段那一档,只是各多一枚 Required 标记(见模板里的注释)。
-   间距同时承担分组:组与组 24px、组内 8–10px */
+     重点   —— 只有起稿那一段有底色(一块淡底圆角槽),另外四段都是白面上的清单
+     段标题 —— 15px/600 满墨 + 一句 12px 的说明(见 .wz-group-head)
+     行     —— 段内每一栏是"标签在左、内容在右"的列表行,四段同一形状:
+               同一个宽度、同一条 88px 标签列、同一条 12px 发丝线
+     控件   —— 输入框一律无框无底:可写这件事由行的底色和左缘那道短竖线去说
+   字号**五档**(整个向导只有这五档,任何一处都该能对上其中一档):
+       20 页面主标题   —— 只有起稿那一块
+       16 段标题       —— 各段题头,以及第 2、3 步的标题
+       14 值 / 正文    —— 输入框、右栏的值、详情
+       13 说明         —— 段说明、步骤说明、状态提示
+       12 标签         —— 行标签、键、图注
+   上一版是 20/15/13/12 四档,问题出在 13 与 12 只差 1px:密集的行里
+   这两档在视觉上根本分不开,整页就只剩"满墨"与"灰"两种重量,
+   于是"信息没有差距"。拉开到 14 对 12 之后,相邻两档至少差 1px、
+   多则 4px,且每一档都对应一个**固定的语义角色** —— 不再出现
+   "同一个角色在这个段里 12、在那个段里 13"这种说法。
+
+   间距同时承担分组:段与段 32px、段内标题到内容是 8px —— 四倍的落差 */
 .wz-form {
-  /* 组与组 24px(--sp-5)、组内 8–10px。三倍的落差就是分层的依据,不靠边框;
-     滚动已经交给信息区了,这里不必再为了省高度把层次压平 */
-  gap: var(--sp-5);
+  gap: var(--sp-6);
 }
-/* 姓名 + 性别:两条必填自成一格,内部按组内的 8px,
-   与外面各组的 24px 拉开 —— 它们是一件事,不是两组 */
+/* 姓名 + 性别:一个段(题头是 Basics)。
+   卡身比照 .wz-fields —— 行与行之间一条发丝线,行内标签左、值右。
+   它自己不再是卡:这一整块已经是卡里的一段 */
 .wz-basics {
   display: flex;
   flex-direction: column;
-  gap: var(--sp-2);
+  gap: 0;
+}
+/* 按首行对齐,不按中线 —— 标签现在是两行(字段名 + 标记),
+   整块居中的话"Name"会比输入框里那行字高出四五个像素,
+   而这两行本来就该齐在第一条基线上 */
+.wz-basics > .wz-field {
+  align-items: flex-start;
 }
 
-/* 起稿块是这一页的重点:它是最常用的入口 —— 一句话交给模型,
-   下面所有栏位由它填出来。所以它拿的是整张卡上唯一一块"区域"待遇:
-   淡墨底 + 同色描边(别处的框都是白底细线),里面的输入槽比块底亮一档,
-   于是"区域 - 输入槽 - 主按钮"三层一眼分得开。
-   内边距与外层表单同档:它是这张卡上分量最重的一块,不该比包着它的地方更挤 */
+/* 起稿是这一页的第一段,也是它最常用的入口 —— 一句话交给模型,
+   下面所有栏位由它填出来。整段坐在一块淡底圆角槽里:
+   这是这张卡上唯一一块有底色的地方,另外四段都是白面上一行行的清单 ——
+   "重点"靠的是"这一块跟别的不一样",而不是把标题再放大一号 */
 .wz-draft {
+  /* 起稿中那圈呼吸光晕要拿它当定位基准(见 .halo-breathe)。
+     光晕只加在槽外,槽本身全程不动 —— 与首页那个输入框同一套:
+     槽还是那个槽,变的是槽外的光 */
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: var(--sp-3);
-  padding: var(--sp-4);
-  border: 1px solid color-mix(in oklch, var(--accent) 22%, var(--line));
+  /* 12px:与下面每一行的横向内边距同档,于是槽里的字仍然落在
+     距卡边 24px 那条竖线上,和另外四段对齐 */
+  padding: var(--sp-3);
   border-radius: var(--r-sm);
-  background: var(--accent-soft);
+  background: var(--bg-elev);
+  transition: background var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+}
+/* 光标进到这一栏时,槽从淡底翻成白面并亮起一圈淡墨。
+   全站不给输入框画焦点描边(见 style.css),这一下就是它的焦点信号 */
+.wz-draft:has(textarea:focus) {
+  background: var(--surface);
+  box-shadow: inset 0 0 0 1px color-mix(in oklch, var(--accent) 18%, transparent);
 }
 /* 标题与引导语贴成一组:两者是一句话的两半(问什么 + 怎么答) */
 .wz-draft-head {
@@ -2103,32 +3228,43 @@ function specRows(c: Character) {
   flex-direction: column;
   gap: 3px;
 }
+/* 这一页最大的字(20px,--fs-xl),比第二档的段标题高整整五档。
+   层次要的是这种一眼可见的落差;此前它只比段标题大一档(16 对 15),
+   等于把"最大"和"次大"糊在一起,一页自然没有重点 */
 .wz-draft-title {
-  font-size: var(--fs-md);
+  font-size: var(--fs-xl);
   font-weight: 600;
   letter-spacing: var(--ls-tight);
   color: var(--text);
 }
-/* 引导语用 text-2 而不是 text-3:这块底是 accent-soft,
-   text-3 在它上面只有 4.22:1,过不了正文的 4.5(与 .wz-draft-hint 同一笔账) */
 .wz-draft-sub {
   max-width: 56ch;
-  font-size: var(--fs-xs);
-  line-height: 1.65;
+  font-size: var(--fs-sm);
+  line-height: 1.6;
   color: var(--text-2);
 }
-/* 输入槽。比块底亮一档、字号抬到 15px 并给正文色 ——
+/* 输入槽。字号抬到 15px 并给正文色 ——
    这一栏收的是"一个人的样子",是整页唯一写给人看的话,而下面各栏是填给模型的参数;
    字号与颜色把这两件事分开(15px 与首页的提示词框同档,不是新开的尺寸)。
+   它自己不画边框也不画底线:外面那层淡底槽就是它的边界,
+   再描一道线等于把"这是一块能写字的地方"说两遍。
    选择器带上 textarea 是为了压过 .ed-input 那几条:两个单类分处文件两头,
    靠先后顺序去赢太脆 */
 textarea.wz-idea {
-  background: var(--surface);
+  padding: 0;
   font-size: var(--fs-md);
   line-height: 1.6;
   resize: none;
-  /* 随内容长高(见 vGrow),所以不留滚动条 */
-  overflow: hidden;
+  /* 随内容长高(见 vGrow),但最多长到 6 行 —— 与首页那个提示词框同一档
+     (见 App.vue 的 INPUT_MAX_ROWS)。封顶之后转成内部滚动。
+     不封顶的代价在这一页比首页还大:起稿块在整张卡的最上面,
+     一段半页长的描述会把下面整套设定、连右栏那份摘要一起顶出视口,
+     而用户填到一半最需要看的恰恰是"它到底读出了什么"。
+     em 跟着自身的字号走,窄屏那条 16px 的规则一改,这里也自己跟着涨 */
+  max-height: calc(1.6em * 6);
+  /* 只放行纵向:一长串没有空格的字符不该顶出一条横向滚动条 */
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 /* 动作行:提示与报错占左边的余量,主按钮钉在右边。
    用 flex-end + margin-right:auto 而不是 space-between —— 没有提示时按钮也不挪位 */
@@ -2153,7 +3289,7 @@ textarea.wz-idea {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: var(--fs-xs);
+  font-size: var(--fs-sm);
   line-height: 1.5;
   color: var(--text-2);
 }
@@ -2163,108 +3299,365 @@ textarea.wz-idea {
   color: var(--danger);
 }
 
-/* 组:标题 + 一句说明 + 内容 */
+/* 组:卡外一行标题(带一句副题)+ 一张装内容的卡 */
 .wz-group {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: var(--sp-2);
 }
-/* 组标题行下面压一条横线:它是"分层"最直接的凭据 ——
-   光靠字号差,那一排灰标签会把组标题淹掉 */
+/* 段与段之间:一条两端内缩的发丝线。
+   原来只靠留白分层("留白已经说了这是新的一段"),可每一段如今都挂着三四行
+   内容,那点留白被内容吃掉了 —— "几块糊在一起"是连着的两次反馈。
+   线两端各空 12px,和行内那条发丝线同一个规矩:横贯到边会把整段封死 */
+.wz-group + .wz-group {
+  position: relative;
+}
+/* 线画在**段间留白的正中**(gap 是 32px,见 .wz-form),上下各 16px。
+   它不占布局 —— 段与段的节奏仍旧由那一处留白说了算,这条线只是把
+   "这里是两段"指出来,不再往上加一层间距(见下面这段被推翻的注释) */
+.wz-group + .wz-group::before {
+  content: '';
+  position: absolute;
+  top: -16px;
+  left: 12px;
+  right: 12px;
+  height: 1px;
+  background: var(--line);
+}
+/* 段标题与副题上下排,像小节的题头。
+   标题行下面仍然不压横线 —— 那条线已经画在段与段之间了,
+   同一个分隔说两遍才是多余的 */
 .wz-group-head {
   display: flex;
-  align-items: baseline;
-  flex-wrap: wrap;
-  gap: 2px 10px;
-  padding-bottom: 8px;
-  border-bottom: 1px solid var(--line);
+  flex-direction: column;
+  gap: 3px;
+  /* 与下面每一行的内容同一条左边缘:行自己有 12px 横向内边距,
+     眉标就得补上同样那 12px,否则它会比它管的那些行往里缩 */
+  padding: 0 var(--sp-3);
 }
+/* 段标题:15px / 600 / 满墨 —— 一个实打实的标题。
+   上一版把它做成 12px 全大写的眉标,想靠"换一种写法"分层;
+   可眉标和行标签同为 12px,一页里就只剩"起稿标题 16、其余全 12"两档,
+   反而比原来更平。层次终究要靠字号差,字距与大小写是辅助。
+
+   这一页的**五档**(全向导统一,见 .wz-form 那段的总说明):
+     20 页面主标题 / 16 段标题 / 14 行值 / 13 说明 / 12 标签
+   段标题原来是 15,而第 2、3 步的标题是 16 —— 同一个角色两种字号,
+   这正是"字很乱"的来源。现在统一到 16 */
 .wz-group-title {
   display: inline-flex;
-  /* 基线对齐:标题里有 "Optional" 这种小一号的字,居中会看起来是斜的 */
   align-items: baseline;
+  flex-wrap: wrap;
   gap: 8px;
-  /* 15px/600 满墨 —— 与字段标签(12/500 灰)差两档,
-     原来 13/600 和标签几乎一样重,所以组与组之间看不出边界 */
-  font-size: var(--fs-md);
+  font-size: var(--fs-lg);
   font-weight: 600;
+  letter-spacing: var(--ls-tight);
   color: var(--text);
 }
-/* 说明用 text-3 而不是 text-4:后者在浅色面上过不了 4.5:1 */
+/* 段说明:压在标题下面,与标题差三档。
+   原来是 12px + text-3,而"说明"这一角色在别的段里时而是 12、时而是 13,
+   颜色时而 text-2 时而 text-3 —— 现在统一到 13px/text-2 这一档:
+   它是要读的一句话,不是可以扫过去的脚注(--text-3 那档留给标签) */
 .wz-group-hint {
-  font-size: var(--fs-xs);
-  color: var(--text-3);
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+  color: var(--text-2);
 }
-/* 标签行里的小标记:Optional / Required 用同一套,位置也一样 ——
-   有标记的那几栏一眼看得出来,没标记的就是普通栏。
-   不做胶囊:一块 --surface-hover 的底会把 11px 的灰字压到 4.17:1,
-   同一个意思,一行更淡的字就够了,也少一件装饰 */
+/* "必填"用一枚墨色星号,不写 "Required" 这个词 ——
+   星号是表单里通用的约定,一眼认得,而且只占一个字宽;
+   写成词(八九个字符)会把这 88px 的标签列挤成两种版式:
+   放得下的挤成一行、放不下的折成两行,同一张卡里两行标签就不是一个形状。
+   颜色用 --accent(与字段值同色的墨),不是 --text-3:
+   它是这几个字里唯一一条"约束",该压得住旁边那行灰标签。
+   读屏不听它(aria-hidden),必填由控件自己的 aria-required 说 */
 .wz-mark {
-  font-size: var(--fs-micro);
-  font-weight: 400;
-  color: var(--text-3);
+  flex: none;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  line-height: 1;
+  color: var(--accent);
 }
-/* "必填"要能压住视线:它是一条约束,不是一句补充。
-   全表只有姓名与性别两栏必填,所以不必再用星号加图例那种写法 */
-.wz-mark.is-required {
-  font-weight: 500;
+
+/* 字段区:一列"标签在左、值在右"的列表行 ——
+   与详情页那张规格表(.spec,84px 标签列)是同一套读法,只是这里可以就地改。
+   为什么是一列而不是两列 —— 四段必须长得一样宽才看得出是一份表:
+   两列时 Spec 那一段是两个半宽的行,而 Basics 与 Reference image 是整宽的行,
+   并排放在一张卡里,每一段的边界都落在不同的横线上,越看越乱。
+   值那一栏有 700px 上下,13px 的字一行放得下十二个词,
+   所以改成一列并没有把行撑高多少 —— 换来的是四段同一个形状 */
+.wz-fields {
+  display: grid;
+  grid-template-columns: 1fr;
+  /* 行与行不留缝:相邻两行的发丝线正好是一条分界。
+     内外留白全部交给每一行自己(见 .wz-field)—— 它不再是卡,是卡里的一段 */
+  gap: 0;
+}
+/* 一行。它自己就是可悬停的那一块(与设置页的 .row 同一套做法):
+   底色一深,既说明"这一格能写",也把这一行从上下两行里挑出来 */
+.wz-field {
+  position: relative;
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: var(--sp-3);
+  min-width: 0;
+  padding: 10px 12px;
+  border-radius: var(--r-sm);
+  transition: background var(--dur) var(--ease);
+}
+/* ===== 嗓音 =====
+   两块:上面一排引擎(系统嗓子 / 自己配的那把),下面按来源分叉。
+   分叉只有一行输入 —— 因为三种来源在请求那边本来就只差"voice 从哪来" */
+/* 这一组的容器。给一块淡底,把它从上面的"行"里挑出来(见模板里的注释)。
+   内边距 12/14 与 .wz-field 那一档对齐,里面的东西不必再自己撑边距 */
+.voice-panel {
+  display: flex;
+  flex-direction: column;
+  padding: 14px;
+  border-radius: var(--r-sm);
+  background: var(--bg-elev);
+}
+/* 面板里分三块:引擎 → 来源 → 要填的那一格。
+   三块的形状各不相同(一排胶囊、一排胶囊、一个输入框),不划线就会糊成一片 ——
+   块与块之间一条发丝线,两端内缩,与卡里别处的分隔同一个规矩 */
+.voice-block + .voice-block {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+/* 组内的小标题(Engine / Voice source)。
+   满墨 + 大写 + 字距:这一组里除了字段名,别的字都是 --text-2 的灰 ——
+   标题只有用最重的那档墨色才压得住,分块才立得起来 */
+.voice-cap {
+  display: block;
+  margin: 0 0 8px;
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  letter-spacing: var(--ls-eyebrow);
+  text-transform: uppercase;
+  color: var(--text);
+}
+.voice-seg {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.voice-seg button {
+  min-height: 36px;
+  padding: 0 13px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: none;
+  color: var(--text-2);
+  font-size: var(--fs-sm);
+  cursor: pointer;
+  transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease),
+    color var(--dur) var(--ease);
+}
+.voice-seg button:hover {
+  border-color: var(--line-strong);
+  color: var(--text);
+}
+/* 选中的那枚用实心纸色 —— 与查看器的主操作同一个说法:
+   这一组里"现在哪一档"必须一眼看得出来 */
+.voice-seg button.on {
+  border-color: var(--cta);
+  background: var(--cta);
+  color: var(--cta-text);
+}
+/* 说明:解释"这一档是什么意思"。它是要读的一句话,留在 13px/--text-2 */
+.voice-note {
+  margin: 8px 0 0;
+  font-size: var(--fs-sm);
+  line-height: 1.5;
   color: var(--text-2);
 }
 
-/* 字段区:两列,每格是"标签在上、输入在下"。
-   为什么两列 —— 一栏一行往下堆时整张表有近千像素,而卡身可用高度是
-   「视口 − 卡头 48 − 卡脚 60 − 上下留白 32」,900px 的屏只有约 760px:
-   校对一遍得上下翻。两列之后十几行变六七行,一屏能看全。
-   为什么标签在上而不是在左 —— 在左的话每列只剩 338 − 96 − 12 = 230px,
-   13px 下约 37 字符,而字段值上限是 12 个词(约 70 字符) */
-.wz-fields {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  align-items: start;
-  gap: var(--sp-3) var(--sp-4);
+/* —— 要填的那一格 ——
+   上面全是灰字,这里必须一眼看出"框里才是要写的"。所以三件事同时做:
+   字段名压成 12px 的墨色小标、控件套一个白面描边的框、注脚退回框外的灰字。
+   框是这一组里唯一的"可写"信号 —— 它也是"哪些是要填的"这句话的答案 */
+.voice-field {
+  display: block;
 }
-.wz-field {
+/* 块里第一格贴块顶(上边距由块自己出),后面的格与它拉开一档 */
+.voice-block > .voice-field:first-child {
+  margin-top: 0;
+}
+.voice-field + .voice-field {
+  margin-top: 14px;
+}
+/* 墨色而不是灰:它是"这一格填什么",就压在框的上沿,该比注脚重 */
+.voice-label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  color: var(--text);
+}
+/* 框。白面托在淡灰面板上,再描一道发丝线 —— 深色主题下两者明暗相反,
+   但"这里是一个框"这件事两边都成立。
+   min-height 40px 是这一页可点区域的底线(与性别那枚分段控件同档) */
+.voice-control {
   display: flex;
-  flex-direction: column;
-  gap: 5px;
+  align-items: center;
+  min-height: 40px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+}
+.voice-control:hover {
+  border-color: var(--line-strong);
+}
+/* 焦点落在框上,而不是里面那条无框的字(.ed-input 自己的焦点样式是空的),
+   否则"光标落在这格"就没有任何信号 */
+.voice-control:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+/* 内边距由框来撑,里面的控件不再自己留上下余量(否则会多出 4px) */
+.voice-control .ed-input {
+  flex: 1;
+  padding: 0;
+}
+/* 描述那一档的 textarea 随内容长高(见 vGrow),框也跟着长 */
+.voice-control textarea.ed-input {
+  resize: none;
+  line-height: 1.5;
+}
+/* 注脚:框下面那行解释。与 .voice-note 同档 —— 两者的分界交给位置,
+   一句在选项下、一句在框下 */
+.voice-hint {
+  display: block;
+  margin-top: 6px;
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+  color: var(--text-2);
+}
+/* 注脚里的强调句(如 "This description is the voice.")。
+   原来 em 被抹成和正文一样的灰,等于没强调 —— 它该压得住旁边那句解释 */
+.voice-hint em {
+  font-style: normal;
+  font-weight: 600;
+  color: var(--text);
+}
+.voice-clone {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.voice-sample {
+  font-size: var(--fs-xs);
+  color: var(--text-3);
+  overflow-wrap: anywhere;
+}
+.voice-audition {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 14px;
+}
+/* 报错。display:block 是给 clone 那一条(它是 span)补的 ——
+   行内元素上写 margin-top 本来就不生效 */
+.voice-err {
+  display: block;
+  margin: 8px 0 0;
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+  color: var(--danger);
+}
+/* 行与行之间的发丝线。两端各空 12px —— 一条横贯到卡边的线会把每一行封死 */
+.wz-field::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 12px;
+  right: 12px;
+  height: 1px;
+  background: var(--line);
+}
+/* 一段的第一行不画:它上面是段标题,不是另一行 */
+.wz-fields > .wz-field:first-child::before,
+.wz-basics > .wz-field:first-child::before {
+  opacity: 0;
+}
+/* 焦点标记:左缘一条 accent 短竖线。
+   全站不给输入框画焦点描边(见 style.css),只靠"底色深了一档"
+   在键盘操作时太轻,加这一道就知道光标落在哪一行 */
+.wz-field::after {
+  content: '';
+  position: absolute;
+  left: 2px;
+  top: 10px;
+  bottom: 10px;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--accent);
+  opacity: 0;
+  transform: scaleY(0.4);
+  transition: opacity var(--dur) var(--ease), transform var(--dur) var(--ease);
+}
+.wz-field:hover,
+.wz-field:focus-within {
+  background: var(--bg-elev);
+}
+.wz-field:focus-within::after {
+  opacity: 1;
+  transform: none;
+}
+/* 值占满标签右边的那点余量。它自己不带边框也不带底 ——
+   行的底色与左缘那道线已经说清了"这一格能写" */
+.wz-field > .ed-input {
+  flex: 1;
   min-width: 0;
+  width: auto;
 }
 /* 备注是自由文本,占满两列 */
 .wz-field.is-wide {
   grid-column: 1 / -1;
 }
 
-/* —— 性别:两枚胶囊 ——
-   外面那层 .wz-field 与 Name 完全一样,只把控件换掉。
-   选中态沿用全站那一套(见 SettingsPage 的 .purpose-opt):
-   墨色描边 + 抬高一点,而不是涂成实心 —— 两枚里有一个是默认值,
-   涂黑会让它看着像按钮而不是"已经选好的那个" */
+/* —— 性别:一枚分段控件 ——
+   原来是并列的两枚描边胶囊、各占一半宽,与上下那些输入框一样重,
+   读起来像"两颗待按的按钮"。现在收成一枚系统设置那样的分段控件:
+   一条浅槽 + 一枚落在槽里的墨色药丸。
+   选中态涂实心是刻意的:两枚里那个默认值本来就已经是"选好的那个",
+   换个说法喊出来(药丸)比再画一圈描边更一眼看得懂,也正是这种控件的惯例。
+   外面那层 .wz-field 与 Name 完全一样,只把控件换掉 */
 .wz-sex {
-  display: flex;
-  gap: var(--sp-2);
+  display: inline-flex;
+  flex: none;
+  /* 不留 margin-left:auto —— 它也是"这一行的值",要和 Name 的输入框、
+     以及下面每组里的值一样从那条 88px 的竖线起排。
+     推到最右会把同一张卡里的两个值分成两种落点(一个贴标签、一个贴右边缘),
+     这一页的读法本来就是"标签一列、值一列" */
+  gap: 2px;
+  padding: 3px;
+  border-radius: 999px;
+  background: var(--bg-elev);
 }
 .wz-sex-opt {
   /* 隐藏的 radio 是绝对定位的,得有个定位锚点收住它 */
   position: relative;
-  flex: 1;
-  min-width: 0;
   display: flex;
   align-items: center;
   justify-content: center;
   /* 40px 是这一页所有可点区域的底线:再矮在触屏上就点不准了 */
   min-height: 40px;
-  padding: 0 14px;
-  border: 1px solid var(--line);
-  border-radius: var(--r-sm);
-  background: var(--bg);
+  padding: 0 16px;
+  border-radius: 999px;
   color: var(--text-2);
   font-size: var(--fs-sm);
   cursor: pointer;
-  transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease),
-    box-shadow var(--dur) var(--ease), color var(--dur) var(--ease);
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
 }
-.wz-sex-opt:hover {
-  border-color: var(--line-strong);
+/* 未选中的那枚悬停只提亮文字 —— 槽里的空白不该再长出第二个色块 */
+.wz-sex-opt:not(:has(input:checked)):hover {
+  color: var(--text);
 }
 /* 原生 radio 藏起来但留在 Tab 键序里:方向键切换、读屏念"已选中",
    都是它自带的。换成 button 就得把这些重写一遍 */
@@ -2278,26 +3671,37 @@ textarea.wz-idea {
   text-transform: capitalize;
 }
 .wz-sex-opt:has(input:checked) {
-  border-color: var(--text);
-  background: var(--surface);
-  box-shadow: var(--sh-sm);
-  color: var(--text);
+  background: var(--accent);
+  color: var(--accent-contrast);
 }
 /* 全站不画焦点描边(见 style.css 的 :focus-visible),所以键盘聚焦
-   也走"描边 + 一圈晕"这条路,与 .ed-input:focus 同一套 */
+   也走"描边 + 一圈晕"这条路 */
 .wz-sex-opt:has(input:focus-visible) {
-  border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
+/* 行标签:定宽 88px 的左边一列 —— 所有字段值于是从同一条竖线起排。
+   88px 与详情页规格表的 84px 同一档(这里多 4px,是因为表单里的字要首字母大写、
+   最长的一条 "Nose & mouth" 得留出富余)。
+
+   字号与颜色都压到最安静那一档(12px / 500 / text-3):
+   这一段里标签只是"这一格填什么"的提示,真正的内容是右边那个值,
+   而值给的是 13px 的满墨 —— 两者差的不只是 1px,还有一整档色深。
+   标签再重一点,一行里就会变成两段同样有分量的字,谁也不让谁。
+
+   这一行里还会跟两枚小东西:必填的星号(.wz-mark)、
+   "模型填过"的小点(.wz-ai)—— 都是字段名的一部分,跟它同一行 */
 .wz-label {
+  flex: none;
+  width: 88px;
   display: flex;
   align-items: center;
   gap: 6px;
-  /* 12/500 灰 —— 字段标签是这一页的第四档,比组标题低两档。
-     12px 与详情页规格表的 .spec-k 同一档,不是新开的尺寸 */
+  /* 与右边的值对齐首行基线:值的输入框自带 4px 上内边距 */
+  padding-top: 4px;
   font-size: var(--fs-xs);
   font-weight: 500;
-  color: var(--text-2);
+  line-height: 1.4;
+  color: var(--text-3);
 }
 /* 起稿填过、还没动过的标记。一枚小点就够了 ——
    用户一改那一栏就消失(见 markEdited),组说明里同时换成对应图例 */
@@ -2308,32 +3712,28 @@ textarea.wz-idea {
   border-radius: 50%;
   background: var(--accent);
 }
-/* 给读屏的"这栏是模型填的"。视觉上靠那枚点,但那枚点不值得被念出来 */
-.wz-sr {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  margin: -1px;
-  padding: 0;
-  border: 0;
-  overflow: hidden;
-  clip: rect(0 0 0 0);
-  white-space: nowrap;
-}
-/* 参考图:空态与有图态同一个外框、同一个高度 —— 挑完图不该整块往上跳一下 */
+/* 给读屏的"这栏是模型填的"。视觉上靠那枚点,但那枚点不值得被念出来 ——
+   样式在 style.css 的 .sr-only,这里不另立一份 */
+/* 参考图:空态与有图态同一个高度 —— 挑完图不该整块往上跳一下。
+   它就是段里的一行:横向内边距与 .wz-field 同档(12px),
+   于是它的外框与上面那些行的悬停底色同起同止,
+   里面的图与字也落在距卡边 24px 那条竖线上。
+   这里不再额外收 margin —— 卡自己已经收了 12px,
+   再收一层会让这一段的框比别的段窄一圈(就是"宽度不一致"的由来) */
 .wz-ref {
+  /* 读取中那圈呼吸光晕的定位基准(见模板里的 halo-breathe)。
+     光晕只加在卡外,卡本身全程不动 */
+  position: relative;
   display: flex;
   align-items: center;
   gap: var(--sp-3);
   min-height: 68px;
-  padding: 9px var(--sp-3);
-  border: 1px solid var(--line);
+  padding: 10px var(--sp-3);
   border-radius: var(--r-sm);
-  background: var(--bg);
 }
+/* 空态只留一条虚线槽:它此刻是个"往这儿放图"的入口,还不是一行内容 */
 .wz-ref-pick {
-  border-style: dashed;
-  border-color: var(--line-strong);
+  border: 1px dashed var(--line-strong);
   cursor: pointer;
   transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease);
 }
@@ -2359,12 +3759,12 @@ textarea.wz-idea {
   min-width: 0;
 }
 .wz-ref-main {
-  font-size: var(--fs-sm);
+  font-size: var(--fs-base);
   font-weight: 500;
   color: var(--text);
 }
 .wz-ref-hint {
-  font-size: var(--fs-xs);
+  font-size: var(--fs-sm);
   /* 同 text-3 的账:这块底是 bg,悬停时变 bg-elev,text-3 在后者上只有 4.40:1 */
   color: var(--text-2);
 }
@@ -2378,37 +3778,82 @@ textarea.wz-idea {
   border-radius: var(--r-sm);
   border: 1px solid var(--line);
 }
+/* 有图之后这一块多一行识图状态,所以外面包一层纵向容器。
+   图片那一行本身的高度不变(见上面的 min-height) */
+.wz-ref-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+/* 识图状态行:左边是取景框与说明,右边是重读按钮。
+   min-height 兜住基线 —— 从"读取中"到"已读"再到"又跟了一行说明",
+   每次换态整块不该抽一下 */
+.wz-scan {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  min-height: 34px;
+  /* 与上下那两行的内容同一条左边缘(上面 .wz-ref 自己收了 12px 外边距) */
+  padding: 0 var(--sp-3);
+}
+/* 取景框与它下面那几句说明竖着排。颜色定在这里:
+   LatticeLoader 的 label 走 currentColor,跟着它就有了深浅两种主题下的正确墨色 */
+.wz-scan-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--text-2);
+}
+.wz-scan-hint {
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+  color: var(--text-2);
+}
+.wz-scan-err {
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+  color: var(--danger);
+}
 
-/* —— 表单控件:所有文本输入共用 —— */
+/* —— 表单控件:所有文本输入共用 ——
+   无框、无底、无圆角:它现在是"列表行里的一段可写文字",不是一个盒子。
+   行的底色与左缘那道短竖线负责说"这一格能写、光标正落在这儿"(见 .wz-field),
+   盒子只会把一行行东西重新切回原来那种方框阵 —— 那正是这一版要丢掉的 */
 .ed-input {
   width: 100%;
   min-width: 0;
-  padding: 10px 12px;
-  border: 1px solid var(--line);
-  border-radius: var(--r-sm);
-  background: var(--bg);
+  padding: 4px 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
   color: var(--text);
-  font-size: var(--fs-sm);
-  transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+  /* 14px:整份表单里"值"的统一档。原来是 13,和 12 的标签只差 1px ——
+     两者在密集的行里几乎分不出来,"信息没有差距"说的就是这一处 */
+  font-size: var(--fs-base);
 }
 /* 占位符显式定色:浏览器默认那一档灰在浅色面上过不了 4.5:1 */
 .ed-input::placeholder {
   color: var(--text-3);
 }
-/* 聚焦给一圈晕(accent-soft 这个 token 本来就是留给聚焦的);
-   只换描边色在键盘操作时太不起眼 */
 .ed-input:focus {
   outline: none;
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-soft);
+  box-shadow: none;
 }
-/* 规格字段是 textarea,随内容长高(见 vGrow)。
-   刻意不封顶:封顶就得配 overflow,字段里会多出一条自己的滚动条 ——
-   一页里不该有两条。长内容让这一格变高,整张卡跟着长,滚动交给卡片自己 */
+/* 规格字段是 textarea,随内容长高(见 vGrow),但三行封顶。
+   为什么不封顶:一行行往下摞的表里,只要有一格长起来,
+   整份表的分栏线就跟着塌一格 —— 用户扫的时候会以为那是一片空白,
+   而不是"这一栏我写多了"。封顶之后每一行的高度是稳定的。
+   封顶就要配内部滚动(不能让它溢出),这是这一版认下的代价:
+   一页里两条滚动条,好过一次把整张表的节奏打乱。
+   1.5em × 3 跟着自身字号走,窄屏那条 16px 的规则一改,这里也自己跟着涨 */
 .wz-field textarea.ed-input {
   resize: none;
   line-height: 1.5;
-  overflow: hidden;
+  max-height: calc(1.5em * 3);
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 .ed-btn {
   display: inline-flex;
@@ -2909,42 +4354,52 @@ textarea.wz-idea {
 .hero {
   display: flex;
   align-items: center;
-  gap: var(--sp-4);
+  /* 图与文字之间留一档半的呼吸:200px 的图旁边紧贴文字会读起来像"图注" */
+  gap: var(--sp-5);
   padding: var(--sp-5);
   border: 1px solid var(--line);
   border-radius: var(--r);
   background: var(--surface);
 }
-.hero-avatar {
+/* 主视觉:正脸那张图。3:4 与列表里的角色卡同一个比例,圆角也同一档 ——
+   这一页是那张卡"打开之后",同一个人不该换个形状。
+   影是贴边接触影(见 --sh-sm):浅色主题里照片边缘不托一道会糊在卡面上。
+   没有正脸时是一块淡底的占位框,尺寸不塌 —— 那一栏的存在感先立住 */
+.hero-shot {
   flex: none;
-  width: 88px;
-  height: 88px;
-  display: inline-flex;
+  /* 240 × 320。内容区约 1040px,它占四分之一 —— 再小就只是"配图",
+     再大又会把下面那五张设定图压成附属品,而它们才是这一页的正文 */
+  width: 240px;
+  aspect-ratio: 3 / 4;
+  display: flex;
   align-items: center;
   justify-content: center;
   overflow: hidden;
-  border-radius: 50%;
-  border: 1px solid var(--line);
-  background: var(--bg-elev);
-  color: var(--text-3);
+  border-radius: 24px;
+  background: var(--image-bg);
+  color: var(--text-4);
+  box-shadow: var(--sh-sm);
 }
-.hero-avatar img {
+.hero-shot img {
   width: 100%;
   height: 100%;
   object-fit: cover;
   display: block;
 }
-.hero-avatar svg {
-  width: 32px;
-  height: 32px;
+.hero-shot svg {
+  width: 40px;
+  height: 40px;
 }
 .hero-body {
   flex: 1;
   min-width: 0;
 }
+/* 名字是这一页的标题,而它旁边现在站的是一张 267px 高的图 ——
+   22px 的名字配那个体量会显得像图注。抬到 28px(fs-3xl,与各页页标题同档) */
 .hero-name {
-  font-size: var(--fs-2xl);
-  line-height: 1.25;
+  font-size: var(--fs-3xl);
+  line-height: 1.2;
+  letter-spacing: var(--ls-tight);
   color: var(--text);
 }
 .hero-sub {
@@ -3000,6 +4455,21 @@ textarea.wz-idea {
   flex: none;
   padding: 10px 16px;
 }
+/* 两枚动作同排(Chat + 一次补齐)。它们是这一列的收尾,跟在标签下面 ——
+   不再是右侧独立的一列:左边站着 267px 的图,再切出第三列按钮,
+   那一列会孤零零地悬在中线上,读起来像工具栏而不是一个人。
+   整条 hero 在窄屏会换行,这一组自己也留一条换行的余地 */
+.hero-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-top: var(--sp-4);
+}
+.hero-chat {
+  min-height: 40px;
+  padding: 10px 15px;
+}
 
 .panel {
   margin-top: var(--sp-4);
@@ -3007,6 +4477,24 @@ textarea.wz-idea {
   border: 1px solid var(--line);
   border-radius: var(--r);
   background: var(--surface);
+}
+/* 三张资料表(Spec / Personality / Voice)并排,收成一段"附录"。
+   它们原来是三张上下堆叠的卡,一路读下来就是一堵"表单墙" ——
+   可它们其实是同等次要的东西:都是"要用的时候才查"的资料,
+   而这一页的主角是上面那张脸,以及它那五张设定图。
+   并排之后它们从"页面正文"退成一段注脚,视线扫过就行。
+   用 auto-fit 而不是写死三列:窄屏自己落成两列、一列,不必再挂一条媒体查询 */
+.dt-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: var(--sp-4);
+  align-items: start;
+  margin-top: var(--sp-4);
+}
+/* 并排之后卡自己那条上边距要去掉:间隙由 grid 的 gap 统一给,
+   否则三张卡会一起再往下挪一格 */
+.dt-facts > .panel {
+  margin-top: 0;
 }
 .panel-head {
   display: flex;
@@ -3119,9 +4607,10 @@ textarea.wz-idea {
   background: var(--accent);
   color: var(--accent-contrast);
 }
-/* 一次只跑一张:生成期间其余空位是停用的,必须看得出来,
-   否则和平时长得一样、点了却没反应。
-   正在跑的那一格不走这里 —— 它换成了停止位,是可点的 */
+/* 该停用的入口要看得出来,否则和平时长得一样、点了却没反应。
+   只有一种情况会停用:正脸正在重跑 —— 那时其余几张拿到的会是上一版正脸。
+   别的组合都允许同时跑,各自有自己的进度与停止位 ——
+   正在跑的那一格不走这里,它换成了停止位,是可点的 */
 .cell-img:disabled {
   cursor: default;
   opacity: 0.4;
@@ -3526,10 +5015,32 @@ textarea.wz-idea {
 }
 
 @media (max-width: 720px) {
-  /* 窄屏放不下两列,退回一列。标签本来就在输入上方,所以结构不必再改,
-     只要把网格收成一列 —— 上一版标签在左,窄屏还得额外把标签挪上去 */
-  .wz-fields {
-    grid-template-columns: 1fr;
+  /* 窄屏时标签左、值右会挤不下(88 + 12 + 分段控件 ~150 就顶到边了):
+     标签回到值上面,行变成上下两段 */
+  .wz-fields > .wz-field,
+  .wz-basics > .wz-field {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 6px;
+  }
+  /* 标签在值上方,88px 那一列不复存在,自然拿到整行宽 */
+  .wz-label {
+    width: auto;
+    padding-top: 0;
+  }
+  .wz-sex {
+    align-self: flex-start;
+  }
+  /* 上下两段之后"左缘那条短竖线"要跟着缩:它标的是这一行,不是这一整块 */
+  .wz-field::after {
+    top: 9px;
+    bottom: auto;
+    height: 18px;
+  }
+  /* 列里不能让输入框 flex:1 —— 主轴变成竖的,flex-basis:0 会把文本域压没 */
+  .wz-field > .ed-input {
+    flex: none;
+    width: 100%;
   }
   /* 16px 以下 iOS Safari 聚焦时会放大整页(与提示词库同一档处理)。
      名字那栏现在也用 .ed-input,所以一并覆盖到了。
@@ -3555,9 +5066,11 @@ textarea.wz-idea {
     gap: 6px;
     padding: 12px var(--sp-4);
   }
-  /* 卡片把留白收一档:视口本来就窄,给表单多留一点宽度。
-     高度上限也用同一档 —— 上下各留这么点,卡不至于贴到屏幕边 */
+  /* 三张卡之间、以及卡与屏幕边之间的留白都收一档:
+     视口本来就窄,给表单多留一点宽度 */
   .wizard {
+    gap: var(--sp-3);
+    padding: var(--sp-3);
     width: calc(100% - 2 * var(--sp-3));
     max-height: calc(100vh - 2 * var(--sp-3));
   }
@@ -3618,9 +5131,9 @@ textarea.wz-idea {
     flex-wrap: wrap;
     padding: var(--sp-4);
   }
-  .hero-avatar {
-    width: 64px;
-    height: 64px;
+  .hero-shot {
+    width: 104px;
+    border-radius: 16px;
   }
   .hero-cta {
     width: 100%;

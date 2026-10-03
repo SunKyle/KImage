@@ -2,6 +2,7 @@
 import {
   PhHouse,
   PhMaskHappy,
+  PhChatCircleDots,
   PhFrameCorners,
   PhBooks,
   PhClockCounterClockwise,
@@ -44,6 +45,10 @@ defineProps<{
     <template #chars>
       <!-- 人形:角色是"同一个人跨图保持一致"的那件事 -->
       <PhMaskHappy class="seg-ico" aria-hidden="true" />
+    </template>
+    <template #chat>
+      <!-- 圆头对话气泡:跟这个角色说话,与 CharacterPage 那次对话是同一件事 -->
+      <PhChatCircleDots class="seg-ico" aria-hidden="true" />
     </template>
     <template #canvas>
       <!-- 四角取景框:画布是"框住一块地方来加工"的工作台 -->

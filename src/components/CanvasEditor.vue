@@ -31,6 +31,7 @@ import {
   PhStop
 } from '@phosphor-icons/vue'
 import { editImage, extOf, generateFrom, imageSrc } from '../api'
+import { blobToDataURL } from '../lib/idb'
 import type { ApiConfig, EditMode, ResultItem } from '../types'
 
 /* 自由画布 · P0:本地变换 + 保存成一条新记录。
@@ -60,13 +61,15 @@ type Op =
    applyOp 遇到它就直接换上,不重算。撤销之后重做、直接跳到某一步,
    走的都是同一份结果,不会二次调用接口(那既慢又要花钱)。
 
-   存位图而不是 Blob:重放是同步的(见 rebuild 与 buildSteps),
+   存位图而不是 Blob:重放是同步的(见 rebuild 与 replayAll),
    而 Blob 得异步解码。这份内存由 resetAll 收口 —— 换图、撤图时统一 close */
 type AiOp = {
   k: 'ai'
-  /* 左栏与步骤条上的说法,如 'Background removed'。
+  /* 这一步做了什么,如 'Background removed'。两行:
+     标题是一句说法,副题补上细节(用户写的那句指令、或者改动幅度)。
      存下来是因为事后从位图上认不出这一步做了什么 */
   label: string
+  sub: string
   bitmap: ImageBitmap
 }
 
@@ -122,13 +125,17 @@ function showRailTip(e: Event) {
   const r = el.getBoundingClientRect()
   const b = body.getBoundingClientRect()
   const text = el.dataset.tip ?? ''
+  /* 默认贴右缘。只有图片那条要反过来 —— 它本来就站在舞台右沿,
+     气泡再往右就出了这一层,只能往左让 */
+  const side = el.dataset.tipSide === 'left' ? 'left' : 'right'
   // 与全站的悬停气泡同一个节奏:稍等一下再冒出来,
   // 鼠标扫过一排键时才不会闪成一片(那边是 250ms 的 transition-delay)
   tipTimer = window.setTimeout(() => {
     railTip.value = {
       text,
+      side,
       // 贴着这个键的右缘(与全站的 calc(100% + 8px) 同一个间距),竖直居中
-      x: r.right - b.left + 8,
+      x: side === 'left' ? r.left - b.left - 8 : r.right - b.left + 8,
       y: r.top - b.top + r.height / 2
     }
   }, 250)
@@ -150,7 +157,7 @@ const tool = ref<'pan' | 'crop' | 'lasso' | 'eraser'>('pan')
 const showMore = ref(false)
 /* 左栏键的悬停提示。它渲染在 .cv-body 这一层、不在按钮里 ——
    左栏内部有滚动容器,跟在按钮旁边的那种气泡会被那块裁掉半个 */
-const railTip = ref({ text: '', x: 0, y: 0 })
+const railTip = ref({ text: '', x: 0, y: 0, side: 'right' })
 // 当前图像(已应用全部操作)的像素尺寸。响应式是因为要显示在顶栏
 const imgW = ref(0)
 const imgH = ref(0)
@@ -166,12 +173,12 @@ type JobKind = EditMode | 'create'
 
 /* 在途的那一次 AI 请求,以及它是哪一件。有值时画布上要说清"正在算",
    也不再接第二个请求。
-   记着 kind 是为了让对应的那颗键变成"停止" —— 只看"有没有在途"的话,
-   三颗 AI 键会一起转圈,而停止键会同时冒出三个。
+   记着 kind 是为了让左栏"在跑的是哪一颗"说得清 —— 只看"有没有在途"的话,
+   三颗 AI 键会一起亮起来。步骤条上那一格、输入框里的发送键也都靠它认人。
 
    它放在这一堆界面状态里而不是紧挨着 runJob:左栏、步骤条、取景都要看它,
    而它们散在这个文件的前半段 —— 声明得太晚,那几处就只能读到未初始化 */
-const job = ref<{ kind: JobKind; label: string } | null>(null)
+const job = ref<{ kind: JobKind; label: string; sub: string } | null>(null)
 
 /* 刚被停下来的那一下要有个交代:盘子撤掉和"算失败了"看起来一模一样,
    不吭声的话用户分不清是停了还是坏了 */
@@ -218,17 +225,64 @@ const regenOpen = ref(false)
 const regenText = ref('')
 const regenEl = ref<HTMLTextAreaElement | null>(null)
 
-/* 换背景那句话。与上面那条分开,是因为它没有选区可依附:
-   改的是整幅图,输入框按"整幅"的位置摆(见 .cv-bar 的定位) */
+/* 换背景那句话。它与局部重绘分开,是因为它没有选区可依附 ——
+   改的是整幅图,所以要有个固定的落点(见 .cv-assist) */
 const bgOpen = ref(false)
 const bgText = ref('')
-const bgEl = ref<HTMLTextAreaElement | null>(null)
-
 /* 按这张图再画一张。参考图不用挑 —— 就是画布现在这张,
-   所以要写的只有"画成什么样"。与换背景那张同占舞台顶上,靠 genOpen 互斥 */
+   所以要写的只有"画成什么样"。与换背景共用同一块面板,靠 closeComposers 互斥 */
 const genOpen = ref(false)
 const genText = ref('')
-const genEl = ref<HTMLTextAreaElement | null>(null)
+/* 面板里那个输入框。两件事共用一个,所以 ref 也只有一个 */
+const assistEl = ref<HTMLTextAreaElement | null>(null)
+
+/* —— 助手面板 ——
+   换背景与"照这张再画一张"改的都是整幅:没有哪一点可以依附,
+   所以它们不该像局部重绘那样贴着"那一块"走,而要有块固定的地方。
+   为什么是右侧而不是浮在画面上:这两句描述往往是一整句话,
+   340px 的浮条写起来憋屈,而且它正好压在你要描述的那张图上。
+   两件事共用一块面板 —— 它们在左栏上本来就是挨着的两颗键,
+   来回切的时候这一块不该整个收掉再长出来 */
+const assistOpen = computed(() => bgOpen.value || genOpen.value)
+
+/* 输入框那条 v-model。两个 ref 各存各的那句话(收起时会清掉,见 closeBg),
+   所以切来切去不会串味 */
+const assistText = computed({
+  get: () => (genOpen.value ? genText.value : bgText.value),
+  set: (v: string) => {
+    if (genOpen.value) genText.value = v
+    else bgText.value = v
+  }
+})
+
+/* 面板上随"替谁说"而变的那几处字样。除此之外两件事一模一样 ——
+   两套外壳会让人以为是两个地方,而它们只是同一件事的两个由头 */
+const assistSpec = computed(() => {
+  if (genOpen.value) {
+    return {
+      label: 'Create from this picture',
+      /* 标题左边那枚图标,用的就是刚才按下的那颗左栏键 ——
+         面板与那颗键是同一件事的两半,长一样才连得上 */
+      icon: PhMagicWand,
+      placeholder: 'The same person, walking a rainy neon alley at night…',
+      hint: 'The picture on the canvas goes in as the reference — say only what you want to see.',
+      cta: 'Create',
+      submit: createFromThis,
+      close: closeGen
+    }
+  }
+  /* 换背景是兜底那一档:面板开着时两者必有其一是真的,
+     所以这里不必再判一次 —— 收起来的时候也没人读它 */
+  return {
+    label: 'Replace background',
+    icon: PhMountains,
+    placeholder: 'A sunlit studio with tall windows, concrete floor…',
+    hint: 'The whole picture goes to the model — describe the setting, not the person in it.',
+    cta: 'Replace',
+    submit: replaceBackground,
+    close: closeBg
+  }
+})
 
 const canUndo = computed(() => ops.value.length > 0)
 const canRedo = computed(() => redoOps.value.length > 0)
@@ -240,16 +294,29 @@ const dirty = computed(
     strokes.value.length > 0
 )
 
-/* 画面改到第几版了。ops / redoOps 一动就 +1。
-   存完不再撤图,所以"这一下点保存,会不会又存出一条一模一样的"需要有人记着:
-   记的是上一次存的时候画面是第几版(见 save 与 finishSave) */
-const rev = ref(0)
-watch([ops, redoOps], () => {
-  rev.value++
-})
+/* 画面改到第几版。
+   这里按操作序列本身认版本,而不是"动过几次":撤销一下再重做回来,
+   画面与已经存过的那一版一模一样,而计数式的版本号已经 +2 ——
+   保存键于是重新亮起,一点就多出一条重复的记录(rev 本来就是为了防这个)。
+   每个 op 领一个稳定序号,序列的序号连起来就是这一版的身份 */
+const opSeq = new WeakMap<object, number>()
+let opSeqNext = 0
+const rev = computed(() =>
+  ops.value
+    .map((op) => {
+      let s = opSeq.get(op)
+      if (s === undefined) {
+        s = ++opSeqNext
+        opSeq.set(op, s)
+      }
+      return s
+    })
+    .join(',')
+)
 /* 上一次成功保存时的版本。存过之后画面没再动过,这个键就该是灰的 ——
-   而不是让人多点一次,多出一条自己都不知道从哪来的记录 */
-const savedRev = ref(-1)
+   而不是让人多点一次,多出一条自己都不知道从哪来的记录。
+   空串是一个不会等于任何真实签名的初值 */
+const savedRev = ref('')
 const canSave = computed(
   () => !!props.item && !saving.value && rev.value !== savedRev.value
 )
@@ -323,6 +390,25 @@ const ctxStyle = computed(() => {
 })
 const zoomPct = computed(() => Math.round(view.value.scale * 100))
 
+/** 宽高比。约不干净就整个不给 —— 1241 × 855 除下来是 1241:855,
+ *  比不写还碍事。两端都落进 20 以内才算一条能用的比例
+ *  (1:1、4:3、3:2、16:9、2:3 都在这一档里) */
+const ratioLabel = computed(() => {
+  const w = imgW.value
+  const h = imgH.value
+  if (!w || !h) return ''
+  let a = w
+  let b = h
+  while (b) {
+    const t = b
+    b = a % b
+    a = t
+  }
+  const p = w / a
+  const q = h / a
+  return p <= 20 && q <= 20 ? `${p}:${q}` : ''
+})
+
 const MIN_ZOOM = 0.05
 const MAX_ZOOM = 8
 /* 选区小于这个像素数就当作误触丢弃(图像坐标,不是屏幕坐标) */
@@ -392,9 +478,26 @@ function applyOp(cur: HTMLCanvasElement, op: Op): HTMLCanvasElement {
   return out
 }
 
-function replay(src: ImageBitmap, list: Op[]): HTMLCanvasElement {
+/* 重放时把每一帧交给调用方看一眼 —— 步骤条那排缩略图要的正是中间帧,
+   于是两件事可以合成一趟(见 replayAll)。
+   op 为空表示这是原图那一帧 */
+function replay(
+  src: ImageBitmap,
+  list: Op[],
+  onFrame?: (c: HTMLCanvasElement, op?: Op) => void
+): HTMLCanvasElement {
   let cur = firstFrame(src)
-  for (const op of list) cur = applyOp(cur, op)
+  onFrame?.(cur)
+  for (const op of list) {
+    const next = applyOp(cur, op)
+    /* 中间帧用完就置零:一张 4000px 的画布是几十 MB,
+       交给 GC 只是"迟早会收",而这一串操作会连着造好几张
+       (与步骤条那边同一处理) */
+    cur.width = 0
+    cur.height = 0
+    cur = next
+    onFrame?.(cur, op)
+  }
   return cur
 }
 
@@ -404,14 +507,18 @@ function replay(src: ImageBitmap, list: Op[]): HTMLCanvasElement {
    撤销掉的那一步自然就从条上消失了。
    点其中一张就回到那一步(见 goStep)。
    ------------------------------------------------------------------ */
-const stepUrls = ref<string[]>([])
+/* 条上的一格 = 缩略图 + 它干了什么。
+   只给缩略图的话,走到十几步就认不出哪张是哪张了 —— 而这几行字
+   正是"重放出来的图"说不出口的那件事(见 describeOp) */
+type StepRow = { url: string; title: string; sub: string }
+const steps = ref<StepRow[]>([])
 const trackEl = ref<HTMLElement | null>(null)
 
 /* 步骤条什么时候露面。动过图之后它才出现 —— 它说的是"改到哪一步了",
    没动过图时那一排只有原图,白占位置。
    在途那一次是例外:结果还没回来,但"有件事正在算"得立刻看得见,
    而且它算完要落在哪儿,也得先把格子腾出来 */
-const showStrip = computed(() => !!props.item && (stepUrls.value.length > 1 || !!job.value))
+const showStrip = computed(() => !!props.item && (steps.value.length > 1 || !!job.value))
 
 /* 步骤条有多高,得让左栏知道 —— 它俩都在左下角抢同一块地方,
    不报出去的话那条竖栏会一路铺到卡片底下,被步骤条压住
@@ -460,42 +567,87 @@ function stepShot(c: HTMLCanvasElement): string {
   return t.toDataURL()
 }
 
-function buildSteps() {
+/** 某一步"干了什么"。缩略图只说得清改完长什么样,
+ *  说不清改的是背景还是画幅 —— 这一格补的就是那句话。
+ *  尺寸取的是**这一步之后**的画幅:裁剪之后剩多少、转过来多宽,
+ *  都是看这一步才用得上的数 */
+function describeOp(op: Op, w: number, h: number): { title: string; sub: string } {
+  const size = `${w} × ${h}`
+  switch (op.k) {
+    case 'rotate':
+      return {
+        title: 'Rotated',
+        sub: Math.abs(op.deg) === 180
+          ? 'Half turn'
+          : op.deg > 0
+            ? 'A quarter turn clockwise'
+            : 'A quarter turn counter-clockwise'
+      }
+    case 'flip':
+      return { title: 'Flipped', sub: op.axis === 'h' ? 'Left to right' : 'Top to bottom' }
+    case 'crop':
+      return { title: 'Cropped', sub: size }
+    default:
+      /* AI 那几步的说法在入栈时就写定了(见 runEdit)——
+         事后从位图上认不出它做过什么 */
+      return { title: op.label, sub: op.sub || size }
+  }
+}
+
+/* 把操作序列重放一遍,顺手把步骤条那排缩略图取出来,交回当前画面。
+ *
+ *  合成一趟是有意的:步骤条要的缩略图恰好就是重放的中间帧。以前分两趟 ——
+ *  rebuild 重放一次拿画面,buildSteps 再重放一次拿缩略图 —— 一条十几步的
+ *  操作序列在大图上等于把同一件几百毫秒的活干两遍。
+ *
+ *  撤掉的那几步(重做栈)接着当前画面往下算:整条时间线本来就是
+ *  ops + redoOps 拼起来的,从末尾往后放正好接得上,不必从原图重来 */
+function replayAll(): HTMLCanvasElement | null {
   if (!source) {
-    stepUrls.value = []
-    return
+    steps.value = []
+    return null
   }
-  /* 撤掉的那几步也要画出来。它们没消失,只是退到了重做栈里 ——
-     条上留着它们,才看得出"刚才改到哪儿",也才能一点就回去。
-     两段接起来正好是完整的时间线:重做栈的栈顶就是紧接着当前的那一步 */
-  const urls: string[] = []
-  let cur = firstFrame(source)
-  urls.push(stepShot(cur))
-  for (const op of [...ops.value, ...redoOps.value]) {
-    const next = applyOp(cur, op)
-    /* 上一帧用完了就把画布清空:一张 4000px 的画布是几十 MB,
-       十几步攒下来会把内存吃光(显式清空比等 GC 更稳) */
-    cur.width = 0
-    cur.height = 0
-    cur = next
-    urls.push(stepShot(cur))
+  const rows: StepRow[] = []
+  const cur = replay(source, ops.value, (frame, op) => {
+    rows.push(
+      op
+        ? { url: stepShot(frame), ...describeOp(op, frame.width, frame.height) }
+        : { url: stepShot(frame), title: 'Original', sub: `${frame.width} × ${frame.height}` }
+    )
+  })
+  /* applyOp 不改传进去的那张(它总是另造一张交出来),所以 cur 可以安全当起点 ——
+     它自己还要给调用方当当前画面,所以下面只清中间帧 */
+  let tail = cur
+  for (const op of redoOps.value) {
+    const next = applyOp(tail, op)
+    if (tail !== cur) {
+      tail.width = 0
+      tail.height = 0
+    }
+    tail = next
+    rows.push({ url: stepShot(tail), ...describeOp(op, tail.width, tail.height) })
   }
-  cur.width = 0
-  cur.height = 0
-  stepUrls.value = urls
+  if (tail !== cur) {
+    tail.width = 0
+    tail.height = 0
+  }
+  steps.value = rows
+  return cur
 }
 
 /** 重放一遍并刷新画面。两种选区都属于"还没落地的操作",每次重放都要清掉 ——
  *  它们是相对当时那张画面画的,画面变了就不再指同一块地方 */
 function rebuild(refit = true) {
   if (!source) return
-  base = replay(source, ops.value)
+  /* 一趟出两样:当前画面 + 步骤条那一排缩略图(见 replayAll) */
+  const next = replayAll()
+  if (!next) return
+  base = next
   imgW.value = base.width
   imgH.value = base.height
   cropRect.value = null
   lassoPath.value = null
   strokes.value = []
-  buildSteps()
   if (refit) fit()
   schedule()
 }
@@ -528,6 +680,10 @@ function fit() {
 /** 以某个舞台内坐标为锚点缩放:光标底下的那个像素保持不动 */
 function zoomAt(px: number, py: number, factor: number) {
   const v = view.value
+  /* 守卫:下面那个 f = k / v.scale 一旦碰上 0 就是 Infinity,坐标会整片飞走。
+     MIN_ZOOM 已经把它挡在 0.05 以上,这里只是不让"将来有人改了 MIN_ZOOM"
+     变成一次静默的整屏错乱 */
+  if (!v.scale) return
   const k = clamp(v.scale * factor, MIN_ZOOM, MAX_ZOOM)
   if (k === v.scale) return
   const f = k / v.scale
@@ -743,11 +899,14 @@ function clampPoint(p: Point): Point {
 
 /** 舞台坐标 → 图像坐标 */
 function toImage(clientX: number, clientY: number) {
-  const s = stageEl.value!
+  const s = stageEl.value
+  if (!s) return { x: 0, y: 0 }
   const box = s.getBoundingClientRect()
+  // 同上:比例为 0 时不该得到 Infinity 的坐标,退回 1:1
+  const k = view.value.scale || 1
   return {
-    x: (clientX - box.left - view.value.x) / view.value.scale,
-    y: (clientY - box.top - view.value.y) / view.value.scale
+    x: (clientX - box.left - view.value.x) / k,
+    y: (clientY - box.top - view.value.y) / k
   }
 }
 
@@ -798,13 +957,29 @@ function updatePinch() {
   schedule()
 }
 
+/** 收掉围不出面积的套索(少于三个点):一次误触、一条直线。
+ *  点本身在收进来时已经夹过边界了,这里不用再夹一遍 */
+function dropDegenerateLasso() {
+  if ((lassoPath.value?.length ?? 0) < 3) lassoPath.value = null
+}
+
 function onPointerDown(e: PointerEvent) {
   if (loading.value || !base) return
   const s = stageEl.value
   if (!s) return
-  s.setPointerCapture(e.pointerId)
+  /* 指针已经失效时按规范会抛 NotFoundError,而这一抛会把后面整套落笔状态
+     一起丢掉。抓不到捕获不影响继续画,吞掉就好 */
+  try {
+    s.setPointerCapture(e.pointerId)
+  } catch {
+    /* ignore */
+  }
   pointers.set(e.pointerId, { x: e.clientX, y: e.clientY })
   if (pointers.size === 2) {
+    /* 第二指落下 = 用户要缩放,不是接着画。手上那一笔套索就地收掉 ——
+       否则会留下一条两点直线选区:收尾的判断在 onPointerUp,
+       而那里 drag 已经被清空,认不出刚才画的是套索 */
+    dropDegenerateLasso()
     drag = null
     startPinch()
     return
@@ -940,16 +1115,17 @@ function onPointerMove(e: PointerEvent) {
 }
 
 function onPointerUp(e: PointerEvent) {
-  const wasLasso = drag?.mode === 'lasso'
   pointers.delete(e.pointerId)
-  if (pointers.size < 2) pinch = null
+  /* 手指数一变,双指缩放的基准就过期了:三指减到两指、或抬起一指再按下另一指,
+     距离与中点已经换了人 —— 不重取基准,下一个 move 会拿"新人"去比"旧人",
+     画面直接跳一下。还剩两指以上就按当前这两个重取 */
+  if (pointers.size >= 2) startPinch()
+  else pinch = null
   drag = null
   const r = cropRect.value
   // 点一下(而不是拖)会在原地留下一个零尺寸的框,那种误触直接丢掉
   if (r && (r.w < MIN_CROP || r.h < MIN_CROP)) cropRect.value = null
-  /* 套索同理:三个点以下围不出面积(一次误触、一条直线),丢掉。
-     点本身在收进来时已经夹过边界了,这里不用再夹一遍 */
-  if (wasLasso && (lassoPath.value?.length ?? 0) < 3) lassoPath.value = null
+  dropDegenerateLasso()
   schedule()
 }
 
@@ -993,7 +1169,12 @@ function pushOp(op: Op, force = false) {
      force 只有 runEdit 用 —— 它要落的正是这次在途算出来的结果 */
   if (job.value && !force) return
   ops.value = [...ops.value, op]
-  // 新动作走的是新分支,原来的重做链就作废了
+  /* 新动作走的是新分支,原来的重做链就作废了。
+     清空前把里面的 AI 位图显式放掉:那是全尺寸的图像资源,
+     等 GC 不如自己 close(与 resetAll 同一处理) */
+  for (const o of redoOps.value) {
+    if (o.k === 'ai') o.bitmap.close()
+  }
   redoOps.value = []
   rebuild()
 }
@@ -1015,7 +1196,12 @@ function applyCrop() {
   })
 }
 
+/* 下面三个都会改写操作序列,所以同样受 AI 那一步的在途锁约束:
+   它算的是发起那一刻的画面,撤掉或跳走之后结果再落回来,
+   序列与实际像素就对不上了。pushOp 那道锁拦的是"新动作",拦不住这几个。
+   界面上它们会一起变灰(见步骤条那三个 .sbtn) */
 function undo() {
+  if (job.value) return
   if (!ops.value.length) return
   const last = ops.value[ops.value.length - 1]
   ops.value = ops.value.slice(0, -1)
@@ -1024,6 +1210,7 @@ function undo() {
 }
 
 function redo() {
+  if (job.value) return
   const [next, ...rest] = redoOps.value
   if (!next) return
   redoOps.value = rest
@@ -1032,8 +1219,10 @@ function redo() {
 }
 
 /** 跳到某一步(步骤条上点了一张)。
- *  比连按撤销快,而且只重放一次 —— 中间那些帧根本不必画出来 */
+ *  比连按撤销快,而且只重放一次 —— 中间那些帧根本不必画出来。
+ *  复位也走这里,所以在途锁对它同样生效 */
 function goStep(i: number) {
+  if (job.value) return
   const n = ops.value.length
   if (i === n) return
   if (i < n) {
@@ -1071,26 +1260,53 @@ let editAbort: AbortController | null = null
    视图操作(缩放、平移)不受影响 —— 那些不改内容 */
 const locked = computed(() => !props.item || !!job.value)
 
+/* 画布 → data URL,但把编码那一段让出去。
+ *
+ *  toDataURL 是全同步的:一张 3840px 的 PNG 编码能把主线程按住几百毫秒,
+ *  这段时间里占位、进度条都动不了(正是 nextPaint 想避开的那件事)。
+ *  toBlob 把编码交给浏览器,再由 FileReader 读成 data URL —— 那一步也是异步的。
+ *  接口那边要的仍然是 data URL(见 types.ts 的 EditParams),最后一程不变 */
+function canvasDataUrl(c: HTMLCanvasElement): Promise<string> {
+  return new Promise((resolve, reject) => {
+    c.toBlob((b) => {
+      if (!b) {
+        reject(new Error('Could not encode the image'))
+        return
+      }
+      blobToDataURL(b).then(resolve, reject)
+    }, 'image/png')
+  })
+}
+
 /** 当前画面编成 data URL。送出去编辑的是它,而不是原图 ——
  *  用户是在"已经裁过、转过"的画面上动的手,送原图等于让他白改一遍 */
-function currentImage(): string {
+function currentImage(): Promise<string> {
   const c = base
-  if (!c) throw new Error('There is nothing on the canvas to edit')
-  return c.toDataURL('image/png')
+  if (!c) return Promise.reject(new Error('There is nothing on the canvas to edit'))
+  return canvasDataUrl(c)
 }
+
+/* 全透明 mask 的缓存。它是"整幅都要重做"那一类的输入(去背景、换背景),
+   与画面内容无关 —— 尺寸一样就是同一份字节,不必每点一次都重新编一张全尺寸的图 */
+let maskCache: { key: string; url: string } | null = null
 
 /** 整幅都重做的 mask:一张全透明、尺寸与原图一致的 PNG。
  *  去背景用这种 —— 它没有"要保留"的部分,主体在哪由模型自己认 */
-function fullMask(): string {
+function fullMask(): Promise<string> {
   const c = base
-  if (!c) throw new Error('There is nothing on the canvas to edit')
+  if (!c) return Promise.reject(new Error('There is nothing on the canvas to edit'))
+  const key = `${c.width}x${c.height}`
+  if (maskCache?.key === key) return Promise.resolve(maskCache.url)
   // 什么都不画就是全透明,别多此一举地先铺一层再擦掉
-  return newCanvas(c.width, c.height).toDataURL('image/png')
+  return canvasDataUrl(newCanvas(c.width, c.height)).then((url) => {
+    maskCache = { key, url }
+    return url
+  })
 }
 
 /** 把上游回来的那张对回画布原来的画幅。
  *
- *  请求那边已经按原尺寸去要了(见 api.ts 的 editSize),但上游听不听话不由我们 ——
+ *  请求那边已经按原尺寸去要了(见 api.ts 的 allowedSizeFor),但上游听不听话不由我们 ——
  *  只认固定几档画幅的厂商,一张 16:9 的图也只能给到 3:2。这里再兜一道,
  *  让"编辑不改变画幅"这件事在本地成立,而不是托付给别人。
  *
@@ -1146,6 +1362,7 @@ function nextPaint(): Promise<void> {
 async function runJob(
   kind: JobKind,
   label: string,
+  sub: string,
   produce: (frame: HTMLCanvasElement, cfg: ApiConfig, signal: AbortSignal) => Promise<ResultItem>
 ) {
   const cfg = props.config
@@ -1156,7 +1373,7 @@ async function runJob(
   }
   error.value = ''
   stopped.value = false
-  job.value = { kind, label }
+  job.value = { kind, label, sub }
   const ctl = new AbortController()
   editAbort = ctl
   try {
@@ -1189,7 +1406,7 @@ async function runJob(
     /* 先撤掉在途标记再入栈:pushOp 会拦下"在途期间的操作",
        而这一步正是这次在途本身的结果 */
     job.value = null
-    pushOp({ k: 'ai', label, bitmap: bmp }, true)
+    pushOp({ k: 'ai', label, sub, bitmap: bmp }, true)
   } catch (e) {
     /* 主动取消不算失败:用户已经换了图,再弹一条错误只是噪声 */
     if (!ctl.signal.aborted) error.value = e instanceof Error ? e.message : 'Edit failed'
@@ -1206,30 +1423,28 @@ async function runJob(
 }
 
 /** 在图上改一块。原图、mask、画幅都在同一刻取定 */
-async function runEdit(
+function runEdit(
   mode: EditMode,
   label: string,
-  maskOf: () => string,
+  sub: string,
+  maskOf: () => Promise<string>,
   prompt?: string
 ) {
-  await runJob(mode, label, (frame, cfg, signal) =>
-    editImage(
-      {
-        image: currentImage(),
-        mask: maskOf(),
-        mode,
-        prompt,
-        size: `${frame.width}x${frame.height}`
-      },
+  return runJob(mode, label, sub, async (frame, cfg, signal) => {
+    /* 原图与 mask 一起编:两张图互不相干,没必要串成一条。
+       两者都是"这一刻的画面",所以都等到让帧之后才取(见 runJob) */
+    const [image, mask] = await Promise.all([currentImage(), maskOf()])
+    return editImage(
+      { image, mask, mode, prompt, size: `${frame.width}x${frame.height}` },
       cfg,
       signal
     )
-  )
+  })
 }
 
 /** 照这张再画一张。参考图就是画布现在这张,不用挑 —— 挑的是"画成什么样" */
 async function runGenerate(prompt: string) {
-  await runJob('create', shortLabel(prompt), (frame, cfg, signal) => {
+  await runJob('create', 'New picture', shortLabel(prompt), (frame, cfg, signal) => {
     const ref = refShot()
     if (!ref) throw new Error('There is nothing on the canvas to hand over')
     return generateFrom({ prompt, image: ref, size: `${frame.width}x${frame.height}` }, cfg, signal)
@@ -1254,17 +1469,18 @@ function stop() {
 
 /** 一键去背景:整幅重做,不需要用户先画选区 */
 function removeBackground() {
-  runEdit('remove-bg', 'Background removed', fullMask)
+  runEdit('remove-bg', 'Background removed', 'Left transparent', fullMask)
 }
 
 /** 套索那块变成 mask。与 fullMask 只差形状:一个整幅透明,一个按路径挖空。
  *
  *  先铺满不透明黑(=整幅都保留),再用 destination-out 把选区的透明度擦成 0 ——
  *  mask 里透明才是"要改",所以这里要的是"挖掉",不是"填上" */
-function lassoMask(): string {
+function lassoMask(): Promise<string> {
   const c = base
   const path = lassoPath.value
-  if (!c || !path || path.length < 3) throw new Error('There is no selection to edit')
+  if (!c || !path || path.length < 3)
+    return Promise.reject(new Error('There is no selection to edit'))
   const m = newCanvas(c.width, c.height)
   const ctx = m.getContext('2d')
   if (ctx) {
@@ -1277,21 +1493,22 @@ function lassoMask(): string {
     ctx.closePath()
     ctx.fill()
   }
-  return m.toDataURL('image/png')
+  return canvasDataUrl(m)
 }
 
 /** 清掉套索圈住的那块内容。它和去背景走同一条路,
  *  差别只在送上去的区域是"这一块"而不是"整幅" */
 function eraseSelection() {
-  runEdit('erase', 'Erased the selection', lassoMask)
+  runEdit('erase', 'Erased', 'The lassoed area', lassoMask)
 }
 
 /** 橡皮抹过的那几片变成 mask。与套索同一套规矩(黑底 + 挖空),
  *  只是形状由描边决定:圆头圆角,粗细就是笔头直径 */
-function eraserMask(): string {
+function eraserMask(): Promise<string> {
   const c = base
   const list = strokes.value
-  if (!c || !list.length) throw new Error('There is nothing painted to erase')
+  if (!c || !list.length)
+    return Promise.reject(new Error('There is nothing painted to erase'))
   const m = newCanvas(c.width, c.height)
   const ctx = m.getContext('2d')
   if (ctx) {
@@ -1311,12 +1528,12 @@ function eraserMask(): string {
       ctx.stroke()
     }
   }
-  return m.toDataURL('image/png')
+  return canvasDataUrl(m)
 }
 
 /** 清掉橡皮抹过的那几片。它和套索的消除是同一步,只是形状从描边来 */
 function erasePainted() {
-  runEdit('erase', 'Erased the painted area', eraserMask)
+  runEdit('erase', 'Erased', 'The painted area', eraserMask)
 }
 
 /** 笔头大小按几何级数走:等差的加减在两端的体感差太远 ——
@@ -1333,10 +1550,11 @@ function clearStrokes() {
 }
 
 /** 步骤与气泡上那句说明。整句话可能很长而位置就那么点,
- *  截一段够认出来就行;完整的那句照原样送上去 */
-function shortLabel(text: string): string {
+ *  截一段够认出来就行;完整的那句照原样送上去。
+ *  上限做成参数:步骤条上那行副题比悬停气泡窄得多 */
+function shortLabel(text: string, max = 48): string {
   const t = text.trim()
-  return t.length > 48 ? `${t.slice(0, 48)}…` : t
+  return t.length > max ? `${t.slice(0, max)}…` : t
 }
 
 /** 局部重绘:把套索圈住的那块交给模型,照着这句话重做。
@@ -1344,7 +1562,7 @@ function shortLabel(text: string): string {
 function regenSelection() {
   const p = regenText.value.trim()
   if (!p) return
-  runEdit('regen', shortLabel(p), lassoMask, p)
+  runEdit('regen', 'Reimagined', shortLabel(p, 30), lassoMask, p)
 }
 
 /** 换背景:整幅交给模型,换成用户说的那个。
@@ -1352,7 +1570,7 @@ function regenSelection() {
 function replaceBackground() {
   const p = bgText.value.trim()
   if (!p) return
-  runEdit('replace-bg', `Background · ${shortLabel(p)}`, fullMask, p)
+  runEdit('replace-bg', 'New background', shortLabel(p, 30), fullMask, p)
 }
 
 /* 三处指令框:局部重绘那条贴着选区走,换背景与"照这张再创作"都挂在舞台顶上。
@@ -1379,12 +1597,12 @@ function closeRegen() {
   regenText.value = ''
 }
 
-/** 换背景那个输入框。它没有选区可依附,所以按整幅的位置摆(见 .cv-ctx.is-bar) */
+/** 换背景那块面板。它没有选区可依附,所以按整幅的位置摆(见 .cv-assist) */
 async function openBg() {
   closeComposers()
   bgOpen.value = true
   await nextTick()
-  bgEl.value?.focus()
+  assistEl.value?.focus()
 }
 
 function closeBg() {
@@ -1392,12 +1610,12 @@ function closeBg() {
   bgText.value = ''
 }
 
-/** 照这张再创作的输入框。与换背景同占舞台顶上,靠 closeComposers 互斥 */
+/** 照这张再创作的那块面板。与换背景共用外壳,靠 closeComposers 互斥 */
 async function openGen() {
   closeComposers()
   genOpen.value = true
   await nextTick()
-  genEl.value?.focus()
+  assistEl.value?.focus()
 }
 
 function closeGen() {
@@ -1433,13 +1651,13 @@ function resetAll() {
   editAbort = null
   job.value = null
   /* 先把 AI 那几步带着的位图放掉再清空。它们是全尺寸的图像资源,
-     等 GC 不如显式 close(与 buildSteps 里"用完就清空画布"同一个理由) */
+     等 GC 不如显式 close(与 replayAll 里"用完就清空画布"同一个理由) */
   for (const op of [...ops.value, ...redoOps.value]) {
     if (op.k === 'ai') op.bitmap.close()
   }
   ops.value = []
   redoOps.value = []
-  stepUrls.value = []
+  steps.value = []
   cropRect.value = null
   /* 套索与笔迹也是"还没落地的选区",而且记的是上一张图的坐标 ——
      留着会在新图上画出一块对不上任何东西的选区 */
@@ -1452,7 +1670,7 @@ function resetAll() {
   saving.value = false
   confirmDiscard.value = false
   /* 换图之后是新的一张,上一张"存到第几版"与它无关 */
-  savedRev.value = -1
+  savedRev.value = ''
   tool.value = 'pan'
   imgW.value = 0
   imgH.value = 0
@@ -1515,13 +1733,16 @@ async function load() {
     // 等舞台量出尺寸再适配,否则第一次 fit 算出来的是 0
     await nextTick()
     if (token !== loadToken) return
-    base = replay(bmp, [])
+    /* 走同一条路:它顺手把"原图"那一格也备好了 ——
+       ops 这时是空的,这一趟就是原图那一帧,不必再单跑一次 */
+    const first = replayAll()
+    if (!first) return
+    base = first
     imgW.value = base.width
     imgH.value = base.height
     /* 笔头一开始给短边的 6%:一张 4000px 的图和一张 400px 的图上,
        "看着差不多大"才是合理的默认 —— 写死一个像素值必然有一头不好用 */
     eraserSize.value = Math.round(clamp(Math.min(base.width, base.height) * 0.06, 12, 400))
-    buildSteps()
     fit()
   } catch {
     loading.value = false
@@ -1670,6 +1891,15 @@ function requestDiscard() {
 /* ===== 键盘 =====
    绑在 window 上而不是这块区域上:焦点可能在按钮上,
    而 Cmd+Z / 空格拖拽这些不该因为焦点跑了就失效 */
+/** 焦点是不是落在一个自己消化空格的控件上。
+ *  拦空格是为了"按住空格拖动画布",但按钮的激活恰恰发生在 keyup 的空格上 ——
+ *  keydown 一 preventDefault,整页的按钮就都按不动了(Enter 仍然可以)。
+ *  所以按钮上的空格必须让过去 */
+function ownsSpace(e: KeyboardEvent) {
+  const t = e.target as HTMLElement | null
+  return !!t?.closest('button, a[href], [role="button"], [contenteditable="true"]')
+}
+
 function onKeyDown(e: KeyboardEvent) {
   // 不在这一页时一律不管 —— 首页的输入框、设置页的表单都要正常收字
   if (!props.active) return
@@ -1711,7 +1941,20 @@ function onKeyDown(e: KeyboardEvent) {
     requestDiscard()
     return
   }
-  if (e.code === 'Space' && !spaceDown.value) {
+  /* 焦点在输入控件里时,下面这些全部让路:空格要能打出来,字母是打字,
+     不该顺手把工具换掉。指令框自己 stop 了事件,这里再兜一道 ——
+     免得以后在这页加个输入框又把同一件事重踩一次 */
+  const target = e.target as HTMLElement | null
+  if (
+    target &&
+    (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)
+  ) {
+    return
+  }
+  /* 带 ⌘/Ctrl 的组合键交给浏览器:⌘C / ⌘V / ⌘L / ⌘E 都是系统自己的,
+     不能因为字母恰好是 c / v / l / e 就把工具切走(z 那条已经单独处理过) */
+  if (mod) return
+  if (e.code === 'Space' && !spaceDown.value && !ownsSpace(e)) {
     e.preventDefault()
     spaceDown.value = true
     return
@@ -1725,6 +1968,11 @@ function onKeyDown(e: KeyboardEvent) {
 
 function onKeyUp(e: KeyboardEvent) {
   if (e.code === 'Space') spaceDown.value = false
+}
+/* 按住空格切走窗口时,keyup 会落到别的窗口上 —— 回来后画布会一直"粘"在
+   临时平移态。失焦就把它松开 */
+function onBlur() {
+  spaceDown.value = false
 }
 
 /* 换图才重新载入。切走再切回来不动任何状态(见 active 的注释)——
@@ -1767,17 +2015,28 @@ onBeforeUnmount(() => {
   ro?.disconnect()
   window.removeEventListener('keydown', onKeyDown)
   window.removeEventListener('keyup', onKeyUp)
+  window.removeEventListener('blur', onBlur)
   if (frame) cancelAnimationFrame(frame)
   window.clearTimeout(tipTimer)
   window.clearTimeout(stopTimer)
   // 这一页要走了,在途的那次编辑再落地也没有意义
   editAbort?.abort()
-  source?.close?.()
+  source?.close()
+  /* 操作序列里那几步 AI 位图、以及最后那张画布,同样是全尺寸的图像资源:
+     整页卸载时一并放掉,不必等 GC —— 与 resetAll 走同一套 */
+  for (const op of [...ops.value, ...redoOps.value]) {
+    if (op.k === 'ai') op.bitmap.close()
+  }
+  if (base) {
+    base.width = 0
+    base.height = 0
+  }
 })
 
 // 键盘是全局的,挂载即生效;active 在回调里判断
 window.addEventListener('keydown', onKeyDown)
 window.addEventListener('keyup', onKeyUp)
+window.addEventListener('blur', onBlur)
 
 function clamp(n: number, lo: number, hi: number) {
   return Math.min(hi, Math.max(lo, n))
@@ -1796,6 +2055,7 @@ function clamp(n: number, lo: number, hi: number) {
       <div
         ref="bodyEl"
         class="cv-body"
+        :class="{ 'has-assist': assistOpen }"
         @pointerover="showRailTip"
         @pointerleave="hideRailTip"
         @focusin="showRailTip"
@@ -1815,20 +2075,25 @@ function clamp(n: number, lo: number, hi: number) {
         </svg>
 
         <nav ref="railEl" class="cv-rail" :class="{ busy: !!job }" aria-label="Tools">
-          <!-- 操作键都排在这一段里:左边一列是常用项,展开的那几组从它右手边长出来。
+          <!-- 操作键都排在这一段里:上面是常用的两组,低频那几组折在它下面。
                放不下时滚的是这一段 -->
           <div class="rail-scroll">
-            <!-- 常驻那一列。键上只留图标,名字与快捷键交给悬停提示 ——
-                 一行字会把这条竖栏撑宽一倍,而它本身只是"认图标"的辅助 -->
+            <!-- 常驻那一列。键上带名字,不再只靠图标 ——
+                 前四个基础工具还好猜,但"套索"和"照着这张再画一张"之间,
+                 图标是猜不出差别的。名字与快捷键仍然都挂在悬停提示里,
+                 而提示留着是为了那个快捷键,不是为了名字 -->
             <div class="rail-col">
               <!-- AI 的那一组:凡是最后会走到模型那一步的,都收在这里。
                    前两颗是"先圈出要动的地方"(套索、橡皮)—— 它们自己不调接口,
                    但圈出来就是为了紧跟着按下 Erase / Reimagine,算同一条路,
                    所以摆在这一组的最前头。后三颗是整幅交给它。
-                   全站只有这一组是彩色图标。
-                   它也是唯一"要等上游"的一组:在途的那一颗会变成停止键
-                   (只看"有没有在途"的话,会一起转圈,停止键也会同时冒出好几个) -->
+                   全站只有这一组是彩色图标,而组标题要说的正是
+                    "这条线为什么圈在这里"—— 那句话光靠图标颜色说不出来。
+                   它也是唯一"要等上游"的一组:在途的那一颗会亮起来(见 .is-busy),
+                   但图标与名字一个字都不换 —— 键说的是"它是什么",
+                   认脸的东西在忙的时候改掉,下次找它就得多想一步 -->
               <div class="rail-grp rail-ai">
+                <span class="rail-eyebrow">AI</span>
                 <button
                   class="tool tip-right"
                   :class="{ on: tool === 'lasso' }"
@@ -1839,6 +2104,7 @@ function clamp(n: number, lo: number, hi: number) {
                   @click="tool = 'lasso'"
                 >
                   <PhLasso aria-hidden="true" />
+                  <span class="tool-name">Lasso</span>
                 </button>
                 <button
                   class="tool tip-right"
@@ -1850,52 +2116,65 @@ function clamp(n: number, lo: number, hi: number) {
                   @click="tool = 'eraser'"
                 >
                   <PhEraser aria-hidden="true" />
+                  <span class="tool-name">Eraser</span>
                 </button>
+                <!-- 这三颗在途时不换脸:键上的图标与名字说的是"它是什么",
+                     在那一刻把它变成别的东西,下次要找它就认不出来了。
+                     在途只补两层状态(见 .tool.is-busy):淡底 + 一圈呼吸的金光。
+                     键本身在跑的时候是禁用的,所以也点不出第二下 ——
+                     要停,去步骤条上那一格(它就在画面下沿、写着这次在算什么),
+                     或者在右侧面板里按 Stop -->
                 <button
                   class="tool tip-right"
-                  :class="{ on: job?.kind === 'remove-bg' }"
-                  :disabled="locked && job?.kind !== 'remove-bg'"
-                  :data-tip="job?.kind === 'remove-bg' ? 'Stop' : 'Remove background'"
-                  :aria-label="job?.kind === 'remove-bg' ? 'Stop' : 'Remove background'"
-                  @click="job?.kind === 'remove-bg' ? stop() : removeBackground()"
+                  :class="{ 'is-busy': job?.kind === 'remove-bg' }"
+                  :disabled="locked"
+                  data-tip="Remove background"
+                  aria-label="Remove background"
+                  @click="removeBackground"
                 >
-                  <PhStop v-if="job?.kind === 'remove-bg'" class="is-stop" aria-hidden="true" />
-                  <PhCheckerboard v-else aria-hidden="true" />
+                  <PhCheckerboard aria-hidden="true" />
+                  <!-- 名字只留动词,宾语交给图标(透明棋盘格)与悬停说明。
+                       一行一个词的竖栏才扫得动 —— 完整说法都在 data-tip 里 -->
+                  <span class="tool-name">Remove</span>
                 </button>
                 <button
                   class="tool tip-right"
-                  :class="{ on: bgOpen || job?.kind === 'replace-bg' }"
-                  :disabled="locked && job?.kind !== 'replace-bg'"
+                  :class="{ on: bgOpen, 'is-busy': job?.kind === 'replace-bg' }"
+                  :disabled="locked"
                   :aria-expanded="bgOpen"
-                  :data-tip="job?.kind === 'replace-bg' ? 'Stop' : 'Replace background'"
-                  :aria-label="job?.kind === 'replace-bg' ? 'Stop' : 'Replace background'"
-                  @click="job?.kind === 'replace-bg' ? stop() : bgOpen ? closeBg() : openBg()"
+                  data-tip="Replace background"
+                  aria-label="Replace background"
+                  @click="bgOpen ? closeBg() : openBg()"
                 >
-                  <PhStop v-if="job?.kind === 'replace-bg'" class="is-stop" aria-hidden="true" />
-                  <PhMountains v-else aria-hidden="true" />
+                  <PhMountains aria-hidden="true" />
+                  <span class="tool-name">Replace</span>
                 </button>
                 <button
                   class="tool tip-right"
-                  :class="{ on: genOpen || job?.kind === 'create' }"
-                  :disabled="locked && job?.kind !== 'create'"
+                  :class="{ on: genOpen, 'is-busy': job?.kind === 'create' }"
+                  :disabled="locked"
                   :aria-expanded="genOpen"
-                  :data-tip="job?.kind === 'create' ? 'Stop' : 'Create from this picture'"
-                  :aria-label="job?.kind === 'create' ? 'Stop' : 'Create a new picture from this one'"
-                  @click="job?.kind === 'create' ? stop() : genOpen ? closeGen() : openGen()"
+                  data-tip="Create from this picture"
+                  aria-label="Create a new picture from this one"
+                  @click="genOpen ? closeGen() : openGen()"
                 >
-                  <PhStop v-if="job?.kind === 'create'" class="is-stop" aria-hidden="true" />
-                  <PhMagicWand v-else aria-hidden="true" />
+                  <PhMagicWand aria-hidden="true" />
+                  <span class="tool-name">Create</span>
                 </button>
               </div>
 
               <span class="rail-sep" aria-hidden="true"></span>
 
-              <!-- 基础的一组:这张图怎么来、怎么走、怎么存,以及不经过模型的
-                   那些改法(平移、裁剪)。与上面那组的分界线是"会不会走到模型":
-                   这里的每一下都是当场算出来的,不等谁。
+              <!-- 基础的一组:怎么把图弄进来,以及不经过模型的那两个改法
+                   (平移、裁剪),再加上这张图怎么走、怎么存。
+                   与上面那组的分界线是"会不会走到模型":
+                   这里的每一下都是当场算出来的,不等谁 ——
+                   而这个区别靠组标题说了出来,只给图标上色的话,
+                   用户看到的只是"这几个图标怎么是彩的"。
                    存过之后画面没再动,保存键就是灰的 ——
-                   也就是它同时回答了"现在有没有东西可存" -->
+                   它同时回答了"现在有没有东西可存" -->
               <div class="rail-grp">
+                <span class="rail-eyebrow">Picture</span>
                 <button
                   class="tool tip-right"
                   data-tip="Upload a picture"
@@ -1903,15 +2182,7 @@ function clamp(n: number, lo: number, hi: number) {
                   @click="pickFile"
                 >
                   <PhUploadSimple aria-hidden="true" />
-                </button>
-                <button
-                  class="tool tip-right"
-                  :disabled="!item"
-                  data-tip="Take this picture off the canvas"
-                  aria-label="Take this picture off the canvas"
-                  @click="requestDiscard"
-                >
-                  <PhX aria-hidden="true" />
+                  <span class="tool-name">Upload</span>
                 </button>
                 <button
                   class="tool tip-right"
@@ -1921,6 +2192,20 @@ function clamp(n: number, lo: number, hi: number) {
                   @click="save"
                 >
                   <PhFloppyDisk aria-hidden="true" />
+                  <!-- "存成一条新记录"这层意思收进悬停说明里,
+                       键上只留 Save —— 而存过之后它自己变成 Saved 并置灰,
+                       所以那层意思在界面上也没丢 -->
+                  <span class="tool-name">{{ rev === savedRev ? 'Saved' : 'Save' }}</span>
+                </button>
+                <button
+                  class="tool tip-right"
+                  :disabled="!item"
+                  data-tip="Take this picture off the canvas"
+                  aria-label="Take this picture off the canvas"
+                  @click="requestDiscard"
+                >
+                  <PhX aria-hidden="true" />
+                  <span class="tool-name">Discard</span>
                 </button>
                 <button
                   class="tool tip-right"
@@ -1932,6 +2217,7 @@ function clamp(n: number, lo: number, hi: number) {
                   @click="tool = 'pan'"
                 >
                   <PhArrowsOutCardinal aria-hidden="true" />
+                  <span class="tool-name">Move</span>
                 </button>
                 <button
                   class="tool tip-right"
@@ -1943,6 +2229,7 @@ function clamp(n: number, lo: number, hi: number) {
                   @click="tool = 'crop'"
                 >
                   <PhCrop aria-hidden="true" />
+                  <span class="tool-name">Crop</span>
                 </button>
               </div>
 
@@ -1960,15 +2247,21 @@ function clamp(n: number, lo: number, hi: number) {
                   @click="showMore = !showMore"
                 >
                   <PhCaretRight class="cv-caret" :class="{ flip: showMore }" aria-hidden="true" />
+                  <span class="tool-name">{{ showMore ? 'Less' : 'More' }}</span>
                 </button>
               </div>
             </div>
 
-            <!-- 低频的那几组折在右手边:从那一列的侧面长出来,
-                 而不是继续往下堆 —— 这条竖栏的高度就不随展开变 -->
+            <!-- 低频的那几组折在它下面:键是带字的,横着展开会顶出这条卡片,
+                 所以改成往下长。代价是这条竖栏的高度随展开变 ——
+                 那一截由 .rail-scroll 接住,放不下就滚 -->
+            <!-- 动词放组标题,行里只留那一维:ROTATE 下面就是 Left / Right ——
+                  一行一个词之后,"向左还是向右"这类差别才是一眼可辨的,
+                  而"Rotate left / Rotate right"读起来要先在两个"Rotate"里跳一次 -->
             <Transition name="rail-fold">
               <div v-if="showMore" id="cv-more" class="rail-fold">
                 <div class="rail-grp">
+                  <span class="rail-eyebrow">Rotate</span>
                   <button
                     class="tool tip-right"
                     :disabled="locked"
@@ -1977,6 +2270,7 @@ function clamp(n: number, lo: number, hi: number) {
                     @click="rotate(-90)"
                   >
                     <PhArrowCounterClockwise aria-hidden="true" />
+                    <span class="tool-name">Left</span>
                   </button>
                   <button
                     class="tool tip-right"
@@ -1986,7 +2280,14 @@ function clamp(n: number, lo: number, hi: number) {
                     @click="rotate(90)"
                   >
                     <PhArrowClockwise aria-hidden="true" />
+                    <span class="tool-name">Right</span>
                   </button>
+                </div>
+
+                <span class="rail-sep" aria-hidden="true"></span>
+
+                <div class="rail-grp">
+                  <span class="rail-eyebrow">Flip</span>
                   <button
                     class="tool tip-right"
                     :disabled="locked"
@@ -1995,6 +2296,7 @@ function clamp(n: number, lo: number, hi: number) {
                     @click="flip('h')"
                   >
                     <PhFlipHorizontal aria-hidden="true" />
+                    <span class="tool-name">Horizontal</span>
                   </button>
                   <button
                     class="tool tip-right"
@@ -2004,12 +2306,14 @@ function clamp(n: number, lo: number, hi: number) {
                     @click="flip('v')"
                   >
                     <PhFlipVertical aria-hidden="true" />
+                    <span class="tool-name">Vertical</span>
                   </button>
                 </div>
 
                 <span class="rail-sep" aria-hidden="true"></span>
 
                 <div class="rail-grp">
+                  <span class="rail-eyebrow">Zoom</span>
                   <button
                     class="tool tip-right"
                     :disabled="!item"
@@ -2018,6 +2322,7 @@ function clamp(n: number, lo: number, hi: number) {
                     @click="zoomStep(1 / 1.25)"
                   >
                     <PhMagnifyingGlassMinus aria-hidden="true" />
+                    <span class="tool-name">Out</span>
                   </button>
                   <button
                     class="tool tip-right"
@@ -2027,6 +2332,7 @@ function clamp(n: number, lo: number, hi: number) {
                     @click="zoomStep(1.25)"
                   >
                     <PhMagnifyingGlassPlus aria-hidden="true" />
+                    <span class="tool-name">In</span>
                   </button>
                   <button
                     class="tool tip-right"
@@ -2036,6 +2342,7 @@ function clamp(n: number, lo: number, hi: number) {
                     @click="fit"
                   >
                     <PhCornersOut aria-hidden="true" />
+                    <span class="tool-name">Fit</span>
                   </button>
                 </div>
               </div>
@@ -2092,7 +2399,10 @@ function clamp(n: number, lo: number, hi: number) {
               <PhTrash aria-hidden="true" />
               Clear
             </button>
-            <button class="ctx-btn is-cta" :disabled="locked" @click="applyCrop">Apply crop</button>
+            <button class="ctx-btn is-cta" :disabled="locked" @click="applyCrop">
+              <PhCrop aria-hidden="true" />
+              Apply crop
+            </button>
           </div>
 
           <!-- 套索那条:形状是手画出来的,所以这里报不出宽高,
@@ -2106,12 +2416,15 @@ function clamp(n: number, lo: number, hi: number) {
             role="status"
             @pointerdown.stop
           >
-            <span class="ctx-size">Selection</span>
+            <span class="ctx-tag">Selection</span>
             <button class="ctx-btn" @click="lassoPath = null">
               <PhTrash aria-hidden="true" />
               Clear
             </button>
-            <button class="ctx-btn" :disabled="locked" @click="eraseSelection">Erase</button>
+            <button class="ctx-btn" :disabled="locked" @click="eraseSelection">
+              <PhEraser aria-hidden="true" />
+              Erase
+            </button>
             <button class="ctx-btn is-cta" :disabled="locked" @click="openRegen">
               <PhSparkle aria-hidden="true" />
               Reimagine
@@ -2157,13 +2470,13 @@ function clamp(n: number, lo: number, hi: number) {
                笔迹是散开的,贴谁都不对;而笔头大小得在落笔之前就能调,
                所以它只要工具选中就露面,不看有没有抹过 -->
           <div
-            v-if="item && tool === 'eraser' && !bgOpen && !genOpen"
+            v-if="item && tool === 'eraser'"
             class="cv-ctx is-bar"
             role="group"
             aria-label="Eraser"
             @pointerdown.stop
           >
-            <span class="ctx-size">Eraser</span>
+            <span class="ctx-tag">Eraser</span>
             <button
               class="ctx-btn is-icon"
               :disabled="eraserSize <= ERASER_MIN"
@@ -2191,80 +2504,88 @@ function clamp(n: number, lo: number, hi: number) {
               :disabled="locked || !strokes.length"
               @click="erasePainted"
             >
+              <PhEraser aria-hidden="true" />
               Erase
             </button>
           </div>
 
-          <!-- 换背景:改的是整幅,没有选区可依附,所以按"整幅"的位置挂在顶上。
-               与橡皮那条同占一个位置,靠 bgOpen 互斥(见 openBg 与 openRegen) -->
-          <div
-            v-if="item && bgOpen"
-            class="cv-ctx is-composer is-bar"
-            @pointerdown.stop
-          >
-            <p class="ctx-eyebrow">Replace background</p>
-            <textarea
-              ref="bgEl"
-              v-model="bgText"
-              class="ctx-input"
-              rows="2"
-              placeholder="Describe the new background…"
-              aria-label="Describe the new background"
-              @keydown.stop="composerKey($event, replaceBackground, closeBg)"
-            ></textarea>
-            <div class="ctx-acts">
-              <button class="ctx-btn" @click="closeBg">Cancel</button>
-              <button
-                class="ctx-btn is-cta is-icon"
-                :disabled="!job && (locked || !bgText.trim())"
-                :aria-label="job ? 'Stop' : 'Apply the new background'"
-                @click="job ? stop() : replaceBackground()"
-              >
-                <PhStop v-if="job" aria-hidden="true" />
-                <PhPaperPlaneRight v-else aria-hidden="true" />
-              </button>
-            </div>
-          </div>
-
-          <!-- 照这张再画一张。参考图不用挑 —— 画布上摆着的就是,
-               所以要写的只有"画成什么样"。与换背景那张同占舞台顶上,
-               靠 closeComposers 互斥(见 openGen) -->
-          <div v-if="item && genOpen" class="cv-ctx is-composer is-bar" @pointerdown.stop>
-            <p class="ctx-eyebrow">Create from this picture</p>
-            <textarea
-              ref="genEl"
-              v-model="genText"
-              class="ctx-input"
-              rows="2"
-              placeholder="Describe what you want to make…"
-              aria-label="Describe what you want to make"
-              @keydown.stop="composerKey($event, createFromThis, closeGen)"
-            ></textarea>
-            <div class="ctx-acts">
-              <button class="ctx-btn" @click="closeGen">Cancel</button>
-              <button
-                class="ctx-btn is-cta is-icon"
-                :disabled="!job && (locked || !genText.trim())"
-                :aria-label="job ? 'Stop' : 'Create from this picture'"
-                @click="job ? stop() : createFromThis()"
-              >
-                <PhStop v-if="job" aria-hidden="true" />
-                <PhPaperPlaneRight v-else aria-hidden="true" />
-              </button>
-            </div>
-          </div>
         </div>
 
-        <!-- 角落的一行注脚:多少像素、现在放到多大。
-             点它就回到 1:1 —— 缩放按钮进了左栏,这个数字顺手顶上 -->
+        <!-- —— 助手面板 ——
+             换背景与"照这张再画一张"改的都是整幅,没有哪一点可以依附,
+             所以它们不该像局部重绘那样贴着"那一块"飘,而要有个固定的落点。
+             落在右侧而不是浮在画面上:这两句描述常是一整句话,
+             浮在顶上那块条子写起来憋屈,而且它正好压着你正要描述的那张图。
+
+             它把画布挤窄、而不是盖上去 —— 挤窄之后舞台尺寸变了,
+             ResizeObserver 会重新取景,于是图始终整幅看得见。
+             这也是这两件事里唯一"值得把画布让出去"的时刻:
+             用户此刻在写整幅的改法,他要看的就是整幅 -->
+        <Transition name="assist">
+          <aside
+            v-if="assistOpen"
+            class="cv-assist"
+            :aria-label="assistSpec.label"
+            @pointerdown.stop
+          >
+            <div class="assist-inner">
+              <div class="assist-head">
+                <!-- 这一块面板自己就是一页的头,所以标题是个真的标题,
+                     不是那套 11px 的眉标 —— 眉标是给"一组东西的说明"用的,
+                     而它是这张卡唯一的身份 -->
+                <h2 class="assist-title">
+                  <component :is="assistSpec.icon" class="assist-ico" aria-hidden="true" />
+                  {{ assistSpec.label }}
+                </h2>
+                <button
+                  class="assist-x"
+                  aria-label="Close"
+                  @click="assistSpec.close()"
+                >
+                  <PhX aria-hidden="true" />
+                </button>
+              </div>
+              <textarea
+                ref="assistEl"
+                v-model="assistText"
+                class="assist-input"
+                rows="5"
+                :placeholder="assistSpec.placeholder"
+                :aria-label="assistSpec.label"
+                @keydown.stop="composerKey($event, assistSpec.submit, assistSpec.close)"
+              ></textarea>
+              <p class="assist-hint">{{ assistSpec.hint }}</p>
+              <div class="assist-acts">
+                <button class="btn" @click="assistSpec.close()">Cancel</button>
+                <!-- 在途时它变成停止键。写的动作已经发出去了,
+                     这一下能做的就只剩"把在算的那件停掉" -->
+                <button
+                  class="btn is-cta"
+                  :disabled="!job && (locked || !assistText.trim())"
+                  @click="job ? stop() : assistSpec.submit()"
+                >
+                  {{ job ? 'Stop' : assistSpec.cta }}
+                </button>
+              </div>
+            </div>
+          </aside>
+        </Transition>
+
+        <!-- 右上角那枚读出:多少像素、什么比例、现在放到多大。
+             点它就回到 1:1 —— 缩放按钮进了左栏,这个数字顺手顶上。
+             三段各占一格而不是连成一句话:三个数是三件事,
+             连排之后那串等宽数字糊在一起,反而谁也读不出来 -->
         <button
           v-if="item && imgW"
           class="cv-status"
+          data-tip-side="left"
           data-tip="Zoom to 100%"
           aria-label="Zoom to 100%"
           @click="zoomTo100"
         >
-          {{ imgW }} × {{ imgH }} · {{ zoomPct }}%
+          <span>{{ imgW }} × {{ imgH }}</span>
+          <span v-if="ratioLabel" class="status-ratio">{{ ratioLabel }}</span>
+          <span class="status-zoom">{{ zoomPct }}%</span>
         </button>
 
         <!-- 有未保存改动时的确认。它浮在画布上沿居中 ——
@@ -2289,16 +2610,23 @@ function clamp(n: number, lo: number, hi: number) {
             <PhClockCounterClockwise />
           </span>
           <div ref="trackEl" class="strip-track">
-            <template v-for="(u, i) in stepUrls" :key="i">
+            <template v-for="(s, i) in steps" :key="i">
+              <!-- 每一格是"缩略图 + 它干了什么"。只摆缩略图时,
+                   走到十几步就认不出哪张是哪张 —— 而这几行字才说得清
+                   这一步动的是背景、画幅还是某一小块 -->
               <button
                 class="step"
                 :class="{ on: i === ops.length, future: i > ops.length }"
+                :disabled="!!job"
                 :aria-current="i === ops.length ? 'true' : undefined"
-                :aria-label="i === 0 ? 'Original' : `Step ${i}`"
-                :title="i === 0 ? 'Original' : `Step ${i}`"
+                :aria-label="`${s.title} — ${s.sub}`"
                 @click="goStep(i)"
               >
-                <img :src="u" alt="" />
+                <img :src="s.url" alt="" />
+                <span class="step-cap">
+                  <span class="step-title">{{ s.title }}</span>
+                  <span class="step-sub">{{ s.sub }}</span>
+                </span>
               </button>
 
               <!-- 在途的那一格:结果还没回来,没有缩略图可画,先占住位置。
@@ -2313,7 +2641,13 @@ function clamp(n: number, lo: number, hi: number) {
                 :aria-label="`Stop: ${job.label}`"
                 @click="stop"
               >
-                <PhStop aria-hidden="true" />
+                <span class="job-box">
+                  <PhStop aria-hidden="true" />
+                </span>
+                <span class="step-cap">
+                  <span class="step-title">Working…</span>
+                  <span class="step-sub">{{ job.sub }}</span>
+                </span>
               </button>
             </template>
           </div>
@@ -2324,7 +2658,7 @@ function clamp(n: number, lo: number, hi: number) {
           <div class="strip-acts">
             <button
               class="sbtn"
-              :disabled="!canUndo"
+              :disabled="!canUndo || !!job"
               data-tip="Undo (⌘Z)"
               aria-label="Undo"
               @click="undo"
@@ -2333,7 +2667,7 @@ function clamp(n: number, lo: number, hi: number) {
             </button>
             <button
               class="sbtn"
-              :disabled="!canRedo"
+              :disabled="!canRedo || !!job"
               data-tip="Redo (⇧⌘Z)"
               aria-label="Redo"
               @click="redo"
@@ -2342,7 +2676,7 @@ function clamp(n: number, lo: number, hi: number) {
             </button>
             <button
               class="sbtn"
-              :disabled="!canUndo"
+              :disabled="!canUndo || !!job"
               data-tip="Back to the original"
               aria-label="Back to the original"
               @click="reset"
@@ -2352,12 +2686,13 @@ function clamp(n: number, lo: number, hi: number) {
           </div>
         </div>
 
-        <!-- 左栏键的悬停提示。渲染在这一层、不在按钮里面 ——
-             那里面是滚动容器,跟着按钮走的气泡会被裁掉半个 -->
+        <!-- 工具键的悬停提示。渲染在这一层、不在按钮里面 ——
+             左栏内部是滚动容器,跟着按钮走的气泡会被那块裁掉半个 -->
         <Transition name="cv-tip">
           <span
             v-if="railTip.text"
             class="rail-tip"
+            :class="{ 'is-left': railTip.side === 'left' }"
             :style="{ left: `${railTip.x}px`, top: `${railTip.y}px` }"
             aria-hidden="true"
           >{{ railTip.text }}</span>
@@ -2397,6 +2732,9 @@ function clamp(n: number, lo: number, hi: number) {
      用页面底色,和全站连成一片 */
   background: var(--bg);
   overflow: hidden;
+  /* 助手面板的宽度。一处定义,面板本身与那几个要让位的浮层共用 ——
+     写两份的话,改宽度时总会漏掉一个 */
+  --assist-w-open: 300px;
 }
 
 /* 键盘走查时得看得见落点。全局把 outline 关掉了(见 style.css),
@@ -2411,24 +2749,53 @@ function clamp(n: number, lo: number, hi: number) {
   display: none;
 }
 
-/* 画布右上角的一行注脚:多少像素、现在放到多大。
+/* 画布右上角那枚读出:多少像素、什么比例、现在放到多大。
    它是状态而不是操作,所以只占角落、不挡手 —— 点一下回到 1:1。
-   放上面是因为下沿归步骤条:步数一多那条会横着铺过来,角落就没了 */
+   放上面是因为下沿归步骤条:步数一多那条会横着铺过来,角落就没了。
+
+   它得做成实心一枚:纯文字飘在角落时,画布的底色会直接透上来,
+   数字一落到深色画面上就没了 —— 而这几个数是"我在改哪张图"的唯一交代 */
 .cv-status {
   position: absolute;
   top: var(--sp-4);
-  right: var(--sp-4);
+  /* 面板那一侧让出来:它量的是整块 .cv-body,不让就压到面板头上 */
+  right: calc(var(--sp-4) + var(--assist-w));
   z-index: 1;
-  padding: 2px 6px;
-  border-radius: 6px;
-  font-size: var(--fs-micro);
-  color: var(--text-3);
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 30px;
+  padding: 0 11px;
+  border-radius: 999px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+  font-size: var(--fs-xs);
+  color: var(--text-2);
   font-variant-numeric: tabular-nums;
-  transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+  /* right 那一项是给助手面板的:面板一开,这个数就得跟着"让"过去。
+     不写它的话胶囊会瞬移 300px,而面板还在一点点铺开 */
+  transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease),
+    right 320ms var(--ease);
+}
+/* 格与格之间那个点。写在 CSS 里而不是模板里 ——
+   比例那格是可缺的,做成元素的话缺一次就多一个孤零零的点 */
+.cv-status > span + span::before {
+  content: '·';
+  margin-right: 7px;
+  color: var(--text-4);
+}
+/* 比例是算出来的副信息,压一档;缩放是这一下要去做的事,提一档 */
+.status-ratio {
+  color: var(--text-3);
+}
+.status-zoom {
+  color: var(--text);
+  font-weight: 500;
 }
 .cv-status:hover {
-  background: var(--surface);
-  color: var(--text);
+  background: var(--bg-elev);
+  border-color: var(--line-strong);
 }
 
 /* —— 空态:画布区域照旧铺开,提示落在它正中 ——
@@ -2474,9 +2841,27 @@ function clamp(n: number, lo: number, hi: number) {
   position: relative;
   display: flex;
   min-height: 0;
+  /* 画布底色铺在这一层,而不是铺在 .cv-stage 上。
+     舞台与助手面板是并排的两个 flex 子项,宽度还是动画过来的小数 ——
+     各自铺自己的底色,接缝处迟早会漏出一条一像素的线。
+     提到共同的那一层之后,中间根本没有缝可漏,
+     面板铺开就只是"画布变窄",看不出两块东西的相接。
+     舞台这一块因此不再自带底色:它就是这层上"可以用来改图"的那一段 */
+  background: var(--image-bg);
+  /* 助手面板占掉的宽度。那几个绝对定位的浮层(尺寸读出、确认条)
+     量的都是整块 .cv-body,面板一开它们就会跑到面板头上去 ——
+     所以这个数得让它们看得见。
+     不能改用 calc 去读面板自身的宽度:面板收起时它不在文档里 */
+  --assist-w: 0px;
+}
+.cv-body.has-assist {
+  --assist-w: var(--assist-w-open);
 }
 /* 工具条浮在画布左上角。它不占版面 —— 画布从它底下铺过去,
-   于是"能改图的地方"始终是整块,而不是被切掉一条的剩余 */
+   于是"能改图的地方"始终是整块,而不是被切掉一条的剩余。
+
+   宽度定死:键上现在带名字,宽度由最长的那条标签说了算。
+   交给内容去撑的话,展开/收起、切语言都会让整条左右晃一下 */
 .cv-rail {
   position: absolute;
   left: var(--sp-4);
@@ -2484,11 +2869,14 @@ function clamp(n: number, lo: number, hi: number) {
   z-index: 2;
   display: flex;
   flex-direction: column;
-  /* 键靠着左沿排:分隔线按同一条线对位,底部那几件也才对得上 */
-  align-items: flex-start;
   gap: var(--sp-2);
-  /* 高度封顶,而且不许被内容撑破:展开的内容并排成第二列,
-     所以展开前后这条的高度是一样的。真要放不下,滚的是里面那一截。
+  /* 宽度跟着最长的那条标签走。名字收成一个词之后最长的就剩 "Horizontal"
+     (13px 下约 65px),剩下的余量不多。
+     下限就在这儿:再窄就得截断,而一条被截断的工具名比没有更难认。
+     真要更窄,只能动那两处 —— 标签降成 12px,或者把按键的左右内边距收一档。
+       152 = 描边(2)+ 卡片内边距(24)+ 键内边距(20)+ 图标(18)+ 间距(10)+ 标签(78) */
+  width: 152px;
+  /* 高度封顶,而且不许被内容撑破。真要放不下,滚的是里面那一截。
      左下角那条步骤条也得让出来 —— 它是后来才长出来的,不让就会压住这条。
      --strip-h 由 JS 量出来(见 measureStrip),量不到时按 0 算,
      于是没有步骤条的时候,这条和从前一样 */
@@ -2512,6 +2900,10 @@ function clamp(n: number, lo: number, hi: number) {
      或者被某个浏览器当成无效引用),整块就会画不出来 —— 图标直接消失。
      url() 后面允许跟一个颜色当退路,那就不会出现"键还在、图标没了" */
   fill: url(#cv-ai-grad) var(--ai-from);
+  /* 这一组的图标比别处大一档。渐变的色相跨度要靠面积才看得出来 ——
+     18px 的细描边扫过去还是一片灰,而这一组是整页的重点 */
+  width: 20px;
+  height: 20px;
 }
 /* 只装一个渐变定义,不参与布局。不用 display:none —— 那是"不渲染",
    某些浏览器会连里面的 gradient 一起不认,引用它的 fill 会退成黑色 */
@@ -2527,41 +2919,83 @@ function clamp(n: number, lo: number, hi: number) {
 .cv-ai-to {
   stop-color: var(--ai-to);
 }
-/* 两条例外。灰掉的键不该还亮着;
-   停止键是这一组里唯一的破坏性动作,归 --danger —— 与步骤条上那一格同色。
-   两条都要比上面那条更具体才盖得住 */
+/* 一条例外:灰掉的键不该还亮着渐变。
+   要比上面那条更具体才盖得住 */
 .rail-ai .tool:disabled svg {
   fill: var(--text-4);
 }
-.rail-ai .tool svg.is-stop {
-  fill: var(--danger);
+/* 这一颗正在跑。它不换成停止键(见模板那条注释),只补两层状态:
+   与选中态同一层淡底,再加一圈慢慢呼吸的金光 ——
+   金在全站只用来报"机器在动"(见 style.css 的 .halo-breathe)。
+   底下那两条 :disabled 得让开:它此刻正是"在跑的那件事"本身,
+   灰掉之后渐变一没,这一组唯一的色彩就恰好在最要紧的时候消失了。
+   (这三颗从来只当发射键用,不参与工具选中,所以这层淡底不会被误读成"选中了") */
+.rail-ai .tool.is-busy,
+.rail-ai .tool.is-busy:disabled {
+  background: var(--accent-soft);
+  color: var(--text);
+  animation: rail-busy 1.8s ease-in-out infinite;
+}
+.rail-ai .tool.is-busy svg,
+.rail-ai .tool.is-busy:disabled svg {
+  fill: url(#cv-ai-grad) var(--ai-from);
+}
+@keyframes rail-busy {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+  50% {
+    box-shadow: 0 0 14px -2px color-mix(in oklch, var(--ai-halo) 58%, transparent);
+  }
+}
+/* 动效被关掉之后呼吸会停在某一帧上 —— 可能正好停在最淡的那帧。
+   这里直接给最亮那一帧,把"它正在忙"原样留下来 */
+@media (prefers-reduced-motion: reduce) {
+  .rail-ai .tool.is-busy,
+  .rail-ai .tool.is-busy:disabled {
+    animation: none;
+    box-shadow: 0 0 14px -2px color-mix(in oklch, var(--ai-halo) 58%, transparent);
+  }
 }
 .rail-grp {
   display: flex;
   flex-direction: column;
   /* 4 而不是 8:一组之内这些键是"同一件事的几个选项",挨紧一点才像一簇。
-     组与组那条短线两侧仍是 8(见 .rail-col 的 gap),于是"内紧外松" ——
+     组与组那道横线两侧仍是 8(见 .rail-col 的 gap),于是"内紧外松" ——
      分组的层次靠这两档差撑起来,不必再加别的装饰 */
   gap: var(--sp-1);
   /* 不许被压缩:卡片限高时该滚动,而不是把每个键挤扁 */
   flex: none;
 }
-/* 组与组之间的一道短线。它要落在键的中线上:键宽 44、线宽 24,
-   于是左偏 10px —— 不能用 align-self: center,列宽会随展开变化,
-   那样线会跑到整条卡片的正中,而不是键的正中 */
+/* 组标题。它回答的是"下面这几颗为什么是一组" ——
+   字形与全站其它小标题同源(见 .ctx-eyebrow):全大写 + 字距。
+   左右内边距与键取齐,标题才会和它管着的那些字落在同一条竖线上。
+   多给 2px 下边距:4px 的组内间距对"标题 → 内容"这层关系来说太挤了 */
+.rail-eyebrow {
+  margin-bottom: 2px;
+  padding: 0 10px;
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: var(--ls-eyebrow);
+  text-transform: uppercase;
+  /* 比正文里那些眉标深一档:它是这条竖栏里唯一的层级说明,
+     压到 --text-4 就等于没有 —— 上一版就是这样,分组等于白分 */
+  color: var(--text-3);
+}
+/* 组与组之间一道横线。铺满整条 ——
+   这一列现在是份带字的清单,一道 24px 的短线夹在带字的行之间,
+   看着像个没写完的破折号 */
 .rail-sep {
-  width: 24px;
+  width: 100%;
   height: 1px;
-  margin-left: 10px;
   background: var(--line);
-  align-self: flex-start;
   flex: none;
 }
-/* 常用项那一截:超过卡片高度时只滚它 */
+/* 常驻那一截:超过卡片高度时只滚它 */
 .rail-scroll {
   display: flex;
-  flex-direction: row;
-  align-items: flex-start;
+  flex-direction: column;
   gap: var(--sp-2);
   flex: 1 1 auto;
   min-height: 0;
@@ -2577,70 +3011,81 @@ function clamp(n: number, lo: number, hi: number) {
 .rail-col {
   display: flex;
   flex-direction: column;
-  align-items: flex-start;
   gap: var(--sp-2);
   flex: none;
 }
 
-/* 折起来的这几组:从常用项那一列的右手边长出来,展开的是宽度。
-   max-width 只是给过渡用的上下限,不参与实际布局 */
+/* 折起来的这几组:键盘上带字,横着展开会顶出卡片,所以改成往下长。
+   max-height 只是给过渡用的上下限,不参与实际布局 */
 .rail-fold {
   display: flex;
   flex-direction: column;
-  align-items: flex-start;
   gap: var(--sp-2);
   flex: none;
   overflow: hidden;
 }
-/* 展开:宽度与淡入同步走一条曲线 —— 时长错开的话会先亮起来再慢慢推开,像两下。
-   给足 340ms,它是"推开一条边栏",快了像闪一下 */
+/* 展开:高度与淡入同步走一条曲线 —— 时长错开的话会先亮起来再慢慢长开,像两下。
+   给足 340ms,它是"掀开一段清单",快了像闪一下 */
 .rail-fold-enter-active {
-  transition: max-width 340ms var(--ease), opacity 340ms var(--ease);
+  transition: max-height 340ms var(--ease), opacity 340ms var(--ease);
 }
-/* 收起只收窄,不淡出也不位移。三件事一起做的时候,
-   宽度还没收完内容就已经淡没了,末尾剩一段空收 —— 看着就是"卡了一下"。
+/* 收起只缩短,不淡出也不位移。三件事一起做的时候,
+   高度还没收完内容就已经淡没了,末尾剩一段空收 —— 看着就是"卡了一下"。
    曲线换成先慢后快,让它越收越快、干脆让开 */
 .rail-fold-leave-active {
-  transition: max-width 200ms cubic-bezier(0.4, 0, 1, 1);
+  transition: max-height 200ms cubic-bezier(0.4, 0, 1, 1);
 }
 .rail-fold-enter-from {
-  max-width: 0;
+  max-height: 0;
   opacity: 0;
 }
 .rail-fold-leave-to {
-  max-width: 0;
+  max-height: 0;
 }
 .rail-fold-enter-to,
 .rail-fold-leave-from {
-  /* 44 就是内容本身的宽度(一个键)。再多给一截是空推,
-     末尾那段没有内容跟上,看起来会"刹不住" */
-  max-width: 44px;
+  /* 比内容(两组七键 + 两枚标题 ≈ 400px)再放宽一点:
+     卡在内容高度上,最后一帧会因为差几像素而"刹一下" */
+  max-height: 440px;
   opacity: 1;
 }
 
-/* 一个工具键:只剩图标。名字与快捷键交给悬停提示 ——
-   带一行字的话这条竖栏要宽出去近一倍,而字本身只是"认图标"的辅助。
+/* 一个工具键:图标 + 名字。名字不是装饰 ——
+   "套索"和"照着这张再画一张"之间的差别,图标说不出来。
    选中态只有一层淡底:不勾边,也不做实心 ——
    一圈描边会让这个键看着"被框住",实心块则把白卡片切成两半 */
 .tool {
   display: flex;
   align-items: center;
-  justify-content: center;
-  width: 44px;
-  height: 44px;
+  gap: 10px;
+  width: 100%;
+  /* 40 是触控的底线。它比 44 略矮,是因为这一列现在有十来行 */
+  height: 40px;
   flex: none;
+  padding: 0 10px;
   /* 比卡片(16)小一档:内嵌一层的圆角要跟着内缩,不然两圈弧线会打架 */
-  border-radius: 12px;
+  border-radius: 10px;
   color: var(--text-2);
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  /* 全站把 button 的 text-align 重置成了 inherit,这里要的是左对齐 */
+  text-align: left;
   transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
 }
 /* 所有键上的图标走同一条尺寸,而且不许被压扁 ——
-   两列、常驻与展开的图标因此落在同一个视觉尺度上 */
+   常驻与展开的图标因此落在同一个视觉尺度上 */
 .tool svg {
   display: block;
-  width: 19px;
-  height: 19px;
+  width: 18px;
+  height: 18px;
   flex: none;
+}
+/* 名字自己收紧:min-width 归零之后,长了才会省略而不是把键撑出去 */
+.tool-name {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 .tool:hover:not(:disabled) {
   background: var(--bg-elev);
@@ -2654,12 +3099,13 @@ function clamp(n: number, lo: number, hi: number) {
   color: var(--text-4);
   cursor: default;
 }
-/* More 的箭头:朝右是"还能展开",翻过来是"现在能收起" */
+/* More 的箭头:朝右是"还能展开",转下来是"现在能收起"。
+   转 90 而不是 180:那几组是往下的,箭头也该指着那个方向 */
 .cv-caret {
   transition: transform var(--dur) var(--ease);
 }
 .cv-caret.flip {
-  transform: rotate(180deg);
+  transform: rotate(90deg);
 }
 /* 这一页的键都不再走全站那套 ::after 气泡 —— 它挂在按钮旁边,
    而 rail 和步骤条内部都是滚动容器,气泡会被裁掉一半;
@@ -2701,6 +3147,17 @@ function clamp(n: number, lo: number, hi: number) {
   border-right-color: var(--cta);
   transform: translateY(-50%);
 }
+/* 反过来贴左缘的那几处(图片那条站在舞台右沿,气泡只能往左让):
+   整块按自身宽度左移,三角镜像到右侧,入场那 4px 也从左边来 */
+.rail-tip.is-left {
+  translate: -100% -50%;
+}
+.rail-tip.is-left::before {
+  right: auto;
+  left: 100%;
+  border-right-color: transparent;
+  border-left-color: var(--cta);
+}
 .cv-tip-enter-active,
 .cv-tip-leave-active {
   transition: opacity 130ms var(--ease), transform 130ms var(--ease);
@@ -2710,14 +3167,19 @@ function clamp(n: number, lo: number, hi: number) {
   opacity: 0;
   transform: translateX(-4px);
 }
+.rail-tip.is-left.cv-tip-enter-from,
+.rail-tip.is-left.cv-tip-leave-to {
+  transform: translateX(4px);
+}
 .cv-stage {
   position: relative;
   flex: 1;
   min-width: 0;
   /* 顶栏往下这一整块就是编辑区:铺满、不留边、不勾框。
      它是"能改图的地方",不是版面上的一张卡 ——
-     画框会让人以为图只能待在框里 */
-  background: var(--image-bg);
+     画框会让人以为图只能待在框里。
+     底色由 .cv-body 铺(见上),这一层不再自带 ——
+     旁边那块助手面板要让出来的是"宽度",不是"换一个颜色" */
   overflow: hidden;
   /* 触屏上禁掉浏览器自己的手势,否则拖一下就变成滚页面 */
   touch-action: none;
@@ -2769,70 +3231,291 @@ function clamp(n: number, lo: number, hi: number) {
   color: var(--text-3);
 }
 
+/* —— 助手面板 ——
+   换背景与"照这张再画一张"的落点(见 assistOpen 那段注释)。
+
+   两层要分清:外面那一条是"从画布里让出来的空地",里面那张才是面板。
+   它不是浮层 —— 这一条是实切走的,画布跟着变窄。
+   之所以肯把画布让出去:用户此刻在写整幅的改法,他要看的就是整幅,
+   让出一条正好把图完整地留在剩下的地方。
+
+   这一条不另铺底色:画布色铺在 .cv-body 上(见那段注释),它俩本就是一层。
+   两种颜色之间会平白多出一条"到此为止"的界线,而这条界线什么也没说明 ——
+   同色之后整块看起来还是画布,只是右边落了一张卡。
+   卡片因此得自己站住:--surface 加上一圈描边和影,才不会糊进画布里。
+
+   开合用宽度过渡。舞台尺寸会连着变几十帧,而 ResizeObserver 每帧都重新取景,
+   于是图是"跟着收"过去的,不是跳一下。卡片宽度写死、由外层裁:
+   内容一跟着回流,过渡里就看得到字在挤 */
+.cv-assist {
+  display: flex;
+  flex: none;
+  width: var(--assist-w-open);
+  padding: var(--sp-4);
+  overflow: hidden;
+}
+.assist-inner {
+  display: flex;
+  flex-direction: column;
+  /* 减去两侧的 16:那一条里只落这张卡,宽就是空地的可用宽 */
+  width: calc(var(--assist-w-open) - var(--sp-4) * 2);
+  flex: none;
+  /* 高度跟内容走,不撑满那一条。撑满之后中间那片输入区会摊成一大片空白,
+     一屏上最显眼的就剩"什么都没写" —— 一块比内容大三倍的卡,
+     读不出它到底想让你做什么。收成内容高度,它才是一个能一眼看完的东西 */
+  align-self: flex-start;
+  max-height: 100%;
+  padding: var(--sp-4);
+  border-radius: var(--r);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  /* 与左栏那条工具条同一套影:画面上浮着的两块东西不该长得像两套。
+     底不是纯白而是画布色,所以这一圈影得比那边再托得住一点 ——
+     卡要是不浮起来,它就只是画布上另一块浅色 */
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06), 0 10px 24px -6px rgba(0, 0, 0, 0.16);
+  transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+}
+/* 光标进去之后整张卡亮起来 —— 与首页那块输入区同一套漫反射柔光
+   (见 App 的 .prompt-box:focus-within)。这是这块面板最该有的那个"重点":
+   此刻屏幕上唯一在写东西的地方就是它 */
+.assist-inner:focus-within {
+  border-color: color-mix(in oklch, var(--accent) 34%, var(--line));
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.06),
+    0 10px 24px -6px rgba(0, 0, 0, 0.16),
+    0 0 8px -3px color-mix(in oklch, var(--accent) 16%, transparent),
+    0 0 20px -6px color-mix(in oklch, var(--accent) 22%, transparent),
+    0 0 42px -14px color-mix(in oklch, var(--accent) 26%, transparent);
+}
+.assist-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-4);
+}
+.assist-title {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  font-size: var(--fs-lg);
+  font-weight: 600;
+  line-height: 1.25;
+  letter-spacing: var(--ls-tight);
+  color: var(--text);
+}
+/* 与打开它的那颗左栏键同一个渐变(见 .rail-ai)。
+   20px 是必要的:再小,那道七十度的色相跨度就看不出来了 */
+.assist-ico {
+  width: 20px;
+  height: 20px;
+  flex: none;
+  fill: url(#cv-ai-grad) var(--ai-from);
+}
+.assist-x {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  flex: none;
+  border-radius: 999px;
+  color: var(--text-3);
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+.assist-x svg {
+  width: 16px;
+  height: 16px;
+}
+.assist-x:hover {
+  background: var(--bg-elev);
+  color: var(--text);
+}
+/* 输入框无框无底,但不再吃掉中间那一整块 ——
+   它的大小由"要写一句话"这件事定,不由屏幕高度定。
+   给一圈框只会缩掉能写的地方,所以框还是没有,只是高度改成了定值 */
+.assist-input {
+  width: 100%;
+  min-height: 108px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  /* 16px 是硬要求:iOS Safari 聚焦到比它小的框上会把整页放大 */
+  font-size: 16px;
+  line-height: 1.55;
+  font-family: inherit;
+  /* 高度本来就跟着面板走,再给个拖拽手柄只会让人以为能拖 */
+  resize: none;
+}
+.assist-input::placeholder {
+  color: var(--text-4);
+}
+.assist-input:focus {
+  outline: none;
+}
+/* 一句"这句话会怎么被用掉"。写在输入框下面而不是上面:
+   上面那句该说"要写什么",这一句只负责兜住"要不要把人也写进去"这类误会。
+   两者同色同重的话会分不清哪个是提示哪个是正文,所以它压一档 */
+.assist-hint {
+  margin-top: var(--sp-3);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+  color: var(--text-3);
+}
+/* 两个键落在底沿,像一处对话的发送栏 ——
+   中间那块输入区就是这一整块面板的主体 */
+.assist-acts {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--sp-2);
+  margin-top: var(--sp-4);
+}
+/* 展开比收起慢:收起是"赶紧腾地方",铺开才是"请进来" */
+.assist-enter-active {
+  transition: width 320ms var(--ease), opacity 320ms var(--ease);
+}
+.assist-leave-active {
+  transition: width 200ms cubic-bezier(0.4, 0, 1, 1), opacity 200ms var(--ease);
+}
+.assist-enter-from,
+.assist-leave-to {
+  width: 0;
+  opacity: 0;
+}
+
 /* —— 浮在选区旁的上下文条 ——
    贴在选区正上方(放不下就翻到下面),不占版面行高。
-   它铺在画面上,所以得靠一层较重的阴影把自己托起来 */
+   它铺在画面上,所以得靠一层较重的阴影把自己托起来。
+
+   圆角用 --r 而不是胶囊:它装的是"一枚标签 + 几个键",是个盒子,不是一颗键。
+   胶囊里再套一层胶囊,内外圆角同心不了 —— 那正是看着毛糙的源头。
+   内边距 6 配内圆角 10(16 - 6),两层正好同心 */
 .cv-ctx {
   position: absolute;
   z-index: 3;
   display: flex;
   align-items: center;
   gap: var(--sp-1);
-  padding: 4px 4px 4px 14px;
-  border-radius: 999px;
+  padding: 6px;
+  border-radius: var(--r);
   background: var(--surface);
   border: 1px solid var(--line);
-  /* 贴边细影 + 一圈弥散:--sh-md 的偏移太大,这么小的胶囊会看着"飞起来" */
+  /* 贴边细影 + 一圈弥散:--sh-md 的偏移太大,这么小的盒子会看着"飞起来" */
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06), 0 12px 32px rgba(0, 0, 0, 0.14);
   white-space: nowrap;
   cursor: default;
   /* 窄屏上让它收着走,别探出舞台 */
   max-width: calc(100% - 16px);
+  transition: border-color var(--dur) var(--ease);
 }
+/* 条首那枚标签("Selection"/"Eraser")。与输入区顶上那行眉标同一套写法 ——
+   全站的小标题都长这样,它在这里的职责也一样:说清这一条在管什么。
+   它和"键"必须一眼分得开,否则会被读成又一个按钮 */
+.ctx-tag,
+.ctx-eyebrow {
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: var(--ls-eyebrow);
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+/* 文字键的左右各有 12px 内边距,而标签只从卡片边缘起算 6 —— 补到 12,和键里的字齐平 */
+.ctx-tag {
+  padding: 0 2px 0 6px;
+}
+
+/* 数值读出(裁剪框的宽 × 高)。它是"值"不是"话":不走眉标那套 ——
+   大写加字距会把 1024 × 768 拉得七零八落 */
 .ctx-size {
+  padding: 0 2px 0 6px;
   font-size: var(--fs-xs);
   color: var(--text-2);
   font-variant-numeric: tabular-nums;
 }
+/* 文字键:卡片里的"菜单项" —— 不描边,靠悬停底色交代可点 */
 .ctx-btn {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 6px;
   height: 32px;
   padding: 0 12px;
-  border-radius: 999px;
+  border-radius: 10px;
   color: var(--text);
   font-size: var(--fs-sm);
-  transition: background var(--dur) var(--ease);
+  font-weight: 500;
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease),
+    border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease),
+    transform 120ms var(--ease);
 }
 .ctx-btn svg {
   width: 15px;
   height: 15px;
 }
-.ctx-btn:hover {
+.ctx-btn:hover:not(:disabled) {
   background: var(--bg-elev);
 }
+
+/* 图标键单独立一套:圆形 + 描边,与主输入框那一排(34px 圆键)同一个造型。
+   一列里只有图标、没有文字时,不描边它就散在空气里 */
+.ctx-btn.is-icon {
+  width: 32px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+}
+.ctx-btn.is-icon svg {
+  width: 16px;
+  height: 16px;
+}
+.ctx-btn.is-icon:hover:not(:disabled) {
+  border-color: var(--line-strong);
+}
+.ctx-btn.is-icon:active:not(:disabled) {
+  transform: scale(0.94);
+}
+
+/* 主操作:纸色实心。悬停只换底色 —— 叠一层 --bg-elev 会让它变成和素色键一样的东西 */
 .ctx-btn.is-cta {
   background: var(--cta);
   color: var(--cta-text);
+  border-color: var(--cta);
 }
-.ctx-btn.is-cta:hover {
+.ctx-btn.is-cta:hover:not(:disabled) {
   background: var(--cta-hover);
+  border-color: var(--cta-hover);
+}
+.ctx-btn.is-icon.is-cta {
+  box-shadow: 0 2px 8px color-mix(in oklch, var(--cta) 30%, transparent);
+}
+.ctx-btn.is-icon.is-cta:hover:not(:disabled) {
+  box-shadow: 0 4px 12px color-mix(in oklch, var(--cta) 42%, transparent);
 }
 .ctx-btn:disabled {
   opacity: 0.38;
   cursor: not-allowed;
+  box-shadow: none;
 }
 
 /* —— 写指令那一态 ——
-   还是那条浮条,换了个形态:从横排胶囊变成一块小输入区。
-   圆角收成 --r 而不是胶囊 —— 它现在是个面,不是一枚键 */
+   还是那条浮条,换了个形态:从横排换成一块小输入区。
+   圆角收成 --r 而不是胶囊 —— 它现在是个面,不是一枚键。
+   聚焦时给它一圈与主输入框同源的光晕(见 App 的 .prompt-box:focus-within):
+   小卡片缺了这层交代,光标进去之后整块看着是"死的" */
 .cv-ctx.is-composer {
   display: block;
-  width: 320px;
-  padding: 10px 10px 8px;
+  width: 340px;
+  padding: 12px;
   border-radius: var(--r);
   white-space: normal;
+}
+.cv-ctx.is-composer:focus-within {
+  border-color: color-mix(in oklch, var(--accent) 34%, var(--line));
+  /* 用 outline 而不是 box-shadow:底部那条 is-bar 的影更散更大,
+     改 box-shadow 会让它在聚焦那一刻突然变浅 */
+  outline: 3px solid color-mix(in oklch, var(--accent) 9%, transparent);
 }
 .ctx-input {
   display: block;
@@ -2854,24 +3537,28 @@ function clamp(n: number, lo: number, hi: number) {
 .ctx-input:focus {
   outline: none;
 }
+/* 动作收在右下角成一组。铺满一行的话,"取消"和"发送"会被三百来像素的空白隔开,
+   看着像两个不相干的东西 */
 .ctx-acts {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
   gap: var(--sp-2);
-  margin-top: 6px;
+  margin-top: 10px;
 }
-/* 图标键定宽:不写的话它比旁边的文字键窄,一行里居中不了 */
-.ctx-btn.is-icon {
-  width: 32px;
-  padding: 0;
-  justify-content: center;
+/* 取消是次级:降一档颜色,把重量让给主键 */
+.ctx-acts .ctx-btn:not(.is-cta) {
+  color: var(--text-2);
+}
+.ctx-acts .ctx-btn:not(.is-cta):hover:not(:disabled) {
+  color: var(--text);
 }
 
 /* —— 不带选区的那条 ——
-   橡皮的工具带和换背景的输入框都作用于整体,没有"贴着谁"可言,
-   所以统一挂在舞台顶上居中:左栏在左上角、历史条在左下角,
-   这一条正好占中间那道空档 */
+   只剩橡皮的工具带了。它作用于整幅、又没有"贴着谁"可言,
+   所以挂在舞台顶上居中:左栏在左上角、历史条在左下角,
+   这一条正好占中间那道空档。
+   (换背景与"照这张再画一张"原来也占这里,现在归了右侧的助手面板) */
 .cv-ctx.is-bar {
   top: 16px;
   left: 50%;
@@ -2879,8 +3566,9 @@ function clamp(n: number, lo: number, hi: number) {
   /* 它比贴选区那种胶囊离图更远,影得再散一点才托得起来 */
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06), 0 16px 40px rgba(0, 0, 0, 0.18);
 }
+/* 笔头尺寸夹在两枚圆键中间。定宽 + 等宽数字:数字一跳,那两枚键就跟着左右挪 */
 .bar-val {
-  min-width: 52px;
+  min-width: 56px;
   text-align: center;
   font-size: var(--fs-xs);
   color: var(--text-2);
@@ -2890,18 +3578,13 @@ function clamp(n: number, lo: number, hi: number) {
    用 rail-sep 会画成横线,反倒把一排按键切成上下两半 */
 .bar-sep {
   width: 1px;
-  height: 18px;
-  margin: 0 2px;
+  height: 20px;
+  margin: 0 3px;
   background: var(--line);
 }
-/* 输入区顶上那行小字。与全站的眉标同一套写法 */
+/* 输入区顶上那行小字。字形与 .ctx-tag 同源(见上),这里只管它和输入框的距离 */
 .ctx-eyebrow {
-  margin: 0 0 6px;
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: var(--ls-eyebrow);
-  text-transform: uppercase;
-  color: var(--text-3);
+  margin: 0 0 8px;
 }
 
 .cv-text {
@@ -2921,8 +3604,9 @@ function clamp(n: number, lo: number, hi: number) {
   display: flex;
   align-items: center;
   gap: var(--sp-4);
-  /* 宽度收着长:右侧留一截,不顶到画布对面 */
-  max-width: calc(100% - var(--sp-6));
+  /* 宽度收着长:右侧留一截,不顶到画布对面。
+     助手面板那一侧也要让出来,否则步数一多它就从面板底下钻过去了 */
+  max-width: calc(100% - var(--sp-6) - var(--assist-w));
   padding: var(--sp-2) var(--sp-4);
   border-radius: var(--r);
   background: var(--surface);
@@ -2943,36 +3627,36 @@ function clamp(n: number, lo: number, hi: number) {
 }
 /* 在途的那一格:结果还没回来,没有缩略图可画,先占住位置。
    它同时是"停"的入口 —— 图算完之前,用户能做的决定只有"还要不要它"。
-   尺寸得跟真格子严丝合缝(52 的图 + 2×2 的内边距),否则它一出现,
+   虚框顶着真缩略图那么大、文字摆在同一档,否则它一出现,
    后面那几格会整体窜一下 —— 而那正是"结果快回来了"的一刻,不该抖 */
 .step.is-job {
+  color: var(--text-3);
+}
+.job-box {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 56px;
-  height: 56px;
-  padding: 0;
+  width: 44px;
+  height: 44px;
+  flex: none;
   border: 1px dashed var(--line-strong);
-  color: var(--text-3);
-  background: transparent;
-  /* 它是个按钮,得把浏览器给按钮的那套默认值摘掉 */
-  font: inherit;
-  cursor: pointer;
-  transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease);
+  border-radius: 8px;
   /* 呼吸:一个不动的虚线框看着像"这里坏了",动着才像"正在填" */
   animation: cv-slot 1.6s ease-in-out infinite;
 }
-.step.is-job svg {
-  width: 20px;
-  height: 20px;
+.job-box svg {
+  width: 18px;
+  height: 18px;
 }
 /* 指着它时就别呼吸了 —— 眼下它是"等着被按",不是"正在填"。
    转成实线红边:停掉意味着这次算的全不要了,是这个动作里唯一的破坏性后果 */
 .step.is-job:hover {
+  color: var(--danger);
+}
+.step.is-job:hover .job-box {
   animation: none;
   border-style: solid;
   border-color: var(--danger);
-  color: var(--danger);
 }
 @keyframes cv-slot {
   0%,
@@ -2995,15 +3679,16 @@ function clamp(n: number, lo: number, hi: number) {
 }
 .strip-head svg {
   display: block;
-  width: 19px;
-  height: 19px;
+  width: 18px;
+  height: 18px;
   flex: none;
 }
-/* 步数多了就横向滚,不换行 —— 换行会把底栏顶高,画布跟着缩 */
+/* 步数多了就横向滚,不换行 —— 换行会把底栏顶高,画布跟着缩。
+   间距给到 24:步与步之间那道箭头(见 .step + .step::before)要站在这里 */
 .strip-track {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 24px;
   /* min-width: 0 是这条能滑起来的关键:flex 子项默认 min-width: auto,
      十几步之后它会被内容撑开,把整页的宽度带跑 ——
      左侧工具条会跟着挪位。归零之后它才老实横向滚动 */
@@ -3016,21 +3701,85 @@ function clamp(n: number, lo: number, hi: number) {
 .strip-track::-webkit-scrollbar {
   display: none;
 }
+/* 一步 = 缩略图 + 它干了什么。图只说得出"改完长什么样",
+   说不清动的是背景还是画幅 —— 那两句话就摆在图右手边 */
 .step {
-  display: block;
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 9px;
   flex: none;
-  padding: 2px;
+  padding: 2px 8px 2px 2px;
   border-radius: 10px;
+  /* 全站把 button 的 text-align 重置成了 inherit,这里要的是左对齐 */
+  text-align: left;
+  font: inherit;
+  transition: background var(--dur) var(--ease), opacity var(--dur) var(--ease);
+}
+.step:not(.is-job):hover {
+  background: var(--bg-elev);
+}
+/* AI 那一步在途时整条步骤条冻结(见 undo / goStep 的在途锁):
+   跳走会让它的结果落回一个已经不是它发起时的序列上。
+   唯一还能点的是旁边那格 Working… —— 它自带停止 */
+.step:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+/* 步与步之间那道小箭头。步子挨着排的时候,"先做了什么"是靠左右顺序说的,
+   但一条横排里这个顺序并不明显 —— 箭头把它挑明。
+   绝对定位:它站在 24px 的间距里,不参与任何一格的实际宽度 */
+.step + .step::before {
+  content: '';
+  position: absolute;
+  left: -15px;
+  top: 50%;
+  width: 6px;
+  height: 6px;
+  /* 比分隔线深一档:它要说的是"先后",而 --line-strong 在画布色上
+     只是两条若有若无的划痕 */
+  border-top: 1.5px solid var(--text-4);
+  border-right: 1.5px solid var(--text-4);
+  transform: translateY(-50%) rotate(45deg);
 }
 /* 描边画在图上、不画在容器上:紧贴图片的那一圈才说得清"选中的是这张" */
 .step img {
   display: block;
-  width: 52px;
-  height: 52px;
+  width: 44px;
+  height: 44px;
+  flex: none;
   border-radius: 8px;
   background: var(--bg-elev);
   box-shadow: 0 0 0 1px var(--line);
-  transition: box-shadow var(--dur) var(--ease), opacity var(--dur) var(--ease);
+  transition: box-shadow var(--dur) var(--ease);
+}
+/* 两行字。整条要能一眼扫过去,所以宁可省略也不让某一步长出去 ——
+   一步拉长半条,后面的就全被推出视野了 */
+.step-cap {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  max-width: 132px;
+}
+.step-title,
+.step-sub {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.step-title {
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  color: var(--text-2);
+  transition: color var(--dur) var(--ease);
+}
+/* 副题原来用 --text-4,在浅色画布上几乎看不见 ——
+   一行读不出来的字,等于那一格只有一张缩略图,补文案就白补了。
+   它仍然比标题轻一档,但得在"看得清"这一侧 */
+.step-sub {
+  font-size: var(--fs-micro);
+  color: var(--text-3);
 }
 .step:not(.on):hover img {
   box-shadow: 0 0 0 1px var(--line-strong);
@@ -3038,10 +3787,18 @@ function clamp(n: number, lo: number, hi: number) {
 .step.on img {
   box-shadow: 0 0 0 2px var(--accent);
 }
+/* 当前那一步的字提一档:一圈金边说的是"图在这",加粗的是"话也在这" */
+.step.on .step-title {
+  color: var(--text);
+}
 /* 已经撤掉、但还回得去的那几步压淡一档:
-   留在条上是让人看见"改到哪儿了",但不该和图上正生效的几步抢注意力 */
-.step.future img {
-  opacity: 0.4;
+   留在条上是让人看见"改到哪儿了",但不该和图上正生效的几步抢注意力。
+   指到它时又亮回来 —— 那说明用户正在考虑要不要重做这一步 */
+.step.future {
+  opacity: 0.45;
+}
+.step.future:hover {
+  opacity: 1;
 }
 /* 撤销 / 重做 / 复位。它们站在缩略图右侧,用一道淡竖线隔开 ——
    左边是"我改到哪儿了",右边是对这段序列的三个动作 */
@@ -3068,8 +3825,8 @@ function clamp(n: number, lo: number, hi: number) {
 /* 与左栏那些键的图标同一个尺寸,跨区域看着才是一套 */
 .sbtn svg {
   display: block;
-  width: 19px;
-  height: 19px;
+  width: 18px;
+  height: 18px;
   flex: none;
 }
 .sbtn:hover:not(:disabled) {
@@ -3084,21 +3841,29 @@ function clamp(n: number, lo: number, hi: number) {
 /* —— 确认条 ——
    浮在画布上沿居中。底部已经是步骤条的地盘,
    两件事挤在同一处会互相看不清 */
+/* 壳与 .cv-ctx 同一套(见上):同样的面、同样的描边、同样的影。
+   它俩占据的是同一个位置(舞台顶上居中),一个胶囊一个方盒会立刻露馅 */
 .cv-ask {
   position: absolute;
   top: var(--sp-4);
-  left: 50%;
+  /* 居中要按"画布那一块"算,不是按整条 .cv-body ——
+     面板开着的时候,居中的落点是画布的正中 */
+  left: calc(50% - var(--assist-w) / 2);
   transform: translateX(-50%);
   z-index: 3;
   display: flex;
   align-items: center;
   gap: var(--sp-2);
-  padding: var(--sp-1) var(--sp-1) var(--sp-1) var(--sp-4);
-  border-radius: 999px;
+  padding: 6px;
+  border-radius: var(--r);
   background: var(--surface);
   border: 1px solid var(--line);
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06), 0 12px 32px rgba(0, 0, 0, 0.14);
   white-space: nowrap;
+}
+/* 里面的键左右各有 18px 内边距,这行字得跟着往里让一点才不贴边 */
+.cv-ask .cv-text {
+  padding-left: 6px;
 }
 
 .btn {
@@ -3162,49 +3927,100 @@ function clamp(n: number, lo: number, hi: number) {
     flex-direction: row;
     align-items: center;
     /* 横过来之后限的是宽度不是高度 */
+    width: auto;
     max-height: none;
     padding: var(--sp-1) var(--sp-2);
     /* 八九项横排,极窄的机器上宁可横向滑,也不让它被裁掉 */
     overflow-x: auto;
   }
+  /* 横排时名字与组标题一律收掉 —— 一行十几项带字会顶到屏幕外,
+     而在手机上这条要的是"一眼看全有哪几个工具",不是把每个都说清。
+     名字仍留在 aria-label 里,读屏照样念得出来 */
+  .rail-eyebrow,
+  .tool-name {
+    display: none;
+  }
   .rail-grp {
     flex-direction: row;
+    align-items: center;
+  }
+  /* 键回到正方形:横排时宽度交给内容排,不必再撑满 */
+  .tool {
+    width: 44px;
+    height: 44px;
+    justify-content: center;
+    padding: 0;
   }
 
   /* 窄屏整条是横的:两列也跟着横过来,接成一条长带 */
   .rail-scroll {
+    flex-direction: row;
+    align-items: center;
     overflow: visible;
   }
   .rail-col {
     flex-direction: row;
+    align-items: center;
   }
-  /* 横过来之后短线转成竖的,偏移也从左改到上 —— 同样是为了对着键的中线 */
+  /* 横过来之后短线转成竖的。居中交给 flex 的 align-items,
+     不必再像从前那样靠 margin-top 把它硬推到键的中线上 */
   .rail-sep {
     width: 1px;
     height: 24px;
-    margin-left: 0;
-    margin-top: 10px;
   }
-  /* 横过来之后这一组也是横的,展开的是一长串而不是"一个键" */
+  /* 横过来之后这一组也是横的,展开的是一长串而不是"一段清单" */
   .rail-fold {
     flex-direction: row;
+    align-items: center;
+  }
+  /* 窄屏改回按宽度展开:这两个值要把上面那套 max-height 一并顶掉,
+     否则收起时高度也被压着,滑动看起来会卡一下 */
+  .rail-fold-enter-active,
+  .rail-fold-leave-active {
+    transition: max-width 300ms var(--ease), opacity 300ms var(--ease);
+  }
+  .rail-fold-enter-from,
+  .rail-fold-leave-to {
+    max-height: none;
+    max-width: 0;
   }
   .rail-fold-enter-to,
   .rail-fold-leave-from {
+    max-height: none;
     max-width: 420px;
   }
   .cv-strip {
     padding: var(--sp-2) var(--sp-3);
+  }
+  /* 一步带字要将近 200px 宽,手机上一条只看得见两格 ——
+     而步骤条本来就要"一眼看全".所以窄屏只留缩略图 */
+  .step-cap {
+    display: none;
+  }
+  .step {
+    gap: 0;
+    padding: 2px;
   }
   .step img {
     width: 40px;
     height: 40px;
   }
   /* 占位跟着缩略图一起收窄,不然窄屏上它比谁都大一圈 */
-  .step.is-job {
-    width: 44px;
-    height: 44px;
+  .job-box {
+    width: 40px;
+    height: 40px;
   }
+  /* 窄屏也不改形态:照样是从画布里切走的一条、上面落一张卡。
+     换成盖上去的抽屉会丢掉"图始终整幅看得见"这件事,
+     而那正是这块面板存在的理由 */
+  .cv-assist {
+    padding: var(--sp-3);
+  }
+  .assist-inner {
+    width: calc(var(--assist-w-open) - var(--sp-3) * 2);
+    padding: var(--sp-3);
+  }
+
   /* 角落那行注脚在小屏上没地方站 */
   .cv-status {
     display: none;

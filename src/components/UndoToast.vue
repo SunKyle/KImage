@@ -26,7 +26,29 @@ let anim: Animation | null = null
    用普通对象而不是 ref —— 它只影响动画,不参与渲染 */
 const hold = { hover: false, hidden: false }
 
+/* 偏好减少动态时那条引信不烧(WAAPI 动画不受 style.css 里那条 CSS 抑制影响,
+   它只管 CSS 动画与过渡),但"到点自动消失"和"悬停暂停"这两条行为得原样保住 ——
+   于是同一段时间改由一个定时器来走 */
+const reduceMotion =
+  typeof window.matchMedia === 'function' &&
+  window.matchMedia('(prefers-reduced-motion: reduce)').matches
+let fuseTimer = 0
+/** 定时器这一轮还剩多少毫秒(暂停时按已走过的扣掉) */
+let fuseRemain = 0
+let fuseAt = 0
+
 function sync() {
+  if (reduceMotion) {
+    if (fuseTimer) {
+      window.clearTimeout(fuseTimer)
+      fuseTimer = 0
+      fuseRemain -= Date.now() - fuseAt
+    }
+    if (hold.hover || hold.hidden) return
+    fuseAt = Date.now()
+    fuseTimer = window.setTimeout(() => emit('expire'), Math.max(0, fuseRemain))
+    return
+  }
   const a = anim
   if (!a) return
   // 已经烧完(playState 为 finished)时不要再 play,否则会把 onfinish 又跑一遍
@@ -38,8 +60,16 @@ function sync() {
    把 dashoffset 从 0 推到 -1 就是"绕一圈烧完" */
 function burn() {
   anim?.cancel()
+  window.clearTimeout(fuseTimer)
+  fuseTimer = 0
   const el = rim.value
   if (!el) return
+  if (reduceMotion) {
+    fuseRemain = props.duration
+    fuseAt = Date.now()
+    fuseTimer = window.setTimeout(() => emit('expire'), props.duration)
+    return
+  }
   anim = el.animate([{ strokeDashoffset: 0 }, { strokeDashoffset: -1 }], {
     duration: props.duration,
     easing: 'linear',
@@ -66,11 +96,20 @@ onMounted(() => {
   burn()
   document.addEventListener('visibilitychange', onVisibility)
   /* 删除之后,原来那个「删除」菜单项已经不存在了,焦点会掉到 body 上。
-     接过来放在撤销按钮上:键盘用户接着按 Enter/Escape 就能撤销 */
-  btn.value?.focus({ preventScroll: true })
+     接过来放在撤销按钮上:键盘用户接着按 Enter/Escape 就能撤销。
+
+     但有两件事不该被这一下打断:焦点还稳稳待在别处(用户正在别的地方操作),
+     以及正落在输入框里 —— 抢过来会打断正在敲的字,移动端还会弹起键盘。
+     所以只认"焦点真的丢了"那一种 */
+  const at = document.activeElement as HTMLElement | null
+  const typing =
+    !!at && (at.tagName === 'INPUT' || at.tagName === 'TEXTAREA' || at.isContentEditable)
+  const lost = !at || at === document.body || !at.isConnected
+  if (lost && !typing) btn.value?.focus({ preventScroll: true })
 })
 onBeforeUnmount(() => {
   document.removeEventListener('visibilitychange', onVisibility)
+  window.clearTimeout(fuseTimer)
   anim?.cancel()
 })
 </script>

@@ -1,4 +1,4 @@
-import type { ApiConfig, EditParams, GenParams, HistoryEntry, PromptItem, ResultItem, ReuseParams, Collection, Character, CharacterDraft, CharacterFields, CharacterView, CharacterViewKind, ImportedCharacter } from './types'
+import type { ApiConfig, EditParams, GenParams, HistoryEntry, PromptItem, ResultItem, ReuseParams, Collection, Character, CharacterDraft, CharacterFields, CharacterPersona, CharacterView, CharacterViewKind, CharacterVoice, ChatMessage, ImportedCharacter, ImportedChat, ImportedChatMessage } from './types'
 import type { PruneResult, CoverRecord, CharRefRecord } from './lib/idb'
 import { titleFromPrompt } from './lib/text'
 import {
@@ -21,6 +21,10 @@ const CONFIG_KEY = 'kimage.apiConfigs'
 const CONFIG_ACTIVE_KEY = 'kimage.apiActive'
 // 「当前生效的文本配置」记录的 id:文本类别也有自己的当前项,与出图那条各自独立
 const TEXT_ACTIVE_KEY = 'kimage.apiActiveText'
+// 「当前生效的识图配置」记录的 id:识图同样是独立的一类
+const VISION_ACTIVE_KEY = 'kimage.apiActiveVision'
+// 「当前生效的朗读配置」记录的 id:朗读也是独立的一类(它连协议都不是 OpenAI 兼容那套)
+const TTS_ACTIVE_KEY = 'kimage.apiActiveTts'
 
 export function uid(): string {
   return Math.random().toString(36).slice(2) + Date.now().toString(36)
@@ -248,13 +252,14 @@ export const TEXT_PROVIDERS: TextProvider[] = [
     model: 'gpt-4o-mini'
   },
   {
-    /* DeepSeek 只有对话模型(deepseek-chat / deepseek-reasoner),没有出图,
-       所以它只在这一份预设里,不进 PROVIDERS —— 出图那行给出一个画不了图的
-       选项等于骗人 */
+    /* DeepSeek 没有出图模型,所以它只在这一份预设里,不进 PROVIDERS ——
+       出图那行给出一个画不了图的选项等于骗人。
+       deepseek-flash 是 V4.1-Flash,文本与图片输入共用同一个模型名;
+       旧的 deepseek-chat / deepseek-reasoner 已退役,只是名字还被兼容路由 */
     id: 'deepseek',
     label: 'DeepSeek',
     baseUrl: 'https://api.deepseek.com/v1',
-    model: 'deepseek-chat'
+    model: 'deepseek-flash'
   },
   {
     id: 'dashscope-compat',
@@ -266,6 +271,44 @@ export const TEXT_PROVIDERS: TextProvider[] = [
     id: 'ark',
     label: 'Volcengine Ark',
     baseUrl: 'https://ark.cn-beijing.volces.com/api/v3'
+  }
+]
+
+/* ===== 识图(把参考图读成角色设定)的模型预设 ==========================
+   与上面两表又不同:这里要的是"能看图的对话模型"。
+   识图与改写走同一条路(/chat/completions + 一条 user 消息),差别只在
+   消息的 content 里多带一张图 —— 所以地址格式与 TEXT_PROVIDERS 完全一致,
+   百炼同样要列 compatible-mode 那条(原生 /api/v1 是另一套协议)。
+   出图那侧的图像模型帮不上忙:能画图的未必能看图。
+   -------------------------------------------------------------------- */
+export const VISION_PROVIDERS: TextProvider[] = [
+  {
+    id: 'openai',
+    label: 'OpenAI',
+    baseUrl: 'https://api.openai.com/v1',
+    model: 'gpt-4o-mini'
+  },
+  {
+    id: 'dashscope-compat',
+    label: 'Bailian (compatible mode)',
+    baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    model: 'qwen-vl-max'
+  },
+  {
+    /* Ark 的模型名常常是推理接入点 id(ep-…),写死一个公开模型名只是给个起点 */
+    id: 'ark',
+    label: 'Volcengine Ark',
+    baseUrl: 'https://ark.cn-beijing.volces.com/api/v3',
+    model: 'doubao-1.5-vision-pro'
+  },
+  {
+    /* 2026-09-10 起 deepseek-flash(V4.1-Flash)原生支持图片输入;
+       上一代的 deepseek-v4-flash-vision-exp 已下线,兼容路由到它。
+       同厂的 deepseek-v4-pro 明确不支持视觉,所以别写它 */
+    id: 'deepseek',
+    label: 'DeepSeek',
+    baseUrl: 'https://api.deepseek.com/v1',
+    model: 'deepseek-flash'
   }
 ]
 
@@ -334,7 +377,14 @@ function normalizeConfig(c: ApiConfig): ApiConfig {
   return {
     ...c,
     vendor: c.vendor || inferVendor(c.baseUrl),
-    kind: c.kind === 'text' ? 'text' : 'image'
+    kind:
+      c.kind === 'text'
+        ? 'text'
+        : c.kind === 'vision'
+          ? 'vision'
+          : c.kind === 'tts'
+            ? 'tts'
+            : 'image'
   }
 }
 
@@ -357,6 +407,246 @@ export function loadActiveTextId(): string {
 
 export function saveActiveTextId(id: string) {
   localStorage.setItem(TEXT_ACTIVE_KEY, id)
+}
+
+// 识图类别的当前生效配置 id:三类各记各的,配一条识图不该顶掉出图或改写
+export function loadActiveVisionId(): string {
+  return localStorage.getItem(VISION_ACTIVE_KEY) || ''
+}
+
+export function saveActiveVisionId(id: string) {
+  localStorage.setItem(VISION_ACTIVE_KEY, id)
+}
+
+// 朗读类别的当前生效配置 id:与上面三条互不影响
+export function loadActiveTtsId(): string {
+  return localStorage.getItem(TTS_ACTIVE_KEY) || ''
+}
+
+export function saveActiveTtsId(id: string) {
+  localStorage.setItem(TTS_ACTIVE_KEY, id)
+}
+
+/* ===== 朗读(语音合成) =================================================
+   与前面几类不同:这条路上游给的**不是** JSON,而是音频字节。
+   所以这一块只有两件事要办 —— 拼请求、把回来的字节包成 Blob。
+   选哪条路(浏览器自带的还是这里)、缓存、播放全在 lib/speech.ts。
+   ------------------------------------------------------------------ */
+
+/* 火山的 Resource ID 其实是**两个维度**拧在一起的东西:
+ *   代际  1.0 / 2.0          —— 音色列表按它分成两份,两边的音色不能互换
+ *   商品  语音合成 / 声音复刻  —— 两个分开卖,而且各自要单独开通
+ *
+ * 关键在于:**商品这一维由档位就决定了**。内置音色必然走语音合成、复刻音色必然
+ * 走声音复刻,没有第三种可能。所以真正需要用户选的只有代际。
+ *
+ * 于是配置里存的是代际("2.0" / "1.0"),完整的 X-Api-Resource-Id 在 resourceIdOf
+ * 里拼出来。以前这里让用户直接挑商品,界面上摆着四个选项 —— 而 Clone 档根本不读它,
+ * 于是同一格里塞了两件事,互相污染过两次(拿复刻商品去要一把内置音色)。
+ * 老配置里存的是完整 ID,ttsGenerationOf 认得出来,不必迁移。 */
+export const TTS_GENERATIONS = [
+  { id: '2.0', label: '2.0 — seed-tts-2.0 / seed-icl-2.0' },
+  { id: '1.0', label: '1.0 — seed-tts-1.0 / seed-icl-1.0' }
+]
+
+/** 把配置里那个值归一成代际。空 = 2.0(当下的默认);
+ *  老配置留下的完整 ID(seed-tts-1.0、seed-icl-2.0 之类)也在这里一并认出来 */
+export function ttsGenerationOf(rid?: string): string {
+  const v = (rid || '').trim()
+  return v.includes('1.0') ? '1.0' : '2.0'
+}
+
+/** 复刻音色的"版本风味"。**只有这两个取值**(见上游错误码文档里的 InvalidModel 一条):
+ *  model 这个字段只对复刻 2.0 生效,而它的枚举就是这两个。
+ *
+ *  以前这里是一个自由输入框,于是"照 Resource ID 填成 seed-tts-2.0"这种写法
+ *  完全可能 —— 上游只回一句 [Invalid argument] InvalidModel,既不说是哪个字段,
+ *  也不说合法值是什么。干脆改成点选,空串 = 交给上游默认(standard) */
+export const TTS_MODELS = [
+  { id: '', label: 'Auto' },
+  { id: 'seed-tts-2.0-standard', label: 'Standard' },
+  { id: 'seed-tts-2.0-expressive', label: 'Expressive' }
+]
+
+/* 试听用的固定短句。**固定是有意的**:用户每改一次音色描述都会点一次试听,
+   而试听走的是真请求。同一句话配同一个音色在缓存里必然命中,第二次起不花钱。
+   中文那半句用全角标点:半角逗号/问号给到的停顿比全角短,试听句本身就不该
+   带着这个毛病(合成前另有一道规整,见 server 的 tidyForSpeech) */
+export const TTS_AUDITION_TEXT = 'Hey, it is me. 你好，能听见我说话吗？'
+
+/** 合成请求里那个"音色"的形状。与 CharacterVoice 分开是因为
+ *  服务端只认这几个字段,不该把 browser 档那些也发过去 */
+function voicePayloadOf(v: CharacterVoice) {
+  return {
+    source: v.source || 'preset',
+    vendorVoice: v.vendorVoice || '',
+    describe: v.describe || '',
+    speed: typeof v.speed === 'number' ? v.speed : 0
+  }
+}
+
+/** 拼出真正的 X-Api-Resource-Id。
+ *
+ *  "哪个商品"由档位决定(内置 → 语音合成,复刻 → 声音复刻),
+ *  "哪一代"由配置里那个代际决定 —— 两者一乘就是那个字符串。
+ *  用户不必知道它的存在,更不必拿音色去和它对照 —— 之前两次
+ *  "resource ID is mismatched with speaker" 都是这么来的。
+ *
+ *  **描述那一档不发它**:它走的是"音频生成"那条端点,文档里没有这个头 ——
+ *  一个用不上的头,最好的结果是被忽略,最坏的结果是被拒 */
+function resourceIdOf(cfg: ApiConfig, v: CharacterVoice): string {
+  if (v.source === 'describe') return ''
+  const family = v.source === 'clone' ? 'seed-icl' : 'seed-tts'
+  /* 每角色那个覆盖值优先,但它同样得是**完整形态**。这里原来是
+     `if (v.resourceId) return v.resourceId` —— 原样透出,于是配置里存成
+     "2.0" 这种裸代际时会被整份发出去,上游回一句
+     `[resource_id=2.0] requested resource not granted`,读起来像"没开通",
+     实则只是我们发了个半成品(实测踩过)。现在统一下去:
+     不带 seed- 前缀的一律按"族 + 代际"补齐。
+     服务端另有一道一样的兜底(见 normalizeResourceId),两边都补。 */
+  const rid = (v.resourceId || cfg.resourceId || '').trim()
+  return rid.startsWith('seed-') ? rid : `${family}-${ttsGenerationOf(rid)}`
+}
+
+/** 合成请求的 body。两个入口共用 —— 它们只差"谁来读响应" */
+function ttsRequestBody(cfg: ApiConfig, v: CharacterVoice, text: string): string {
+  return JSON.stringify({
+    text,
+    voice: voicePayloadOf(v),
+    // 复刻 2.0 认这个字段来选标准版/表现力版,其余型号带上会被忽略
+    model: cfg.model || '',
+    resourceId: resourceIdOf(cfg, v),
+    baseUrl: cfg.baseUrl,
+    apiKey: cfg.apiKey
+  })
+}
+
+/** 把一句话合成成音频。返回的是可以直接喂给 <audio> 的 Blob */
+export async function synthesizeSpeech(
+  cfg: ApiConfig,
+  v: CharacterVoice,
+  text: string,
+  signal?: AbortSignal
+): Promise<Blob> {
+  const resp = await fetch('/api/tts', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    signal,
+    body: ttsRequestBody(cfg, v, text)
+  })
+  if (!resp.ok) throw new Error(await failureMessage(resp))
+  const blob = await resp.blob()
+  if (!blob.size) throw new Error('The TTS service returned no audio')
+  return blob
+}
+
+/** 同一条请求,但**不读响应体** —— 交回去让调用方边收边播(见 speech.ts)。
+ *
+ *  分成两个函数而不是把 synthesizeSpeech 的返回类型改宽:缓存命中的那条路
+ *  仍然只想要一个 Blob,不该被卷进流式那套里。
+ *
+ *  注意服务端的头是**推迟到第一帧音频才写**的(见 server 的 pipeTtsAudio),
+ *  所以这个 fetch 会一直悬到上游真的吐出第一个音频块 ——
+ *  失败(鉴权、未开通、资源不匹配)因此仍能当普通错误抛出来,不会变成"空音频" */
+export async function synthesizeSpeechStream(
+  cfg: ApiConfig,
+  v: CharacterVoice,
+  text: string,
+  signal?: AbortSignal
+): Promise<Response> {
+  const resp = await fetch('/api/tts', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    signal,
+    body: ttsRequestBody(cfg, v, text)
+  })
+  if (!resp.ok) throw new Error(await failureMessage(resp))
+  if (!resp.body) throw new Error('The TTS service returned no audio')
+  return resp
+}
+
+/** 缓存键。**必须同时含文本与音色指纹** —— 少了文本,同一角色的两句话会互相命中;
+ *  少了指纹,改了描述之后还会拿到旧描述合成的音频,而用户以为改动没生效 */
+export function ttsCacheKey(cfg: ApiConfig, v: CharacterVoice, text: string): string {
+  const print = [
+    cfg.baseUrl,
+    cfg.model || '',
+    resourceIdOf(cfg, v),
+    v.source || 'preset',
+    v.vendorVoice || '',
+    v.describe || '',
+    typeof v.speed === 'number' ? v.speed : 0
+  ].join('\u0001')
+  return `${print}\u0002${text}`
+}
+
+/** 上传一段样本换一个可反复用的音色代号。
+ *  代号由我们取名(上游那条 custom_speaker_id 的路),所以返回值里那个 id
+ *  是本地算出来的,不依赖上游的响应形状 */
+export async function cloneVoice(
+  cfg: ApiConfig,
+  sampleDataUrl: string,
+  customId: string,
+  name: string
+): Promise<{ vendorVoice: string; bytes: number }> {
+  const resp = await fetch('/api/voice/clone', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      sample: sampleDataUrl,
+      name,
+      customId,
+      baseUrl: cfg.baseUrl,
+      apiKey: cfg.apiKey
+    })
+  })
+  if (!resp.ok) throw new Error(await failureMessage(resp))
+  const data = (await resp.json()) as { vendorVoice?: string; bytes?: number }
+  if (typeof data.vendorVoice !== 'string' || !data.vendorVoice) {
+    throw new Error('The cloning service did not return a voice id')
+  }
+  return { vendorVoice: data.vendorVoice, bytes: typeof data.bytes === 'number' ? data.bytes : 0 }
+}
+
+/** 克隆代号的格式要求(上游会拦):8~256 字符、只能数字字母与 - _、
+ *  必须以字母开头、结尾不能是 - 或 _,也不能撞官方前缀。
+ *  前缀用 kimage_ 天然满足全部条件 —— 它不是两个字母加下划线,
+ *  也不会撞上 S_ / ICL_ / BV / moon_ 那一串官方保留名 */
+export function newVoiceId(): string {
+  const tail = Math.random().toString(36).slice(2, 10)
+  return `kimage_${tail}`
+}
+
+/** 空嗓音。新建角色、以及给老角色补一份时都用它 ——
+ *  默认走浏览器自带的语音:免费、立刻出声,用户没要求之前不该先花钱 */
+export function emptyCharVoice(): CharacterVoice {
+  return { engine: 'browser' }
+}
+
+/** 从盘上读回来的嗓音。外部文件、老数据都可能形状不对,
+ *  所以逐项收一遍 —— 认不出的字段丢掉,engine 认不出就退回 browser */
+export function coerceCharVoice(raw: unknown): CharacterVoice | undefined {
+  if (!raw || typeof raw !== 'object') return undefined
+  const o = raw as Record<string, unknown>
+  const str = (k: string) => (typeof o[k] === 'string' ? (o[k] as string) : undefined)
+  const num = (k: string) => (typeof o[k] === 'number' && Number.isFinite(o[k]) ? (o[k] as number) : undefined)
+  const source =
+    o.source === 'describe' || o.source === 'clone' || o.source === 'preset' ? o.source : undefined
+  const out: CharacterVoice = {
+    engine: o.engine === 'tts' ? 'tts' : 'browser',
+    ...(str('voiceName') ? { voiceName: str('voiceName') } : {}),
+    ...(num('rate') !== undefined ? { rate: num('rate') } : {}),
+    ...(num('pitch') !== undefined ? { pitch: num('pitch') } : {}),
+    ...(str('configId') ? { configId: str('configId') } : {}),
+    ...(source ? { source } : {}),
+    ...(str('vendorVoice') ? { vendorVoice: str('vendorVoice') } : {}),
+    ...(str('describe') ? { describe: str('describe') } : {}),
+    ...(str('sampleId') ? { sampleId: str('sampleId') } : {}),
+    ...(str('sampleName') ? { sampleName: str('sampleName') } : {}),
+    ...(num('speed') !== undefined ? { speed: num('speed') } : {}),
+    ...(str('resourceId') ? { resourceId: str('resourceId') } : {})
+  }
+  return out
 }
 
 /** 连通性测试的判决。判断在服务端做(只有它知道怎么打上游),文案在这里拼 */
@@ -386,7 +676,9 @@ export async function testConnection(config: ApiConfig): Promise<TestResult> {
         apiKey: config.apiKey,
         model: config.model,
         protocol: getProvider(config.vendor || inferVendor(config.baseUrl), config.model).protocol,
-        kind: config.kind === 'text' ? 'text' : 'image'
+        /* 探活要打真实端点:出图打 /images/generations,改写与识图都是对话模型,
+           探 /chat/completions(识图那类也走它,只是消息里多带一张图) */
+        kind: config.kind === 'image' || !config.kind ? 'image' : 'text'
       })
     })
     const data = await resp.json().catch(() => null)
@@ -410,6 +702,31 @@ export async function testConnection(config: ApiConfig): Promise<TestResult> {
       detail: e instanceof Error ? e.message : 'Request failed'
     }
   }
+}
+
+/**
+ * 把非 2xx 响应摊成一句能读的报错。后端自己的错误一律是
+ * { error, detail } 形状的 JSON,拿不到 JSON 就说明这段响应不是后端发的 ——
+ * 开发环境里最常见的就是 vite 代理连不上 3000 端口上的后端
+ * (这时它回一个空体的 500),原样的 "Request failed (500)" 只会让人
+ * 往模型或上游那边找原因,所以这里补一句指路。
+ */
+async function failureMessage(resp: Response): Promise<string> {
+  let msg = `Request failed (${resp.status})`
+  try {
+    const body = await resp.json()
+    if (body?.error) msg = body.error
+    // 附带上游原始报错 detail，便于定位 503/4xx 原因
+    if (body?.detail) msg = `${msg} — ${body.detail}`
+    return msg
+  } catch {
+    /* 响应不是 JSON,见上 */
+  }
+  if (resp.status >= 500) {
+    msg +=
+      " — the API server did not answer. If you're running locally, check that the dev backend is still up (npm run dev)."
+  }
+  return msg
 }
 
 /**
@@ -439,18 +756,7 @@ export async function generate(
     signal
   })
 
-  if (!resp.ok) {
-    let msg = `Request failed (${resp.status})`
-    try {
-      const body = await resp.json()
-      if (body?.error) msg = body.error
-      // 附带上游原始报错 detail，便于定位 503/4xx 原因
-      if (body?.detail) msg = `${msg} — ${body.detail}`
-    } catch {
-      /* ignore */
-    }
-    throw new Error(msg)
-  }
+  if (!resp.ok) throw new Error(await failureMessage(resp))
 
   return await imagesFrom(resp)
 }
@@ -601,17 +907,7 @@ export async function editImage(
     signal
   })
 
-  if (!resp.ok) {
-    let msg = `Request failed (${resp.status})`
-    try {
-      const body = await resp.json()
-      if (body?.error) msg = body.error
-      if (body?.detail) msg = `${msg} — ${body.detail}`
-    } catch {
-      /* ignore */
-    }
-    throw new Error(msg)
-  }
+  if (!resp.ok) throw new Error(await failureMessage(resp))
 
   const items = await imagesFrom(resp)
   return items[0]
@@ -689,18 +985,7 @@ export async function enhancePrompt(
     })
   })
 
-  if (!resp.ok) {
-    let msg = `Request failed (${resp.status})`
-    try {
-      const body = await resp.json()
-      if (body?.error) msg = body.error
-      // 附带上游原始报错 detail，便于定位 503/4xx 原因
-      if (body?.detail) msg = `${msg} — ${body.detail}`
-    } catch {
-      /* ignore */
-    }
-    throw new Error(msg)
-  }
+  if (!resp.ok) throw new Error(await failureMessage(resp))
 
   const data = (await resp.json()) as { prompt?: string }
   const out = typeof data.prompt === 'string' ? data.prompt.trim() : ''
@@ -983,6 +1268,10 @@ type CharacterManifest = {
     createdAt: number
     fields?: CharacterFields
     desc?: string
+    /* 人格设定。纯 JSON,跟着 manifest 走即可 —— 不进这一步的话,
+       导出的角色在对方那里会变成一个没有性格的角色,
+       而人格恰恰是这个功能里最难重写的一份数据 */
+    persona?: CharacterPersona
     refKind?: CharacterViewKind
     /** zip 内的相对路径。没有这一项就是没有那张图 */
     ref?: string
@@ -990,8 +1279,18 @@ type CharacterManifest = {
        少了它,导入回来的角色在重跑其余四张时就只剩正脸一张参考图 */
     source?: string
     views?: Partial<Record<CharacterViewKind, string>>
+    /* 对话与记忆。**单独一个文件,不内嵌进 manifest** ——
+       几百条消息塞进 character.json 会让那份"给人看的清单"变成一坨机器数据。
+       没有这一项 = 这个包没带对话(老包、或没聊过的角色) */
+    chat?: string
   }>
 }
+
+/* 导出时最多带上多少条消息。设定图与对话都要跟着角色走,但两者性质不同:
+   图是有限的几张,对话可以无限长 —— 一个聊了几千轮的角色,全带出去就是
+   包里塞进几 MB 纯文本。而分享时真正要传的是**记忆**(它记得什么),
+   消息只是让那份记忆有个能对照的来处,给最近一档就够了 */
+export const CHAT_EXPORT_MSGS = 300
 
 /** Blob → 扩展名。设定图统一是 JPEG,但参考图可能是用户上传的 PNG,
  *  所以照实判,不写死(与 extOf 同一份 MIME 表) */
@@ -1030,20 +1329,29 @@ function characterZipName(name: string): string {
 }
 
 /**
- * 导出一个角色:character.json + 主参考图 + 五张设定图,打成一个 zip。
+ * 导出一个角色:character.json + 主参考图 + 设定图 + 对话(chat.json),打成一个 zip。
  *
  * 与 exportImages 同一套:动态引入 fflate(导出是低频动作,不该进首屏那份包)、
  * level 0(图已是压缩格式,再压只是白烧 CPU)、串行读字节。
  * 返回包内实际写进去的图片张数,好在界面上如实回执 —— 一个只有设定的角色
  * 也能导出,那种包小得多,该让用户知道。
+ *
+ * chat 是那份对话(消息 + 记忆),由调用方从库里读好交进来:
+ * 消息在界面里是按角色懒加载的,主界面才是碰 IndexedDB 的那一层。
  */
-export async function exportCharacter(c: Character, views: CharacterView[]): Promise<number> {
+export async function exportCharacter(
+  c: Character,
+  views: CharacterView[],
+  chat?: ImportedChat
+): Promise<number> {
   const files: Record<string, Uint8Array> = {}
   const entry: CharacterManifest['characters'][number] = {
     name: c.name,
     createdAt: c.createdAt,
     ...(c.fields ? { fields: c.fields } : {}),
     ...(c.desc ? { desc: c.desc } : {}),
+    // 没写过的角色不往包里塞一份空壳:四项全空时这两边长得一样,少一项更干净
+    ...(hasPersona(c.persona) ? { persona: c.persona } : {}),
     ...(c.refKind ? { refKind: c.refKind } : {})
   }
 
@@ -1070,6 +1378,22 @@ export async function exportCharacter(c: Character, views: CharacterView[]): Pro
   }
   if (Object.keys(map).length) entry.views = map
 
+  /* 对话单独一个文件。消息与记忆都为空时不写 —— 一个没聊过的角色,
+     包里多一份空壳只会让"这个包带了对话"这句话变得不可信 */
+  if (chat && (chat.messages.length || chat.memory)) {
+    /* 只写消息与记忆 —— images 是 Blob,序列化进 JSON 会变成一堆空对象。
+       它们另走文件(见下) */
+    const meta: ImportedChat = { messages: chat.messages, memory: chat.memory }
+    files['chat.json'] = new TextEncoder().encode(JSON.stringify(meta, null, 2))
+    entry.chat = 'chat.json'
+    /* 对话里附过的图一起带走。**缺了它们,对方拿到的是一串
+       "不知道在说什么的回复"** —— 消息在,而消息指着的那张图不在。
+       文件名就是 imageId,导入那边按消息里的引用去取 */
+    for (const img of chat.images || []) {
+      files[`chat/${img.id}.${extOfBlob(img.blob)}`] = new Uint8Array(await img.blob.arrayBuffer())
+    }
+  }
+
   const manifest: CharacterManifest = { format: 'kimage-character', version: 1, characters: [entry] }
   files['character.json'] = new TextEncoder().encode(JSON.stringify(manifest, null, 2))
 
@@ -1083,6 +1407,56 @@ export async function exportCharacter(c: Character, views: CharacterView[]): Pro
   return images
 }
 
+/* 单个 zip 条目的解压上限。zip 炸弹是最省事的一类攻击:压缩包几十 KB,
+   解开可以是几十 GB —— 而下面是一次性全部解开再建 Blob,不拦就是页面自己
+   把自己撑爆。角色图最多几 MB,给到 32MB 已经很宽了 */
+const MAX_CHAR_ENTRY = 32 * 1024 * 1024
+
+/* 从角色包里读回的对话最多认多少条。与导出那边的 CHAT_EXPORT_MSGS 不是一个数:
+   那边是"我们自己愿意带出去多少",这边是"愿意从外部文件里收下多少" ——
+   后者得防着别人手写一个十万条消息的包。 */
+const CHAT_IMPORT_MSGS = 2000
+
+/** 从角色包里读回一段对话。包是外部文件,所以逐条过筛 ——
+ *  认不出的角色、空正文、不认识的字键一律丢掉(与 fields / persona 同一处理)。
+ *  记忆的游标**不在文件里**:那一份由导入方按收到的消息重新推平。 */
+function coerceImportedChat(raw: unknown): ImportedChat | undefined {
+  if (!raw || typeof raw !== 'object') return undefined
+  const src = raw as { messages?: unknown; memory?: unknown }
+  const rows = Array.isArray(src.messages) ? src.messages.slice(0, CHAT_IMPORT_MSGS) : []
+  /* 时间戳坏了就按次序补一个:整段对话的**相对次序**比绝对时刻要紧得多 ——
+     界面上靠它排序,全一样或者全是 0 会让顺序彻底乱掉 */
+  const t0 = Date.now() - rows.length * 1000
+  const messages: ImportedChatMessage[] = []
+  rows.forEach((row, i) => {
+    if (!row || typeof row !== 'object') return
+    const o = row as Record<string, unknown>
+    const role = o.role === 'user' || o.role === 'assistant' ? o.role : null
+    const content = typeof o.content === 'string' ? o.content.slice(0, CHAT_MAX_CHARS) : ''
+    if (!role || !content.trim()) return
+    messages.push({
+      role,
+      content,
+      createdAt:
+        typeof o.createdAt === 'number' && Number.isFinite(o.createdAt) && o.createdAt > 0
+          ? o.createdAt
+          : t0 + i * 1000,
+      ...(o.stopped === true ? { stopped: true } : {}),
+      ...(o.truncated === true ? { truncated: true } : {}),
+      ...(typeof o.mood === 'string' && o.mood ? { mood: o.mood.slice(0, 24) } : {}),
+      /* 附图的那个引用键。**不查它指的那张图在不在包里** —— 那要等图读完
+         才知道,而"消息留着、图没了"是一种可接受的降级(界面不画它,也不报错)。
+         这里只收紧形状:它会变成文件名,放开就等于把路径交给外部文件 */
+      ...(typeof o.imageId === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(o.imageId)
+        ? { imageId: o.imageId }
+        : {})
+    })
+  })
+  const memory = typeof src.memory === 'string' ? src.memory.trim().slice(0, CHAT_MAX_CHARS) : ''
+  if (!messages.length && !memory) return undefined
+  return { messages, memory }
+}
+
 /** 读一个角色 zip。返回的每条都换过 id ——
  *  不沿用文件里的 id:它可能与现有的撞上,而列表里两条同 id 会让渲染与删除都错乱
  *  (与配置的导入同一条理由)。内容来自外部文件,所以逐项规整,坏的就丢掉。 */
@@ -1091,7 +1465,16 @@ export async function readCharacterZip(file: File): Promise<ImportedCharacter[]>
   // 先把字节读出来:unzip 的回调不是 async,不能在里面 await
   const zipBytes = new Uint8Array(await file.arrayBuffer())
   const entries = await new Promise<Record<string, Uint8Array>>((resolve, reject) => {
-    unzip(zipBytes, (err, out) => (err ? reject(err) : resolve(out)))
+    unzip(
+      zipBytes,
+      {
+        /* 解压前按清单里声明的大小过一遍,超限的条目直接跳过。
+           manifest 永远放行 —— 它只有几百字节,而把它滤掉会让下面的报错
+           变成"这不是角色包",把真正的原因盖住 */
+        filter: (f) => f.name.split('/').pop() === 'character.json' || f.originalSize <= MAX_CHAR_ENTRY
+      },
+      (err, out) => (err ? reject(err) : resolve(out))
+    )
   })
 
   /* manifest 不一定在根目录:用户很可能解压看一眼再重新打包,于是整包多套了一层
@@ -1117,6 +1500,19 @@ export async function readCharacterZip(file: File): Promise<ImportedCharacter[]>
     throw new Error('character.json inside that zip has no characters.')
   }
 
+  /* 包里的对话附图。它们都摊在 chat/ 一个目录下,按 imageId 索引 ——
+     同一个包里可能有多个角色的对话,图放在一起,各自按消息里的引用去取 */
+  const chatImgs = new Map<string, Blob>()
+  for (const [path, bytes] of Object.entries(entries)) {
+    const name = path.slice(path.lastIndexOf('/') + 1)
+    if (name === 'chat.json' || !path.startsWith(`${base}chat/`)) continue
+    const id = name.replace(/\.[a-z0-9]+$/i, '')
+    if (!id) continue
+    /* 一律按 jpeg 报:导出时压过的就是 jpeg。万一包里是别的格式,
+       浏览器也会按内容嗅探,不影响显示 */
+    chatImgs.set(id, new Blob([new Uint8Array(bytes)], { type: 'image/jpeg' }))
+  }
+
   const known = new Set<string>(CHARACTER_VIEWS.map((v) => v.kind))
   const out: ImportedCharacter[] = []
   for (const c of parsed.characters) {
@@ -1136,12 +1532,36 @@ export async function readCharacterZip(file: File): Promise<ImportedCharacter[]>
     const refBytes = typeof c.ref === 'string' ? fileAt(c.ref) : undefined
     // 老包(底图还是单独一项之前导的)没有 source,读到的就是空 —— 退化成单图参考
     const sourceBytes = typeof c.source === 'string' ? fileAt(c.source) : undefined
+    /* 对话读不出来只丢对话:角色本身照常导入,与"某一张图丢了"同一处理。
+       一个坏掉的 chat.json 不该让整份角色设定也跟着进不来 */
+    let chat: ImportedChat | undefined
+    const chatBytes = typeof c.chat === 'string' ? fileAt(c.chat) : undefined
+    if (chatBytes) {
+      try {
+        chat = coerceImportedChat(JSON.parse(new TextDecoder().decode(chatBytes)))
+      } catch {
+        chat = undefined
+      }
+    }
+    /* 把这段对话真正引用到的图挂上去。**只挂用到的那些** ——
+       包里的图是全体角色共用的一个目录,每个角色都装一份会重复写库 */
+    if (chat) {
+      const used = new Set(chat.messages.map((m) => m.imageId).filter((x): x is string => !!x))
+      const imgs = [...used]
+        .map((id) => ({ id, blob: chatImgs.get(id) }))
+        .filter((x): x is { id: string; blob: Blob } => !!x.blob)
+      if (imgs.length) chat.images = imgs
+    }
     out.push({
       name: c.name.trim(),
       createdAt: typeof c.createdAt === 'number' ? c.createdAt : Date.now(),
-      // 补齐缺的键:外部文件里的设定可能是老版本写的(见 emptyCharFields)
-      ...(c.fields ? { fields: { ...emptyCharFields(), ...c.fields } } : {}),
+      // 补齐缺的键并逐项收成字符串:文件里的设定可能是老版本写的,也可能是坏的
+      ...(c.fields ? { fields: coerceCharFields(c.fields) } : {}),
       ...(typeof c.desc === 'string' && c.desc.trim() ? { desc: c.desc.trim() } : {}),
+      // 与 fields 同一处理:包是外部文件,脏数据照样要防
+      ...(hasPersona(coerceCharPersona(c.persona))
+        ? { persona: coerceCharPersona(c.persona) }
+        : {}),
       ...(refBytes
         ? { ref: new Blob([refBytes as BlobPart], { type: sniffMime(refBytes) }) }
         : {}),
@@ -1152,7 +1572,8 @@ export async function readCharacterZip(file: File): Promise<ImportedCharacter[]>
       ...(refBytes && typeof c.refKind === 'string' && known.has(c.refKind)
         ? { refKind: c.refKind as CharacterViewKind }
         : {}),
-      views
+      views,
+      ...(chat ? { chat } : {})
     })
   }
   return out
@@ -1273,6 +1694,60 @@ const CHAR_FIELD_ORDER: Array<keyof CharacterFields> = [
 export function emptyCharFields(): CharacterFields {
   const out = {} as CharacterFields
   for (const k of CHAR_FIELD_ORDER) out[k] = ''
+  return out
+}
+
+/* 把读进来的设定逐项收成字符串:
+   - 补齐缺的键 —— 老角色的 fields 里没有后来加的 face / brows / noseMouth 等项;
+   - 非字符串的值一律置空 —— 外部的 zip 与 localStorage 都可能被写坏
+     (手改、同步工具截断,或一份人手拼的 character.json)。
+
+   收口只做在这一处是有意的:界面上读这些值的地方写的是 `(v || '').trim()`,
+   它们统一假定值一定是字符串 —— 一个数字或对象就够让角色页整个崩掉,
+   而逐个读点去防等于把同一个判断抄十几遍 */
+function coerceCharFields(raw: Partial<CharacterFields> | undefined): CharacterFields {
+  const out = emptyCharFields()
+  if (!raw) return out
+  for (const k of CHAR_FIELD_ORDER) {
+    const v = raw[k]
+    out[k] = typeof v === 'string' ? v : ''
+  }
+  return out
+}
+
+/* 人格的字段顺序。四项都是自由文本,本身没有强弱之分 ——
+   但拼提示词时顺序必须固定:顺序一变,同一个角色每轮拿到的条件就不一样,
+   而聊天最忌讳的正是"同一个人今天一个样明天一个样" */
+const CHAR_PERSONA_KEYS: Array<keyof CharacterPersona> = [
+  'traits',
+  'voice',
+  'address',
+  'boundaries'
+]
+
+/** 一份空人格:新建角色、读入老角色、解析导入包都拿它当底 */
+export function emptyCharPersona(): CharacterPersona {
+  return { traits: '', voice: '', address: '', boundaries: '' }
+}
+
+/** 人格里有没有写出内容。四项全空 = 这个角色还没设定过性格,
+ *  界面上据此决定要不要给一句引导 */
+export function hasPersona(p: CharacterPersona | undefined): boolean {
+  if (!p) return false
+  return CHAR_PERSONA_KEYS.some((k) => (p[k] || '').trim())
+}
+
+/* 与 coerceCharFields 同一条理由、同一个收口:老角色根本没有 persona 这个字段,
+   而外部的 zip 与 localStorage 都可能被写坏(手改、同步工具截断)。
+   界面上读它的地方一律当"值一定存在且一定是字符串"来写,
+   一个数字或对象就够让对话页整个崩掉 —— 而逐个读点去防等于把同一个判断抄十遍 */
+function coerceCharPersona(raw: Partial<CharacterPersona> | undefined): CharacterPersona {
+  const out = emptyCharPersona()
+  if (!raw) return out
+  for (const k of CHAR_PERSONA_KEYS) {
+    const v = raw[k]
+    out[k] = typeof v === 'string' ? v : ''
+  }
   return out
 }
 
@@ -1415,17 +1890,37 @@ export async function draftCharacterFields(
       apiKey: cfg.apiKey
     })
   })
-  if (!resp.ok) {
-    let msg = `Request failed (${resp.status})`
-    try {
-      const body = await resp.json()
-      if (body?.error) msg = body.error
-      if (body?.detail) msg = `${msg} — ${body.detail}`
-    } catch {
-      /* ignore */
-    }
-    throw new Error(msg)
-  }
+  if (!resp.ok) throw new Error(await failureMessage(resp))
+  const data = (await resp.json()) as { prompt?: string }
+  return parseCharacterDraft(data.prompt || '')
+}
+
+/**
+ * 用识图模型把一张参考图读成角色的结构化设定 —— 上传底图之后的那一步。
+ *
+ * 与 draftCharacterFields 走同一个代理、同一套鉴权与超时,只是档位不同:
+ * 这里发的是多模态消息(图 + 一句中性指令),回的是同一份十二行,
+ * 所以解析也共用 parseCharacterDraft。
+ * 用的是「用途 = 识图」那条配置:能画图的模型未必会看图,两者常常不是同一个服务商。
+ */
+export async function draftCharacterFromImage(
+  cfg: ApiConfig,
+  image: string,
+  signal?: AbortSignal
+): Promise<CharacterDraft> {
+  const resp = await fetch('/api/enhance', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    signal,
+    body: JSON.stringify({
+      mode: 'vision',
+      image,
+      textModel: cfg.model,
+      baseUrl: cfg.baseUrl,
+      apiKey: cfg.apiKey
+    })
+  })
+  if (!resp.ok) throw new Error(await failureMessage(resp))
   const data = (await resp.json()) as { prompt?: string }
   return parseCharacterDraft(data.prompt || '')
 }
@@ -1443,9 +1938,10 @@ const NONE_ISH = /^(none|n\/?a|null|nothing|no|-|—|–)$/i
  */
 export function parseCharacterDraft(text: string): CharacterDraft {
   const fields = emptyCharFields()
+  const persona = emptyCharPersona()
   let name = ''
   /* 查表前把标签里的非字母全部去掉,所以 "Nose & mouth" / "Facial hair" /
-     "Face marks" 这类多词标签怎么写都能对上 —— 起稿那条提示里用可读的两词
+     "Face marks" 这类多词标签怎么写都能对上 —— 起稿那条提示里用可读的多词
      标签,比为了迁就解析器写成 "NoseMouth" 好得多(人要能直接读懂回的是什么) */
   const keys: Record<string, keyof CharacterFields> = {
     gender: 'gender',
@@ -1459,6 +1955,14 @@ export function parseCharacterDraft(text: string): CharacterDraft {
     facemarks: 'faceMarks',
     outfit: 'outfit',
     marks: 'marks'
+  }
+  /* 人格那四行单独一张表。两张表的键不重合,所以可以各查各的 ——
+     查不到长相那张就再查这张,不必合成一张大表 */
+  const personaKeys: Record<string, keyof CharacterPersona> = {
+    personality: 'traits',
+    voice: 'voice',
+    address: 'address',
+    boundaries: 'boundaries'
   }
   for (const raw of text.split('\n')) {
     const line = raw
@@ -1475,11 +1979,17 @@ export function parseCharacterDraft(text: string): CharacterDraft {
       name = NONE_ISH.test(value) ? '' : value
       continue
     }
+    const pkey = personaKeys[label]
+    if (pkey) {
+      /* 人格那几栏没有"none 要换个说法"的情况 —— 写 none 就是留空 */
+      persona[pkey] = NONE_ISH.test(value) ? '' : value
+      continue
+    }
     const key = keys[label]
     if (!key) continue
     fields[key] = NONE_ISH.test(value) ? (key === 'facialHair' ? 'clean-shaven' : '') : value
   }
-  return { name, fields }
+  return { name, fields, persona }
 }
 
 /** 读出角色列表,并把参考图从 IndexedDB 贴回条目上 */
@@ -1500,9 +2010,15 @@ export async function loadCharacters(): Promise<Character[]> {
   const refs = await getAllCharRefs()
   for (const c of list) {
     /* 老角色的 fields 里没有后来加的字段(face / brows / noseMouth ...)。
-       在入口补齐空串,后面所有读的地方就能当它们一定存在 —— 不补的话
-       CharacterFields 这个类型就是在骗人,每读一处都得再防一次 undefined */
-    if (c.fields) c.fields = { ...emptyCharFields(), ...c.fields }
+       在入口补齐空串并逐项收成字符串,后面所有读的地方就能当它们一定存在 ——
+       不补的话 CharacterFields 这个类型就是在骗人,每读一处都得再防一次 undefined;
+       而 localStorage 被同步工具截断或手改时,一个非字符串的值就够让角色页崩掉。
+       desc 同理:它要过 inline() 的 replace,值不是字符串一样会抛 */
+    if (c.fields) c.fields = coerceCharFields(c.fields)
+    if (typeof c.desc !== 'string') delete c.desc
+    /* 人格一律补齐(不加 if) —— 与 fields 不同,这里读它的地方(角色页表单与对话页)
+       全都当它一定存在来写,补在入口最省事;四项空串也就几十字节 */
+    c.persona = coerceCharPersona(c.persona)
     const ref = refs.get(c.id)
     if (ref) c.ref = ref
     // 底图另有 key,不是设定图之一(见 idb.ts 的 charSourceKey)
@@ -1530,6 +2046,207 @@ export async function saveCharacters(list: Character[]): Promise<void> {
     if (c.sourceRef instanceof Blob) refs.push({ id: charSourceKey(c.id), data: c.sourceRef })
   }
   await putCharRefs(refs)
+}
+
+/* ===== 角色对话 =====================================================
+   与出图、改写都不同的一条路:它是流式的。请求从 /api/chat 出去,
+   上游的 SSE 已由服务端收窄成"每行一个 JSON"(见 server 的 /api/chat),
+   所以这里只需要按行读、逐行解析 —— 不必再解一层 SSE 的框架
+   (data: 前缀、事件分隔、注释行,全都省掉了)。
+
+   不能用 EventSource:它只支持 GET,既带不了请求体,也带不了 Authorization
+   —— 密钥是每个用户自己配的,必须随请求发,所以这一段只能手写。
+   -------------------------------------------------------------------- */
+
+/** 一次对话要交给服务端的角色资料。只取提示词用得上的那几项 ——
+ *  逐项面貌特征(face / hair / brows …)是写给图像模型的像素级约束,
+ *  对聊天是噪声,还会把话题往长相上引(见 server 的 CHAT_PROMPTS) */
+export interface ChatCharacterPayload {
+  name: string
+  identity: string
+  outfit: string
+  marks: string
+  persona: CharacterPersona
+}
+
+/** 一轮最多带多少条历史。更早的不发、也不做摘要(记忆是二期的事)。
+ *  取条数而不是字数:条数可预期,而字数要靠额外估算。
+ *  20 条大约十轮来回,够撑起一段有来有回的对话 */
+export const CHAT_WINDOW = 20
+
+/* 单条消息的字符上限。与 server 的 CHAT_MAX_CHARS 是一对数,改一个要改另一个。
+   放在这里是为了让界面在发之前就能拦下并说清楚 ——
+   只由服务端切,用户看到的是"我发了一大段,它只回了前半截" */
+export const CHAT_MAX_CHARS = 8000
+
+/** 一轮对话收尾时的状态 */
+export interface ChatStreamResult {
+  /* 上游为什么停下:'stop' 是正常说完,'length' 是撞上了 max_tokens,
+     其余按上游原话带回。空串表示上游没给这一项 —— 按正常处理 */
+  finish: string
+  /* 这一轮的情绪。模型写在回复最末尾的那枚 [mood:xxx],
+     由服务端剪下来单独送来 —— 正文里读不到它。
+     空串 = 这一轮没给(模型没写,或收在半截上被剪掉了) */
+  mood: string
+}
+
+/* ===== 长期记忆的节奏 =================================================
+   滑出窗口的消息会被压成一段简报。三个数字决定它什么时候压、压多少。
+   -------------------------------------------------------------------- */
+
+/* 攒够多少条"没进摘要"的消息才压一次。取 20(正好一个窗口):
+   压完之后未覆盖的剩一个窗口,再攒满一个窗口才压下一次 ——
+   也就是大约每 20 条消息多花一次调用,而这一批刚好是一整轮新的对话 */
+export const CHAT_SUMMARIZE_AFTER = 20
+
+/* 单次压缩最多吃多少条。正常情况一次只压 20 条 ——
+   这个上限是留给"老用户第一次打开记忆"的:他那几千条历史得分几轮才追平,
+   一轮吃太多既费钱,压出来的摘要也会糊成一团 */
+export const CHAT_SUMMARY_CAP = 300
+
+/**
+ * 把一批滑出窗口的消息压进记忆。
+ *
+ * 系统提示词在服务端(见 server 的 ENHANCE_PROMPTS.summary)—— 与改写、
+ * 拆角色同一条分工:改措辞不该要求用户重装前端。这里只负责把
+ * "旧记忆 + 这一批消息"摊成一份逐条记录交出去。
+ */
+export async function summarizeChat(
+  cfg: ApiConfig,
+  previous: string,
+  messages: ChatMessage[],
+  signal?: AbortSignal
+): Promise<string> {
+  /* 逐条带上说话人。不带的话模型只看到一堆交错的话,
+     分不清承诺是谁许的、又被谁拒绝了 —— 而那正是简报最该留下的东西 */
+  const lines = messages.map(
+    (m) => `${m.role === 'user' ? 'User' : 'Character'}: ${m.content}`
+  )
+  const prompt =
+    (previous ? `What you already remember:\n${previous}\n\n` : '') +
+    `What was said since:\n${lines.join('\n')}`
+
+  const resp = await fetch('/api/enhance', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    signal,
+    body: JSON.stringify({
+      prompt,
+      mode: 'summary',
+      textModel: cfg.model,
+      baseUrl: cfg.baseUrl,
+      apiKey: cfg.apiKey
+    })
+  })
+  if (!resp.ok) throw new Error(await failureMessage(resp))
+  const data = (await resp.json()) as { prompt?: string }
+  const out = typeof data.prompt === 'string' ? data.prompt.trim() : ''
+  if (!out) throw new Error('Upstream returned no memory to keep')
+  return out
+}
+
+/** 把一个角色摊成对话要用的那份资料 */
+export function chatPayloadOf(c: Character): ChatCharacterPayload {
+  const f = c.fields
+  return {
+    name: c.name,
+    identity: inline(f?.identity),
+    outfit: inline(f?.outfit),
+    marks: inline(f?.marks),
+    persona: coerceCharPersona(c.persona)
+  }
+}
+
+export interface ChatStreamOpts {
+  character: ChatCharacterPayload
+  /** 要发出去的历史,已按窗口截好 */
+  messages: Array<{ role: 'user' | 'assistant'; content: string }>
+  /* 长期记忆的简报。空串 = 还没压过,服务端据此决定要不要那一段。
+     它是"这一整段对话的状态",不属于角色资料,所以与 character 分开传 */
+  memory: string
+  /* 用户这一轮附的图(data URL)。**只发当前这一条** ——
+     历史里那些图不重发:一张图要吃掉上千 token,而窗口有 20 条,
+     全发一遍就是几万 token,换来的只是"它还记得你看过那张图" */
+  images?: string[]
+  cfg: ApiConfig
+  /** 每一块增量。调用方拿到就往气泡上追加 */
+  onDelta: (delta: string) => void
+  signal?: AbortSignal
+}
+
+/**
+ * 发一轮对话。正常收完(或用户点了 Stop)就返回,真出错才抛出。
+ *
+ * 出错与"按了 Stop"都要由调用方保留已经收到的文本 ——
+ * 这一层只如实抛出,绝不回头清理已经交给 onDelta 的内容。
+ */
+export async function chatStream(opts: ChatStreamOpts): Promise<ChatStreamResult> {
+  const resp = await fetch('/api/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    signal: opts.signal,
+    body: JSON.stringify({
+      character: opts.character,
+      messages: opts.messages,
+      memory: opts.memory || undefined,
+      images: opts.images?.length ? opts.images : undefined,
+      textModel: opts.cfg.model,
+      baseUrl: opts.cfg.baseUrl,
+      apiKey: opts.cfg.apiKey
+    })
+  })
+
+  /* 流还没开就失败(没配模型、上游 401、一把 HTML 错误页…):
+     服务端这时还没写过任何字节,回的是与其他端点同一形状的 JSON,
+     所以这里能复用同一套报错摊平 */
+  if (!resp.ok) throw new Error(await failureMessage(resp))
+
+  const reader = resp.body?.getReader()
+  if (!reader) throw new Error('This browser cannot read streamed responses')
+
+  const decoder = new TextDecoder()
+  /* 一块读进来常常只到半行 —— 按 \n 切开,最后那段不完整的留回缓冲,
+     等下一块拼上再解。这个缓冲区比什么都重要:少了它,长回复里
+     每隔几个词就会掉一次 JSON.parse */
+  let buf = ''
+  /* 上游为什么停下。它出现在最后一个数据帧里(finish_reason),
+     紧跟 [DONE] 之前 —— 所以得一路记着,等收尾时再报上去。
+     丢掉它等于把"正常说完"和"额度用完了"混成同一件事 */
+  let finish = ''
+  /* 这一轮的情绪。与 finish 同路:服务端在收尾那一帧一起给 ——
+     正文里的标签已经被它剪掉了,这里是唯一的来源 */
+  let mood = ''
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+      const lines = buf.split('\n')
+      buf = lines.pop() ?? ''
+      for (const line of lines) {
+        const text = line.trim()
+        if (!text) continue
+        let evt: { delta?: string; done?: boolean; error?: string; finish?: string; mood?: string }
+        try {
+          evt = JSON.parse(text)
+        } catch {
+          // 半行,或上游塞进来的杂质:跳过就好,不该为一行解不开掐掉整轮回复
+          continue
+        }
+        if (typeof evt.delta === 'string' && evt.delta) opts.onDelta(evt.delta)
+        // 错误放在 delta 之后判:上游可能是"说了一半才断",那半句要留住
+        if (evt.error) throw new Error(evt.error)
+        if (evt.done) return { finish: evt.finish || finish, mood: evt.mood || mood }
+        if (typeof evt.finish === 'string' && evt.finish) finish = evt.finish
+        if (typeof evt.mood === 'string' && evt.mood) mood = evt.mood
+      }
+    }
+  } finally {
+    /* 用户按 Stop 时 fetch 会被 abort,而 reader 不会自己放开 ——
+       不取消这条读流就悬着。已经读完时取消是空操作 */
+    reader.cancel().catch(() => {})
+  }
+  return { finish, mood }
 }
 
 /* ===== 提示词库(收藏) ===== */

@@ -20,13 +20,15 @@ import {
   PhGauge,
   PhPaintBucket,
   PhImageSquare,
-  PhTextT
+  PhTextT,
+  PhEye
 } from '@phosphor-icons/vue'
 import PromptLibrary from './components/PromptLibrary.vue'
 import ImagePreview from './components/ImagePreview.vue'
 import HistoryPage from './components/HistoryPage.vue'
 import CanvasEditor from './components/CanvasEditor.vue'
 import CharacterPage from './components/CharacterPage.vue'
+import ChatPage from './components/ChatPage.vue'
 import SettingsPage from './components/SettingsPage.vue'
 import NavSegment from './components/NavSegment.vue'
 import LatticeLoader from './components/LatticeLoader.vue'
@@ -41,6 +43,10 @@ import {
   saveActiveId,
   loadActiveTextId,
   saveActiveTextId,
+  loadActiveVisionId,
+  saveActiveVisionId,
+  loadActiveTtsId,
+  saveActiveTtsId,
   loadHistory,
   addHistoryRecord,
   removeHistoryRecord,
@@ -52,10 +58,18 @@ import {
   saveCollections,
   characterDesc,
   characterFaceDesc,
+  chatPayloadOf,
+  chatStream,
+  coerceCharVoice,
+  summarizeChat,
+  CHAT_WINDOW,
+  CHAT_SUMMARIZE_AFTER,
+  CHAT_SUMMARY_CAP,
   loadCharacters,
   saveCharacters,
   exportCharacter,
   readCharacterZip,
+  CHAT_EXPORT_MSGS,
   getProvider,
   inferVendor,
   allowedSizes,
@@ -69,11 +83,19 @@ import {
   BACKGROUND_OPTIONS,
   CHARACTER_VIEWS
 } from './api'
-import { blobToDataURL, urlToBlob, getCharViews, putCharView } from './lib/idb'
+import { blobToDataURL, urlToBlob, getCharViews, putCharView, getChatMessages, putChatMessage, deleteChatMessage, deleteChatOf, deleteVoiceSample, putChatImage, getChatImage, deleteChatImage, CHAT_PAGE, getChatSummary, putChatSummary, countChatMessages, getChatMessagesToSummarize, getLastChatLine } from './lib/idb'
 import { titleFromPrompt } from './lib/text'
+import { stopSpeaking } from './lib/speech'
 import { NAV_ITEMS } from './lib/nav'
+import {
+  applyTheme,
+  currentTheme,
+  saveTheme,
+  watchSystemTheme,
+  type Theme
+} from './lib/theme'
 import type { Cap, EnhanceMode, Provider } from './api'
-import type { ApiConfig, Collection, FavoritePayload, HistoryEntry, PromptItem, ResultItem, ReuseParams, Character, CharacterFields, CharacterStat, CharacterView, CharacterViewKind, CharacterWork, ImportedCharacter } from './types'
+import type { ApiConfig, Collection, FavoritePayload, HistoryEntry, PromptItem, ResultItem, ReuseParams, Character, CharacterFields, CharacterPersona, CharacterStat, CharacterView, CharacterViewKind, CharacterVoice, CharacterWork, ChatMessage, ChatSummary, ImportedCharacter, ImportedChat } from './types'
 
 // —— 状态 ——
 const prompt = ref('')
@@ -189,7 +211,12 @@ const refImage = ref('') // 图生图参考图 (data URL)
 const characters = ref<Character[]>([])
 /* 角色页的组件句柄:第 1 步存完由它把向导推进到下一步
    (见 saveCharFromPage)。这一页自己管向导的步数,所以"存完该去哪"得由它说了算 */
-const charPageRef = ref<{ onSaved: (id: string) => void } | null>(null)
+const charPageRef = ref<{
+  // 新建存完:角色页据此把向导推进到"主视图"那一步
+  onSaved: (id: string) => void
+  // 编辑存完:角色页据此关掉向导、回到这个角色的详情页
+  onUpdated: (id: string) => void
+} | null>(null)
 /* 这次创作套用的角色 id。空 = 不用角色 */
 const activeCharId = ref('')
 /* 设定图:按角色 id 缓存已取出的视图。只在这个角色被选中时才读 IndexedDB ——
@@ -207,8 +234,44 @@ const charViewControllers = new Map<string, AbortController>()
 function charViewKey(charId: string, kind: CharacterViewKind) {
   return `${charId}:${kind}`
 }
-// 六个平级页面:首页 / 角色 / 画布 / 提示词库 / 历史记录 / 接口设置,同时只挂载一个
-type Page = 'home' | 'chars' | 'canvas' | 'lib' | 'history' | 'settings'
+
+/* —— 角色对话 ——
+   与设定图同一套分工:这一页只管展示,消息从哪读、请求怎么发都在主界面。
+   状态也按角色分开,理由与 charViewBusy 那次一模一样:
+   A 在说话时切到 B,B 的界面不该跟着显示"正在输入" */
+/* 当前在看哪个角色的对话。空 = 还没挑(对话页会给一句"挑一个") */
+const chatCharId = ref('')
+/* 已取到的消息,按角色 id 缓存。进对话页时才读,启动时不碰。
+   注意这里装的是**最近一档**(见 idb.ts 的 CHAT_PAGE),不是全部历史 */
+const chatMessages = ref<Record<string, ChatMessage[]>>({})
+/* 前面还有更早的没读。界面据此决定要不要给"加载更早" ——
+   没有它就分不清"这是第一句"和"只读到这里" */
+const chatHasMore = ref<Record<string, boolean>>({})
+/* 长期记忆:滑出窗口的消息压成的一段简报,按角色各一份。
+   有没有这个键 = 这个角色压过没有 */
+const chatSummary = ref<Record<string, ChatSummary>>({})
+/* 每个角色的**最后一条**消息,只用来喂左栏(摘要那一行 + 最近活跃排序)。
+   单独存一份是因为消息是按角色懒加载的:没打开过的角色 chatMessages 里没有键,
+   左栏就会把它当成"从没聊过" —— 明明聊过,却显示 No messages yet 并排到最后。
+   取法见 idb.ts 的 getLastChatLine,代价与消息条数无关 */
+const chatLast = ref<Record<string, ChatMessage>>({})
+/* 正在压记忆的角色。压缩是后台动作,但同一个角色不该叠两个 */
+const chatSummarizing = new Set<string>()
+/* "这段对话还作数吗"的代次。压缩是异步的,回来时得知道这期间它有没有被清掉 ——
+   不查的话,一次后台整理会把用户刚清掉的记忆又写回去。
+   与角色起稿的 draftSeq 是同一套做法:对不上就整份丢弃 */
+const chatSeq = new Map<string, number>()
+function bumpChatSeq(id: string) {
+  chatSeq.set(id, (chatSeq.get(id) || 0) + 1)
+}
+/* 各角色正在生成中(没有该角色的键 = 空闲) */
+const chatBusy = ref<Record<string, boolean>>({})
+/* 一轮对话的中断手柄,按角色各存一个 —— 与 charViewControllers 同一个理由 */
+const chatControllers = new Map<string, AbortController>()
+/* 正在读取的角色。同一 id 可能被两处同时触发(选角色的 watch 与角色页的入口) */
+const chatLoading = new Map<string, Promise<void>>()
+// 七个平级页面:首页 / 角色 / 对话 / 画布 / 提示词库 / 历史记录 / 接口设置,同时只挂载一个
+type Page = 'home' | 'chars' | 'chat' | 'canvas' | 'lib' | 'history' | 'settings'
 const page = ref<Page>('home')
 const previewEntry = ref<HistoryEntry | null>(null)
 
@@ -405,16 +468,33 @@ const activeTextName = computed(() => {
   return c.name || c.model || 'Not configured'
 })
 
-// 参数面板按用途分开列出:出图与改写各有各的"当前",混在一排里点谁生效说不清,
-// 而且文本配置被 activateConfig 选中会顶掉出图用的接口
-const imageConfigs = computed(() => configs.value.filter((c) => c.kind !== 'text'))
+/* 参数面板按用途分开列出:出图、改写、识图与朗读各有各的"当前",混在一排里点谁生效说不清,
+   而且文本/识图配置被 activateConfig 选中会顶掉出图用的接口。
+   出图那条要排掉另外三类 —— 它们也走配置列表,但打的是对话端点或语音端点,拿来出图必错 */
+const imageConfigs = computed(
+  () => configs.value.filter((c) => c.kind !== 'text' && c.kind !== 'vision' && c.kind !== 'tts')
+)
 const textConfigs = computed(() => configs.value.filter((c) => c.kind === 'text'))
+const visionConfigs = computed(() => configs.value.filter((c) => c.kind === 'vision'))
 
 // —— 历史图墙(输入框下方,可收起) ——
 const feedOpen = ref(true)
 const FEED_LIMIT = 12
 // 老记录没有 w/h,图片加载完再按真实像素补一下比例(与历史页同一个思路)。key 同 feedItems
 const measured = ref<Record<string, number>>({})
+/* 记录被删掉、或被存储清理淘汰之后,它量出来的比例跟着没用了 ——
+   键只增不减会一直挂在内存里(与历史页同一处理) */
+watch(history, (list) => {
+  const alive = new Set<string>()
+  for (const e of list) for (let i = 0; i < e.results.length; i++) alive.add(`${e.id}-${i}`)
+  const next: Record<string, number> = {}
+  let dropped = false
+  for (const k of Object.keys(measured.value)) {
+    if (alive.has(k)) next[k] = measured.value[k]
+    else dropped = true
+  }
+  if (dropped) measured.value = next
+})
 // 把历史记录里的多张图摊平成图墙,最新的排在最前
 const feedItems = computed(() => {
   const out: Array<{
@@ -595,17 +675,24 @@ function commitSize(e: Event) {
 }
 
 // —— 主题 ——
-const theme = ref<'light' | 'dark'>('light')
-const THEME_KEY = 'kimage.theme'
-onMounted(() => {
-  const saved = localStorage.getItem(THEME_KEY)
-  theme.value = saved === 'dark' ? 'dark' : 'light'
-})
+/* 初值必须与 main.ts 同一套口径(存档优先、否则跟随系统)。
+   原来这里只认存档、没有就硬当浅色,于是系统是深色且用户没手动设过时:
+   页面已是深色,按钮却显示"切到深色",点一下毫无变化 —— 要连点两次才对 */
+const theme = ref<Theme>(currentTheme())
 function toggleTheme() {
   theme.value = theme.value === 'dark' ? 'light' : 'dark'
-  document.documentElement.setAttribute('data-theme', theme.value)
-  localStorage.setItem(THEME_KEY, theme.value)
+  applyTheme(theme.value)
+  saveTheme(theme.value)
 }
+/* 系统里切深浅色,页面要跟着走(用户手动设过就不再跟,见 watchSystemTheme) */
+let unwatchSystemTheme: (() => void) | null = null
+onMounted(() => {
+  unwatchSystemTheme = watchSystemTheme((t) => {
+    theme.value = t
+    applyTheme(t)
+  })
+})
+onBeforeUnmount(() => unwatchSystemTheme?.())
 
 // —— 顶部导航滚动状态:页面一滑动就浮出毛玻璃底,避免与内容糊在一起 ——
 const scrolled = ref(false)
@@ -626,7 +713,10 @@ onBeforeUnmount(() => window.removeEventListener('scroll', onScroll))
 const navView = computed({
   get: () => page.value as string,
   set: (v: string) => {
-    page.value = v as Page
+    /* 认过再写:主区是几个 v-if 铺出来的,page 落到清单外的值上,整页就是空白
+       (没有任何兜底分支)。控件那边给的都是清单里的值,但这是唯一的入口,
+       在这里收一次窄,比给每个分支补 v-else 划算 */
+    if (NAV_ITEMS.some((i) => i.value === v)) page.value = v as Page
   }
 })
 /* 字标里跟在 KImage 后面那一截:当前在哪一页。
@@ -647,6 +737,15 @@ const activeId = ref('')
 const textConfig = ref<ApiConfig | null>(null)
 // 文本类别当前生效配置的 id,与 activeId 各自独立
 const activeTextId = ref(loadActiveTextId())
+/* 识图用的配置:把角色向导里上传的参考图读成设定。三类配置同在 configs 里,
+   只是用途不同 —— 能画图的模型未必会看图,所以它是一条独立的「当前」 */
+const visionConfig = ref<ApiConfig | null>(null)
+const activeVisionId = ref(loadActiveVisionId())
+/* 朗读用的合成配置。前三类打的都是 OpenAI 兼容那套,这一条不是 ——
+   它走 /api/v3/tts/...,还要一个 Resource-Id(见 types.ts 的 ApiConfig.resourceId)。
+   同样是一条独立的「当前」:朗读配置被选中不该顶掉出图或改写 */
+const ttsConfig = ref<ApiConfig | null>(null)
+const activeTtsId = ref(loadActiveTtsId())
 // 接口设置页的视图:'list' = 已保存接口列表,'form' = 新增/编辑接口表单(独立一屏)
 const cfgView = ref<'list' | 'form'>('list')
 // 表单页要编辑/复制的来源;null 表示新增空白。
@@ -781,6 +880,29 @@ onMounted(() => {
       saveActiveTextId(activeText.id)
     }
   }
+  // 识图配置:与文本那条同一套挑法(按存的 id 找,落空就退到第一条)
+  const activeVision =
+    configs.value.find((c) => c.id === activeVisionId.value && c.kind === 'vision') ||
+    configs.value.find((c) => c.kind === 'vision')
+  if (activeVision) {
+    visionConfig.value = { ...activeVision }
+    if (activeVisionId.value !== activeVision.id) {
+      activeVisionId.value = activeVision.id
+      saveActiveVisionId(activeVision.id)
+    }
+  }
+  // 朗读配置:同一套挑法。没配时 ttsConfig 为 null 是正常的 ——
+  // 朗读会退回浏览器自带的语音(见 lib/speech),不是错误
+  const activeTts =
+    configs.value.find((c) => c.id === activeTtsId.value && c.kind === 'tts') ||
+    configs.value.find((c) => c.kind === 'tts')
+  if (activeTts) {
+    ttsConfig.value = { ...activeTts }
+    if (activeTtsId.value !== activeTts.id) {
+      activeTtsId.value = activeTts.id
+      saveActiveTtsId(activeTts.id)
+    }
+  }
   /* 库封面存在 IndexedDB 里,读取因此是异步的(见 api.ts 的 loadPrompts)。
      不 await —— 首页不必等它,提示词库页挂载时数据早到了 */
   loadPrompts().then((list) => (libItems.value = list))
@@ -792,7 +914,13 @@ onMounted(() => {
   // 作品集目录是同步读的 localStorage,直接落一次
   collections.value = loadCollections()
   // 角色要连 IndexedDB 里的参考图一起取,所以是异步的
-  loadCharacters().then((list) => (characters.value = list.map(normalizeChar)))
+  loadCharacters().then((list) => {
+    characters.value = list.map(normalizeChar)
+    /* 左栏那行"最后说了什么"需要每个角色各读一条 ——
+       没打开过的角色在 chatMessages 里没有键,光靠它是读不到的(见 loadChatLast)。
+       启动时补一趟就够:之后每一句都由 sendChat / runChat 就地更新 */
+    void loadChatLast()
+  })
 })
 
 /* 新建一份配置(进入独立的新增接口表单页)。
@@ -811,7 +939,57 @@ function editConfig(c: ApiConfig) {
   cfgSeed.value = { ...c }
   cfgView.value = 'form'
 }
-// 保存表单草稿(新增或更新),并设为激活
+/* 当前生效的出图配置指向了一条已经不存在的(或已经改了用途的)配置时,
+   按用途重挑一条;一条都没有就清空。删除与"改用途"两条路共用它 ——
+   不收拾的话生效值会悬空:界面显示着它,它却已经发不出请求 */
+function repickActiveImage() {
+  const next = configs.value.find((c) => c.kind !== 'text' && c.kind !== 'vision')
+  if (next) {
+    config.value = { ...next }
+    activeId.value = next.id
+    saveActiveId(next.id)
+  } else {
+    config.value = { id: '', name: '', baseUrl: '', apiKey: '', model: '', vendor: 'custom' }
+    activeId.value = ''
+    saveActiveId('')
+  }
+}
+// 文本侧同理。没有文本配置时 textConfig 为 null 是正常态,增强按钮会提示去配一条
+function repickActiveText() {
+  const next = configs.value.find((c) => c.kind === 'text')
+  if (next) {
+    activateTextConfig(next)
+  } else {
+    textConfig.value = null
+    activeTextId.value = ''
+    saveActiveTextId('')
+  }
+}
+// 识图侧同理:没有识图配置时 visionConfig 为 null,角色向导里会提示去配一条
+function repickActiveVision() {
+  const next = configs.value.find((c) => c.kind === 'vision')
+  if (next) {
+    activateVisionConfig(next)
+  } else {
+    visionConfig.value = null
+    activeVisionId.value = ''
+    saveActiveVisionId('')
+  }
+}
+/* 朗读侧同理。**它与上面三条有一处不同**:ttsConfig 为 null 不是错误态 ——
+   朗读会自动走浏览器自带的语音,只是听起来不是这个角色自己的嗓子 */
+function repickActiveTts() {
+  const next = configs.value.find((c) => c.kind === 'tts')
+  if (next) {
+    activateTtsConfig(next)
+  } else {
+    ttsConfig.value = null
+    activeTtsId.value = ''
+    saveActiveTtsId('')
+  }
+}
+
+// 保存表单草稿(新增或更新),并设为对应用途的激活项
 function saveSettings(draft: ApiConfig) {
   const cfg = {
     ...draft,
@@ -819,15 +997,52 @@ function saveSettings(draft: ApiConfig) {
     name: draft.name.trim() || cfgNameFromUrl(draft.baseUrl)
   }
   const idx = configs.value.findIndex((c) => c.id === cfg.id)
+  /* 这一条原来是什么用途。表单允许改用途(见设置页的 setPurpose),
+     改过之后它必须从原来那一侧退场 —— 否则那一侧的「当前生效」
+     还留着它改之前的快照:界面说当前用它,实际发出去的却已经不是一回事了 */
+  const prevKind = idx >= 0 ? configs.value[idx].kind : undefined
+  const kind =
+    cfg.kind === 'text'
+      ? 'text'
+      : cfg.kind === 'vision'
+        ? 'vision'
+        : cfg.kind === 'tts'
+          ? 'tts'
+          : 'image'
   if (idx >= 0) configs.value[idx] = cfg
   else configs.value.push(cfg)
   saveConfigs(configs.value)
-  /* 按用途分派到各自的「当前生效」:两类各自独立,存文本配置不该把出图的当前项顶掉
+
+  // 换了用途 ⇒ 原来那一侧的「当前」必须重挑,不能留着一个已经不属于它的快照
+  if (prevKind && prevKind !== kind) {
+    if (prevKind === 'text') {
+      if (activeTextId.value === cfg.id) repickActiveText()
+    } else if (prevKind === 'vision') {
+      if (activeVisionId.value === cfg.id) repickActiveVision()
+    } else if (prevKind === 'tts') {
+      if (activeTtsId.value === cfg.id) repickActiveTts()
+    } else {
+      if (activeId.value === cfg.id) repickActiveImage()
+      // 它也不再参与出图的选择集合(那个集合决定这次发给哪些模型)
+      selectedIds.value = selectedIds.value.filter((id) => id !== cfg.id)
+      if (!selectedIds.value.length && config.value.id) selectedIds.value = [config.value.id]
+    }
+  }
+
+  /* 按用途分派到各自的「当前生效」:四类各自独立,存一条不该把别类的当前项顶掉
      (反之亦然)。同步成副本而不是直接用 cfg —— 之后改表单草稿不能再牵动生效值。 */
-  if (cfg.kind === 'text') {
+  if (kind === 'text') {
     textConfig.value = { ...cfg }
     activeTextId.value = cfg.id
     saveActiveTextId(cfg.id)
+  } else if (kind === 'vision') {
+    visionConfig.value = { ...cfg }
+    activeVisionId.value = cfg.id
+    saveActiveVisionId(cfg.id)
+  } else if (kind === 'tts') {
+    ttsConfig.value = { ...cfg }
+    activeTtsId.value = cfg.id
+    saveActiveTtsId(cfg.id)
   } else {
     config.value = { ...cfg }
     activeId.value = cfg.id
@@ -875,6 +1090,18 @@ function activateTextConfig(c: ApiConfig) {
   activeTextId.value = c.id
   saveActiveTextId(c.id)
 }
+// 设某条识图配置为当前生效(同上,走识图那条通道)
+function activateVisionConfig(c: ApiConfig) {
+  visionConfig.value = { ...c }
+  activeVisionId.value = c.id
+  saveActiveVisionId(c.id)
+}
+// 设某条朗读配置为当前生效(同上,走朗读那条通道)
+function activateTtsConfig(c: ApiConfig) {
+  ttsConfig.value = { ...c }
+  activeTtsId.value = c.id
+  saveActiveTtsId(c.id)
+}
 /* 删除一条配置;若删的是激活项,自动激活剩余第一条。
    删除本身立刻改列表,但落盘推迟到撤销窗口结束 —— 于是"撤销"只要把这一条
    放回去、并把「当前生效」的指向恢复即可,不必从磁盘上搬回来。
@@ -885,34 +1112,18 @@ function removeConfig(c: ApiConfig) {
   if (at < 0) return
   const wasActive = activeId.value === c.id
   const wasActiveText = activeTextId.value === c.id
+  const wasActiveVision = activeVisionId.value === c.id
+  const wasActiveTts = activeTtsId.value === c.id
   const wasSelected = selectedIds.value.includes(c.id)
 
   /* 选择集合里也要摘掉它:被删的那条不再参与生成,但它留在集合里会让
      长度算错 —— 剩两条其实只剩一条,却仍被当成对比模式。摘完一个不剩就退回当前这条 */
   configs.value = configs.value.filter((x) => x.id !== c.id)
   // 占着各自「当前生效」的那条被删掉时,同样要按用途重新挑一条,免得生效值悬空
-  if (wasActiveText) {
-    const nextText = configs.value.find((x) => x.kind === 'text')
-    if (nextText) {
-      activateTextConfig(nextText)
-    } else {
-      textConfig.value = null
-      activeTextId.value = ''
-      saveActiveTextId('')
-    }
-  }
-  if (wasActive) {
-    const next = configs.value.find((x) => x.kind !== 'text')
-    if (next) {
-      config.value = { ...next }
-      activeId.value = next.id
-      saveActiveId(next.id)
-    } else {
-      config.value = { id: '', name: '', baseUrl: '', apiKey: '', model: '', vendor: 'custom' }
-      activeId.value = ''
-      saveActiveId('')
-    }
-  }
+  if (wasActiveText) repickActiveText()
+  if (wasActiveVision) repickActiveVision()
+  if (wasActiveTts) repickActiveTts()
+  if (wasActive) repickActiveImage()
   selectedIds.value = selectedIds.value.filter((id) => id !== c.id)
   if (!selectedIds.value.length && config.value.id) selectedIds.value = [config.value.id]
 
@@ -937,6 +1148,16 @@ function removeConfig(c: ApiConfig) {
         textConfig.value = { ...c }
         activeTextId.value = c.id
         saveActiveTextId(c.id)
+      }
+      if (wasActiveVision) {
+        visionConfig.value = { ...c }
+        activeVisionId.value = c.id
+        saveActiveVisionId(c.id)
+      }
+      if (wasActiveTts) {
+        ttsConfig.value = { ...c }
+        activeTtsId.value = c.id
+        saveActiveTtsId(c.id)
       }
       saveConfigs(configs.value)
     },
@@ -1009,12 +1230,19 @@ async function importLibItems(items: PromptItem[]) {
      封面只在旧版备份里才有,而且是 320px 的 data URL 缩略图 —— 转成 Blob 收下,
      比没有强;尺寸够不够清楚不是导入这一步该管的事 */
   const clean: PromptItem[] = []
+  /* 撞 id 就换新的:一份备份里可能自己就有两条同 id(手改过、或同一份导两次),
+     也可能与库里已有的撞上。重复 id 会让 v-for 的 :key 重复,
+     而编辑/删除都按 id 查找 —— 只会命中的第一条,表现就是"删不掉"或"删错一条" */
+  const seen = new Set(libItems.value.map((i) => i.id))
   for (const i of items) {
     if (!i || typeof i.prompt !== 'string' || !i.prompt.trim()) continue
     const thumb = typeof i.thumb === 'string' && i.thumb.startsWith('data:image/') ? i.thumb : ''
+    let id = typeof i.id === 'string' && i.id ? i.id : uid()
+    if (seen.has(id)) id = uid()
+    seen.add(id)
     const item = normalizePrompt({
       ...i,
-      id: i.id || uid(),
+      id,
       prompt: i.prompt,
       cover: i.cover instanceof Blob ? i.cover : undefined,
       thumb: undefined,
@@ -1036,25 +1264,48 @@ async function importLibItems(items: PromptItem[]) {
 /* 导入的配置来自外部文件,逐条规整:没有 baseUrl 的存下来也发不出请求;
    id 若和现有的撞了必须换新的,否则列表里两条同 id,渲染和删除都会错乱 */
 function importConfigs(list: ApiConfig[]) {
+  /* 撞 id 就换新的。这里必须维护一份"这次已经用掉的 id",不能只跟现有列表比:
+     map 期间 configs.value 不变,同一个文件里两条同 id 会双双通过 */
+  const seen = new Set(configs.value.map((c) => c.id))
   const clean: ApiConfig[] = list
     .filter((c) => c && typeof c.baseUrl === 'string' && c.baseUrl.trim())
-    .map((c) => ({
-      id: c.id && !configs.value.some((x) => x.id === c.id) ? c.id : uid(),
-      name: typeof c.name === 'string' && c.name.trim() ? c.name : cfgNameFromUrl(c.baseUrl),
-      baseUrl: c.baseUrl.trim(),
-      apiKey: typeof c.apiKey === 'string' ? c.apiKey : '',
-      model: typeof c.model === 'string' ? c.model : '',
-      vendor: typeof c.vendor === 'string' ? c.vendor : 'custom',
-      // 外部文件的脏数据不该让配置错类:认不出是 'text' 的一律当出图
-      kind: c.kind === 'text' ? ('text' as const) : ('image' as const)
-    }))
+    .map((c) => {
+      let id = typeof c.id === 'string' && c.id ? c.id : uid()
+      if (seen.has(id)) id = uid()
+      seen.add(id)
+      return {
+        id,
+        name: typeof c.name === 'string' && c.name.trim() ? c.name : cfgNameFromUrl(c.baseUrl),
+        baseUrl: c.baseUrl.trim(),
+        apiKey: typeof c.apiKey === 'string' ? c.apiKey : '',
+        model: typeof c.model === 'string' ? c.model : '',
+        vendor: typeof c.vendor === 'string' ? c.vendor : 'custom',
+        // 外部文件的脏数据不该让配置错类:只认得出 text / vision / tts,其余一律当出图
+        kind:
+          c.kind === 'text'
+            ? ('text' as const)
+            : c.kind === 'vision'
+              ? ('vision' as const)
+              : c.kind === 'tts'
+                ? ('tts' as const)
+                : ('image' as const),
+        /* 朗读那条的资源标识。丢掉它的话,导入进来的朗读配置会变成
+           "地址与密钥都对、但每次请求都被上游拒掉(access denied)",
+           而原因藏在一格看不见的字段里 */
+        ...(typeof c.resourceId === 'string' && c.resourceId.trim()
+          ? { resourceId: c.resourceId.trim() }
+          : {})
+      }
+    })
   if (!clean.length) return
   // 追加而不是覆盖:导入是补充,不该把现有配置清掉
   configs.value = [...clean, ...configs.value]
   saveConfigs(configs.value)
   // 原本一条都没配(生成会被拦下来)时,顺手把导入里第一条出图配置设为当前,不然导完照样发不出请求
   if (!configured()) {
-    const first = configs.value.find((c) => c.kind !== 'text')
+    const first = configs.value.find(
+      (c) => c.kind !== 'text' && c.kind !== 'vision' && c.kind !== 'tts'
+    )
     if (first) {
       config.value = { ...first }
       activeId.value = first.id
@@ -1065,6 +1316,11 @@ function importConfigs(list: ApiConfig[]) {
   if (!textConfig.value) {
     const nextText = configs.value.find((c) => c.kind === 'text')
     if (nextText) activateTextConfig(nextText)
+  }
+  // 识图那边同理 —— 三类「当前」互不隶属,缺哪一条就补哪一条
+  if (!visionConfig.value) {
+    const nextVision = configs.value.find((c) => c.kind === 'vision')
+    if (nextVision) activateVisionConfig(nextVision)
   }
 }
 
@@ -1080,6 +1336,12 @@ function onPickRef(e: Event) {
   }
   reader.readAsDataURL(file)
   ;(e.target as HTMLInputElement).value = ''
+}
+/* 键盘也能选参考图。那个入口是 <label for>:它不在 Tab 序里,而点它才触发
+   file input —— 补上 tabindex 与回车/空格之后,把触发这件事显式写出来 */
+const refInputEl = ref<HTMLInputElement | null>(null)
+function pickRef() {
+  refInputEl.value?.click()
 }
 /* 参考图的存档副本:配方要能完整复现,就得连参考图一起留下 ——
    hasRef 只说得出"用过参考图",说不出是哪一张,重跑时就会悄悄退化成文生图。
@@ -1209,6 +1471,10 @@ function normalizeChar(c: Character): Character {
   const legacySource = c.refKind ? undefined : c.ref
   if (c.refKind && c.refKind !== 'front') delete c.refKind
   if (!c.sourceRef && legacySource) c.sourceRef = legacySource
+  /* 嗓音逐项收一遍:它是从 localStorage 读回来的,可能被手改过、
+     也可能来自更早的版本 —— 形状不对时整个退回"浏览器语音",
+     而不是让一个残缺的对象一路走到合成请求里 */
+  c.voice = coerceCharVoice(c.voice)
   return c
 }
 
@@ -1240,34 +1506,92 @@ function pickChar(id: string) {
   hideCharPeek()
 }
 
-/** 存下一个新角色(角色页交过来的草稿)。名字必填 —— 没名字的卡没法认 */
+/* 存角色这条链不算快(参考图要压缩、角色要落 IndexedDB),而第 1 步那个按钮
+   在等待期间仍可点 —— 连点两下就会建出两个角色,第一个还没有任何界面引用它。
+   所以做一次幂等。判定放在这个唯一的写入入口上,而不是角色页那个按钮上 */
+let savingChar = false
+
+/** 存下角色页交过来的草稿:带 id 是改这一条,不带就是新建。
+ *  名字必填 —— 没名字的卡没法认 */
 async function saveCharFromPage(d: {
+  /* 带 id = 改这一条,不带 = 新建。角色页那边按"向导里有没有正在编辑的对象"给 */
+  id?: string
   name: string
   fields: CharacterFields
   desc: string
+  /* 人格设定。与 fields 分开进(见 types.ts 的 CharacterPersona)——
+     它只服务对话,不该混进任何出图的提示词 */
+  persona: CharacterPersona
+  /* 嗓音。与 persona 同一条理由:只服务对话。它比 persona 多一层 ——
+     clone 档会在库里留下一段样本音频(按 sampleId 认领) */
+  voice: CharacterVoice
   refData: string
 }) {
   const name = d.name.trim()
-  if (!name) return
-  /* 上传的参考图会当角色卡封面直接铺出来,所以按显示级存(见 CHAR_IMAGE_MAX),
-     不走那条"只喂给模型"的 refThumbOf —— 512 做卡面一眼就糊 */
-  const ref = d.refData ? await charImageBlob(d.refData) : undefined
-  const c: Character = {
-    id: uid(),
-    name,
-    createdAt: Date.now(),
-    fields: { ...d.fields },
-    desc: d.desc.trim(),
-    /* 这一张同时是封面的底图(正脸出来之前先用它顶着)和"第一步的参考图"。
-       两者指向同一个 Blob,但语义不同,所以两个字段都写 ——
-       正脸生成后封面会被换成正脸,而参考图那份还得留着给其余四张用 */
-    ...(ref ? { ref, sourceRef: ref } : {})
+  if (!name || savingChar) return
+  savingChar = true
+  try {
+    /* 上传的参考图会当角色卡封面直接铺出来,所以按显示级存(见 CHAR_IMAGE_MAX),
+       不走那条"只喂给模型"的 refThumbOf —— 512 做卡面一眼就糊 */
+    const ref = d.refData ? await charImageBlob(d.refData) : undefined
+
+    /* —— 改一条已有的 ——
+       名字与设定照单更新;参考图只有真换了才动(refData 为空 = 没换那张)。
+       封面 ref 一律不碰:它要么是生成出来的正脸,要么是这张角色最初那张图 ——
+       换一张参考图不该顺手把脸也换掉 */
+    if (d.id) {
+      const c = characters.value.find((x) => x.id === d.id)
+      if (!c) return
+      /* 备注也算设定的一部分:它同样会拼进提示词(见 characterDesc),
+         改它的效果和改某一栏字段是一样的 */
+      const before = JSON.stringify({ ...(c.fields || {}), desc: c.desc || '' })
+      c.name = name
+      c.fields = { ...d.fields }
+      c.desc = d.desc.trim()
+      c.persona = { ...d.persona }
+      /* 换音色时旧的那段克隆样本要跟着清掉 —— 留着就是一段没人认领的录音。
+         只在"换了另一个样本"时清:同一个 sampleId 再存一次当然不动它 */
+      const prevSample = c.voice?.sampleId
+      const nextSample = d.voice.sampleId
+      c.voice = { ...d.voice }
+      if (prevSample && prevSample !== nextSample) void deleteVoiceSample(prevSample)
+      if (ref) c.sourceRef = ref
+      await saveCharacters(characters.value)
+      /* 改的可能只是一个名字,也可能把脸改了。设定动了就得说一声 ——
+         那五张设定图是按旧设定生成的,不提示的话用户会以为它们跟着一起变了。
+         一张视图都没有时不必说这句:没有"旧的"可以重跑 */
+      const hasViews = (charViews.value[c.id] || []).length > 0
+      notice.value =
+        hasViews && before !== JSON.stringify({ ...d.fields, desc: c.desc })
+          ? 'Saved. The reference views were made from the old spec — regenerate them if the face changed.'
+          : `Saved “${c.name}”.`
+      /* 编辑没有第 2、3 步要走,收尾就是回到这个人自己的详情页 */
+      charPageRef.value?.onUpdated(c.id)
+      return
+    }
+
+    const c: Character = {
+      id: uid(),
+      name,
+      createdAt: Date.now(),
+      fields: { ...d.fields },
+      desc: d.desc.trim(),
+      persona: { ...d.persona },
+      voice: { ...d.voice },
+      /* 这一张同时是封面的底图(正脸出来之前先用它顶着)和"第一步的参考图"。
+         两者指向同一个 Blob,但语义不同,所以两个字段都写 ——
+         正脸生成后封面会被换成正脸,而参考图那份还得留着给其余四张用 */
+      ...(ref ? { ref, sourceRef: ref } : {})
+    }
+    characters.value = [c, ...characters.value]
+    await saveCharacters(characters.value)
+    /* 存完把 id 交回角色页,让向导推进到"主视图"那一步。
+       这里不负责跳转 —— 向导的步数归角色页自己管 */
+    charPageRef.value?.onSaved(c.id)
+  } finally {
+    // 失败时也要松开,否则按钮从此点不动
+    savingChar = false
   }
-  characters.value = [c, ...characters.value]
-  await saveCharacters(characters.value)
-  /* 存完把 id 交回角色页,让向导推进到"主视图"那一步。
-     这里不负责跳转 —— 向导的步数归角色页自己管 */
-  charPageRef.value?.onSaved(c.id)
 }
 
 /* 删掉一个角色。与别处(提示词 / 配置 / 历史)同一套:
@@ -1279,10 +1603,13 @@ function deleteChar(id: string) {
   if (at < 0) return
   const gone = characters.value[at]
   const wasActive = activeCharId.value === id
+  // 与 activeCharId 同一处理:留着一个已不在的角色 id,对话页会指着一段没人认领的历史
+  const wasChatting = chatCharId.value === id
   characters.value = characters.value.filter((c) => c.id !== id)
   /* 这一条不能等窗口结束:当前套用的角色是个 id 引用,
      留着一个已经不在列表里的 id,下一次生成会莫名多出一段角色描述 */
   if (wasActive) detachCharacter()
+  if (wasChatting) chatCharId.value = ''
 
   scheduleUndo({
     label: 'Character deleted',
@@ -1291,6 +1618,7 @@ function deleteChar(id: string) {
       characters.value.splice(Math.min(at, characters.value.length), 0, gone)
       // 恢复「当前套用的角色」—— 它当初是被这次删除夺走的,现在物归原主
       if (wasActive) activeCharId.value = id
+      if (wasChatting) chatCharId.value = id
       /* 撤销要立刻落盘:窗口里别的操作可能已经把"它不在"写进去了。
          图是整批按归属清理的,所以这一步同时保住它的主图与设定图 */
       saveCharacters(characters.value)
@@ -1301,9 +1629,40 @@ function deleteChar(id: string) {
          六张图一直留在内存里(见 idb.ts 与 api.ts 的 releaseSrc) */
       for (const v of charViews.value[id] || []) releaseSrc(v.data)
       releaseSrc(gone.ref)
+      /* 底图是**另一个** Blob:正脸生成成功时 ref 会被换成正脸,那时两者就不再
+         指向同一个实例了 —— 只收 ref 会把底图那张的地址留在弱引用表里 */
+      releaseSrc(gone.sourceRef)
+      /* 克隆用的那段录音也跟着走。它与图不同 —— 那是**用户的录音**,
+         角色没了还把它留在库里,既没人认领也不该留。同样放这一步:
+         撤销回来时它还得在 */
+      if (gone.voice?.sampleId) void deleteVoiceSample(gone.voice.sampleId)
       const rest = { ...charViews.value }
       delete rest[id]
       charViews.value = rest
+      /* 对话跟着角色一起走:人没了,跟他聊的那一段留着也没有对象了。
+         放在这一步(真正落盘)而不是点删除那一刻 —— 撤销回来时对话还得在 */
+      chatControllers.get(id)?.abort()
+      chatControllers.delete(id)
+      /* 对话里附过的图也跟着走。**先收 id 再清消息** ——
+         消息一旦从内存里抹掉,就再也问不出它带过哪几张图了,
+         那些图会变成永远没人认领的孤儿 */
+      for (const m of chatMessages.value[id] || []) {
+        if (m.imageId) void deleteChatImage(m.imageId)
+      }
+      const chatRest = { ...chatMessages.value }
+      delete chatRest[id]
+      chatMessages.value = chatRest
+      const moreRest = { ...chatHasMore.value }
+      delete moreRest[id]
+      chatHasMore.value = moreRest
+      /* 在途的压缩也要作废 —— 它会往一份已经没人认领的记忆里写。
+         deleteChatOf 连记忆一起清,所以这里不用再单独删一次库里的那份 */
+      bumpChatSeq(id)
+      const sumRest = { ...chatSummary.value }
+      delete sumRest[id]
+      chatSummary.value = sumRest
+      dropChatLast(id)
+      void deleteChatOf(id)
       saveCharacters(characters.value)
     }
   })
@@ -1332,6 +1691,15 @@ async function duplicateChar(id: string) {
     createdAt: Date.now(),
     ...(src.fields ? { fields: { ...src.fields } } : {}),
     ...(src.desc ? { desc: src.desc } : {}),
+    /* 人格与嗓音一起拷。它们与设定同属"这个人是谁"——
+       复制一个角色的意思本来就是"同一副皮囊、同一个性格,拿去改点别的",
+       不拷这两样的话,复制出来的是个没性格也没嗓子的陌生人。
+       (人格这一项在加嗓音之前一直漏着,一起补上) */
+    ...(src.persona ? { persona: { ...src.persona } } : {}),
+    /* 嗓音照拷,但**丢掉 sampleId** —— 那段录音属于原件。
+       共用同一个 id 的话,删掉其中一个角色会把另一个的样本也清掉。
+       留着 vendorVoice 就够合成用了,副本只是不能再"重新克隆"那一手 */
+    ...(src.voice ? { voice: { ...src.voice, sampleId: undefined, sampleName: undefined } } : {}),
     ...(src.ref ? { ref: reBlob(src.ref) } : {}),
     ...(src.sourceRef ? { sourceRef: reBlob(src.sourceRef) } : {}),
     ...(src.refKind ? { refKind: src.refKind } : {})
@@ -1362,18 +1730,93 @@ async function exportChar(id: string) {
   if (!c) return
   try {
     if (!charViews.value[id]) await loadCharViews(id)
-    const images = await exportCharacter(c, charViews.value[id] || [])
-    notice.value = images
-      ? `Exported “${c.name}” with ${images} image${images === 1 ? '' : 's'}.`
-      : `Exported “${c.name}” — it has no images yet, so the zip is settings only.`
+    const chat = await readChatForExport(id)
+    const images = await exportCharacter(c, charViews.value[id] || [], chat)
+    const msgCount = chat.messages.length
+    /* 回执要把两样都说到:一个只有设定没有图的角色,与一个连对话都带走的角色,
+       导出来的东西差别很大,让用户知道包里到底装了什么 */
+    const parts: string[] = []
+    if (images) parts.push(`${images} image${images === 1 ? '' : 's'}`)
+    if (msgCount) parts.push(`${msgCount} message${msgCount === 1 ? '' : 's'}`)
+    notice.value = parts.length
+      ? `Exported “${c.name}” with ${parts.join(' and ')}.`
+      : `Exported “${c.name}” — it has no images or conversation yet, so the zip is settings only.`
   } catch (e: any) {
     notice.value = e?.message || 'Could not export this character'
   }
 }
 
+/** 备好一个角色的对话,交给导出。
+ *
+ *  记忆**从库里读**:界面里那份是按角色懒加载的,没打开过的角色在内存里根本没有。
+ *  消息只取最近一档(CHAT_EXPORT_MSGS)—— 分享时真正要传的是"它记得什么",
+ *  消息只是那份记忆的来处,而且对话可以无限长,全带出去包里会塞进几 MB 纯文本。 */
+async function readChatForExport(id: string): Promise<ImportedChat> {
+  const [sum, page] = await Promise.all([
+    chatSummary.value[id] ? Promise.resolve(chatSummary.value[id]) : getChatSummary(id),
+    getChatMessages(id, CHAT_EXPORT_MSGS)
+  ])
+  const messages = page.list.map((m) => ({
+    role: m.role,
+    content: m.content,
+    createdAt: m.createdAt,
+    ...(m.stopped ? { stopped: true } : {}),
+    ...(m.truncated ? { truncated: true } : {}),
+    ...(m.mood ? { mood: m.mood } : {}),
+    ...(m.imageId ? { imageId: m.imageId } : {})
+  }))
+  /* 附图一起带走。**缺了它们,对方拿到的是一串"不知道在说什么的回复"** ——
+     消息在,而消息指着的那张图不在。读不回来的那张跳过:
+     少一张图不该让整份导出失败 */
+  const ids = [...new Set(messages.map((m) => m.imageId).filter((x): x is string => !!x))]
+  const images: Array<{ id: string; blob: Blob }> = []
+  for (const imgId of ids) {
+    const rec = await getChatImage(imgId)
+    if (rec) images.push({ id: imgId, blob: rec.blob })
+  }
+  return {
+    messages,
+    // 忘掉过的角色导出的就是空串(库里那条正文为空),包里也就不带记忆
+    memory: sum?.text || '',
+    ...(images.length ? { images } : {})
+  }
+}
+
+/** 把角色包里带回来的那段对话写进库。
+ *
+ *  消息 id 一律换新(与角色 id 同一条理由:不沿用文件里的标识)。
+ *  记忆则按**收到的这些消息**重新对游标 —— 不能照抄包里那份:
+ *  那些 id 与时间戳在本地已经不成立,照抄会让下一轮压缩要么把导入的这段
+ *  整段重新压一遍,要么一条都不压。 */
+async function writeImportedChat(charId: string, chat: ImportedChat) {
+  const msgs: ChatMessage[] = chat.messages.map((m) => ({ id: uid(), charId, ...m }))
+  for (const m of msgs) await putChatMessage(m)
+  if (!chat.memory) return
+  const last = msgs[msgs.length - 1]
+  await putChatSummary({
+    charId,
+    text: chat.memory,
+    upToId: last?.id || '',
+    upToAt: last?.createdAt || 0,
+    covered: msgs.length,
+    /* 这份记忆是跟着包过来的,不是此刻压出来的。界面上那行"多久没动过"
+       显示的是它落到这台机器上的时间 —— 除此之外没有更早的时刻可写 */
+    updatedAt: Date.now()
+  })
+}
+
+/* 角色包的大小上限:一个角色是 1 张主图 + 5 张设定图,正常不过几 MB。
+   不拦的话整个文件会先被读进内存再解压 —— 一个上百 MB 的 zip 就能把标签页顶掉,
+   而它显然不会是角色包 */
+const MAX_CHAR_ZIP = 64 * 1024 * 1024
+
 /* 导入角色 zip。文件里的 id 一律换新 —— 与现有的撞上会让列表里出现两条同 id,
    渲染和删除都会错乱(与配置的导入同一条理由) */
 async function importCharFile(file: File) {
+  if (file.size > MAX_CHAR_ZIP) {
+    notice.value = 'That file is too large to be a character export.'
+    return
+  }
   let list: ImportedCharacter[]
   try {
     list = await readCharacterZip(file)
@@ -1387,6 +1830,7 @@ async function importCharFile(file: File) {
   }
 
   const added: Character[] = []
+  let msgs = 0
   try {
     for (const imp of list) {
       const c: Character = {
@@ -1395,18 +1839,36 @@ async function importCharFile(file: File) {
         createdAt: imp.createdAt,
         ...(imp.fields ? { fields: { ...imp.fields } } : {}),
         ...(imp.desc ? { desc: imp.desc } : {}),
+        ...(imp.persona ? { persona: { ...imp.persona } } : {}),
         ...(imp.ref ? { ref: imp.ref } : {}),
         ...(imp.sourceRef ? { sourceRef: imp.sourceRef } : {}),
         ...(imp.refKind ? { refKind: imp.refKind } : {})
       }
       // 与 duplicateChar 同一条顺序要求:图先写,再交给 saveCharacters 落盘
       for (const v of imp.views) await putCharView(c.id, v.kind, v.data)
+      /* 对话跟着角色一起落库。顺序也是要紧的:先得有这个角色 id,
+         而记忆的游标要指着已经写进去的最后一条消息 */
+      if (imp.chat) {
+        await writeImportedChat(c.id, imp.chat)
+        msgs += imp.chat.messages.length
+        /* 包里的附图跟着落库。**id 原样用** —— 消息里引用的就是它,
+           与"消息 id 一律换新"不同:那个是本地身份,这个只是一根引用的键 */
+        for (const img of imp.chat.images || []) {
+          await putChatImage({ id: img.id, blob: img.blob, createdAt: Date.now() })
+        }
+      }
       added.push(c)
     }
     characters.value = [...added, ...characters.value]
     await saveCharacters(characters.value)
-    notice.value =
+    /* 补一趟左栏那行摘要:导入的对话已经在库里,而 chatLast 只在启动时读过一次 ——
+       不补的话,这些明明带着历史的角色在左栏会显示 "No messages yet" */
+    if (msgs) void loadChatLast()
+    const base =
       added.length === 1 ? `Imported “${added[0].name}”.` : `Imported ${added.length} characters.`
+    notice.value = msgs
+      ? `${base} Includes ${msgs} message${msgs === 1 ? '' : 's'} of conversation.`
+      : base
   } catch {
     notice.value = 'Could not save the imported characters.'
   }
@@ -1640,22 +2102,520 @@ async function genRemainingViews(charId: string) {
 
 /* 取出某个角色的设定图并缓存。已经取过就不再读 IndexedDB ——
    启动时不碰这些图,5 张 × N 个角色全读进来太重 */
+/* 正在路上的读取。同一个 id 可能被两处同时触发(创作区选中角色时的 watch,
+   与角色页的 @open),读两遍 IndexedDB 是白费 */
+const charViewsLoading = new Map<string, Promise<void>>()
 async function loadCharViews(id: string) {
   if (!id || charViews.value[id]) return
-  const rows = await getCharViews(id)
-  const known = new Set<string>(CHARACTER_VIEWS.map((v) => v.kind))
-  /* 存储层只知道"有个 kind 字符串",这里按已知视图清单收窄 ——
-     万一库里留着旧版写下的未知 kind,不该让它混进网格 */
-  charViews.value = {
-    ...charViews.value,
-    [id]: rows
-      .filter((r) => known.has(r.kind))
-      .map((r) => ({ kind: r.kind as CharacterViewKind, data: r.data }))
-  }
+  const inflight = charViewsLoading.get(id)
+  if (inflight) return inflight
+  const task = (async () => {
+    try {
+      const rows = await getCharViews(id)
+      /* 回来时如果这个角色的图已经有了,就别拿这份快照盖上去:
+         期间多半刚生成完一张,库里那次写入是后发生的,却不一定被这次读看到 ——
+         盖上去的结果是刚出的图从网格上消失,刷新才回来 */
+      if (charViews.value[id]) return
+      const known = new Set<string>(CHARACTER_VIEWS.map((v) => v.kind))
+      /* 存储层只知道"有个 kind 字符串",这里按已知视图清单收窄 ——
+         万一库里留着旧版写下的未知 kind,不该让它混进网格 */
+      charViews.value = {
+        ...charViews.value,
+        [id]: rows
+          .filter((r) => known.has(r.kind))
+          .map((r) => ({ kind: r.kind as CharacterViewKind, data: r.data }))
+      }
+    } finally {
+      charViewsLoading.delete(id)
+    }
+  })()
+  charViewsLoading.set(id, task)
+  return task
 }
 
 // 在创作区选中某个角色时顺手取一次;角色页那边由 @open 触发
 watch(activeCharId, (id) => loadCharViews(id))
+
+/* ===== 角色对话 ======================================================
+   与设定图那条流水线同一套分工:请求从这里发,状态也留在这里,
+   对话页只负责把消息铺出来、把意图交出来(见 ChatPage.vue)。
+   -------------------------------------------------------------------- */
+
+/**
+ * 把每个角色的最后一条消息读进 chatLast —— 左栏那一行摘要与"最近活跃"排序都靠它。
+ *
+ * 消息是按角色懒加载的,不补这一趟的话,没打开过的角色在左栏一律显示
+ * "No messages yet" 并排到最后:明明聊过,看起来却像从没聊过。
+ *
+ * 每个角色只读一条(见 idb.ts 的 getLastChatLine),代价与消息条数无关,
+ * 所以可以放心在角色列表变化时整批重读。**只往后合并,不整体替换** ——
+ * 刚说完的那一句比库里读出来的新,不能被盖回去。
+ */
+async function loadChatLast() {
+  const ids = characters.value.map((c) => c.id)
+  if (!ids.length) return
+  const got = await getLastChatLine(ids)
+  if (!got.size) return
+  const next = { ...chatLast.value }
+  for (const [id, msg] of got) {
+    const known = next[id]
+    if (!known || known.createdAt < msg.createdAt) next[id] = msg
+  }
+  chatLast.value = next
+}
+
+/* 说完一句就地把左栏那行更新掉,不必整批重读 */
+function setChatLast(id: string, msg: ChatMessage) {
+  chatLast.value = { ...chatLast.value, [id]: msg }
+}
+/* 清空/删除之后要把那行也撤掉,否则左栏还留着已经不存在的摘要 */
+function dropChatLast(id: string) {
+  if (!chatLast.value[id]) return
+  const next = { ...chatLast.value }
+  delete next[id]
+  chatLast.value = next
+}
+
+/** 取某个角色的对话。与 loadCharViews 同一套懒加载 + 去重:
+ *  同一个 id 可能被选角色的 watch 与角色页的入口同时触发 */
+async function loadChatMessages(id: string) {
+  if (!id || chatMessages.value[id]) return
+  const inflight = chatLoading.get(id)
+  if (inflight) return inflight
+  const task = (async () => {
+    try {
+      /* 消息与记忆一起取:两者是同一屏的两半,
+         分两趟只会让记忆晚一拍出现 */
+      const [page, sum] = await Promise.all([getChatMessages(id, CHAT_PAGE), getChatSummary(id)])
+      chatMessages.value = { ...chatMessages.value, [id]: page.list }
+      chatHasMore.value = { ...chatHasMore.value, [id]: page.hasMore }
+      if (sum) chatSummary.value = { ...chatSummary.value, [id]: sum }
+    } finally {
+      chatLoading.delete(id)
+    }
+  })()
+  chatLoading.set(id, task)
+  return task
+}
+watch(chatCharId, (id) => {
+  if (id) loadChatMessages(id)
+})
+
+/**
+ * 往前再读一档。**这只是显示上限,库里一条都没少** ——
+ * 和"清空"完全是两回事,所以它不该有任何破坏性的味道。
+ *
+ * 这里不走 loadChatMessages:它会把内存里那份整个换掉,
+ * 而读的这段时间里可能刚说完一句 —— 用库里那份盖上去就把新句子抹了。
+ * 所以按 id 并一遍:老的在前面,内存里那份新的接在后面。
+ */
+async function loadEarlierChat(id: string) {
+  if (!chatHasMore.value[id] || chatLoading.has(id)) return
+  const cur = chatMessages.value[id] || []
+  const task = (async () => {
+    try {
+      const { list, hasMore } = await getChatMessages(id, cur.length + CHAT_PAGE)
+      const seen = new Set(list.map((m) => m.id))
+      chatMessages.value = {
+        ...chatMessages.value,
+        [id]: [...list, ...cur.filter((m) => !seen.has(m.id))].sort(
+          (a, b) => a.createdAt - b.createdAt
+        )
+      }
+      chatHasMore.value = { ...chatHasMore.value, [id]: hasMore }
+    } finally {
+      chatLoading.delete(id)
+    }
+  })()
+  chatLoading.set(id, task)
+  return task
+}
+
+/**
+ * 看一眼要不要把滑出窗口的消息压进记忆 —— 每一轮说完之后顺手跑,不挡用户看回复。
+ *
+ * "该不该压"由三个数算出来:**总条数 − 窗口大小 − 已覆盖条数**。
+ * 减掉窗口,是因为最近那些条本来就还在上下文里,压了也是白压;
+ * 结果够 CHAT_SUMMARIZE_AFTER 才值得花一次调用。
+ *
+ * 全程静默:它是一次后台整理,失败就从这一轮退出,covered 不推进,
+ * 下一轮再试 —— 不弹提示,也不会因此丢东西。
+ */
+async function maybeSummarize(id: string) {
+  const cfg = textConfig.value
+  if (!cfg || chatSummarizing.has(id)) return
+  chatSummarizing.add(id)
+  const seq = chatSeq.get(id) || 0
+  try {
+    const cur = chatSummary.value[id]
+    const total = await countChatMessages(id)
+    const want = total - CHAT_WINDOW - (cur?.covered || 0)
+    if (want < CHAT_SUMMARIZE_AFTER) return
+
+    /* 由旧往新收。收多少条正是上面那个 want(封顶 CHAT_SUMMARY_CAP),
+       这样算出来的边界刚好落在"最近窗口"前面,窗口里的原话一句都不会被压掉 */
+    const batch = await getChatMessagesToSummarize(
+      id,
+      cur?.upToAt || 0,
+      Math.min(want, CHAT_SUMMARY_CAP)
+    )
+    if (!batch.length) return
+
+    const text = await summarizeChat(cfg, cur?.text || '', batch)
+    /* 这期间对话被清掉过(或角色被删)就别写了 ——
+       否则一次后台整理会把用户刚清掉的记忆又请回来 */
+    if ((chatSeq.get(id) || 0) !== seq) return
+
+    /* 这期间用户亲手改过记忆:他写的那个版本,比这轮重回炉压出来的更算数。
+       这一轮就丢掉 —— covered 没动,消息一条不少,下一轮连着他的新版本一起再压 */
+    if ((chatSummary.value[id]?.text || '') !== (cur?.text || '')) return
+
+    const last = batch[batch.length - 1]
+    const next: ChatSummary = {
+      charId: id,
+      text,
+      upToId: last.id,
+      upToAt: last.createdAt,
+      covered: (cur?.covered || 0) + batch.length,
+      updatedAt: Date.now()
+    }
+    await putChatSummary(next)
+    chatSummary.value = { ...chatSummary.value, [id]: next }
+  } catch {
+    /* 见上:后台整理失败不打扰用户 */
+  } finally {
+    chatSummarizing.delete(id)
+  }
+}
+
+/** 用户亲手改那段记忆。
+ *  只换正文:upToAt / covered 说的是"哪些消息已经进去过了",
+ *  改几个字不改变这件事 —— 动了它们,下一轮会把老消息重新压一遍。
+ *  updatedAt 跟着刷,因为界面拿它显示"多久没动过了":
+ *  用户刚写完的这一版,就不该还挂着"3 天前" */
+async function editChatSummary(id: string, text: string) {
+  const cur = chatSummary.value[id]
+  if (!cur) return
+  const next: ChatSummary = { ...cur, text, updatedAt: Date.now() }
+  chatSummary.value = { ...chatSummary.value, [id]: next }
+  await putChatSummary(next)
+}
+
+/** 忘掉这段记忆。**消息一条都不删** —— "角色不再记得"和"这事发生过"是两回事,
+ *  那份原文还在库里,想回看随时能往上翻。
+ *
+ *  关键在于**不能只把正文清空**。压缩是从 upToAt 之后接着取的:
+ *  正文一空而游标没动,下一轮就会把刚忘掉的那段重新压回来 —— 等于没忘。
+ *  所以连游标一起推到最后一条:忘掉的那一段从此不再进记忆,
+ *  而**在这之后**说的新话照常重新积累起来。
+ *  记录本身留着(正文为空),因为那个"从哪之后不再记得"的游标得有地方待;
+ *  界面据此不再显示记忆块(见 ChatPage 的 hasMemory)。 */
+async function forgetChatSummary(id: string) {
+  const before = chatSummary.value[id]
+  const list = chatMessages.value[id] || []
+  const last = list[list.length - 1]
+  if (!before || !last) return
+  /* 在途的压缩要是正跑着,回来会把记忆写回来 —— 作废那一轮 */
+  bumpChatSeq(id)
+  const total = await countChatMessages(id)
+  const next: ChatSummary = {
+    charId: id,
+    text: '',
+    /* covered 与 upToAt 一起推平到"最后一条为止"。
+       covered 宁可算多一点:多算了只是下一轮少压一次,
+       算少了会把已经忘掉的那段重新捞回来 */
+    upToId: last.id,
+    upToAt: last.createdAt,
+    covered: total,
+    updatedAt: Date.now()
+  }
+  chatSummary.value = { ...chatSummary.value, [id]: next }
+  /* 与"清空对话"不同,这一步**立刻落盘**:忘掉就该马上生效,
+     而且只有一条记录,写它不心疼。撤销再把老的那版写回去 */
+  await putChatSummary(next)
+  scheduleUndo({
+    label: 'Memory forgotten',
+    undo: () => {
+      chatSummary.value = { ...chatSummary.value, [id]: before }
+      void putChatSummary(before)
+    },
+    /* 上面已经落过笔了,窗口结束没有别的事要做 ——
+       记忆是模型生成的,撤销窗口一过就真的找不回来了 */
+    purge: () => {}
+  })
+}
+
+/** 进对话页时挑一个角色:留着上次那个(还在的话),否则取列表第一个。
+ *  一个角色都没有时保持空 —— 页面自己会给"先去建一个"的空态 */
+function ensureChatChar() {
+  if (chatCharId.value && characters.value.some((c) => c.id === chatCharId.value)) return
+  chatCharId.value = characters.value[0]?.id || ''
+}
+
+/** 从别处进对话页:带上要看的那个人(角色详情页的入口走这里) */
+function openChat(charId: string) {
+  chatCharId.value = charId
+  page.value = 'chat'
+}
+
+/** 把一条消息追加进内存里的那一份 */
+function pushChatMessage(id: string, msg: ChatMessage) {
+  chatMessages.value = { ...chatMessages.value, [id]: [...(chatMessages.value[id] || []), msg] }
+}
+
+function isAbort(e: unknown): boolean {
+  return !!e && typeof e === 'object' && (e as { name?: string }).name === 'AbortError'
+}
+
+/**
+ * 发一轮,一边收一边长。
+ *
+ * 三条收尾路径 —— 说完 / 用户按 Stop / 上游出错 —— **都保留已经收到的字**:
+ * 用户按 Stop 不是"这次失败了",是"说到这儿够了",
+ * 把半句话删掉等于惩罚他按了那个按钮(与设定图"中断后保留旧图"同一条原则)。
+ */
+async function runChat(id: string) {
+  const c = characters.value.find((x) => x.id === id)
+  const cfg = textConfig.value
+  if (!c || chatBusy.value[id]) return
+  if (!cfg) {
+    notice.value = 'Add a text model in API settings before chatting.'
+    return
+  }
+
+  /* 上文现场从内存里取:最近 CHAT_WINDOW 条。
+     被截掉的旧消息**不从库里删** —— 它们还在,只是这一轮不带 */
+  const context = (chatMessages.value[id] || [])
+    .slice(-CHAT_WINDOW)
+    .map((m) => ({ role: m.role, content: m.content }))
+  // 最后一句必须是用户说的,否则这一轮本来就不该发
+  if (!context.length || context[context.length - 1].role !== 'user') return
+
+  /* 用户这一轮带没带图。带了要另说两件事:
+     1. 请求改用识图那条配置 —— **看图得有看图的模型**,文本模型多半不支持,
+        而它回的那句参数错用户看不出"该换个模型了";没配识图就照旧用文本配置
+        (会报错,但那是实情,如实转述给用户);
+     2. 把那张图读回来转成 data URL 一起发 —— 库里存的是 Blob,
+        发出去要的是字符。**只带当前这一条**:历史里的图不重发(一张上千 token)。 */
+  const lastSent = (chatMessages.value[id] || []).slice(-1)[0]
+  const picId = lastSent?.imageId || ''
+  const useCfg = picId ? visionConfig.value || cfg : cfg
+  let images: string[] | undefined
+  if (picId) {
+    const rec = await getChatImage(picId)
+    /* 读不回来就照常发文字 —— 整轮失败比"少一张图"更糟 */
+    if (rec) images = [await blobToDataURL(rec.blob)]
+  }
+
+  const ctrl = new AbortController()
+  chatControllers.set(id, ctrl)
+  chatBusy.value = { ...chatBusy.value, [id]: true }
+
+  /* 先摆一条空的助手消息占位,增量往它身上长。不这么做的话字会先攒在一个
+     局部变量里、等说完才一次性冒出来,那就不叫流式了。
+     注意:要从 chatMessages 里取回**响应式代理**再改 ——
+     手里那个原始对象改得再勤也不会触发渲染 */
+  pushChatMessage(id, {
+    id: uid(),
+    charId: id,
+    role: 'assistant',
+    content: '',
+    createdAt: Date.now()
+  })
+  const replyList = chatMessages.value[id] || []
+  const reply = replyList[replyList.length - 1]
+
+  let stopped = false
+  let failure = ''
+  /* 上游为什么停下。'length' 表示它撞上了 max_tokens —— 见下面收尾那一段 */
+  let finish = ''
+  /* 这一轮的情绪,由服务端从正文末尾剪下来单独给 */
+  let mood = ''
+  try {
+    const out = await chatStream({
+      character: chatPayloadOf(c),
+      messages: context,
+      /* 长期记忆随请求带上。它是"这一整段对话的状态",
+         与角色资料分开传 —— 同一个角色换一段对话,记忆不该跟着走 */
+      memory: chatSummary.value[id]?.text || '',
+      images,
+      cfg: useCfg,
+      signal: ctrl.signal,
+      onDelta: (delta) => {
+        if (reply) reply.content += delta
+      }
+    })
+    finish = out.finish
+    mood = out.mood
+  } catch (e) {
+    if (isAbort(e)) stopped = true
+    else failure = e instanceof Error ? e.message : 'Request failed'
+  } finally {
+    chatControllers.delete(id)
+    chatBusy.value = { ...chatBusy.value, [id]: false }
+  }
+
+  if (!reply) return
+  if (stopped) reply.stopped = true
+  /* 撞上 max_tokens —— 上游把话说到了额度上沿就停下。
+     与 stopped 分开记:那个是人按的,这个是模型的额度用完了。
+     不记的话前端看到的和"正常说完"一模一样,用户会以为角色话说一半是它自己的风格 */
+  else if (finish === 'length') reply.truncated = true
+  /* 情绪挂在这一条上。收在半截上时多半没有(标签本来就在末尾),
+     没有就不写 —— 界面上那枚小药丸宁可不出,也不要显示一个错的 */
+  if (mood) reply.mood = mood
+  if (!reply.content.trim() && !stopped) {
+    /* 一个字都没收到(上游出错,或它真的什么都没说):
+       把这条空壳摘掉,免得消息流里留一个空气泡。
+       摘掉之后最后一条又回到用户那句 —— 界面上因此会给出"重试",
+       它走的就是 regenerateChat(见那边的注释) */
+    chatMessages.value = {
+      ...chatMessages.value,
+      [id]: (chatMessages.value[id] || []).filter((m) => m.id !== reply.id)
+    }
+    // 左栏那行还停在上一次的回复上,说明这一轮没留下东西:让它退回去
+    dropChatLast(id)
+    void loadChatLast()
+  } else {
+    // 落盘要交原始对象:reactive 代理进不了 IndexedDB 的 structuredClone
+    await putChatMessage({ ...toRaw(reply) })
+    setChatLast(id, { ...toRaw(reply) })
+  }
+  if (stopped) notice.value = 'Stopped.'
+  else if (failure) notice.value = failure
+  /* 收尾之后顺手看一眼要不要压记忆。放在最末是有意的:
+     它是后台整理,不该挡在用户看到回复之前,也不该挤进上面那两句提示 */
+  void maybeSummarize(id)
+}
+
+/** 发一句。先把用户那句落进去,再连同它一起发 ——
+ *  不加这一步,模型看不到这次问的到底是什么 */
+async function sendChat(id: string, body: string, image?: Blob) {
+  if (chatBusy.value[id]) return
+  /* 先把图落库,再把 id 挂到消息上。顺序不能反 ——
+     反过来写的话,中途失败会留下一条指着不存在图片的消息 */
+  let imageId = ''
+  if (image) {
+    imageId = uid()
+    try {
+      await putChatImage({ id: imageId, blob: image, createdAt: Date.now() })
+    } catch {
+      /* 存不下就别把 id 挂上去:那会是一条永远显示不出图的记录,
+         用户还以为是图坏了 */
+      imageId = ''
+      notice.value = 'Could not save that image — sending the message without it.'
+    }
+  }
+  const mine: ChatMessage = {
+    id: uid(),
+    charId: id,
+    role: 'user',
+    content: body,
+    createdAt: Date.now(),
+    ...(imageId ? { imageId } : {})
+  }
+  if (!mine.content.trim() && !mine.imageId) return
+  pushChatMessage(id, mine)
+  await putChatMessage(mine)
+  // 左栏那行摘要跟着这一句走 —— 不必为此重读一遍库
+  setChatLast(id, mine)
+  await runChat(id)
+}
+
+/** 重新生成:删掉最后那条助手消息再发一次。**用户那句不动** ——
+ *  要重来的是它的回答,不是让用户再说一遍 */
+async function regenerateChat(id: string) {
+  if (chatBusy.value[id]) return
+  const list = chatMessages.value[id] || []
+  const last = list[list.length - 1]
+  if (!last) return
+  /* 最后一条是助手消息 ⇒ 说了一半想重来,先把它删掉(用户那句留着)。
+     是用户消息 ⇒ 上一轮压根没答上来(runChat 失败时会把空壳删掉),
+     那就什么都不用删,直接重发。两种情况共用这一个入口,
+     所以"报错之后重试"不需要另写一条链路 */
+  if (last.role === 'assistant') {
+    /* 这条正要被删掉,它可能还在念 —— 念着一条已经不存在的消息没有道理。
+       (不在这里停也不算错:新的回复开始念时会掐掉它,但那中间有几秒) */
+    stopSpeaking()
+    await deleteChatMessage(last.id)
+    chatMessages.value = { ...chatMessages.value, [id]: list.slice(0, -1) }
+    /* 左栏那行摘要可能就是这一条,得跟着回退到上一条 */
+    const prev = list[list.length - 2]
+    if (prev) setChatLast(id, prev)
+    else dropChatLast(id)
+  }
+  await runChat(id)
+}
+
+function stopChat(id: string) {
+  chatControllers.get(id)?.abort()
+}
+
+/** 清空一个角色的对话。走撤销条 —— 与删除角色、清空历史同一套规矩:
+ *  说没就没的东西得留一条退路 */
+function clearChat(id: string) {
+  const list = chatMessages.value[id] || []
+  const beforeSummary = chatSummary.value[id]
+  const beforeLast = chatLast.value[id]
+  if (!list.length && !beforeSummary) return
+  // 正在说话的先掐掉,否则它会往上文里补一句刚落空的消息
+  chatControllers.get(id)?.abort()
+  /* 正在念的那句也一起停:它念的正是一条马上就不存在的消息 */
+  stopSpeaking()
+  /* 也让在途的压缩作废:它回来时这段对话已经不是原来那段了 */
+  bumpChatSeq(id)
+  const before = list.map((m) => ({ ...toRaw(m) }))
+  // 清空之后前面当然没有更早的了,顺手把"加载更早"收掉
+  const hadMore = !!chatHasMore.value[id]
+  chatMessages.value = { ...chatMessages.value, [id]: [] }
+  chatHasMore.value = { ...chatHasMore.value, [id]: false }
+  /* 记忆必须跟着一起清 —— 消息没了而记忆还留着,下一句开口就会提起
+     一段用户刚刚清掉的旧事,那比失忆更糟 */
+  const sumRest = { ...chatSummary.value }
+  delete sumRest[id]
+  chatSummary.value = sumRest
+  // 左栏那行也得跟着空掉,不然它还挂着一段已经不存在的对话
+  dropChatLast(id)
+  scheduleUndo({
+    label: 'Conversation cleared',
+    undo: () => {
+      chatMessages.value = { ...chatMessages.value, [id]: before }
+      chatHasMore.value = { ...chatHasMore.value, [id]: hadMore }
+      if (beforeSummary) chatSummary.value = { ...chatSummary.value, [id]: beforeSummary }
+      if (beforeLast) setChatLast(id, beforeLast)
+      /* 撤销要立刻落盘:窗口里别的操作可能已经把"它是空的"写进去了 */
+      void (async () => {
+        await deleteChatOf(id)
+        for (const m of before) await putChatMessage(m)
+        if (beforeSummary) await putChatSummary(beforeSummary)
+      })()
+    },
+    purge: () => {
+      /* 附过的图也跟着走(与 deleteChar 同一处说明)。
+         这里用它开头取的那份 list —— purge 执行时 chatMessages 里
+         那一份已经被清空了,问不出来 */
+      for (const m of list) {
+        if (m.imageId) void deleteChatImage(m.imageId)
+      }
+      void deleteChatOf(id)
+    }
+  })
+}
+
+// 进对话页时确保手上有一个角色
+watch(page, (p) => {
+  if (p === 'chat') ensureChatChar()
+})
+
+/* 角色是异步读进来的:进页面那一刻可能还没到,挑出来的是空。
+   角色到位(或列表长度变了)时补挑一次 —— 否则明明有角色,
+   对话页却一直停在"挑一个"的空态上 */
+watch(
+  () => characters.value.length,
+  () => {
+    if (page.value === 'chat') ensureChatChar()
+  }
+)
 
 /* 角色最多并进几张参考图。再多上游多半不认,而请求体会迅速变大 */
 const MAX_CHAR_REFS = 4
@@ -1720,7 +2680,9 @@ async function doGenerate() {
     return
   }
   if (!configured()) {
-    fail('Set an API base URL in Settings first')
+    /* 用 notice 而不是 fail:这条路径紧接着就跳到设置页,而 fail 写的是 home
+       那条 .err —— 页面已经切走,提示留在不渲染的 DOM 里等于没提示 */
+    notice.value = 'Set an API base URL in Settings first'
     openConfigManager()
     return
   }
@@ -1802,15 +2764,21 @@ async function runBatch(slots: GenSlot[]) {
   error.value = ''
   notice.value = ''
   canRetry.value = false
+  /* 跑的是 genSlots 里那份响应式代理,而不是传进来的本地数组。
+     ref 的深层代理只在**读取**时才套上,而 runSlot 直接改原对象的
+     state / results —— 不经过 set trap,逐格的完成与失败就不会触发渲染,
+     整批跑完才一起变(点掉一张的停止键,那格骨架会一直转到最后)。
+     按 id 取回代理,顺序与 slots 一致,下面 persistBatch 照旧读原数组 */
+  const ids = new Set(slots.map((s) => s.id))
+  const live = genSlots.value.filter((s) => ids.has(s.id))
   try {
     /* 上限内并发 —— 既不串成一条长队(多张的总耗时等于各张之和),
        也不一次性全丢出去(自己把自己限流) */
-    await runWithLimit(slots, SLOT_CONCURRENCY, runSlot)
+    await runWithLimit(live, SLOT_CONCURRENCY, runSlot)
   } finally {
     await persistBatch(slots)
     /* 结束的槽立刻撤出图墙:留下的只有图和提示。
        骨架格一直挂在那儿会让人以为还在跑 */
-    const ids = new Set(slots.map((s) => s.id))
     genSlots.value = genSlots.value.filter((s) => !ids.has(s.id))
   }
   reportBatch(slots)
@@ -1999,7 +2967,10 @@ async function doRace() {
     openPanel.value = 'config'
     return
   }
-  const runPrompt = prompt.value
+  /* 与单模型那条路一致:套了角色就得把角色设定合成进去。
+     下面参考图与 characterId 都照常备着,提示词少了这一段的话,
+     出的图不像这个角色,记录却声称用了它 —— 预览里重跑还会再错一次 */
+  const runPrompt = composedPrompt()
   const refSrc = refImage.value
   /* 角色在对比出图里同样要并进去:那是另一条链路,参考图得在这儿另做一份快照 */
   const refList: string[] = []
@@ -2211,7 +3182,7 @@ function usePreviewPrompt(p: ReuseParams) {
      不还原它,重跑用的其实是当前生效的那个:换了模型却以为是在同一张图上微调。
      配置已被删掉时保持当前这条,但要说一声,别让人以为还原成了 */
   if (p.configId && p.configId !== config.value.id) {
-    const c = configs.value.find((x) => x.id === p.configId && x.kind !== 'text')
+    const c = configs.value.find((x) => x.id === p.configId && x.kind !== 'text' && x.kind !== 'vision')
     if (c) activateConfig(c)
     else notice.value = 'The model this image used is no longer in your configs — using the current one.'
   }
@@ -2352,17 +3323,42 @@ function createCollection(title: string): string {
   return c.id
 }
 
-/** 删除作品集:目录里摘掉,并把它名下所有记录的归属一并清掉、落盘。
-    清掉归属之后那些记录就重新可以被自动清理 —— 这是删作品的预期语义 */
+/** 删除作品集:目录里摘掉,并把它名下所有记录的归属一并清掉。
+    清掉归属之后那些记录就重新可以被自动清理 —— 这是删作品的预期语义。
+
+    与别处的删除同一套:立刻生效、几秒内可撤销,真正落盘发生在窗口结束时。
+    这里是全站唯一一处点了就不可反悔的删除,而它一按就解除了 pruneHistory
+    对这批记录的豁免 —— 用户特意归拢好的作品可能就被自动清理掉了 */
 function deleteCollection(id: string) {
+  const at = collections.value.findIndex((c) => c.id === id)
+  if (at < 0) return
+  const gone = collections.value[at]
+  /* 摘归属之前先把受影响的记录记下来:撤销时要原样还回去。
+     摘掉归属只动内存,写盘推迟到窗口结束 —— 窗口里撤销回来不必再读一次库 */
+  const detached = history.value.filter((h) => h.collectionId === id)
   collections.value = collections.value.filter((c) => c.id !== id)
   saveCollections(collections.value)
-  for (const h of history.value) {
-    if (h.collectionId === id) {
-      delete h.collectionId
-      saveHistoryRecord(toRaw(h))
+  for (const h of detached) delete h.collectionId
+  scheduleUndo({
+    label: 'Collection deleted',
+    undo: () => {
+      // 放回原来的位置:目录顺序有意义(最近建的在前)
+      collections.value = [
+        ...collections.value.slice(0, Math.min(at, collections.value.length)),
+        gone,
+        ...collections.value.slice(Math.min(at, collections.value.length))
+      ]
+      saveCollections(collections.value)
+      for (const h of detached) {
+        h.collectionId = id
+        saveHistoryRecord(toRaw(h))
+      }
+    },
+    // 窗口结束才算真删:这时才把"归属已摘掉"落盘
+    purge: () => {
+      for (const h of detached) saveHistoryRecord(toRaw(h))
     }
-  }
+  })
 }
 
 /** 把预览里当前这条记录挂到某个作品集下(collectionId 为空串即摘出)。
@@ -2385,7 +3381,7 @@ function createAssignCollection(title: string) {
 </script>
 
 <template>
-  <div class="shell">
+  <div class="shell" :class="{ 'shell-wide': page === 'chat' }">
     <!-- 品牌 + 视图切换 + 全局操作 -->
     <!-- 顶部横条:字标、导航与主题开关都在最顶层,每一页都在(画布页也不例外),
          切页时相对位置不动。
@@ -2431,7 +3427,9 @@ function createAssignCollection(title: string) {
         </header>
 
         <div class="composer">
-          <div class="prompt-box">
+          <!-- 改写中整块输入框走等待态:呼吸光晕(见 style.css 的 .halo-breathe)。
+               原来这段时间里只有改写按钮上的字变了,输入框本身毫无动静 -->
+          <div class="prompt-box" :class="{ 'halo-breathe': enhancing }">
             <!-- 一、输入区(横线上方) -->
             <div class="compose-zone">
               <!-- 改写期间只读:改写结果要整体覆盖回来,中途改字会和它打架。
@@ -2621,6 +3619,21 @@ function createAssignCollection(title: string) {
                         {{ c.name || 'Untitled config' }}
                       </button>
                     </div>
+                    <!-- 识图模型:与上面那条同构。它不进"这次跑哪几个模型"的选择集合,
+                         只在角色向导里读参考图 —— 所以是单选 -->
+                    <div v-if="visionConfigs.length" class="pp-group">
+                      <span class="pp-label"><PhEye class="pp-label-ico" aria-hidden="true" />Vision model</span>
+                      <button
+                        v-for="c in visionConfigs"
+                        :key="c.id"
+                        class="preset"
+                        :class="{ on: visionConfig?.id === c.id }"
+                        :title="`${c.baseUrl}${c.model ? ' · ' + c.model : ''}`"
+                        @click="activateVisionConfig(c)"
+                      >
+                        {{ c.name || 'Untitled config' }}
+                      </button>
+                    </div>
                     <!-- 一条都没有时给一个入口;有配置时只管切换,管理走顶部齿轮 -->
                     <div v-if="!configs.length" class="pp-group">
                       <span class="pp-note">No saved configs</span>
@@ -2778,7 +3791,17 @@ function createAssignCollection(title: string) {
                     <div class="pp-group">
                       <span class="pp-label"><PhImageSquare class="pp-label-ico" aria-hidden="true" />Reference</span>
                       <template v-if="!refImage">
-                        <label class="ref-pick" for="ref-file">+ Choose a reference image</label>
+                        <!-- label 不在 Tab 序里,键盘用户进不来:补上焦点与两个激活键。
+                             样式不另加 —— .ref-pick 自己的 :focus-visible 已经在管描边 -->
+                        <label
+                          class="ref-pick"
+                          for="ref-file"
+                          tabindex="0"
+                          role="button"
+                          @keydown.enter.prevent="pickRef"
+                          @keydown.space.prevent="pickRef"
+                          >+ Choose a reference image</label
+                        >
                       </template>
                       <template v-else>
                         <img class="pp-thumb" :src="refImage" alt="Reference image" />
@@ -2791,7 +3814,7 @@ function createAssignCollection(title: string) {
               </div>
             </div>
 
-            <input id="ref-file" type="file" accept="image/*" hidden @change="onPickRef" />
+            <input ref="refInputEl" id="ref-file" type="file" accept="image/*" hidden @change="onPickRef" />
           </div>
 
           <!-- 报错:默认收成一行,过长才给「详情」;真失败过才给「重试」 -->
@@ -2919,6 +3942,8 @@ function createAssignCollection(title: string) {
         :works="charWorks"
         :busy="charViewBusy"
         :text-config="textConfig || undefined"
+        :vision-config="visionConfig || undefined"
+        :tts-config="ttsConfig || undefined"
         @save="saveCharFromPage"
         @remove="deleteChar"
         @duplicate="duplicateChar"
@@ -2930,6 +3955,33 @@ function createAssignCollection(title: string) {
         @generate-all="genRemainingViews"
         @stop-view="stopCharView"
         @preview="openPreview"
+        @chat="openChat"
+      />
+
+      <!-- 角色对话。与角色页是同一个对象的两个面:一个造它,一个跟它说话 -->
+      <ChatPage
+        v-else-if="page === 'chat'"
+        :characters="characters"
+        :messages="chatMessages"
+        :last-msg="chatLast"
+        :busy="chatBusy"
+        :active="chatCharId"
+        :has-more="!!chatHasMore[chatCharId]"
+        :summary="chatSummary[chatCharId]"
+        :text-config="textConfig || undefined"
+        :vision-config="visionConfig || undefined"
+        :tts-config="ttsConfig || undefined"
+        @select="chatCharId = $event"
+        @send="sendChat"
+        @stop="stopChat"
+        @regenerate="regenerateChat"
+        @edit-summary="editChatSummary"
+        @forget-summary="forgetChatSummary"
+        @notice="notice = $event"
+        @clear="clearChat"
+        @load-earlier="loadEarlierChat"
+        @goto-chars="page = 'chars'"
+        @goto-settings="page = 'settings'"
       />
 
       <!-- 历史记录 -->
@@ -2954,11 +4006,15 @@ function createAssignCollection(title: string) {
         :configs="configs"
         :active-id="activeId"
         :active-text-id="activeTextId"
+        :active-vision-id="activeVisionId"
+        :active-tts-id="activeTtsId"
         :mode="cfgView"
         :seed="cfgSeed"
         :capability-note="capabilityNote"
         @activate="activateConfig"
         @activate-text="activateTextConfig"
+        @activate-vision="activateVisionConfig"
+        @activate-tts="activateTtsConfig"
         @edit="editConfig"
         @duplicate="duplicateConfig"
         @remove="removeConfig"
@@ -3055,6 +4111,60 @@ function createAssignCollection(title: string) {
   max-width: 1080px;
   margin: 0 auto;
   padding: 0 clamp(16px, 4vw, 40px) 64px;
+}
+/* 对话页例外:它是"一块要一直待着的面板",不是一栏内容 ——
+   1080px 的居中栏留给别的页面(那些页是"读一段、做一件事"),
+   而这里左右各空出一大片、对话挤在中间,看着就像没铺满。
+   仍然留一个上限:超宽屏上把消息挤在两千多像素中间的空白里同样不好看 ——
+   两侧说话的人离得太远,一句话要横跨半个屏幕才接得上。
+
+   左右内边距**另给一档**,和下面那道缝取同一个数。
+   别的页面那个 clamp(16px, 4vw, 40px) 是给"读一段就走"的排版留的呼吸,
+   而这一页要的是"贴边铺开" —— 面板四周该是同一圈留白,
+   三边 16px、一边 40px 看着就是没对齐。
+   下面那 16px 不在 padding 里,它挪进了 .chat 的高度算式(见那边的注释),
+   所以这三个数是一对:改这里要连着改那两处。
+   只覆盖左右:上下各有各的账,用 padding 简写会把它们一起冲掉。
+
+   底下那 64px 也归零:那是按"读完一段就走"的页面留的,
+   对一块要占满视口的面板来说,它只是在底下空出一条。
+   底部那点余量改由下面 height 里留出的 16px(--sp-4)承担 ——
+   与 ChatPage 里那条高度算式是一对,改一个要改另一个。
+
+   **锁死一屏**:这一页整页不该出现滚动。
+   它的高度算式里有一项是 JS 量出来的顶栏高度(offsetHeight,取整到像素),
+   末位对不上就会多出不到 1px;而 html 上挂着 scroll-behavior: smooth、
+   滚动条又被全局隐藏(见 style.css),那点溢出既看不见滚动条、又能用触控板滑出来,
+   手感正是"整页在滑"。与其去追那不到 1px,不如把这一页钉住:
+   height 钉到视口,多出来的直接裁掉。
+   注意 height 走 border-box,已含内边距,所以内容正好差 16px 落在那条余量上 */
+.shell-wide {
+  /* 1760 而不是 1600:1600 在 16 寸 Mac(1728)这类屏上已经开始居中留边,
+     而那部分留白和 padding 叠在一起,看着就是"又白了一条"。
+     1760 撑住这一档常见的宽屏;再往上的超宽屏仍然收在中间,
+     否则两侧气泡会离得太远 */
+  max-width: 1760px;
+  /* 与 .chat 算式里那道底部余量同一个数(--sp-4)——
+     面板四周是同一圈留白。下面那处不在这里,别忘了改的时候连它一起改 */
+  padding-left: var(--sp-4);
+  padding-right: var(--sp-4);
+  padding-bottom: 0;
+  height: 100vh;
+  height: 100dvh;
+  /* 用 clip 而不是 hidden:hidden 会把 .shell 变成滚动容器,
+     而聚焦底部那个输入框时浏览器可能把它滚一下 —— 整页跟着挪,
+     就又成了"滑一下"。clip 只裁切、不产生滚动容器,也就不可能被滚。
+     老浏览器不认 clip 时退回 hidden */
+  overflow: hidden;
+  overflow: clip;
+}
+/* 屏确实太矮时(与 .chat 的 min-height: 420px 同一条理由):
+   宁可让整页滚,也不要压成一条缝。这时把上面那把锁解开 */
+@media (max-height: 520px) {
+  .shell-wide {
+    height: auto;
+    overflow: visible;
+  }
 }
 
 .masthead {
@@ -3333,11 +4443,15 @@ function createAssignCollection(title: string) {
   box-shadow: var(--sh-float);
   display: flex;
   flex-direction: column;
-  /* 光晕用更长的时长淡入淡出,避免收放时显得突兀 */
-  transition: border-color var(--dur) var(--ease), box-shadow 340ms var(--ease);
+  /* 光晕用更长的时长淡入淡出,避免收放时显得突兀。
+     边框不参与过渡:这两态里它始终是那条 --line */
+  transition: box-shadow 340ms var(--ease);
 }
+/* 聚焦只亮光晕,不给边框上色:这一圈由内向外渗出的柔光已经说清了
+   "焦点在这儿",再把边框描深一道只是把同一件事说了两遍,
+   而且描深之后框里那层"可以随便写字"的感觉会收紧。
+   于是边框自始至终就是那一条 --line */
 .prompt-box:focus-within {
-  border-color: color-mix(in oklch, var(--accent) 34%, var(--line));
   box-shadow:
     var(--sh-float),
     /* 漫反射:由内向外 4 层递减柔光,越往外越淡,层间无可见边界 */
@@ -3370,12 +4484,25 @@ function createAssignCollection(title: string) {
   border-radius: 0;
   background: transparent;
   box-shadow: none;
+  transition: opacity 220ms var(--ease);
 }
 .prompt-box textarea:focus,
 .prompt-box textarea:focus-visible {
   border: none;
   box-shadow: none;
   outline: none;
+}
+/* 改写中的那几行旧字正被整段换掉:压暗它,一来明说"这会儿先别读这段",
+   二来给"换完了"一个可见的落点 —— 结果写回时它跟着亮回去。
+   只压暗不隐藏:输入框还是那个输入框,不该看成被禁用了 */
+.prompt-box.halo-breathe textarea {
+  opacity: 0.45;
+}
+/* AI 在写的时候那圈金光是主角。点改写键会把焦点留在框里,
+   于是聚焦那套墨色漫反射也亮着 —— 墨色垫在金底下会把它拖脏,
+   所以这段时间让它歇着,只留投影(边框照旧不动) */
+.prompt-box.halo-breathe:focus-within {
+  box-shadow: var(--sh-float);
 }
 /* 二、参数 icon 行(横线下方) */
 .param-bar {

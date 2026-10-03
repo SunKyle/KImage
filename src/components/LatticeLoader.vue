@@ -120,7 +120,9 @@ function startClock() {
 }
 
 onMounted(startClock)
-watch(() => [props.status, props.elapsed], startClock)
+// 两个来源分开列:写成 () => [a, b] 每次求值都返回新数组,
+// 依赖读起来像"这个数组",而它其实什么都不是
+watch([() => props.status, () => props.elapsed], startClock)
 onBeforeUnmount(() => {
   if (ticker !== undefined) clearInterval(ticker)
 })

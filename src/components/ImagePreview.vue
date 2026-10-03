@@ -153,8 +153,11 @@ const entryIndex = computed(() => {
 })
 const canGoUp = computed(() => entryIndex.value > 0)
 const canGoDown = computed(() => entryIndex.value >= 0 && entryIndex.value < props.items.length - 1)
-/** 沿历史列表上下移动:history 是最新在前,所以 -1 是更新的那条 */
+/** 沿历史列表上下移动:history 是最新在前,所以 -1 是更新的那条。
+ *  当前这条已经不在列表里时(entryIndex 为 -1)先退出 —— 拿 -1 去加步长,
+ *  会算出 items[0],也就是"翻到最新那条",而用户其实什么都没按 */
 function goEntry(step: number) {
+  if (entryIndex.value < 0) return
   const next = props.items[entryIndex.value + step]
   if (next) emit('navigate', next)
 }
@@ -163,10 +166,14 @@ function close() {
   emit('close')
 }
 
+/* 一张图都没有时不动:取余的分母是 0,active 会变成 NaN,
+   之后 imgs[NaN] 取不到东西,整块图区空着也说不清为什么 */
 function prev() {
+  if (!imgs.value.length) return
   active.value = (active.value - 1 + imgs.value.length) % imgs.value.length
 }
 function next() {
+  if (!imgs.value.length) return
   active.value = (active.value + 1) % imgs.value.length
 }
 
@@ -262,16 +269,35 @@ function trapTab(e: KeyboardEvent) {
   const first = els[0]
   const last = els[els.length - 1]
   const cur = document.activeElement as HTMLElement | null
+  /* 容器本身也是一个起点:打开时焦点是被主动放在它上面的(见面板那处 tabindex)。
+     两个方向都得认它 —— 只认 first 的话,第一次正向 Tab 会从容器直接走出去,
+     而它被 teleport 到 body 末尾,后面没有可聚焦的元素了 */
+  const atBox = cur === panelEl.value
   if (e.shiftKey) {
-    if (cur === first || cur === panelEl.value) {
+    if (cur === first || atBox) {
       e.preventDefault()
       last.focus()
     }
-  } else if (cur === last) {
+  } else if (cur === last || atBox) {
     e.preventDefault()
     first.focus()
   }
 }
+
+/** 焦点是不是在一个能打字的地方。进到这里说明不是 Esc、也不是 Tab ——
+ *  那剩下的方向键就该归输入框:左右是移光标,上下更糟 ——
+ *  它会顺着历史翻到下一条,连带把刚敲的名字与输入态一起清掉 */
+function isTyping(e: KeyboardEvent) {
+  const t = e.target as HTMLElement | null
+  return (
+    !!t &&
+    (t.tagName === 'INPUT' ||
+      t.tagName === 'TEXTAREA' ||
+      t.tagName === 'SELECT' ||
+      t.isContentEditable)
+  )
+}
+
 // 键盘:左右翻本条的多张图,上下翻历史记录;Esc 分两级,Tab 锁在弹层内
 function onKey(e: KeyboardEvent) {
   if (!props.visible) return
@@ -282,6 +308,7 @@ function onKey(e: KeyboardEvent) {
       collNewTitle.value = ''
     } else close()
   } else if (e.key === 'Tab') trapTab(e)
+  else if (isTyping(e)) return
   else if (e.key === 'ArrowLeft') prev()
   else if (e.key === 'ArrowRight') next()
   else if (e.key === 'ArrowUp') {
@@ -312,6 +339,9 @@ function saveToLibrary() {
   const e = props.entry
   // 空提示词存进去没有意义(主界面也会拦下),这里同样不报「已存」
   if (!e || !e.prompt.trim()) return
+  /* 回执亮着的那一秒里连点会往库里写第二条一模一样的:那不是"再存一次",
+     是同一次点击落了两下 */
+  if (saved.value) return
   emit('favorite', {
     prompt: e.prompt,
     // 模型也带上:库里没有它,卡片就只能显示参数,看不出这张是谁出的
@@ -793,8 +823,8 @@ watch(collAdding, async (v) => {
 }
 /* 图盒按出图比例收缩:高度吃掉缩略图行以外的可用空间,宽度由 aspect-ratio 推出。
    max-width 兜住超宽图。
-   圆角落在 img 上,而不是靠 overflow:hidden 裁盒子 —— 左上角的操作条与它的
-   「…」菜单要能探出图盒,裁掉就点不到了 */
+   圆角落在 img 上而不是靠 overflow:hidden 裁盒子:裁掉的话图片边缘会被切出一道
+   和卡片圆角不重合的直角 */
 .img-wrap {
   position: relative;
   flex: 1 1 auto;

@@ -1,3 +1,5 @@
+import type { ChatImage, ChatMessage, ChatSummary } from '../types'
+
 // 极简 IndexedDB 封装:用来持久化历史记录与提示词封面(比 localStorage 容量大得多)
 const DB_NAME = 'kimage.db'
 const STORE = 'history'
@@ -12,6 +14,28 @@ const CHAR_STORE = 'chars'
 /* 角色的设定图与主参考图共用一个 store:
    主图 key 是裸的角色 id(启动时要读它),视图 key 是 `${角色id}:${视图}`(按需取) */
 const VIEW_SEP = ':'
+/* 角色对话的消息。一期一个角色一条连续对话,所以按 charId 建索引就够了 ——
+   将来要开多段会话时再加 sessionId,并在这里补一条兼容读 */
+const CHAT_STORE = 'chat_messages'
+/* 对话的长期记忆(滑出窗口的消息压成的一段简报)。
+   一个角色一条,keyPath 直接是 charId —— 它是"这一整段对话的当前状态",
+   不是按条存的东西,所以不需要索引。
+   (有一个中间版本把它换成了 sessionId,改动已撤回,但那个版本可能已经把库升了上去。
+    这里不去改表结构 —— 那要整表重建,失败会让库彻底打不开。
+    读与写各自兼容两种形状:见 getChatSummary 与 putChatSummary) */
+const SUMMARY_STORE = 'chat_summaries'
+/* 朗读用的音频缓存。**这不是优化,是这个功能能不能用的前提** ——
+   接了第三方 TTS 之后每合成一句都按字符计费,而"再听一遍"是聊天里最自然的动作。
+   缓存键里已经含了文本与音色指纹(见 api.ts 的 ttsCacheKey),所以改一句描述
+   就不会命中旧的音频 */
+const TTS_STORE = 'tts_cache'
+/* 声音克隆用的样本音频。它是这一块唯一的二进制资产 ——
+   Blob 进不了 localStorage,与设定图(vs charViews)同一条路 */
+const VOICE_SAMPLE_STORE = 'voice_samples'
+/* 聊天里用户附的图。**与消息分开存** —— 消息要一次读一整屏(几十条),
+   而图一条就是几百 KB:混在一张表里,"读这一屏消息"就变成"顺便把
+   这些图全拖进内存"。消息上只留一个 id(见 types.ts 的 ChatMessage.imageId) */
+const CHAT_IMAGE_STORE = 'chat_images'
 /* ===== 历史容量 =====================================================
    不按固定条数淘汰,而是看浏览器给的配额:只有占用接近上限时才清理最旧的一批。
    固定条数会在空间还很宽裕时就静默删记录,而每条记录的体积差很多,
@@ -36,9 +60,17 @@ export interface PruneResult {
   usageRatio: number
 }
 
+/* ===== 库版本。**只能往上加,永远不要改小** ========================
+   IndexedDB 的版本只能升不能降。代码里的号比库里的小时,open 会直接失败
+   (VersionError),而这个失败会被每一处调用 catch 成"读不出来" ——
+   在用户眼里就是"我的图、我的历史全没了",而数据其实一条都没少。
+   所以哪怕这一次没有任何结构要改,号该加也得加。
+   ------------------------------------------------------------------ */
+const DB_VERSION = 11
+
 function openDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, 4)
+    const req = indexedDB.open(DB_NAME, DB_VERSION)
     req.onupgradeneeded = () => {
       const db = req.result
       const tx = req.transaction
@@ -57,9 +89,69 @@ function openDB(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains(CHAR_STORE)) {
         db.createObjectStore(CHAR_STORE, { keyPath: 'id' })
       }
+      // v5 新增:角色对话的消息
+      if (!db.objectStoreNames.contains(CHAT_STORE)) {
+        const chat = db.createObjectStore(CHAT_STORE, { keyPath: 'id' })
+        /* 按角色取消息、按角色清消息都靠它。
+           没有它就得全表读出来再筛,而消息是只增不减的那一类 */
+        chat.createIndex('charId', 'charId')
+      }
+      /* v6 新增:对话消息的复合索引。
+         v5 那条只能按 charId 取全部,而对话页要的是**最近这些条** ——
+         有了 (charId, createdAt) 才能开一个游标从最新往回走,
+         走够一屏就停,不必把这个角色几千条历史整个读进内存 */
+      if (db.objectStoreNames.contains(CHAT_STORE)) {
+        const chat = tx.objectStore(CHAT_STORE)
+        if (!chat.indexNames.contains('charIdCreated')) {
+          chat.createIndex('charIdCreated', ['charId', 'createdAt'])
+        }
+      }
+      /* v7 新增:对话的长期记忆。一个角色一条,keyPath 直接是 charId ——
+         它是"这一整段对话的当前状态",不是按条存的东西 */
+      if (!db.objectStoreNames.contains(SUMMARY_STORE)) {
+        db.createObjectStore(SUMMARY_STORE, { keyPath: 'charId' })
+      }
+      /* v9:把 v8 那次留下的痕迹收拾掉。
+         v8 那个号被写出来过(多段会话的改动,已撤回),可能已经把库升了上去,
+         而它给对话消息挂了一条没人问的会话索引。摘掉即可 ——
+         索引是同步的结构操作,不存在重建表那种中途失败的风险。
+         判断是幂等的:库里没有这条索引时什么都不做 */
+      if (db.objectStoreNames.contains(CHAT_STORE)) {
+        const chat = tx.objectStore(CHAT_STORE)
+        if (chat.indexNames.contains('charIdSessionCreated')) {
+          chat.deleteIndex('charIdSessionCreated')
+        }
+      }
+      /* 注意这里**不去碰** chat_summaries。
+         v8 把它的主键从 charId 换成了 sessionId,要改回去只能整表删掉重建 ——
+         在那个升级事务里做这种操作,Safari 上是有失败风险的,
+         而一旦失败整个升级事务回滚,库就卡在 8 打不开了(正是这次事故的形状)。
+         换一条路:表形状不动,把兼容放在写入处(见 putChatSummary),
+         两种形状都能读写,于是这里什么都不用做 */
+      /* v10 新增:朗读的音频缓存、声音克隆的样本。
+         一个是纯派生物(删了什么都不会丢),一个是唯一原件(删了就真没了),
+         所以分开两张表 —— 清理缓存时的批量删除不该有机会碰到样本 */
+      if (!db.objectStoreNames.contains(TTS_STORE)) {
+        const tts = db.createObjectStore(TTS_STORE, { keyPath: 'key' })
+        // 淘汰最旧的一批时按它游走,不必把记录(含音频)读出来
+        tts.createIndex('createdAt', 'createdAt')
+      }
+      if (!db.objectStoreNames.contains(VOICE_SAMPLE_STORE)) {
+        db.createObjectStore(VOICE_SAMPLE_STORE, { keyPath: 'id' })
+      }
+      /* v11 新增:聊天里的附图(见 CHAT_IMAGE_STORE 的说明) */
+      if (!db.objectStoreNames.contains(CHAT_IMAGE_STORE)) {
+        db.createObjectStore(CHAT_IMAGE_STORE, { keyPath: 'id' })
+      }
     }
     req.onsuccess = () => resolve(req.result)
-    req.onerror = () => reject(req.error)
+    req.onerror = () => {
+      /* 版本号低于库里那个时会被直接拒掉。这种失败会顺着每一处 catch
+         变成"什么都没读到",界面上看就是"数据全没了" ——
+         所以至少在控制台留一句,别让它彻底无声 */
+      console.error('[idb] cannot open', DB_NAME, req.error)
+      reject(req.error)
+    }
   })
 }
 
@@ -259,6 +351,429 @@ export async function putCharView(charId: string, kind: string, data: Blob): Pro
     tx.oncomplete = () => resolve()
     tx.onerror = () => reject(tx.error)
   })
+}
+
+/* ===== 角色对话的消息 =====
+   只增不减的一类数据,所以不放进 localStorage(那里一共只有约 5MB):
+   几十轮对话就是几十上百 KB,塞进去迟早把它撑爆 */
+
+/** 一次读多少条。**这只是显示上限,不是删除** —— 更早的还在库里,
+ *  "加载更早"把这个数再往上抬一档。
+ *  200 条足够铺满好几屏,而一次性渲染几千个气泡会让页面直接卡住 */
+export const CHAT_PAGE = 200
+
+/**
+ * 读出某个角色**最近**的一段消息,按时间升序返回。
+ *
+ * 走 (charId, createdAt) 复合索引开一个倒着走的游标:取够 limit 条就停 ——
+ * 用 getAll 会把这个角色几千条历史整个读进内存,而界面一次只看得见一屏。
+ *
+ * hasMore 表示前面还有更早的没读。多取一条来判:拿到 limit + 1 条就说明
+ * 前面还有(那多出来的一条丢掉,不进返回值)。
+ */
+export async function getChatMessages(
+  charId: string,
+  limit = CHAT_PAGE
+): Promise<{ list: ChatMessage[]; hasMore: boolean }> {
+  try {
+    const db = await openDB()
+    const rows: ChatMessage[] = []
+    let hasMore = false
+    await new Promise<void>((resolve, reject) => {
+      const index = db
+        .transaction(CHAT_STORE, 'readonly')
+        .objectStore(CHAT_STORE)
+        .index('charIdCreated')
+      /* 时间戳作上下界:IDB 不认 Infinity,用 MAX_SAFE_INTEGER 当"直到最后" */
+      const range = IDBKeyRange.bound([charId, 0], [charId, Number.MAX_SAFE_INTEGER])
+      const req = index.openCursor(range, 'prev')
+      req.onsuccess = () => {
+        const cursor = req.result
+        if (!cursor) {
+          resolve()
+          return
+        }
+        if (rows.length >= limit) {
+          hasMore = true
+          resolve()
+          return
+        }
+        rows.push(cursor.value as ChatMessage)
+        cursor.continue()
+      }
+      req.onerror = () => reject(req.error)
+    })
+    // 游标是倒着走的,正回来才是对话的顺序
+    rows.reverse()
+    return { list: rows, hasMore }
+  } catch {
+    /* 读不出来就当没有:这个角色照常能开始一段新对话,
+       不该因为读盘失败整页打不开 */
+    return { list: [], hasMore: false }
+  }
+}
+
+/**
+ * 每个角色**最后一条**消息,一批角色一起取。
+ *
+ * 左栏要显示"最后说了什么"、还要按最近活跃排序,而消息是按角色懒加载的 ——
+ * 没打开过的角色一条都读不到,于是它一律显示 "No messages yet" 并排到最后:
+ * 明明聊过,看起来却像从没聊过。这个 bug 只在"聊过的角色不止一个"时才显形。
+ *
+ * 每个角色开一个倒着走的游标、只取第一条就停,而且全部开在同一个事务里并发跑 ——
+ * **代价与角色数成正比、与消息条数无关**,不会因为某个角色聊了几千轮而变慢。
+ */
+export async function getLastChatLine(charIds: string[]): Promise<Map<string, ChatMessage>> {
+  const out = new Map<string, ChatMessage>()
+  if (!charIds.length) return out
+  try {
+    const db = await openDB()
+    await new Promise<void>((resolve) => {
+      const tx = db.transaction(CHAT_STORE, 'readonly')
+      const index = tx.objectStore(CHAT_STORE).index('charIdCreated')
+      let pending = charIds.length
+      const done = () => {
+        if (--pending === 0) resolve()
+      }
+      /* 事务被打断时上面的 done 不一定跑满,得自己解绳 ——
+         否则这个 promise 永远悬着,左栏就一直停在加载态 */
+      tx.onabort = () => resolve()
+      for (const id of charIds) {
+        const range = IDBKeyRange.bound([id, 0], [id, Number.MAX_SAFE_INTEGER])
+        const req = index.openCursor(range, 'prev')
+        req.onsuccess = () => {
+          const cursor = req.result
+          if (cursor) out.set(id, cursor.value as ChatMessage)
+          done()
+        }
+        // 单个角色读不出来就跳过:少一行摘要不该让整条左栏空掉
+        req.onerror = done
+      }
+    })
+    return out
+  } catch {
+    return out
+  }
+}
+
+/** 追加一条消息。**流式过程中不逐块写** —— 只在整条回复收尾时落一次:
+ *  一次回复可能产生上百个增量,逐块写就是上百次事务,
+ *  而中途崩掉丢掉半句话,与"用户按了 Stop"在用户眼里没有区别 */
+export async function putChatMessage(msg: ChatMessage): Promise<void> {
+  const db = await openDB()
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(CHAT_STORE, 'readwrite')
+    tx.objectStore(CHAT_STORE).put(msg)
+    tx.oncomplete = () => resolve()
+    tx.onerror = () => reject(tx.error)
+  })
+}
+
+/** 删一条。重新生成时删掉最后那条助手消息用 */
+export async function deleteChatMessage(id: string): Promise<void> {
+  const db = await openDB()
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(CHAT_STORE, 'readwrite')
+    tx.objectStore(CHAT_STORE).delete(id)
+    tx.oncomplete = () => resolve()
+    tx.onerror = () => reject(tx.error)
+  })
+}
+
+/** 清掉某个角色的全部对话痕迹:消息 + 长期记忆。
+ *
+ *  两者必须一起走 —— 消息没了而记忆还留着,下一句开口就会提起一段
+ *  用户刚刚清掉的旧事,那比失忆更糟。所以放在同一个事务里,要么都清、要么都没清。 */
+export async function deleteChatOf(charId: string): Promise<void> {
+  const db = await openDB()
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction([CHAT_STORE, SUMMARY_STORE], 'readwrite')
+    const store = tx.objectStore(CHAT_STORE)
+    const keysReq = store.index('charId').getAllKeys(charId)
+    keysReq.onsuccess = () => {
+      for (const k of keysReq.result) store.delete(k)
+    }
+    tx.objectStore(SUMMARY_STORE).delete(charId)
+    tx.oncomplete = () => resolve()
+    tx.onerror = () => reject(tx.error)
+  })
+}
+
+/* ===== 对话的长期记忆 =====
+   滑出窗口的那些消息在这里留下痕迹。写它的是摘要那一步(见 App 的 maybeSummarize),
+   读它的有两处:拼 system 提示词,以及界面顶上那段可展开的"记忆" */
+
+/** 读出某个角色的记忆。读不出来(没压过 / 盘坏了 / 形状不对)一律当没有。
+ *
+ *  这里按 charId 查,而那个中间版本的表主键是 sessionId —— 两种形状下都对:
+ *  那张表里每条记录的 sessionId 就是它的 charId(见 putChatSummary),
+ *  所以 get(charId) 恰好落在同一条上。 */
+export async function getChatSummary(charId: string): Promise<ChatSummary | undefined> {
+  try {
+    const db = await openDB()
+    const row = await new Promise<ChatSummary | undefined>((resolve, reject) => {
+      const req = db.transaction(SUMMARY_STORE, 'readonly').objectStore(SUMMARY_STORE).get(charId)
+      req.onsuccess = () => resolve(req.result as ChatSummary | undefined)
+      req.onerror = () => reject(req.error)
+    })
+    /* 逐项收一遍:这是从盘上读回来的东西,形状不一定是当初写进去的那个。
+       covered / upToAt 是数字参与运算,一个 undefined 就能让"该不该压"
+       算成 NaN 并永远为假 —— 记忆从此再也不更新,而且不报错 */
+    if (
+      !row ||
+      typeof row.text !== 'string' ||
+      typeof row.upToId !== 'string' ||
+      typeof row.upToAt !== 'number' ||
+      typeof row.covered !== 'number'
+    ) {
+      return undefined
+    }
+    return row
+  } catch {
+    return undefined
+  }
+}
+
+export async function putChatSummary(rec: ChatSummary): Promise<void> {
+  const db = await openDB()
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(SUMMARY_STORE, 'readwrite')
+    /* 顺手补一个 sessionId。这张表的主键在正常形状下是 charId,
+       而有一个中间版本(见 openDB 里 v9 那段)把它换成了 sessionId。
+       主键是 sessionId 时,记录里缺这个字段会被 put 直接拒掉(DataError)——
+       于是记忆读得到、却再也写不进去,而且失败是静默的。
+       两种形状下这一句都无害:主键是 charId 时它就是个没人看的闲字段 */
+    tx.objectStore(SUMMARY_STORE).put({ ...rec, sessionId: rec.charId })
+    tx.oncomplete = () => resolve()
+    tx.onerror = () => reject(tx.error)
+  })
+}
+
+/** 这个角色一共有多少条消息。**只看索引、不读记录** ——
+ *  它唯一的用处是算"还有多少条没进摘要",没必要为此把消息捞出来 */
+export async function countChatMessages(charId: string): Promise<number> {
+  try {
+    const db = await openDB()
+    return await new Promise<number>((resolve, reject) => {
+      const req = db
+        .transaction(CHAT_STORE, 'readonly')
+        .objectStore(CHAT_STORE)
+        .index('charIdCreated')
+        .count(IDBKeyRange.bound([charId, 0], [charId, Number.MAX_SAFE_INTEGER]))
+      req.onsuccess = () => resolve(req.result)
+      req.onerror = () => reject(req.error)
+    })
+  } catch {
+    return 0
+  }
+}
+
+/**
+ * 取出"该压进摘要的那一段":从 afterAt 之后、**由旧到新**收 limit 条。
+ *
+ * 方向是关键。反过来(从最新的往回收)第一批会把最近那些还没摘要的消息
+ * 全吃掉,而更早的永远轮不到 —— 对话最开头那一段会被跳过一辈子,
+ * 而这个 bug 只在几百条之后才显形。
+ *
+ * 收多少条由调用方算:**总条数 − 最近要保留的条数 − 已覆盖的条数**。
+ * 这样算出来的边界正好落在"最近窗口"前面,窗口里的原话一句都不会被压掉。
+ */
+export async function getChatMessagesToSummarize(
+  charId: string,
+  afterAt: number,
+  limit: number
+): Promise<ChatMessage[]> {
+  if (limit <= 0) return []
+  try {
+    const db = await openDB()
+    const rows: ChatMessage[] = []
+    await new Promise<void>((resolve, reject) => {
+      const index = db
+        .transaction(CHAT_STORE, 'readonly')
+        .objectStore(CHAT_STORE)
+        .index('charIdCreated')
+      /* 左开:afterAt 那一条已经进过摘要了,不能重复压 */
+      const range = IDBKeyRange.bound(
+        [charId, afterAt],
+        [charId, Number.MAX_SAFE_INTEGER],
+        true,
+        false
+      )
+      const req = index.openCursor(range, 'next')
+      req.onsuccess = () => {
+        const cursor = req.result
+        if (!cursor || rows.length >= limit) {
+          resolve()
+          return
+        }
+        rows.push(cursor.value as ChatMessage)
+        cursor.continue()
+      }
+      req.onerror = () => reject(req.error)
+    })
+    return rows
+  } catch {
+    return []
+  }
+}
+
+/* ===== 朗读的音频缓存 =====
+   每一条都是"某个音色念某段文本"的结果。键里含文本与音色指纹
+   (见 api.ts 的 ttsCacheKey),所以改了描述、换了音色就不会命中旧的音频 */
+
+export interface TtsClipRecord {
+  key: string
+  blob: Blob
+  createdAt: number
+}
+
+/* 缓存条数上限。按**条数**封顶而不是字节数:算字节得先把每条记录(含音频)
+   读出来才知道,而这里单条本来就不大(一句话的 mp3 通常几十 KB),
+   按条数既够用、又完全不必碰盘上的内容 */
+const TTS_CACHE_MAX = 200
+
+/** 取一段念过的音频。没有(或读坏了)返回 undefined —— 调用方据此去合成 */
+export async function getTtsClip(key: string): Promise<Blob | undefined> {
+  try {
+    const db = await openDB()
+    const row = await new Promise<TtsClipRecord | undefined>((resolve, reject) => {
+      const req = db.transaction(TTS_STORE, 'readonly').objectStore(TTS_STORE).get(key)
+      req.onsuccess = () => resolve(req.result as TtsClipRecord | undefined)
+      req.onerror = () => reject(req.error)
+    })
+    return row && row.blob instanceof Blob ? row.blob : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** 存一段音频,顺手淘汰最旧的一批。写不进去只影响"下次还得再合成一次",
+ *  不该让这一次朗读失败,所以整个失败路径都是静默的 */
+export async function putTtsClip(key: string, blob: Blob): Promise<void> {
+  try {
+    const db = await openDB()
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(TTS_STORE, 'readwrite')
+      const store = tx.objectStore(TTS_STORE)
+      store.put({ key, blob, createdAt: Date.now() })
+      const index = store.index('createdAt')
+      /* 裁在同一个事务里:写完就裁,不开第二趟。
+         计数与游标都排在 put 之后,所以看到的是写完之后的账 */
+      const countReq = index.count()
+      countReq.onsuccess = () => {
+        let over = countReq.result - TTS_CACHE_MAX
+        if (over <= 0) return
+        // 索引是升序的,所以游走的方向就是淘汰的顺序:最旧的先走
+        const cursorReq = index.openCursor()
+        cursorReq.onsuccess = () => {
+          const cursor = cursorReq.result
+          if (!cursor || over <= 0) return
+          cursor.delete()
+          over--
+          cursor.continue()
+        }
+      }
+      tx.oncomplete = () => resolve()
+      tx.onerror = () => reject(tx.error)
+    })
+  } catch {
+    /* 见上 */
+  }
+}
+
+/* ===== 声音克隆的样本 =====
+   与音频缓存分开:那些是派生物,删了不会有任何损失;这个是**唯一原件**,
+   删了就真没了。混在一张表里,清缓存时的批量删除就有机会碰到它 */
+
+export interface VoiceSampleRecord {
+  id: string
+  /* 原始文件名。界面上回显"当初用的是哪一段" */
+  name: string
+  blob: Blob
+  bytes: number
+  createdAt: number
+}
+
+export async function putVoiceSample(rec: VoiceSampleRecord): Promise<void> {
+  const db = await openDB()
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(VOICE_SAMPLE_STORE, 'readwrite')
+    tx.objectStore(VOICE_SAMPLE_STORE).put(rec)
+    tx.oncomplete = () => resolve()
+    tx.onerror = () => reject(tx.error)
+  })
+}
+
+export async function getVoiceSample(id: string): Promise<VoiceSampleRecord | undefined> {
+  try {
+    const db = await openDB()
+    const row = await new Promise<VoiceSampleRecord | undefined>((resolve, reject) => {
+      const req = db.transaction(VOICE_SAMPLE_STORE, 'readonly').objectStore(VOICE_SAMPLE_STORE).get(id)
+      req.onsuccess = () => resolve(req.result as VoiceSampleRecord | undefined)
+      req.onerror = () => reject(req.error)
+    })
+    return row && row.blob instanceof Blob ? row : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** 删掉一段样本。删角色、或者用户换掉嗓音时都要走到这里 ——
+ *  留着一段没人认领的录音,比留一个没人认领的图更该清掉 */
+export async function deleteVoiceSample(id: string): Promise<void> {
+  try {
+    const db = await openDB()
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(VOICE_SAMPLE_STORE, 'readwrite')
+      tx.objectStore(VOICE_SAMPLE_STORE).delete(id)
+      tx.oncomplete = () => resolve()
+      tx.onerror = () => reject(tx.error)
+    })
+  } catch {
+    /* 删不掉最多是多占一点空间,不该打断删除角色这件事 */
+  }
+}
+
+/* ===== 聊天里的附图 =====
+   存的是用户附的那张原图。它**不是派生物**:消息上那个 imageId 指着它,
+   删了之后那条消息就只剩一句话 —— 所以清缓存那套不许碰它 */
+export async function putChatImage(rec: ChatImage): Promise<void> {
+  const db = await openDB()
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(CHAT_IMAGE_STORE, 'readwrite')
+    tx.objectStore(CHAT_IMAGE_STORE).put(rec)
+    tx.oncomplete = () => resolve()
+    tx.onerror = () => reject(tx.error)
+  })
+}
+
+export async function getChatImage(id: string): Promise<ChatImage | undefined> {
+  try {
+    const db = await openDB()
+    const row = await new Promise<ChatImage | undefined>((resolve, reject) => {
+      const req = db.transaction(CHAT_IMAGE_STORE, 'readonly').objectStore(CHAT_IMAGE_STORE).get(id)
+      req.onsuccess = () => resolve(req.result as ChatImage | undefined)
+      req.onerror = () => reject(req.error)
+    })
+    return row && row.blob instanceof Blob ? row : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** 删一张附图。删消息、删角色时都要走到这里 */
+export async function deleteChatImage(id: string): Promise<void> {
+  try {
+    const db = await openDB()
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(CHAT_IMAGE_STORE, 'readwrite')
+      tx.objectStore(CHAT_IMAGE_STORE).delete(id)
+      tx.oncomplete = () => resolve()
+      tx.onerror = () => reject(tx.error)
+    })
+  } catch {
+    /* 删不掉最多是多占一点空间,不该因为一张图打断删消息这件事 */
+  }
 }
 
 async function txStore(mode: IDBTransactionMode): Promise<IDBObjectStore> {

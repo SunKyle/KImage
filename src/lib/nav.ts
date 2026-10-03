@@ -14,6 +14,8 @@ export interface NavItem {
 export const NAV_ITEMS: NavItem[] = [
   { value: 'home', label: 'Studio' },
   { value: 'chars', label: 'Characters' },
+  // 对话紧跟角色:两者是同一个对象的两件事,一个造它,一个跟它说话
+  { value: 'chat', label: 'Chat' },
   // 画布紧跟工作室:两者都是"干活的地方",一个是造、一个是改
   { value: 'canvas', label: 'Canvas' },
   { value: 'lib', label: 'Prompt Library' },

@@ -15,7 +15,14 @@ import {
 } from '@phosphor-icons/vue'
 import { exportImages, imageSrc, reuseParamsOf, thumbSrc } from '../api'
 import { blobToDataURL } from '../lib/idb'
+import { titleFromPrompt } from '../lib/text'
 import type { Collection, HistoryEntry, ResultItem, ReuseParams } from '../types'
+
+/** 读屏念出来的名字用短标题:整段提示词可能有上百字,念完没人记得住,
+ *  也与图砖角标、提示词库卡片的口径对不上(那份口径见 lib/text) */
+function titleOf(entry: HistoryEntry) {
+  return titleFromPrompt(entry.prompt)
+}
 
 /* 历史记录:独立页面。
    展示沿用首页「Recent creations」图墙的做法 —— 一条记录里的多张图摊平成一块块图,
@@ -92,14 +99,13 @@ function clearFilter() {
   activeColl.value = ''
 }
 // 正在筛的那个集被删掉了,就回落回全量 —— 不然筛着一个不存在的集,页面卡在空态
-watch(
-  () => [props.collections, activeColl.value],
-  () => {
-    if (activeColl.value && !props.collections.some((c) => c.id === activeColl.value)) {
-      activeColl.value = ''
-    }
+/* 两个来源分开列:写成 () => [a, b] 也能跑,但每次求值都返回一个新数组,
+   读起来像在依赖"这个数组",而它其实什么都不是 */
+watch([() => props.collections, activeColl], () => {
+  if (activeColl.value && !props.collections.some((c) => c.id === activeColl.value)) {
+    activeColl.value = ''
   }
-)
+})
 
 /* —— 多选下载 ——
    下载不写死"已标记的那些":标记是一份长期收藏,而"这次要带走哪几张"
@@ -137,6 +143,15 @@ function toggleAll() {
   else shownTiles.value.forEach((t) => next.add(t.key))
   selected.value = next
 }
+/* 图块消失(记录被删、或被存储清理淘汰)时把对应的键一并摘掉。
+   不摘的话:计数会虚高 —— 显示 Download 3,实际只有 1 张可导;
+   而"全选"是把旧集合复制一份再增删,悬挂的键会被一直复制下去,再也清不掉。
+   这里只数还存在的键,所以 selectedCount 直接取集合大小是准的 */
+watch(tiles, (list) => {
+  const alive = new Set(list.map((t) => t.key))
+  const next = [...selected.value].filter((k) => alive.has(k))
+  if (next.length !== selected.value.size) selected.value = new Set(next)
+})
 
 const exporting = ref(false)
 const exportDone = ref(0)
@@ -206,11 +221,17 @@ onBeforeUnmount(() => {
   window.clearTimeout(msgTimer)
 })
 
+/** 缩略块的比例夹取。上下各 2 / 0.5:极端长条(全景图、长截图)按原比例排会把
+ *  整面墙撑得高低不齐,夹到 2:1 之后仍然看得出是宽幅 */
+function clampRatio(n: number) {
+  return Math.min(2, Math.max(0.5, n))
+}
+
 /** 记录的尺寸解析成宽高比;'auto' 之类解析不出来时返回 null */
 function ratioOfSize(size: string): number | null {
   const [w, h] = size.split('x').map(Number)
   if (!w || !h) return null
-  return Math.min(2, Math.max(0.5, w / h))
+  return clampRatio(w / h)
 }
 
 /* 缩略块按图片真实比例排,而不是按当初选的尺寸 —— 上游可能返回不同比例的图。
@@ -221,7 +242,7 @@ function tileRatio(t: Tile) {
   const m = measured.value[t.key]
   if (m) return m
   const { w, h } = t.entry
-  if (w && h) return Math.min(2, Math.max(0.5, w / h))
+  if (w && h) return clampRatio(w / h)
   return ratioOfSize(t.entry.size) ?? 1
 }
 function onTileLoad(t: Tile, e: Event) {
@@ -229,8 +250,21 @@ function onTileLoad(t: Tile, e: Event) {
   if (measured.value[t.key] || (t.entry.w && t.entry.h)) return
   const img = e.target as HTMLImageElement
   if (!img.naturalWidth || !img.naturalHeight) return
-  measured.value[t.key] = Math.min(2, Math.max(0.5, img.naturalWidth / img.naturalHeight))
+  measured.value[t.key] = clampRatio(img.naturalWidth / img.naturalHeight)
 }
+
+/* 记录被删掉、或被存储清理淘汰之后,它量出来的比例就没用了 ——
+   键只增不减会一直挂在内存里(一张图一个数字,长期使用是笔小账) */
+watch(tiles, (list) => {
+  const alive = new Set(list.map((t) => t.key))
+  const next: Record<string, number> = {}
+  let dropped = false
+  for (const k of Object.keys(measured.value)) {
+    if (alive.has(k)) next[k] = measured.value[k]
+    else dropped = true
+  }
+  if (dropped) measured.value = next
+})
 
 /* 低清底图:先把入库时存的缩略图铺上,原图到了再盖住。
    这样整墙不会先是一片色块、再一起跳出来 */
@@ -357,7 +391,6 @@ function fmt(ts: number) {
         class="tile"
         :class="{ picking: selecting, sel: selecting && selected.has(t.key) }"
         :style="{ aspectRatio: String(tileRatio(t)) }"
-        @click="onTileClick(t)"
       >
         <!-- 画面单占一层:选择态要淡出的是"画面",而砖自己那层画布底必须留着。
              整块一起淡出会让页面纹理从图后透出来,和图片糊成一片 -->
@@ -370,13 +403,13 @@ function fmt(ts: number) {
             @load="onTileLoad(t, $event)"
           />
         </div>
-        <!-- 整块覆盖的按钮:键盘与读屏都走它;
-             外层 div 上的点击只给鼠标兜个底(点浮层空白处也算) -->
+        <!-- 整块覆盖的按钮:键盘、读屏与鼠标都走它 ——
+             inset:0 铺满整块,所以外层不需要再挂一个点击 -->
         <button
           type="button"
           class="tile-open"
           :aria-label="
-            selecting ? `Select: ${t.entry.prompt}` : `Open preview: ${t.entry.prompt}`
+            selecting ? `Select: ${titleOf(t.entry)}` : `Open preview: ${titleOf(t.entry)}`
           "
           :aria-pressed="selecting ? selected.has(t.key) : undefined"
           @click.stop="onTileClick(t)"
@@ -417,21 +450,21 @@ function fmt(ts: number) {
               </button>
               <button
                 class="top"
-                :aria-label="`Use prompt: ${t.entry.prompt.slice(0, 20)}`"
+                :aria-label="`Use prompt: ${titleOf(t.entry)}`"
                 @click.stop="reuse(t.entry)"
               >
                 <PhArrowLineUp aria-hidden="true" />
               </button>
               <button
                 class="top"
-                :aria-label="`Edit on canvas: ${t.entry.prompt.slice(0, 20)}`"
+                :aria-label="`Edit on canvas: ${titleOf(t.entry)}`"
                 @click.stop="emit('edit', t.entry, t.index)"
               >
                 <PhPencilSimple aria-hidden="true" />
               </button>
               <button
                 class="top top-del"
-                :aria-label="`Delete: ${t.entry.prompt.slice(0, 20)}`"
+                :aria-label="`Delete: ${titleOf(t.entry)}`"
                 @click.stop="emit('remove', t.entry)"
               >
                 <PhTrash aria-hidden="true" />

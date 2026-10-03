@@ -12,7 +12,7 @@ import {
   PhEyeSlash
 } from '@phosphor-icons/vue'
 import BrandIcon from './BrandIcon.vue'
-import { PROVIDERS, TEXT_PROVIDERS, getProvider, inferVendor, testConnection } from '../api'
+import { PROVIDERS, TEXT_PROVIDERS, VISION_PROVIDERS, TTS_GENERATIONS, TTS_MODELS, ttsGenerationOf, getProvider, inferVendor, testConnection } from '../api'
 import type { Provider, TextProvider, TestResult } from '../api'
 import type { ApiConfig } from '../types'
 
@@ -28,6 +28,10 @@ const props = defineProps<{
   /* 提示词增强类别里当前生效那条的 id。与 activeId 各自独立:
      两类配置同在一个列表里,但「当前」是分开记的 */
   activeTextId: string
+  /* 识图类别里当前生效那条的 id。同理 —— 三类各记各的当前值 */
+  activeVisionId: string
+  /* 朗读类别里当前生效那条的 id。四类各记各的 */
+  activeTtsId: string
   mode: 'list' | 'form'
   /* 编辑/复制的来源;null 表示新增空白 */
   seed: ApiConfig | null
@@ -39,6 +43,8 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: 'activate', c: ApiConfig): void
   (e: 'activateText', c: ApiConfig): void
+  (e: 'activateVision', c: ApiConfig): void
+  (e: 'activateTts', c: ApiConfig): void
   (e: 'edit', c: ApiConfig): void
   (e: 'duplicate', c: ApiConfig): void
   (e: 'remove', c: ApiConfig): void
@@ -101,26 +107,50 @@ function blank(): ApiConfig {
   return { id: '', name: '', baseUrl: '', apiKey: '', model: '', vendor: 'custom', kind: 'image' }
 }
 
+/* 表单校验:接口地址填错就完全发不出请求,所以提交前拦一下并说清原因。
+   它在这份 setup 里声明得比较早,是因为下面那个灌草稿的 watch 会立刻跑一次
+   (immediate),而它要顺手把上一条配置留下的红字清掉 */
+const urlError = ref('')
+
 // 灌草稿:seed 一变就重置一次,编辑、复制、新增都走这里
 const draft = ref<ApiConfig>(blank())
 watch(
   () => props.seed,
   (v) => {
     draft.value = v ? { ...v } : blank()
+    /* 朗读档的 model 只认固定的两个值。"自由输入框"时代存下来的脏值在这里归零:
+       留着它那排键一个都不亮(看起来像坏了),而它发出去只会换回一句 InvalidModel
+       (服务端另有一道白名单兜底,见那边的 TTS_MODEL_VARIANTS) */
+    if (draft.value.kind === 'tts' && !TTS_MODELS.some((m) => m.id === draft.value.model)) {
+      draft.value.model = ''
+    }
     // 换一条配置就把密钥收回去:上一条的显隐状态不该被带过来
     showKey.value = false
+    /* 上一条的报错也跟着清掉:留着的话它会被挂在刚打开的这一条上,
+       而那条配置本身没有任何问题(要等用户敲一下输入框才会消失) */
+    urlError.value = ''
   },
   { immediate: true }
 )
 
-// 草稿当前用途:老配置没有 kind 时按出图算
-const isText = computed(() => (draft.value.kind || 'image') === 'text')
+/* 草稿当前用途:老配置没有 kind 时按出图算。
+   四类共用一个 kind 字段,所以先把"认不出来的"收成 'image',后面各处只认这四个值 */
+type Purpose = 'image' | 'text' | 'vision' | 'tts'
+const purpose = computed<Purpose>(() =>
+  draft.value.kind === 'text'
+    ? 'text'
+    : draft.value.kind === 'vision'
+      ? 'vision'
+      : draft.value.kind === 'tts'
+        ? 'tts'
+        : 'image'
+)
 
 /* 切换用途:只切 kind 并换掉下面的预设行。
    已填的 baseUrl / apiKey 保留 —— 地址与密钥常常同源,用户可能刚填好,不该被清掉;
    但 model 一定要清空:图像模型名拿去打 /chat/completions 必错,反过来也一样,
    留着只会让人以为还能用。 */
-function setPurpose(kind: 'image' | 'text') {
+function setPurpose(kind: Purpose) {
   if (draft.value.kind === kind) return
   draft.value.kind = kind
   draft.value.model = ''
@@ -129,7 +159,8 @@ function setPurpose(kind: 'image' | 'text') {
 /* 文本预设:地址照写(高亮比的就是地址,它在这里是身份),模型只补空 ——
    已填的模型名常常是对着某家中转写的别名,不该被预设冲掉。
    vendor 也要写下去:它本来只在出图那条路上被写,于是文本配置的 vendor 一直
-   是 add() 给的 'custom',从 DeepSeek 换成 OpenAI 也照样顶着「接线」图标 */
+   是 add() 给的 'custom',从 DeepSeek 换成 OpenAI 也照样顶着「接线」图标。
+   识图那类与文本同构,共用这一个函数(预设行不同,填法一样) */
 function applyTextProvider(p: TextProvider) {
   draft.value.vendor = p.id
   draft.value.baseUrl = p.baseUrl
@@ -137,8 +168,10 @@ function applyTextProvider(p: TextProvider) {
 }
 
 /* 高亮当前地址命中哪个预设:草稿里没有 vendor 字段,直接比地址,
-   省得为了高亮再存一个状态。尾斜杠与大小写不该影响判断 */
-function textPresetOn(p: TextProvider) {
+   省得为了高亮再存一个状态。尾斜杠与大小写不该影响判断。
+   文本与识图两份预设各查各的 —— 同一条地址(如 OpenAI)在两张表里都有,
+   比地址就够了,不必区分是谁调用的 */
+function presetOn(p: TextProvider) {
   const norm = (u: string) => (u || '').trim().replace(/\/+$/, '').toLowerCase()
   return norm(draft.value.baseUrl) === norm(p.baseUrl)
 }
@@ -155,8 +188,31 @@ function applyProvider(p: Provider) {
   if (!draft.value.model.trim() && p.model) draft.value.model = p.model
 }
 
-// 表单校验:接口地址填错就完全发不出请求,所以提交前拦一下并说清原因
-const urlError = ref('')
+/* 朗读目前只接了一家:火山引擎(豆包语音)。它**不是** OpenAI 兼容那套 ——
+   路径是 /api/v3/tts/...,鉴权走 X-Api-Key,而且还要一个 Resource-Id,
+   所以它自成一档,不并进上面那几张预设表。
+   地址只补空,和别处的规矩一样:用户可能已经粘了自己那条中转 */
+const TTS_PRESET = {
+  id: 'volc',
+  label: 'Volcano Engine (Doubao)',
+  baseUrl: 'https://openspeech.bytedance.com/api/v3',
+  // 存的是**代际**,不是商品 —— 商品由角色那边按档位决定(见 api.ts 的 TTS_GENERATIONS)
+  resourceId: '2.0'
+}
+
+function applyTtsPreset() {
+  draft.value.vendor = TTS_PRESET.id
+  if (!draft.value.baseUrl.trim()) draft.value.baseUrl = TTS_PRESET.baseUrl
+  if (!draft.value.resourceId) draft.value.resourceId = TTS_PRESET.resourceId
+}
+
+/* 代际那一排的选中判断。配置里存的是"2.0",但老配置留下的是完整 ID
+   (seed-tts-1.0 之类)—— 两种都要能对上,否则打开旧配置时那一排一个都不亮,
+   看起来像坏了(见 api.ts 的 ttsGenerationOf) */
+function generationOn(id: string) {
+  return ttsGenerationOf(draft.value.resourceId) === id
+}
+
 function submit() {
   const url = draft.value.baseUrl.trim()
   if (!url) {
@@ -229,8 +285,25 @@ function testMessage(r: TestResult, model: string): { text: string; detail?: str
   return { text: 'Could not reach the endpoint', detail: r.detail }
 }
 
+/* 表单是否还是发起测试时那一份。比的就是上面那个 watch 盯着的几项 ——
+   它们任意一项变了,这次测试的结论就不再对应当前表单 */
+function sameDraft(snap: ApiConfig) {
+  const d = draft.value
+  return (
+    d.baseUrl.trim() === snap.baseUrl.trim() &&
+    d.apiKey === snap.apiKey &&
+    d.model === snap.model &&
+    d.vendor === snap.vendor &&
+    d.kind === snap.kind
+  )
+}
+
+/* 测试请求的代次。用户可能在等待中改了草稿、切到另一条配置、
+   或干脆再点一次 —— 那几次的结论混在一起,就会出现"测的是 A,提示却说 B 可用"。
+   只认最后一次发起的那个结果 */
+let testSeq = 0
+
 async function runTest() {
-  if (testing.value) return
   const url = draft.value.baseUrl.trim()
   // 地址是测试的前提,空着就没必要往后走 —— 与保存同一句提示
   if (!url) {
@@ -239,32 +312,42 @@ async function runTest() {
     return
   }
   urlError.value = ''
+  const seq = ++testSeq
   testing.value = true
   testResult.value = null
+  /* 快照这一趟测的到底是哪一份草稿:提示语与请求体都照它来,
+     不能等回来的时候再读 draft —— 那时它可能已经是另一条配置了 */
+  const snap = { ...draft.value, baseUrl: url }
   try {
-    const r = await testConnection({ ...draft.value, baseUrl: url })
-    testResult.value = { ok: r.ok, ...testMessage(r, (draft.value.model || '').trim()) }
+    const r = await testConnection(snap)
+    if (seq !== testSeq || !sameDraft(snap)) return
+    testResult.value = { ok: r.ok, ...testMessage(r, (snap.model || '').trim()) }
   } finally {
-    testing.value = false
+    // 只有还是最后一次才放下 loading:新一轮已经在跑时别把它关掉
+    if (seq === testSeq) testing.value = false
   }
 }
 
 /* 配置的厂商:老配置没写 vendor 就按域名猜,和主页面用的是同一套推断。
-   文本配置多一步:那条路以前不写 vendor(字段是后加的),旧数据里它是 'custom',
-   直接信它的话,DeepSeek 那类配置会一直顶着「接线」图标 —— 所以这种值不可信,
-   按域名认一次。出图配置不动:那里的 custom 是用户明确选的 */
+   文本与识图那两类配置多一步:那两条路以前不写 vendor(字段是后加的),
+   旧数据里它是 'custom',直接信它的话,DeepSeek 那类配置会一直顶着「接线」图标 ——
+   所以这种值不可信,按域名认一次。出图配置不动:那里的 custom 是用户明确选的 */
 function vendorId(c: ApiConfig) {
-  if (c.kind === 'text' && (!c.vendor || c.vendor === 'custom')) {
+  if (c.kind !== 'image' && c.kind && (!c.vendor || c.vendor === 'custom')) {
     const guess = inferVendor(c.baseUrl)
     if (guess !== 'custom') return guess
   }
   return c.vendor || inferVendor(c.baseUrl)
 }
 
-/* 厂商名。预设是两份表 —— 出图的 PROVIDERS 与文本的 TEXT_PROVIDERS,
-   DeepSeek 只做对话所以只在后一份里。两边都查一遍,再退回能力表兜底 */
+/* 厂商名。预设是三份表 —— 出图的 PROVIDERS、文本的 TEXT_PROVIDERS 与识图的
+   VISION_PROVIDERS,DeepSeek 只做对话所以不进第一份。
+   三边都查一遍,再退回能力表兜底 */
 function providerLabel(id: string) {
-  const p = PROVIDERS.find((x) => x.id === id) || TEXT_PROVIDERS.find((x) => x.id === id)
+  const p =
+    PROVIDERS.find((x) => x.id === id) ||
+    TEXT_PROVIDERS.find((x) => x.id === id) ||
+    VISION_PROVIDERS.find((x) => x.id === id)
   return (p || getProvider(id)).label
 }
 function vendorLabel(c: ApiConfig) {
@@ -290,14 +373,17 @@ function endpointLine(url: string) {
   }
 }
 
-/* 列表按用途分两组渲染:两组各自判「当前」(出图比 activeId,文本比 activeTextId),
-   所以把组连同判据一起列成数据,模板里只写一份行。空组直接滤掉,不渲染 */
+/* 列表按用途分四组渲染:各组各自判「当前」(出图比 activeId,改写比 activeTextId,
+   识图比 activeVisionId,朗读比 activeTtsId),所以把组连同判据一起列成数据,
+   模板里只写一份行。空组直接滤掉,不渲染 */
 const groups = computed(() =>
   [
     {
       key: 'image',
       label: 'Image generation',
-      items: props.configs.filter((c) => c.kind !== 'text'),
+      items: props.configs.filter(
+        (c) => c.kind !== 'text' && c.kind !== 'vision' && c.kind !== 'tts'
+      ),
       activeId: props.activeId
     },
     {
@@ -305,6 +391,18 @@ const groups = computed(() =>
       label: 'Prompt enhancing',
       items: props.configs.filter((c) => c.kind === 'text'),
       activeId: props.activeTextId
+    },
+    {
+      key: 'vision',
+      label: 'Image recognition',
+      items: props.configs.filter((c) => c.kind === 'vision'),
+      activeId: props.activeVisionId
+    },
+    {
+      key: 'tts',
+      label: 'Voice',
+      items: props.configs.filter((c) => c.kind === 'tts'),
+      activeId: props.activeTtsId
     }
   ].filter((g) => g.items.length)
 )
@@ -333,6 +431,21 @@ function seedFor(p: Provider): ApiConfig {
 // 入口副标题:会替你填好的地址与模型
 function quickHint(p: Provider) {
   return `Fills ${endpointLine(p.baseUrl)} · ${p.model}`
+}
+
+/* 识图的入口。空态也得给一条 —— 没有它,新用户会把出图那条当成全部,
+   直到在角色页上传了参考图才发现"反填"用不了。
+   与 seedFor 同一套,只是 kind 不同 */
+function visionSeedFor(p: TextProvider): ApiConfig {
+  return {
+    id: '',
+    name: p.label,
+    baseUrl: p.baseUrl,
+    model: p.model || '',
+    apiKey: '',
+    vendor: p.id,
+    kind: 'vision'
+  }
 }
 
 /* 导出把配置原样写成 JSON —— 包括 API Key。
@@ -419,12 +532,20 @@ function onImportFile(e: Event) {
                 :class="{ 'is-current': c.id === g.activeId, 'is-open': openRow === c.id }"
               >
                 <!-- 行本体是 <button>:整行可点 = 把这条设为该类别的当前生效
-                     (出图走 activate,文本走 activateText)。
+                     (出图走 activate,改写走 activateText,识图走 activateVision)。
                      状态列定宽,于是所有行的名字都从同一条竖线起排 -->
                 <button
                   class="row-main-btn"
                   :aria-current="c.id === g.activeId ? 'true' : undefined"
-                  @click="g.key === 'text' ? emit('activateText', c) : emit('activate', c)"
+                  @click="
+                    g.key === 'text'
+                      ? emit('activateText', c)
+                      : g.key === 'vision'
+                        ? emit('activateVision', c)
+                        : g.key === 'tts'
+                          ? emit('activateTts', c)
+                          : emit('activate', c)
+                  "
                 >
                   <span class="dot-col">
                     <span v-if="c.id === g.activeId" class="pill-current"><i aria-hidden="true"></i>Current</span>
@@ -508,6 +629,29 @@ function onImportFile(e: Event) {
               </button>
             </div>
 
+            <!-- 识图那类单独起一排:它解决的是另一个问题(把上传的参考图读成角色设定),
+                 与"出图用哪家"不是同一件事,混在同一排里会被当成又一个出图选项 -->
+            <p class="quick-sep">
+              Or add a vision model — it reads an uploaded reference image into a character spec.
+            </p>
+            <div class="quick">
+              <button
+                v-for="p in VISION_PROVIDERS"
+                :key="p.id"
+                class="quick-item"
+                @click="emit('create', visionSeedFor(p))"
+              >
+                <span class="qm">
+                  <b>
+                    <BrandIcon :brand="p.id" :size="15" />
+                    {{ p.label }}
+                  </b>
+                  <span>{{ endpointLine(p.baseUrl) }} · {{ p.model }}</span>
+                </span>
+                <span class="go"><PhCaretRight aria-hidden="true" /></span>
+              </button>
+            </div>
+
             <p class="empty-foot">Your key stays in this browser. Nothing is sent anywhere except your own API.</p>
           </div>
         </div>
@@ -522,12 +666,17 @@ function onImportFile(e: Event) {
 
         <div class="form-body">
           <div class="block">
-            <!-- 用途:这条配置用来出图还是改写提示词。它决定后面所有字段的含义,
-                 所以给两行带说明的选项,而不是一排只有名字的胶囊 -->
+            <!-- 用途:这条配置用来出图、改写提示词还是识图。它决定后面所有字段的含义,
+                 所以给几行带说明的选项,而不是一排只有名字的胶囊 -->
             <span class="block-label">What is this config for?</span>
             <div class="purpose" role="radiogroup" aria-label="Config purpose">
               <label class="purpose-opt">
-                <input type="radio" name="purpose" :checked="!isText" @change="setPurpose('image')" />
+                <input
+                  type="radio"
+                  name="purpose"
+                  :checked="purpose === 'image'"
+                  @change="setPurpose('image')"
+                />
                 <span class="pm">
                   <b>Image generation</b>
                   <span>Used when you press Generate. Fill in an image model.</span>
@@ -535,10 +684,41 @@ function onImportFile(e: Event) {
                 <span class="tick" aria-hidden="true"><PhCheck /></span>
               </label>
               <label class="purpose-opt">
-                <input type="radio" name="purpose" :checked="isText" @change="setPurpose('text')" />
+                <input
+                  type="radio"
+                  name="purpose"
+                  :checked="purpose === 'text'"
+                  @change="setPurpose('text')"
+                />
                 <span class="pm">
                   <b>Prompt enhancing</b>
                   <span>Used by Quick / Creative. Fill in a chat model.</span>
+                </span>
+                <span class="tick" aria-hidden="true"><PhCheck /></span>
+              </label>
+              <label class="purpose-opt">
+                <input
+                  type="radio"
+                  name="purpose"
+                  :checked="purpose === 'vision'"
+                  @change="setPurpose('vision')"
+                />
+                <span class="pm">
+                  <b>Image recognition</b>
+                  <span>Fills a character spec from a reference image. Needs a vision model.</span>
+                </span>
+                <span class="tick" aria-hidden="true"><PhCheck /></span>
+              </label>
+              <label class="purpose-opt">
+                <input
+                  type="radio"
+                  name="purpose"
+                  :checked="purpose === 'tts'"
+                  @change="setPurpose('tts')"
+                />
+                <span class="pm">
+                  <b>Voice</b>
+                  <span>Reads a character's replies out loud in its own voice. Not OpenAI-compatible.</span>
                 </span>
                 <span class="tick" aria-hidden="true"><PhCheck /></span>
               </label>
@@ -547,9 +727,10 @@ function onImportFile(e: Event) {
 
           <div class="block">
             <span class="block-label">Provider</span>
-            <!-- 预设随用途切换数据源:出图用图像模型预设,文本用对话模型预设 -->
+            <!-- 预设随用途切换数据源:出图用图像模型预设,改写用对话模型预设,
+                 识图用视觉模型预设(后两份都是 /chat/completions,只是模型要求不同) -->
             <div class="presets" role="group" aria-label="Select provider">
-              <template v-if="!isText">
+              <template v-if="purpose === 'image'">
                 <button
                   v-for="p in PROVIDERS"
                   :key="p.id"
@@ -562,13 +743,39 @@ function onImportFile(e: Event) {
                   {{ p.label }}
                 </button>
               </template>
+              <template v-else-if="purpose === 'vision'">
+                <button
+                  v-for="p in VISION_PROVIDERS"
+                  :key="p.id"
+                  type="button"
+                  class="preset"
+                  :class="{ on: presetOn(p) }"
+                  @click="applyTextProvider(p)"
+                >
+                  <BrandIcon :brand="p.id" :size="14" />
+                  {{ p.label }}
+                </button>
+              </template>
+              <template v-else-if="purpose === 'tts'">
+                <!-- 朗读只有一家,而且它不是 OpenAI 兼容那套,所以这里不放"厂商表",
+                     就这一枚。点它是一种"从零开始"的填法,地址与 Resource-Id 一起补齐 -->
+                <button
+                  type="button"
+                  class="preset"
+                  :class="{ on: draft.vendor === TTS_PRESET.id }"
+                  @click="applyTtsPreset"
+                >
+                  <BrandIcon :brand="TTS_PRESET.id" :size="14" />
+                  {{ TTS_PRESET.label }}
+                </button>
+              </template>
               <template v-else>
                 <button
                   v-for="p in TEXT_PROVIDERS"
                   :key="p.id"
                   type="button"
                   class="preset"
-                  :class="{ on: textPresetOn(p) }"
+                  :class="{ on: presetOn(p) }"
                   @click="applyTextProvider(p)"
                 >
                   <BrandIcon :brand="p.id" :size="14" />
@@ -578,9 +785,13 @@ function onImportFile(e: Event) {
             </div>
             <p class="note">
               {{
-                isText
-                  ? 'Text models are called through /chat/completions. For Bailian, pick the compatible-mode address.'
-                  : capabilityNote
+                purpose === 'image'
+                  ? capabilityNote
+                  : purpose === 'vision'
+                    ? 'Vision models are called through /chat/completions with the image attached. For Bailian, pick the compatible-mode address.'
+                    : purpose === 'tts'
+                      ? 'Speech is called through /api/v3/tts/… with an X-Api-Key header. It is billed per character, so the app caches every line it synthesises.'
+                      : 'Text models are called through /chat/completions. For Bailian, pick the compatible-mode address.'
               }}
             </p>
 
@@ -602,11 +813,18 @@ function onImportFile(e: Event) {
                   v-model="draft.baseUrl"
                   placeholder="https://example.com/api/v3"
                   spellcheck="false"
+                  :aria-invalid="!!urlError"
+                  :aria-describedby="urlError ? 'cfg-url-err' : undefined"
                   @input="urlError = ''"
                 />
               </span>
-              <!-- 报错顶掉说明行,不叠成两段小字:错误已经把该填什么说清楚了 -->
-              <span v-if="urlError" class="field-err">{{ urlError }}</span>
+              <!-- 报错顶掉说明行,不叠成两段小字:错误已经把该填什么说清楚了。
+                   role="alert":它是异步判定出来的(提交时才出现),读屏要主动念出来 -->
+              <span v-if="urlError" id="cfg-url-err" class="field-err" role="alert">{{ urlError }}</span>
+              <span v-else-if="purpose === 'tts'" class="note">
+                Stop at the version segment — <code>…/api/v3</code>. Pasting the full endpoint URL
+                from the docs works too.
+              </span>
               <span v-else class="note">
                 Include everything up to and including the version segment, e.g. <code>/api/v3</code>. No trailing
                 slash needed.
@@ -636,31 +854,101 @@ function onImportFile(e: Event) {
               <span class="note">Stored in this browser only. Check your provider's console for where to create one.</span>
             </label>
 
-            <label class="field">
+            <!-- 音色代际。它决定两件事:**去哪一本音色列表里挑 ID**,以及那笔请求算在
+                 哪个商品上 —— 而"商品"那一半其实由角色那边的档位定死了(内置音色必然
+                 走语音合成、复刻音色必然走声音复刻),所以这里只需要选代际,
+                 完整的 X-Api-Resource-Id 由代码拼(见 api.ts 的 resourceIdOf)。
+                 以前这一格叫 Resource ID、让用户直接挑商品,于是同一格里塞了两件事,
+                 界面上摆四个选项而其中两个对 Clone 档根本不起作用 -->
+            <div v-if="purpose === 'tts'" class="field">
+              <span class="flabel">Voice generation</span>
+              <div class="presets" role="group" aria-label="Select generation">
+                <button
+                  v-for="g in TTS_GENERATIONS"
+                  :key="g.id"
+                  type="button"
+                  class="preset"
+                  :class="{ on: generationOn(g.id) }"
+                  @click="draft.resourceId = g.id"
+                >
+                  {{ g.label }}
+                </button>
+              </div>
+              <span class="note">
+                Which generation of voices you use. Built-in voices then go out as
+                <code>seed-tts-*</code> and cloned ones as <code>seed-icl-*</code> — that
+                half is decided by the voice source on the character, not here. Voices are
+                not interchangeable across generations: a 2.0 voice with 1.0 selected is
+                refused by the provider.
+              </span>
+            </div>
+
+            <!-- 朗读这一档的 Model **不是自由字段**:上游只认两个取值,填别的
+                 会被回一句 InvalidModel —— 而那句话既不说是哪个字段、也不说合法值
+                 (见 api.ts 的 TTS_MODELS)。所以照 Resource ID 那样做成一排可点的键 -->
+            <div v-if="purpose === 'tts'" class="field">
+              <span class="flabel">Model <em>— optional</em></span>
+              <div class="presets" role="group" aria-label="Select model">
+                <button
+                  v-for="m in TTS_MODELS"
+                  :key="m.label"
+                  type="button"
+                  class="preset"
+                  :class="{ on: draft.model === m.id }"
+                  @click="draft.model = m.id"
+                >
+                  {{ m.label }}
+                </button>
+              </div>
+              <span class="note">
+                Only cloned voices use this — Standard or Expressive. Auto leaves it to the
+                provider. Nothing else is accepted here.
+              </span>
+            </div>
+
+            <label v-else class="field">
               <span class="flabel">Model</span>
               <span class="input-wrap">
                 <input
                   v-model="draft.model"
-                  :placeholder="isText ? 'gpt-4o-mini' : 'doubao-seedream-3-0-t2i'"
+                  :placeholder="
+                    purpose === 'image' ? 'doubao-seedream-3-0-t2i' : 'gpt-4o-mini'
+                  "
                   spellcheck="false"
                 />
               </span>
               <span class="note">
-                The model ID your API expects — for some providers this is an endpoint ID like <code>ep-2024…</code>.
+                The model ID your API expects — for some providers this is an endpoint ID like ep-2024….
               </span>
             </label>
           </div>
 
           <div class="form-foot">
             <button class="btn-ink" type="submit">Save</button>
-            <button class="btn-line" type="button" :disabled="testing" @click="runTest">
+            <!-- 朗读这条不给"测试":测试要知道打哪个端点、发什么请求,
+                 而合成的最小请求必须带一个音色 —— 音色是角色的东西,不在这一页。
+                 硬测只会打一条不存在的 /chat/completions,回一句误导人的错。
+                 真正该验的时候是角色页那枚"试听",那才是端到端 -->
+            <button
+              v-if="purpose !== 'tts'"
+              class="btn-line"
+              type="button"
+              :disabled="testing"
+              @click="runTest"
+            >
               <PhPlugsConnected aria-hidden="true" />
               {{ testing ? 'Testing…' : 'Test' }}
             </button>
             <button class="btn-line" type="button" @click="emit('cancel')">Cancel</button>
             <!-- 测出来的结果顶掉常驻那行提示:它更要紧,而且草稿一改就消失,
-                 不会长期占着位置 -->
-            <span v-if="testResult" class="test-line" :class="testResult.ok ? 'ok' : 'bad'">
+                 不会长期占着位置。role="status":结果是几秒后才回来的,
+                 写在原地读屏不会知道 —— 这一句让它被念出来 -->
+            <span
+              v-if="testResult"
+              class="test-line"
+              :class="testResult.ok ? 'ok' : 'bad'"
+              role="status"
+            >
               <PhCheckCircle v-if="testResult.ok" aria-hidden="true" />
               <PhWarningCircle v-else aria-hidden="true" />
               <b>{{ testResult.text }}</b>
@@ -1006,6 +1294,13 @@ function onImportFile(e: Event) {
   /* 外层的居中到入口这一层收住:入口里是左对齐的两行字 */
   text-align: left;
 }
+/* 两组入口之间的说明。夹在两个 .quick 之间,不跟着左对齐 —— 它是空态正文的一部分 */
+.quick-sep {
+  margin-top: var(--sp-5);
+  font-size: var(--fs-xs);
+  line-height: 1.6;
+  color: var(--text-3);
+}
 .quick-item {
   display: flex;
   align-items: center;
@@ -1078,18 +1373,28 @@ function onImportFile(e: Event) {
 .block + .block {
   margin-top: var(--sp-5);
 }
+/* 块标题(Provider / What is this config for?)。它原来是 13px 浅灰,
+   而下面紧跟的就是一排同样 13px、同样灰的按钮 —— "Provider" 看上去
+   就像其中一枚没被选中的按钮。
+   抬到满墨 + 600:块标题首先要压得住自己管的那一整块。
+   它与字段名(.flabel,11px 全大写灰)**不同形**是有意的 ——
+   一个是"这一整块是什么",一个是"这一个参数叫什么",两者差一级;
+   同形的话就得靠颜色去分,而颜色这一维在浅色面上本来就很挤 */
 .block-label {
   display: block;
   margin-bottom: var(--sp-2);
   font-size: var(--fs-sm);
-  color: var(--text-2);
+  font-weight: 600;
+  color: var(--text);
 }
 
 /* 用途二选一:它决定后面所有字段的含义,所以给两行带说明的选项,
    而不是一排只有名字的胶囊 */
 .purpose {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  /* 三档并排:每一档都带一句说明,太窄会挤成读不动的一坨,所以给一个下限,
+     放不下时自己折行(表单本身也是收窄居中的) */
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
   gap: 10px;
 }
 .purpose-opt {
@@ -1215,14 +1520,25 @@ function onImportFile(e: Event) {
   display: block;
   margin-top: var(--sp-4);
 }
+/* 参数名(Name / Base URL / API Key / …)。与块标题(.block-label)同一套:
+   13px / 600 / 满墨 —— 这一页里凡是"给某个东西起的名字"都长一样。
+   它和框里那行提示(14px / 400 / --text-3)的差别**不靠字号**:只差 1px,
+   靠的是轻重与明暗 —— 一边是 600 的墨,一边是 400 的浅灰。
+   (更早那两版分别是"13px 浅灰对 14px 浅灰"(灰度 6B6B6B 对 727272,几乎同色)
+   和"11px 全大写",前者分不出、后者与本页其余的名字不同形,
+   都被换掉了 —— 记在这里是为了别再绕回去) */
 .flabel {
   display: block;
-  margin-bottom: 6px;
+  margin-bottom: var(--sp-2);
   font-size: var(--fs-sm);
-  color: var(--text-2);
+  font-weight: 600;
+  color: var(--text);
 }
+/* 标签里的附注(“— optional”这种)。跟着 600 的标签走会显得像正文,
+   所以压回 400、退一档灰 —— 它是一句旁白,不是参数名的一部分 */
 .flabel em {
   font-style: normal;
+  font-weight: 400;
   color: var(--text-3);
 }
 .input-wrap {
@@ -1237,6 +1553,14 @@ function onImportFile(e: Event) {
   background: var(--surface);
   font-size: var(--fs-base);
   transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+}
+/* 占位提示显式定色。浏览器默认那一档灰在浅色面上过不了 4.5:1,
+   而它又没法再浅 —— 所以"提示"与"标签"的区分交给字号与字重(见 .flabel),
+   颜色这一维只负责让两者都达标 */
+.field input::placeholder,
+.field textarea::placeholder {
+  color: var(--text-3);
+  font-weight: 400;
 }
 .field input:focus {
   border-color: var(--accent);

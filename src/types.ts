@@ -8,10 +8,17 @@ export interface ApiConfig {
   // 厂商 id(见 api.ts 的 PROVIDERS);决定支持哪些扩展参数、尺寸与图生图端点
   // 可选是为了兼容加这个字段之前存下来的配置,读的时候会按域名回填
   vendor?: string
-  // 这条配置的用途:'image' 出图,'text' 改写提示词。
-  // 两类要填的模型不是一回事,但地址与密钥常常同源,所以放同一个列表里按用途分区。
-  // 可选是为了兼容加这个字段之前存下来的配置,读的时候一律按 'image' 处理
-  kind?: 'image' | 'text'
+  /* 这条配置的用途:'image' 出图,'text' 改写提示词,'vision' 识图
+     (把上传的参考图读成角色设定 —— 与改写一样走对话模型,但要求它会看图),
+     'tts' 朗读(把角色说的话合成成音频)。
+     四类要填的模型不是一回事,但地址与密钥常常同源,所以放同一个列表里按用途分区。
+     可选是为了兼容加这个字段之前存下来的配置,读的时候一律按 'image' 处理 */
+  kind?: 'image' | 'text' | 'vision' | 'tts'
+  /* 服务级资源标识。目前只有 TTS 用得上:火山引擎拿它选模型版本、
+     而它同时决定计费商品(seed-tts-2.0 是自带音色 / seed-icl-2.0 是复刻音色),
+     所以填错不是"效果差一点",而是直接被拒(access denied)。
+     放在配置上而不是角色上:它是"你开通了哪个商品",属于账号,不属于某个角色 */
+  resourceId?: string
 }
 
 // 生成参数
@@ -64,7 +71,7 @@ export interface EditParams {
   /** 期望的输出画幅,`WxH`。编辑不该改变画幅 ——
    *  不讲这一条的话上游按自己的默认来,而那个默认通常是 1:1,
    *  于是改完一张 3:2 的图会变成方的。
-   *  发出去之前会收窄成目标厂商真认的取值(见 api.ts 的 editSize) */
+   *  发出去之前会收窄成目标厂商真认的取值(见 api.ts 的 allowedSizeFor) */
   size?: string
 }
 
@@ -211,12 +218,92 @@ export interface CharacterFields {
   marks: string
 }
 
-/* 一次 AI 起稿的结果:名字 + 结构化设定。
+/* 角色的"人格":只有聊天用得上的一组设定。
+   刻意与 CharacterFields 分开存 —— 那边是长相,会被 characterFaceDesc 拼进
+   每一张出图的提示词;把性格混进去,等于让"它是什么人"去污染"它长什么样"
+   的像素级约束。
+
+   四个字段而不是一整段自由文本:traits 与 voice 必须分开 ——
+   "是个什么样的人"和"话怎么说出来"是两件事,写在同一段里会被模型平均掉,
+   结果是性格写了、说话方式被稀释成通用口吻。而"像人"主要靠后者 */
+export interface CharacterPersona {
+  // 性格:是个什么样的人。如 "guarded, dry humor, slow to trust"
+  traits: string
+  // 说话方式:怎么说话。如 "short clipped sentences, rarely asks questions"
+  voice: string
+  // 怎么称呼用户,以及它和用户是什么关系。如 "calls you 'kid', an old partner"
+  address: string
+  // 禁区:这个角色绝不会做的事。如 "never breaks character, never mentions AI"
+  boundaries: string
+}
+
+/* 一条对话消息。存在 IndexedDB,按 charId 索引 ——
+   一期一个角色一条连续对话,所以没有 sessionId;将来要开多段会话时再加这个字段 */
+export interface ChatMessage {
+  id: string
+  /* 属于哪个角色。与 HistoryEntry.characterId 同一个口径:
+     角色被删时它的消息一并清掉(见 App 的 deleteChar) */
+  charId: string
+  role: 'user' | 'assistant'
+  content: string
+  createdAt: number
+  /* 用户中途按了 Stop,这条只说到一半。与"上游报错"分开记 ——
+     截断是我们自己按的,不是坏数据,拼上下文时它照样是一条正常的历史消息 */
+  stopped?: boolean
+  /* 上游因为撞上 max_tokens 而停下(它给的 finish_reason 是 'length')。
+     与 stopped 分开:那个是人按的,这个是模型的额度用完了。
+     不记这一项的话,前端看到的和"正常说完"一模一样 ——
+     用户会以为角色话说一半是它自己的风格 */
+  truncated?: boolean
+  /* 这一轮的情绪,一个英文小写词(见服务的 CHAT_MOOD_RE)。
+     它是模型写在回复最末尾的元数据,由服务端剪下来单独送 ——
+     正文里永远不含它,所以这不是"从文本里解析出来的",是原样收到的。
+     只对助手消息有意义;空/缺省 = 这一轮没给 */
+  mood?: string
+  /* 用户这条消息附的图。存的是 IndexedDB 里的 id,**不是字节** ——
+     消息是一条几十字节的记录(一次要读一整屏),图为几百 KB,
+     两者的读法完全不同,所以分开存(见 idb.ts 的 chat_images)。
+     只有用户消息会带它 */
+  imageId?: string
+}
+
+/** 聊天里用户附的那张图。与 ChatMessage 分开存,理由见上面的 imageId */
+export interface ChatImage {
+  id: string
+  blob: Blob
+  createdAt: number
+}
+
+/* 一段对话的长期记忆:滑出窗口的那些消息被压成的一段简报。
+   与消息分开存,因为读法完全不同 —— 消息按条读,这份一次读一条。
+
+   为什么记三个字段而不是一句文本:
+   - upToAt/upToId 回答"从哪一条之后还没进摘要",下一批从这儿往后接;
+   - covered 是"已经进去多少条",配上总条数才知道该不该再压一次 ——
+     有了它就不必为了判断这件事再把消息读一遍。
+   三者缺一个,都会退化成"每次都要全量读一遍才知道该不该压" */
+export interface ChatSummary {
+  charId: string
+  /** 简报正文。空串 = 还没压过 */
+  text: string
+  /** 覆盖到最后哪一条(含) */
+  upToId: string
+  /** upToId 那条的时间戳。游标按时间走,只有 id 是找不到它的 */
+  upToAt: number
+  /** 已经被摘要覆盖的条数 */
+  covered: number
+  /** 最后一次压缩的时间。界面拿它显示"记忆更新于…" */
+  updatedAt: number
+}
+
+/* 一次 AI 起稿的结果:名字 + 结构化设定 + 人格。
    名字不是 CharacterFields 的一员 —— 它是个标识(卡片的标题、消息里的称呼),
-   不参与任何提示词的拼装,所以和"这个人长什么样"那套字段分开 */
+   不参与任何提示词的拼装,所以和"这个人长什么样"那套字段分开。
+   人格同样分开存:它只服务对话,不进任何出图的提示词(见 CharacterPersona) */
 export interface CharacterDraft {
   name: string
   fields: CharacterFields
+  persona: CharacterPersona
 }
 
 /* 设定图里的一张视图。kind 是索引里的键(存进 IndexedDB 时按它定位),
@@ -232,6 +319,48 @@ export interface CharacterView {
   data: Blob
 }
 
+/* 一个角色的**嗓音**:朗读时它听起来是什么样的。
+   与 CharacterPersona 是两件事,别混 —— persona 里那个 voice 字段管的是
+   "话怎么说出来"(短句、少提问),是**文字**;这一份管的是"声音本身"。
+   所以 persona 那边的标签已经从 Voice 改成 Speech style,把这个词让了出来。
+
+   为什么挂在角色上而不是全局:嗓音与"说话方式"一样属于这个人,不属于这台机器。
+
+   三档来源只在"voice 从哪来"上不同,合成请求的形状是一样的:
+   - preset   用厂商自带的一款音色(一个音色名)
+   - describe 写一段话描述,交给认 instructions / text_prompt 的上游现场塑造
+   - clone    传一段音频样本,上游建号时返回一个音色 id */
+export interface CharacterVoice {
+  /* 走哪条路。缺省 = browser,于是老角色与没配过 TTS 的人照旧用浏览器念 */
+  engine: 'browser' | 'tts'
+  /* browser 档:系统音色名(getVoices() 的 name)。留空 = 按角色 id 挑一个 */
+  voiceName?: string
+  /* browser 档的语速与音高,1 为原速 */
+  rate?: number
+  pitch?: number
+  /* tts 档:用哪条 TTS 配置(见 ApiConfig.kind = 'tts') */
+  configId?: string
+  /* tts 档的三种来源之一。缺省按 preset 处理 */
+  source?: 'preset' | 'describe' | 'clone'
+  /* preset 的音色名,或 clone 建号拿到的音色 id —— 都是"上游那一把嗓子" */
+  vendorVoice?: string
+  /* describe 档:那段描述 */
+  describe?: string
+  /* clone 档:本地样本的引用。建号之后合成不再用它,
+     留它是为了"重新克隆 / 删掉样本 / 界面上回显当初用的是哪一段" */
+  sampleId?: string
+  /* clone 档:那段样本的原始文件名。只有界面回显用得上 ——
+     真要拿它去认人,用户认的是文件名,不是一串 id */
+  sampleName?: string
+  /* tts 档的语速。上游的刻度是 [-50,100],0 为原速 */
+  speed?: number
+  /* tts 档的资源标识覆盖。留空时按来源推断:
+     复刻音色必须用复刻那个计费商品(clone ⇒ seed-icl-2.0),
+     其余用配置里填的那个(自带音色 ⇒ seed-tts-2.0)。
+     留着这一项是为了"我开的是复刻 1.0"这种情况有地方写 */
+  resourceId?: string
+}
+
 // 一个角色:可复用的出图预设 —— 一张主参考图 + 一段固定设定 + 名字。
 // 参考图管"形状"、设定管"语义",两者一起注入才谈得上跨图的一致性。
 // 名字与设定是轻量目录,放 localStorage;图是 Blob,按 id 存在 IndexedDB
@@ -244,6 +373,13 @@ export interface Character {
   /* 自由描述。加结构化字段之前,角色的全部设定就写在这里;
      读入时原样保留,合成时排在结构化设定之后当补充 —— 老角色不该因为改了模型就变样 */
   desc?: string
+  /* 人格设定,只有聊天用得上(见 CharacterPersona)。
+     可选是为了兼容加它之前存下来的角色,读入时补空串(coerceCharPersona),
+     所以读的地方可以当它一定存在 */
+  persona?: CharacterPersona
+  /* 朗读用的嗓音(见 CharacterVoice)。可选是为了兼容加它之前存下来的角色 ——
+     没有就是"按系统音色挑一个"(browser 档的缺省行为) */
+  voice?: CharacterVoice
   /* 封面与头像用的那张图。生成正脸成功后它就是正脸本身(见 App 的 genCharView),
      所以列表、详情、创作区三处读它读到的都是同一张脸 */
   ref?: Blob
@@ -266,16 +402,51 @@ export interface Character {
 /* 从一个角色 zip 里读出来的角色。刻意不带 id ——
    文件里的 id 可能与现有的撞上,而列表里两条同 id 会让渲染和删除都错乱,
    所以导入这一步的职责之一就是换新的(见 api.ts 的 readCharacterZip) */
+/* 角色包里带回来的**一条消息**。
+   比 ChatMessage 少两样东西 —— id 与 charId —— 因为它们都是本地身份:
+   文件里的 id 到了这边一定是新的(见 App 的 writeImportedChat),
+   而 charId 属于接收方刚建出来的那个角色。带着它们反而多一层校验 */
+export interface ImportedChatMessage {
+  role: 'user' | 'assistant'
+  content: string
+  createdAt: number
+  stopped?: boolean
+  truncated?: boolean
+  mood?: string
+  /* 这条消息附的图。**这里不换新的**:它就是本地那个 imageId,
+     而包里的图片文件也按这个名字存放(见 ImportedChat.images)——
+     换个新名字只会让消息与图对不上,而这串 id 本来就只是"引用的键" */
+  imageId?: string
+}
+
+/* 角色包里带回来的那段对话。**记忆是主,消息是辅** ——
+   分享一个养熟了的角色,对方最该拿到的是"它记得我们之间发生过什么";
+   消息只是让那段记忆有个能对照的来处。
+   记忆的游标(upToAt / covered)不带过来:那些 id 与时间戳在本地不成立,
+   由导入方按收到的消息重新推平(见 App 的 writeImportedChat) */
+export interface ImportedChat {
+  messages: ImportedChatMessage[]
+  /** 记忆正文。空串 = 这个包没带记忆 */
+  memory: string
+  /* 包里的附图。id 与消息里的 imageId 一一对应。
+     老包、或没发过图的对话没有这一项 —— 那种情况下消息照常导入,
+     只是那条消息上的图没了(界面不会画,也不会报错) */
+  images?: Array<{ id: string; blob: Blob }>
+}
+
 export interface ImportedCharacter {
   name: string
   createdAt: number
   fields?: CharacterFields
   desc?: string
+  persona?: CharacterPersona
   ref?: Blob
   sourceRef?: Blob
   refKind?: CharacterViewKind
   /* 包内带过来的设定图。没带的视图就是没有 —— 与库里那五格一一对应 */
   views: CharacterView[]
+  /* 包内带过来的那段对话。老包、或没聊过的角色没有这一项 */
+  chat?: ImportedChat
 }
 
 /* 一个角色的用量:被拿去出过多少张作品、最后一次是什么时候。

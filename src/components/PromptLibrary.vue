@@ -364,8 +364,16 @@ function onImportFile(e: Event) {
       </div>
 
       <div v-if="items.length" class="lib-filter">
+        <!-- aria-pressed 把"现在筛的是哪个标签"说出来:选中只靠一个 class 与勾号,
+             读屏用户从这些按钮上看不出区别(All 也一样,它是个真的筛选项,
+             只是不筛而已) -->
         <div class="cat-row">
-          <button class="cat" :class="{ on: tagFilter === 'All' }" @click="tagFilter = 'All'">
+          <button
+            class="cat"
+            :class="{ on: tagFilter === 'All' }"
+            :aria-pressed="tagFilter === 'All'"
+            @click="tagFilter = 'All'"
+          >
             All
             <span class="cat-n">{{ items.length }}</span>
           </button>
@@ -374,6 +382,7 @@ function onImportFile(e: Event) {
             :key="t"
             class="cat"
             :class="{ on: tagFilter === t }"
+            :aria-pressed="tagFilter === t"
             @click="tagFilter = t"
           >
             {{ t }}
@@ -391,12 +400,21 @@ function onImportFile(e: Event) {
             <PhCaretDown aria-hidden="true" />
           </button>
           <Transition name="po">
-            <div v-if="openMenu === MENU_SORT" class="menu" :class="{ up: menuUp }">
+            <!-- 一组互斥的选项,但没做方向键导航,所以不声明 menu 语义;
+                 当前的排序用 aria-current 标出来就够了 -->
+            <div
+              v-if="openMenu === MENU_SORT"
+              class="menu"
+              :class="{ up: menuUp }"
+              role="group"
+              aria-label="Sort by"
+            >
               <button
                 v-for="s in SORTS"
                 :key="s.key"
                 class="mitem"
                 :class="{ on: sort === s.key }"
+                :aria-current="sort === s.key ? 'true' : undefined"
                 @click="pickSort(s.key)"
               >
                 {{ s.label }}
