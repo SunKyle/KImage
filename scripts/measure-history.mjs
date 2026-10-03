@@ -17,7 +17,7 @@
    -------------------------------------------------------------------- */
 
 import { spawn } from 'node:child_process'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { WebSocket } from 'undici'
@@ -45,7 +45,20 @@ const PROBE_TWO_TABS = args.includes('--probe-two-tabs')
 /* 调试端口每轮随机取一个:固定端口会与上一次没退干净的实例撞车,
    而那种撞车表现为"连上了,但连到的是别人",量出来的数看着正常其实全错 */
 const PORT = Number(arg('cdp-port', 0)) || 9300 + Math.floor(Math.random() * 600)
-const CHROME = arg('chrome', '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome')
+/* Chrome 的位置按平台找:本地(macOS)与 CI(Linux)要都能跑起来。
+   找不到就交给 PATH —— GitHub 的 runner 上 google-chrome 就在 PATH 里 */
+function defaultChrome() {
+  const candidates = [
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser'
+  ]
+  for (const p of candidates) if (existsSync(p)) return p
+  return 'google-chrome'
+}
+const CHROME = arg('chrome', process.env.CHROME_PATH || defaultChrome())
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
@@ -236,7 +249,11 @@ async function main() {
       await sleep(250)
     }
   }
-  if (!version) throw new Error('Chrome 的调试端口没起来')
+  if (!version) {
+    throw new Error(
+      `Chrome 的调试端口没起来(用的是 ${CHROME})。本地可用 --chrome <路径> 指定,或设 CHROME_PATH`
+    )
+  }
 
   // 找到我们那个页面(启动时就带了 URL)
   let page = null

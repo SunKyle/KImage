@@ -31,3 +31,45 @@ jobs:
 
       - name: Build
         run: npx vite build
+
+  # 性能与跨标签页同步的回归门。
+  # 与上面那个 job 分开:上面判"对不对"(秒级),这里判"有没有变慢/变胖"(分钟级),
+  # 两者红的意义完全不同,混在一个 job 里会让"哪一类坏了"看不出来。
+  perf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Build
+        run: npx vite build
+
+      # GitHub 的 ubuntu runner 自带 Chrome。脚本自己会找它(--no-sandbox 已经带上,
+      # 那只在受限环境里才是必需的)
+      - name: Serve the built app
+        run: |
+          npx vite preview --port 4173 --strictPort &
+          for _ in $(seq 1 40); do
+            curl -sf -o /dev/null http://localhost:4173/ && break
+            sleep 0.5
+          done
+          curl -sf -o /dev/null http://localhost:4173/ || { echo "预览服务没起来"; exit 1; }
+
+      # 预算只钉"结构性"的那两项:DOM 节点数与铺完耗时。
+      # 节点数是结构与数据规模决定的,跑在什么机器上都一样,所以它卡得紧
+      # (实测 3,016,阈值 6,000 留一倍余量);
+      # 耗时随 runner 快慢浮动,阈值给得很松,只拦"塌方式"的回归。
+      # JS 堆不钉:它在不同机器上差得多,钉了只会反复误报。
+      - name: Perf budgets + cross-tab sync
+        run: |
+          node scripts/measure-history.mjs \
+            --url http://localhost:4173/ \
+            --records 500 --images 2 --settle-ms 1500 \
+            --probe-two-tabs \
+            --max-dom-nodes 6000 --max-ms 5000
