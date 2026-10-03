@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { planPrune, shouldCheckStorage, type PruneCandidate } from './idb'
+import {
+  isDeadConnectionError,
+  planPrune,
+  retryOnDeadConnection,
+  shouldCheckStorage,
+  type PruneCandidate
+} from './idb'
 
 /* 造一条候选记录。id 用时间戳序号,u 开头便于在断言里看清"
    第几条"—— createdAt 决定清理顺序,所以测试里两者保持一致 */
@@ -116,5 +122,106 @@ describe('shouldCheckStorage · 体检节奏', () => {
   it('节流参数可覆盖(便于将来按场景调整)', () => {
     expect(shouldCheckStorage(2_000, 1_000, 5, 1_000, 5)).toBe(true)
     expect(shouldCheckStorage(1_500, 1_000, 4, 1_000, 5)).toBe(false)
+  })
+})
+
+/* ===== A1 缓存连接的健壮性 =====
+   把连接改成缓存之后，"连接意外关闭"这条路上必须能自愈 ——
+   否则后续每一次读写都打在死连接上，而每一处调用都把失败 catch 成"空"，
+   在用户眼里就是"我的东西全没了" */
+
+describe('isDeadConnectionError · 什么算“连接已死”', () => {
+  it('认 InvalidStateError（在死连接上建事务时的报法）', () => {
+    expect(isDeadConnectionError({ name: 'InvalidStateError' })).toBe(true)
+  })
+
+  it('也认 DatabaseClosedError（个别实现的叫法）', () => {
+    expect(isDeadConnectionError({ name: 'DatabaseClosedError' })).toBe(true)
+  })
+
+  it('别的错误不算 —— 那些重试也没用，重试会把一次失败变成一次挂死', () => {
+    for (const name of ['AbortError', 'QuotaExceededError', 'VersionError', 'UnknownError']) {
+      expect(isDeadConnectionError({ name }), name).toBe(false)
+    }
+  })
+
+  it('退化输入不抛异常', () => {
+    expect(isDeadConnectionError(null)).toBe(false)
+    expect(isDeadConnectionError(undefined)).toBe(false)
+    expect(isDeadConnectionError('boom')).toBe(false)
+    expect(isDeadConnectionError(new Error('x'))).toBe(false)
+  })
+})
+
+describe('retryOnDeadConnection · 连接死了就重开一次', () => {
+  const dead = () => Object.assign(new Error('dead'), { name: 'InvalidStateError' })
+  const fakeDB = (tag: string) => ({ tag }) as unknown as IDBDatabase
+
+  it('一切正常时只取一次连接、只跑一次', async () => {
+    let opens = 0
+    const res = await retryOnDeadConnection(
+      async () => { opens++; return fakeDB('a') },
+      () => {},
+      (db) => (db as unknown as { tag: string }).tag
+    )
+    expect(res).toBe('a')
+    expect(opens).toBe(1)
+  })
+
+  it('连接已死：清缓存、重开、再跑一次并成功', async () => {
+    let opens = 0
+    let resets = 0
+    const res = await retryOnDeadConnection(
+      async () => { opens++; return fakeDB(opens === 1 ? 'dead' : 'fresh') },
+      () => { resets++ },
+      (db) => {
+        if ((db as unknown as { tag: string }).tag === 'dead') throw dead()
+        return (db as unknown as { tag: string }).tag
+      }
+    )
+    expect(res).toBe('fresh')
+    expect(resets).toBe(1)
+    expect(opens).toBe(2)
+  })
+
+  it('重试仍失败就如实抛出（不无限重试）', async () => {
+    let opens = 0
+    await expect(
+      retryOnDeadConnection(
+        async () => { opens++; return fakeDB('dead') },
+        () => {},
+        () => { throw dead() }
+      )
+    ).rejects.toThrow('dead')
+    expect(opens).toBe(2) // 只重开一次
+  })
+
+  it('不是“连接已死”的错误直接抛，不清缓存也不重开', async () => {
+    let opens = 0
+    let resets = 0
+    const boom = Object.assign(new Error('bad data'), { name: 'DataError' })
+    await expect(
+      retryOnDeadConnection(
+        async () => { opens++; return fakeDB('a') },
+        () => { resets++ },
+        () => { throw boom }
+      )
+    ).rejects.toThrow('bad data')
+    expect(opens).toBe(1)
+    expect(resets).toBe(0)
+  })
+
+  it('run 返回 promise 时，异步失败同样触发重试', async () => {
+    let opens = 0
+    const res = await retryOnDeadConnection(
+      async () => { opens++; return fakeDB(opens === 1 ? 'dead' : 'fresh') },
+      () => {},
+      async (db) => {
+        if ((db as unknown as { tag: string }).tag === 'dead') throw dead()
+        return 'ok'
+      }
+    )
+    expect(res).toBe('ok')
+    expect(opens).toBe(2)
   })
 })

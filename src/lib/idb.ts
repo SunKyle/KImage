@@ -75,8 +75,51 @@ const DB_VERSION = 11
    落盘一条记录、读一屏消息、量一次缩略图,全都要重新握手一次;
    一个连接本来就可以被任意多的事务复用,没必要每次重来。
    失败的 promise 不缓存:版本过低、隐私模式下被拒都可能是"这一次"的事,
-   缓存住会让整个会话再也连不上。 */
+   缓存住会让整个会话再也连不上。
+   另见下面 resetDB 与 retryOnDeadConnection:缓存带来的一处新风险在那里补 */
 let dbPromise: Promise<IDBDatabase> | null = null
+
+/** 清掉缓存的连接 —— 下一次 openDB() 会重新开 */
+function resetDB(): void {
+  dbPromise = null
+}
+
+/**
+ * 这个错误是不是"连接已经死了"。
+ * 死连接上的表现是创建事务时抛 InvalidStateError(Chrome/Safari),
+ * 个别实现给的是 DatabaseClosedError —— 两个名字都认。
+ */
+export function isDeadConnectionError(e: unknown): boolean {
+  const name = (e as { name?: unknown } | null)?.name
+  return name === 'InvalidStateError' || name === 'DatabaseClosedError'
+}
+
+/**
+ * 在一个"活的"连接上做一件事;连接已死就清掉缓存重开一次。
+ *
+ * **缓存连接之后必须补这一环。** 连接会因为浏览器回收存储、DevTools 清存储、
+ * IDB 后端异常而意外关闭;那时缓存里的 promise 仍然指着那个死连接,
+ * 而每一处调用都把失败 catch 成"读不出来" —— 在用户眼里就是**"我的东西全没了"**
+ * (把连接改成缓存之前,每次重开,死了会自然恢复;缓存之后就再也恢复不了)。
+ *
+ * 只对"连接已死"重试一次:别的原因(数据坏、版本不符)重试也没用,
+ * 而无限重试会把一次失败变成一次挂死。
+ */
+export async function retryOnDeadConnection<T>(
+  getDB: () => Promise<IDBDatabase>,
+  reset: () => void,
+  run: (db: IDBDatabase) => T,
+  isDead: (e: unknown) => boolean = isDeadConnectionError
+): Promise<T> {
+  const db = await getDB()
+  try {
+    return await run(db)
+  } catch (e) {
+    if (!isDead(e)) throw e
+    reset()
+    return run(await getDB())
+  }
+}
 
 function openDB(): Promise<IDBDatabase> {
   if (dbPromise) return dbPromise
@@ -162,7 +205,14 @@ function openDB(): Promise<IDBDatabase> {
          下一次调用会重新开、拿到新版本 */
       db.onversionchange = () => {
         db.close()
-        if (dbPromise === opening) dbPromise = null
+        if (dbPromise === opening) resetDB()
+      }
+      /* 连接**意外**关闭时也要清缓存(不是我们主动 close 的那种)。
+         不清的话,后面每一次读写都打在一个死连接上,而所有失败都被 catch 成"空" ——
+         那正是"数据好像全没了"的形状。这条与 onversionchange 是两回事:
+         那个是别人要升级,这个是我们自己这边坏掉了 */
+      db.onclose = () => {
+        if (dbPromise === opening) resetDB()
       }
       resolve(db)
     }
@@ -176,7 +226,7 @@ function openDB(): Promise<IDBDatabase> {
   })
   dbPromise = opening
   opening.catch(() => {
-    if (dbPromise === opening) dbPromise = null
+    if (dbPromise === opening) resetDB()
   })
   return opening
 }
@@ -803,8 +853,11 @@ export async function deleteChatImage(id: string): Promise<void> {
 }
 
 async function txStore(mode: IDBTransactionMode): Promise<IDBObjectStore> {
-  const db = await openDB()
-  return db.transaction(STORE, mode).objectStore(STORE)
+  /* 走"连接已死就重开一次"这条:高频路径上的每一次失败都会在调用方
+     被 catch 成"读不出来",而那与"真的没有数据"长得一模一样 */
+  return retryOnDeadConnection(openDB, resetDB, (db) =>
+    db.transaction(STORE, mode).objectStore(STORE)
+  )
 }
 
 export async function getAll<T>(): Promise<T[]> {
@@ -924,27 +977,31 @@ export async function pruneHistory(): Promise<PruneResult | null> {
   pruneCheckedAt = now
   pruneWrites = 0
 
-  const db = await openDB()
-
   const est = await storageUsage()
   const usageRatio = est ? est.usage / est.quota : 0
   // 有余量就不动历史
   if (est && usageRatio < HIGH_WATER) return null
 
-  /* 全表读一遍:要避让挂了作品集的、以及含标记图的记录,只凭 createdAt 键做不到 */
-  const all = await new Promise<PruneCandidate[]>((resolve, reject) => {
-    const req = db.transaction(STORE, 'readonly').objectStore(STORE).getAll()
-    req.onsuccess = () =>
-      resolve(
-        (req.result as HistoryEntry[]).map((r) => ({
-          id: r.id,
-          createdAt: r.createdAt,
-          ...(r.collectionId !== undefined ? { collectionId: r.collectionId } : {}),
-          ...(r.results?.some((x) => x?.marked) ? { hasMarked: true } : {})
-        }))
-      )
-    req.onerror = () => reject(req.error)
-  })
+  /* 全表读一遍:要避让挂了作品集的、以及含标记图的记录,只凭 createdAt 键做不到。
+     同样走重试:读不出来与"真的没有记录"在调用方看来是一样的 */
+  const all = await retryOnDeadConnection(
+    openDB,
+    resetDB,
+    (live) =>
+      new Promise<PruneCandidate[]>((resolve, reject) => {
+        const req = live.transaction(STORE, 'readonly').objectStore(STORE).getAll()
+        req.onsuccess = () =>
+          resolve(
+            (req.result as HistoryEntry[]).map((r) => ({
+              id: r.id,
+              createdAt: r.createdAt,
+              ...(r.collectionId !== undefined ? { collectionId: r.collectionId } : {}),
+              ...(r.results?.some((x) => x?.marked) ? { hasMarked: true } : {})
+            }))
+          )
+        req.onerror = () => reject(req.error)
+      })
+  )
   // 配额驱动时按比例清;拿不到配额则退回条数兜底
   const want = est ? Math.ceil(all.length * PRUNE_RATIO) : Math.max(0, all.length - HARD_LIMIT)
   const count = Math.min(Math.max(0, all.length - MIN_KEEP), want)
@@ -955,13 +1012,18 @@ export async function pruneHistory(): Promise<PruneResult | null> {
      宁可空间继续吃紧,也不动用户特意留下的东西 */
   if (removedIds.length === 0) return null
 
-  await new Promise<void>((resolve, reject) => {
-    const tx = db.transaction(STORE, 'readwrite')
-    const store = tx.objectStore(STORE)
-    for (const id of removedIds) store.delete(id)
-    tx.oncomplete = () => resolve()
-    tx.onerror = () => reject(tx.error)
-  })
+  await retryOnDeadConnection(
+    openDB,
+    resetDB,
+    (live) =>
+      new Promise<void>((resolve, reject) => {
+        const tx = live.transaction(STORE, 'readwrite')
+        const store = tx.objectStore(STORE)
+        for (const id of removedIds) store.delete(id)
+        tx.oncomplete = () => resolve()
+        tx.onerror = () => reject(tx.error)
+      })
+  )
 
   return { removed: removedIds.length, removedIds, usageRatio, keptMarked }
 }

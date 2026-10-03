@@ -38,6 +38,8 @@ const NO_THUMB = args.includes('--no-thumb')
 const SETTLE_MS = Number(arg('settle-ms', 4000))
 /* 顺带量一下编码成本:画布那条路把位图编成 data URL 是不是真的卡主线程 */
 const PROBE_ENCODE = args.includes('--probe-encode')
+/* 探一下存储层的让位与重开:另一个连接要删库时,应用必须让开并且能重新开起来 */
+const PROBE_REOPEN = args.includes('--probe-reopen')
 /* 调试端口每轮随机取一个:固定端口会与上一次没退干净的实例撞车,
    而那种撞车表现为"连上了,但连到的是别人",量出来的数看着正常其实全错 */
 const PORT = Number(arg('cdp-port', 0)) || 9300 + Math.floor(Math.random() * 600)
@@ -411,6 +413,72 @@ async function main() {
       }, Number(arg('probe-size', 2560)))
     : null
 
+  /* —— 让位与重开探针 ——
+     缓存了连接之后,"别人要删库/升级"这条路上必须做两件事:
+     ① 让开(否则对方的 deleteDatabase 会一直卡在 blocked)
+     ② 之后还能重新开起来并写入(否则缓存就永久指向一个死连接)
+     单测覆盖不到这一段(要真的 IndexedDB),所以在真浏览器里走一遍:
+     标记一张图触发一次写 → 从页面里删库 → 再标记一次触发写 → 读回来确认 */
+  const reopen = PROBE_REOPEN
+    ? await evaluate(async () => {
+        const out = { steps: [] }
+        const open = () =>
+          new Promise((res, rej) => {
+            const r = indexedDB.open('kimage.db')
+            r.onsuccess = () => res(r.result)
+            r.onerror = () => rej(r.error)
+          })
+        const readCount = async () => {
+          const db = await open()
+          const all = await new Promise((res, rej) => {
+            const r = db.transaction('history', 'readonly').objectStore('history').getAll()
+            r.onsuccess = () => res(r.result)
+            r.onerror = () => rej(r.error)
+          })
+          db.close()
+          return all
+        }
+        const clickMark = () => {
+          const b = [...document.querySelectorAll('button')].find(
+            (x) => (x.getAttribute('aria-label') || '').startsWith('Mark image')
+          )
+          if (!b) return false
+          b.click()
+          return true
+        }
+        const settle = () => new Promise((r) => setTimeout(r, 400))
+
+        // ① 先写一次(标记一张图),确认正常
+        out.steps.push(['click first mark', clickMark()])
+        await settle()
+        const afterFirst = await readCount()
+        out.markedAfterFirst = afterFirst.filter((r) => r.results?.some((x) => x.marked)).length
+
+        // ② 从页面里删库:应用的连接必须让开,否则这里会一直 blocked
+        const delStart = performance.now()
+        out.deleteResult = await new Promise((res) => {
+          const req = indexedDB.deleteDatabase('kimage.db')
+          req.onsuccess = () => res('success')
+          req.onerror = () => res('error')
+          req.onblocked = () => res('blocked')
+          setTimeout(() => res('timeout'), 5000)
+        })
+        out.deleteMs = +(performance.now() - delStart).toFixed(1)
+
+        // ③ 再写一次:应用应当重新开库(顺带重建表结构)并写进去
+        await settle()
+        out.steps.push(['click mark after delete', clickMark()])
+        await settle()
+        try {
+          const afterSecond = await readCount()
+          out.recordsAfterReopen = afterSecond.length
+        } catch (e) {
+          out.reopenError = String(e)
+        }
+        return out
+      })
+    : null
+
   const heap = await evaluate(() => {
     const m = performance.memory
     return m ? { usedMB: +(m.usedJSHeapSize / 1048576).toFixed(1) } : null
@@ -426,6 +494,7 @@ async function main() {
     startup: { msToFeedFirstTile: +startupMs.toFixed(1), navTiming },
     background,
     encode,
+    reopen,
     history,
     heap
   }
