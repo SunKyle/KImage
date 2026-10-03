@@ -424,6 +424,9 @@ export interface ImportedChatMessage {
      而包里的图片文件也按这个名字存放(见 ImportedChat.images)——
      换个新名字只会让消息与图对不上,而这串 id 本来就只是"引用的键" */
   imageId?: string
+  /* 角色发过去的那张。与 imageId 同一处理:字节在 ImportedChat.images 里 */
+  photo?: string
+  photoId?: string
 }
 
 /* 角色包里带回来的那段对话。**记忆是主,消息是辅** ——

@@ -83,12 +83,22 @@ async function readChatForExport(id: string): Promise<ImportedChat> {
     ...(m.stopped ? { stopped: true } : {}),
     ...(m.truncated ? { truncated: true } : {}),
     ...(m.mood ? { mood: m.mood } : {}),
-    ...(m.imageId ? { imageId: m.imageId } : {})
+    ...(m.imageId ? { imageId: m.imageId } : {}),
+    /* 角色发的那张也要带走。**两条都要**:漏了 photo 这枚标记,
+       导进来的记录会少一张图;漏了 photoId 就只剩一句"我给你看个东西" */
+    ...(m.photo ? { photo: m.photo } : {}),
+    ...(m.photoId ? { photoId: m.photoId } : {})
   }))
   /* 附图一起带走。**缺了它们,对方拿到的是一串"不知道在说什么的回复"** ——
      消息在,而消息指着的那张图不在。读不回来的那张跳过:
      少一张图不该让整份导出失败 */
-  const ids = [...new Set(messages.map((m) => m.imageId).filter((x): x is string => !!x))]
+  const ids = [
+    ...new Set(
+      messages
+        .flatMap((m) => [m.imageId, m.photoId])
+        .filter((x): x is string => !!x)
+    )
+  ]
   const images: Array<{ id: string; blob: Blob }> = []
   for (const imgId of ids) {
     const rec = await getChatImage(imgId)

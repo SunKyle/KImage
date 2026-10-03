@@ -1756,7 +1756,13 @@ export async function readCharacterZip(file: File): Promise<ImportedCharacter[]>
     /* 把这段对话真正引用到的图挂上去。**只挂用到的那些** ——
        包里的图是全体角色共用的一个目录,每个角色都装一份会重复写库 */
     if (chat) {
-      const used = new Set(chat.messages.map((m) => m.imageId).filter((x): x is string => !!x))
+      /* 用户附的(imageId)与角色发的(photoId)都算"用到了":
+         只收前者的话,角色发过的图在导入后会变成空白 */
+      const used = new Set(
+        chat.messages
+          .flatMap((m) => [m.imageId, m.photoId])
+          .filter((x): x is string => !!x)
+      )
       const imgs = [...used]
         .map((id) => ({ id, blob: chatImgs.get(id) }))
         .filter((x): x is { id: string; blob: Blob } => !!x.blob)
