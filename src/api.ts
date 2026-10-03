@@ -904,14 +904,32 @@ export async function testConnection(config: ApiConfig): Promise<TestResult> {
  */
 async function failureMessage(resp: Response): Promise<string> {
   let msg = `Request failed (${resp.status})`
+  /* 先整段读出来再判:响应不是 JSON 时下面还要看它像不像一页 HTML，
+     而 body 只能读一次，所以用 clone 留一份 —— 调用方不会再读它，
+     但留一份不花什么代价，将来有人在报错之后还想读 body 也不会踩空 */
+  const raw = await resp.clone().text().catch(() => '')
   try {
-    const body = await resp.json()
+    const body = JSON.parse(raw)
     if (body?.error) msg = body.error
     // 附带上游原始报错 detail，便于定位 503/4xx 原因
     if (body?.detail) msg = `${msg} — ${body.detail}`
     return msg
   } catch {
-    /* 响应不是 JSON,见上 */
+    /* 不是 JSON：要么是我们的服务端没答上来,要么是请求**压根没走到服务端** */
+  }
+  /* 401/403 且回的是一页 HTML —— 几乎只有一种情况:部署平台的访问保护
+     (Vercel 的 Deployment Protection)。它把未登录的访客挡在门外,
+     连静态页都进不去,API 更是碰都不碰。只说 "Request failed (401)",
+     用户会一路去查 API key,而问题完全不在那儿 —— 桌面能出图、手机 401,
+     最常见的就是这一条:桌面那个浏览器登录过 Vercel,手机没有 */
+  if ((resp.status === 401 || resp.status === 403) && /<html|<!doctype/i.test(raw)) {
+    return (
+      `Request failed (${resp.status}) — the request never reached the app: ` +
+      'the deployment is behind a login wall and answered with a web page. ' +
+      'On Vercel this is Deployment Protection: turn it off, or set it to protect ' +
+      'only preview deployments (Project → Settings → Deployment Protection), ' +
+      'or open the site in a browser that is logged in to Vercel.'
+    )
   }
   if (resp.status >= 500) {
     msg +=

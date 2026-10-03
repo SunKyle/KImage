@@ -23,6 +23,12 @@ export default defineConfig({
     port: 5175,
     // 端口被占时直接报错退出,而不是悄悄换一个端口
     strictPort: true,
+    /* 默认只听 localhost —— 用手机连本机调试时要显式开:
+     *   npm run dev:lan        然后手机开 http://<这台机器的局域网 IP>:5175
+     * 不默认开有两个理由:一是它会把 /api 这条代理一并暴露给同网段的任何设备
+     * (等于把本机那个上游代理也借出去),二是绝大多数时候根本用不着。
+     * LAN=1 时探的是 0.0.0.0,vite 会顺手把可用的局域网地址打在启动日志里 */
+    host: process.env.LAN === '1' ? true : undefined,
     proxy: {
       // 开发环境将 /api 转发给本地 Express 后端,避开跨域
       '/api': {
