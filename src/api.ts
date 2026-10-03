@@ -17,14 +17,14 @@ import {
   ensurePersisted
 } from './lib/idb'
 
-const CONFIG_KEY = 'kimage.apiConfigs'
-const CONFIG_ACTIVE_KEY = 'kimage.apiActive'
+export const CONFIG_KEY = 'kimage.apiConfigs'
+export const CONFIG_ACTIVE_KEY = 'kimage.apiActive'
 // 「当前生效的文本配置」记录的 id:文本类别也有自己的当前项,与出图那条各自独立
-const TEXT_ACTIVE_KEY = 'kimage.apiActiveText'
+export const TEXT_ACTIVE_KEY = 'kimage.apiActiveText'
 // 「当前生效的识图配置」记录的 id:识图同样是独立的一类
-const VISION_ACTIVE_KEY = 'kimage.apiActiveVision'
+export const VISION_ACTIVE_KEY = 'kimage.apiActiveVision'
 // 「当前生效的朗读配置」记录的 id:朗读也是独立的一类(它连协议都不是 OpenAI 兼容那套)
-const TTS_ACTIVE_KEY = 'kimage.apiActiveTts'
+export const TTS_ACTIVE_KEY = 'kimage.apiActiveTts'
 
 export function uid(): string {
   return Math.random().toString(36).slice(2) + Date.now().toString(36)
@@ -390,6 +390,38 @@ function normalizeConfig(c: ApiConfig): ApiConfig {
 
 export function saveConfigs(list: ApiConfig[]) {
   localStorage.setItem(CONFIG_KEY, JSON.stringify(list))
+}
+
+/* ===== 按用途挑「当前生效」的那条 ====================================
+   四类用途(出图/改写/识图/朗读)共用同一个配置列表,但各自记一个当前值。
+   挑选规则只有一条,抽在这里是因为主界面有六处要用它:启动时挑一遍,
+   删掉一条、改了用途、以及另一个标签页动了配置之后都要重挑 ——
+   六处各写一份 find 迟早会写歪(事实上已经写歪过:出图那条用的是
+   `kind !== 'text'`,于是"只配了一条朗读配置"时,朗读那条会被当成出图配置)。
+   ------------------------------------------------------------------ */
+
+/** 配置的用途。normalizeConfig 保证这个字段一定有值,缺省是 image */
+export type ConfigKind = NonNullable<ApiConfig['kind']>
+
+export function configKindOf(c: ApiConfig): ConfigKind {
+  return c.kind ?? 'image'
+}
+
+/**
+ * 挑出某一类里「当前生效」的那条:
+ * - 先认存着的 id,但要求它**用途仍然是这一类** —— 用户可能已经把它改成别的用途了;
+ * - 对不上就退到这一类里的第一条(只有一条时这是显然的选择,比空着好);
+ * - 这一类一条都没有则返回 undefined(调用方自行决定是清空还是提示"去配一条")。
+ */
+export function pickActiveByKind(
+  list: ApiConfig[],
+  kind: ConfigKind,
+  savedId: string
+): ApiConfig | undefined {
+  return (
+    list.find((c) => c.id === savedId && configKindOf(c) === kind) ??
+    list.find((c) => configKindOf(c) === kind)
+  )
 }
 
 export function loadActiveId(): string {
@@ -1630,7 +1662,7 @@ export async function saveHistoryRecord(entry: HistoryEntry) {
    归属关系(哪条记录属于哪个作品集)挂在记录自己的 collectionId 上,
    和记录一起存在 IndexedDB,所以这里不需要接触 IDB。
    ------------------------------------------------------------------------ */
-const COLL_KEY = 'kimage.collections'
+export const COLL_KEY = 'kimage.collections'
 
 /** 读出作品集目录。目录是本地数据,但别信它一定干净:同步工具截断、手改时
     当数组直接用会让页面崩,滤一遍扔掉坏项 */
@@ -1661,7 +1693,7 @@ export function saveCollections(list: Collection[]): void {
 /* ===== 角色 =====
    目录只有名字/设定/时间,每条几百字节,localStorage 足够;
    参考图是 Blob,按 id 存在 IndexedDB,读的时候贴回去(与提示词封面同一套做法) */
-const CHAR_KEY = 'kimage.characters'
+export const CHAR_KEY = 'kimage.characters'
 
 /* 面貌特征:跨场景不该变的那九项。这九项会并进每一张成品的提示词 ——
    只给头发和眼睛时,肤色、脸型、眉形全靠模型自己从零重编,换个场景就不是同一个人了 */
@@ -2250,7 +2282,7 @@ export async function chatStream(opts: ChatStreamOpts): Promise<ChatStreamResult
 }
 
 /* ===== 提示词库(收藏) ===== */
-const LIB_KEY = 'kimage.prompts'
+export const LIB_KEY = 'kimage.prompts'
 /* 提示词库的读入规范化。老记录只有一个 category 字符串,新的是 tags 数组;
    两套字段的判断收口在这里,别散到各个组件里去分辨"这条是新的还是旧的"。
    'Uncategorized' 是当初的默认值,不是用户填的,转成标签只会多出一个噪声分类 */
