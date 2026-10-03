@@ -323,9 +323,15 @@ function undoEnhance() {
        这一点错了就会"一点不像" —— 参考图是空的,等于纯文生图 */
     const who = deps.characters.value.find((c) => c.id === charId)
     const plan = planChatPhoto(text, self, who ? characterFaceDesc(who) : '')
-    const refList = plan.useRefs ? await deps.charRefSrcsOf(charId) : []
     const ctrl = new AbortController()
     try {
+      /* 取参考图这一步**也要在 try 里**:它会读 IndexedDB、把 Blob 转成 data URL,
+         是这条链上最容易真抛出来的一步。抛出去有两个后果,都不能接受 ——
+         一是"同一张脸"的依据没了却照样发请求(画出来是个陌生人),
+         二是**这个函数往外抛时调用方那侧会静默**:界面既没有提示,
+         那条消息还永远停在骨架上(见 App 的 drawChatPhoto)。
+         所以这里的约定是:**失败只返回 undefined,绝不 reject** */
+      const refList = plan.useRefs ? await deps.charRefSrcsOf(charId) : []
       const res = await generate(
         {
           prompt: plan.prompt,

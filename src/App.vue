@@ -1596,29 +1596,36 @@ function drawChatPhoto(id: string, reply: ChatMessage) {
   if (!scene) return
   // 重试时从失败态翻回"正在画":界面据此把提示换回骨架
   reply.photoFailed = false
-  void generateChatPhoto(id, scene, !!reply.photoSelf).then(async (blob) => {
-    /* 这一条可能已经被删了(清空对话、或单独删掉它):那就别再往上写 */
+
+  /** 这一张没画出来。**先看这条还在不在** —— 它可能已经被删了(清空对话、
+   *  或单独删掉它),那就别再往上写:写回去等于把一条已经删掉的消息复活 */
+  async function markFailed() {
     if (!chatMessages.value[id]?.some((m) => m.id === reply.id)) return
-    if (!blob) {
-      reply.photoFailed = true
-      // 落盘:**刷新之后那行提示与重试键还在**,否则又变回一个永远转的骨架
-      await putChatMessage(toRaw(reply)).catch(() => {})
-      return
-    }
-    const photoId = uid()
-    try {
-      await putChatImage({ id: photoId, blob, createdAt: Date.now() })
-    } catch {
-      reply.photoFailed = true
-      await putChatMessage(toRaw(reply)).catch(() => {})
-      return
-    }
-    reply.photoId = photoId
-    /* 落库只是把这条消息补全:图不进历史,所以这里走的不是 persist,
-       而是"把这一条改写回去"。失败也不回滚界面 —— 失败那一路见上,
-       成功的这一路写不进去也不该把已经画好的图从界面上撤掉 */
+    reply.photoFailed = true
+    // 落盘:**刷新之后那行提示与重试键还在**,否则又变回一个永远转的骨架
     await putChatMessage(toRaw(reply)).catch(() => {})
-  })
+  }
+
+  void generateChatPhoto(id, scene, !!reply.photoSelf)
+    .then(async (blob) => {
+      if (!chatMessages.value[id]?.some((m) => m.id === reply.id)) return
+      if (!blob) return markFailed()
+      const photoId = uid()
+      try {
+        await putChatImage({ id: photoId, blob, createdAt: Date.now() })
+      } catch {
+        return markFailed()
+      }
+      reply.photoId = photoId
+      /* 落库只是把这条消息补全:图不进历史,所以这里走的不是 persist,
+         而是"把这一条改写回去"。失败也不回滚界面 —— 失败那一路见上,
+         成功的这一路写不进去也不该把已经画好的图从界面上撤掉 */
+      await putChatMessage(toRaw(reply)).catch(() => {})
+    })
+    /* 兜一层。generateChatPhoto 的约定是"失败返回 undefined、不往外抛",
+       但真抛出来了也必须落到同一个出口 —— 漏出去这条消息就一直停在骨架上,
+       连那行提示都不会有(从前取参考图那一步就真的在它的 try 之外) */
+    .catch(markFailed)
 }
 
 /** 重画某一条消息里的图。与"重新生成"不同:文字一条都不动,
