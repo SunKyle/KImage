@@ -4,8 +4,18 @@
 export declare const PHOTO_SCENE_CHARS: number
 export declare const TAG_HOLD: number
 export declare function cleanScene(s: unknown): string
-export declare function splitTags(s: unknown): {
+/** 拆出"场景 + 有没有它本人"。charName 用于兜底判据:描述里点了自己的名字 */
+export declare function parsePhotoIntent(
+  raw: unknown,
+  charName?: string
+): { scene: string; self: boolean }
+export declare function splitTags(
+  s: unknown,
+  charName?: string
+): {
   text: string
   mood: string
   photo: string
+  /** 这张图里有没有它本人。true 才把角色设定与设定图发给出图模型 */
+  photoSelf: boolean
 }

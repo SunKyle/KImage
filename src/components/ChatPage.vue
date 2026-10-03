@@ -5,13 +5,13 @@ import {
   PhArrowUp,
   PhArrowsClockwise,
   PhBrain,
-  PhCaretDown,
   PhChatCircleDots,
   PhDotsThree,
   PhEraser,
   PhImage,
   PhMaskHappy,
   PhPencilSimple,
+  PhPushPin,
   PhSlidersHorizontal,
   PhSpeakerHigh,
   PhStopCircle,
@@ -71,6 +71,12 @@ const emit = defineEmits<{
   (e: 'send', charId: string, text: string, image?: Blob): void
   (e: 'stop', charId: string): void
   (e: 'regenerate', charId: string): void
+  /* 删掉单独一条消息。**只交意图** —— 内存与 IndexedDB 两边怎么删、
+     撤销窗口怎么给、附图什么时候收,全归主界面(与清空对话同一条分工) */
+  (e: 'deleteMessage', charId: string, messageId: string): void
+  /* 置顶 / 取消置顶。落在角色自己身上(Character.pinned),由主界面写盘 ——
+     左栏与角色页两处都从这里出去,两个入口不该各写一套 */
+  (e: 'pin', charId: string): void
   /* 用户把那段记忆改成了别的。只换正文,覆盖进度(upToAt/covered)不动 ——
      那些消息本来就已经进去过了,改了正文不等于要重压一遍 */
   (e: 'editSummary', charId: string, text: string): void
@@ -98,8 +104,10 @@ function avatarOf(c: Character): string {
   return coverSrc(c.ref)
 }
 
-/* 最近活跃在前:聊过的按最后一条消息的时间排,没聊过的排在后面(按创建时间)。
-   这份顺序是派生的,不落盘 —— 与 charStats / charWorks 同一条规矩。
+/* 最近活跃在前:**置顶的永远在最前**,其余按最后一条消息的时间排,
+   没聊过的排在后面(按创建时间)。顺序是派生的,不落盘 ——
+   与 charStats / charWorks 同一条规矩;而"置顶"恰恰是派生不出来的那份意愿,
+   所以它存在角色身上(Character.pinned),这里只把它当第一个排序关键字。
    注意列的是**全部**角色,不是"聊过的那些":只列聊过的,新角色就永远开不了头 */
 /* 某个角色最后一句。**内存里那份优先,库里那份兜底** ——
    内存里的更新(刚说完的话就在里面),而 lastMsg 是给没打开过的角色用的:
@@ -112,7 +120,10 @@ function lastOf(id: string): ChatMessage | undefined {
 
 const ordered = computed(() =>
   [...props.characters].sort(
-    (a, b) => (lastOf(b.id)?.createdAt || 0) - (lastOf(a.id)?.createdAt || 0) || b.createdAt - a.createdAt
+    (a, b) =>
+      Number(!!b.pinned) - Number(!!a.pinned) ||
+      (lastOf(b.id)?.createdAt || 0) - (lastOf(a.id)?.createdAt || 0) ||
+      b.createdAt - a.createdAt
   )
 )
 
@@ -149,14 +160,20 @@ function dayLabel(t: number): string {
 
 type Row =
   | { kind: 'sep'; key: string; label: string }
-  | { kind: 'msg'; key: string; msg: ChatMessage }
+  /* first: 这是"新的一段"的第一条(换了人,或者上面刚插了一条时间分隔)。
+     间距据此分两档 —— 见下面 rows 的说明与 .msg.group-first */
+  | { kind: 'msg'; key: string; msg: ChatMessage; first: boolean }
 
 const rows = computed<Row[]>(() => {
   const out: Row[] = []
   let prev = 0
+  /* 上一条是谁说的。换人(或前面插了一条时间分隔)就是"新的一段",
+     间距要多让一档 —— 见 .msg.group-first */
+  let prevRole = ''
   for (const m of msgs.value) {
     const newDay = !prev || new Date(prev).toDateString() !== new Date(m.createdAt).toDateString()
-    if (!prev || newDay || m.createdAt - prev > SEP_GAP) {
+    const brokeByTime = !prev || newDay || m.createdAt - prev > SEP_GAP
+    if (brokeByTime) {
       out.push({
         kind: 'sep',
         key: `sep-${m.id}`,
@@ -164,8 +181,17 @@ const rows = computed<Row[]>(() => {
         label: newDay ? `${dayLabel(m.createdAt)} · ${timeLabel(m.createdAt)}` : timeLabel(m.createdAt)
       })
     }
-    out.push({ kind: 'msg', key: m.id, msg: m })
+    out.push({
+      kind: 'msg',
+      key: m.id,
+      msg: m,
+      /* 连着同一个人的第二句起算"同一段":它还挨着上一句,读起来是一段话。
+         注意分隔线也要算进来 —— 隔了半小时之后的第一句,哪怕还是同一个人说,
+         视觉上也是新的一段 */
+      first: brokeByTime || m.role !== prevRole
+    })
     prev = m.createdAt
+    prevRole = m.role
   }
   return out
 })
@@ -179,9 +205,11 @@ const cursorId = computed(() => {
 
 /* 重新生成:删掉最后那条助手消息、用同样的上文重发。
    用户那条不动。按过 Stop 的那条不提供 —— 它是"说到这儿够了",
-   重发等于把用户的选择覆盖掉 */
+   重发等于把用户的选择覆盖掉。
+   **没配文本模型时不给这枚入口**:消息流不受输入区的门控,而这个动作
+   要先删掉旧回复;发不出去的时候点它等于白丢一条(见主界面的 regenerateChat) */
 const canRegenerate = computed(() => {
-  if (streaming.value) return false
+  if (streaming.value || !props.textConfig) return false
   const last = msgs.value[msgs.value.length - 1]
   return !!last && last.role === 'assistant' && !last.stopped
 })
@@ -191,11 +219,32 @@ const canRegenerate = computed(() => {
    与 Regenerate 共用同一个入口,只是文案不同 —— 同一次动作,
    在"想换个说法"和"刚才没发出去"两种情境下该叫不同的名字 */
 const canRetry = computed(() => {
-  if (streaming.value) return false
+  if (streaming.value || !props.textConfig) return false
   const last = msgs.value[msgs.value.length - 1]
   return !!last && last.role === 'user'
 })
 const regenLabel = computed(() => (canRetry.value ? 'Try again' : 'Regenerate'))
+
+/* ===== 每一条消息的悬停动作 ========================================
+   念 / 删。三条判据分开写,是因为它们各自有各自的理由,合成一个大
+   布尔表达式之后"为什么这条没有那枚按钮"就读不出来了 */
+/** 正在生成的那条不给朗读:半句话念出来只会更难听 */
+function canSpeakMsg(m: ChatMessage): boolean {
+  return canSpeak && m.role === 'assistant' && m.id !== cursorId.value
+}
+/** 正在生成的那条不给删:它还没落盘,删了会与收尾那一步打架(见主界面) */
+function canDeleteMsg(m: ChatMessage): boolean {
+  return !streaming.value && m.id !== cursorId.value
+}
+/** 整排动作有没有东西可放。一个都没有时连外层都不渲染 ——
+   空着一排绝对定位的元素会平白多出一块能接收指针的区域 */
+function hasMsgOps(m: ChatMessage): boolean {
+  return canSpeakMsg(m) || canDeleteMsg(m)
+}
+/** 这条消息挂着图没有(用户附的、或角色发的)。空气泡的判据要用它 */
+function hasAttach(m: ChatMessage): boolean {
+  return !!(m.imageId || m.photoId || m.photo)
+}
 
 const personaMissing = computed(() => !!current.value && !hasPersona(current.value.persona))
 
@@ -208,10 +257,19 @@ const mood = computed(() => {
 })
 
 /* ===== 长期记忆 =====
-   默认折起来:它是"它为什么还记得那件事"的解释,不是每屏都要读的东西。
-   展开就能看到模型此刻真正"记得"的全部内容 —— 记忆是有损的,
-   用户得能亲眼看到损掉了什么,才谈得上信它 */
+   记忆以前是消息流最上面那一块,折起来的一块虚线框。那个位置有个死结:
+   它代表"比这些消息更早的那些",顺序上确实该在最前面 —— 而一进来视口是
+   贴在**底部**的,聊得越久它离得越远。想改一处措辞要先往上翻几百条。
+
+   所以它改成两件事:
+   - 一枚常驻在头部的入口(记忆非空时才出现),写着它多久没动过;
+   - 一张悬浮卡片,点开就看、就能改 —— 位置固定,与对话多长无关。
+
+   记忆是**有损**的,用户得能亲眼看到损掉了什么才谈得上信它;
+   还得改得动 —— 否则唯一的办法是清空整段对话,而那把历史也一起扔了。 */
 const memoryOpen = ref(false)
+const memoryCard = ref<HTMLElement | null>(null)
+const memoryChip = ref<HTMLElement | null>(null)
 
 /** 相对时间。只到"天"这一档就够 —— 记忆本来就是隔一阵才更新一次的 */
 function ago(ts: number): string {
@@ -224,30 +282,43 @@ function ago(ts: number): string {
 }
 /* 有东西可看的记忆。看的是**正文非空**,不是记录在不在 ——
    忘掉之后库里会留一条正文为空的记录(那个"从哪之后不再记得"的游标
-   总得有地方待),那种记录不该在界面上显出一个空的 Memory 块。
+   总得有地方待),那种记录不该在界面上显出一枚空的入口。
    直接把记录本身交出去,模板里 v-if="memory" 一过就能接着取正文 */
 const memory = computed(() => (props.summary?.text ? props.summary : undefined))
 const memoryWhen = computed(() => (memory.value ? ago(memory.value.updatedAt) : ''))
 
-/* 记忆可改。压错了一处就得能就地改 —— 否则用户唯一的办法是清空整段对话,
-   而那把整段历史也一起扔了,代价完全不成比例。
-   编辑态是"这一页临时在做什么",归组件自己管;写回库里的动作交给主界面 */
+/* 编辑态是"这张卡片临时在做什么",归组件自己管;写回库里的动作交给主界面 */
 const memoryEditing = ref(false)
 const memoryDraft = ref('')
-
-/* 正在改的时候别让头把它折起来 —— 折了就等于把手上正在写的东西藏了 */
-function toggleMemory() {
-  if (memoryEditing.value) return
-  memoryOpen.value = !memoryOpen.value
-}
 
 /* 上限就用消息那一档:服务端对记忆收的正是 CHAT_MAX_CHARS,
    这里跟着同一个数,用户改到多少会被下游截断是可以预期的 */
 const memoryTooLong = computed(() => memoryDraft.value.trim().length > CHAT_MAX_CHARS)
 
+/** 开卡片。editing = 直接进编辑态(⋮ 菜单里那条"Edit memory"走它) */
+async function openMemory(editing = false) {
+  /* 菜单与卡片都从头部那一块展开,同时开着会叠在一起。
+     开卡片就先把菜单收掉 —— 菜单那条 Edit memory 也是从这里进来的 */
+  closeMenu()
+  memoryDraft.value = editing ? props.summary?.text || '' : ''
+  memoryEditing.value = editing
+  memoryOpen.value = true
+  /* 焦点收进卡片:Tab 从这里开始走,读屏也会念出它是什么。
+     不这么做的话焦点还在背后那枚入口上,键盘用户 Tab 一路穿到消息流里 */
+  await nextTick()
+  memoryCard.value?.focus()
+}
+function closeMemory() {
+  memoryOpen.value = false
+  cancelEditMemory()
+}
+/** 头部那枚药丸:开着就收,关着就开。模板里直接写这个,不写三元表达式 */
+function toggleMemoryCard() {
+  if (memoryOpen.value) closeMemory()
+  else void openMemory()
+}
 function startEditMemory() {
   memoryDraft.value = props.summary?.text || ''
-  memoryOpen.value = true
   memoryEditing.value = true
 }
 function cancelEditMemory() {
@@ -260,15 +331,22 @@ function saveMemory() {
      清空记忆该走"清空对话",不该在这里留下一个空壳 */
   if (!t || memoryTooLong.value) return
   emit('editSummary', props.active, t)
+  /* 存完退回查看态而不是关掉卡片:让用户看见自己刚写的那版**已经生效**
+     (主界面写回后 props 会跟着更新),比"啪一下收起来"可信 */
   memoryEditing.value = false
+  memoryDraft.value = ''
 }
-/* 换角色时把编辑态收掉:那块记忆已经属于另一个人了,
-   留着草稿会让人以为改的是当前这个。
+/* 卡片里的 Tab 也要圈住 —— 与角色浮层、向导共用一份实现(见 lib/ui) */
+function onMemoryKey(e: KeyboardEvent) {
+  if (e.key === 'Tab') trapTab(memoryCard.value, e)
+}
+/* 换角色时把卡片收掉:那块记忆已经属于另一个人了,留着草稿会让人
+   以为改的是当前这个。
    正念着的那句也一起停 —— 换了人就换了一段对话,上一个人的声音不该还在响 */
 watch(
   () => props.active,
   () => {
-    cancelEditMemory()
+    closeMemory()
     stopSpeaking()
   }
 )
@@ -289,10 +367,12 @@ async function toggleSpeak(msg: ChatMessage) {
   if (!c) return
   /* 走哪条路由角色自己的嗓音决定(见 lib/speech):
      没配过的一律走浏览器,配了就走第三方 —— 失败会自己退回来,
-     并把"退回来了"和原因一起交回来 */
+     并把"退回来了"和原因一起交回来。
+     language 也一样带上:设过语言的角色的朗读音色以它为准,
+     不必再从回复文本里猜它说的是哪国话 */
   const said = await speak(
     msg.content,
-    { charId: c.id, voice: c.voice, cfg: props.ttsConfig },
+    { charId: c.id, voice: c.voice, language: c.persona?.language, cfg: props.ttsConfig },
     msg.id
   )
   if (said) emit('notice', said)
@@ -576,34 +656,47 @@ function onPickerKey(e: KeyboardEvent) {
 }
 
 function onDocPointerDown(e: PointerEvent) {
+  /* 记忆卡片与菜单都是"点外面就收起"的浮层。两件事分开判:
+     卡片里可能正写着草稿,不该因为顺手点掉了菜单把它一起带走 */
+  if (
+    memoryOpen.value &&
+    !isInside(e.target, memoryCard.value) &&
+    !isInside(e.target, memoryChip.value)
+  ) {
+    closeMemory()
+  }
   if (!menuOpen.value) return
   if (isInside(e.target, menuWrap.value)) return
   closeMenu()
 }
 
-/** Esc 是逐层退:先关角色浮层(并把焦点还回去),再关菜单 ——
+/** Esc 是逐层退:先关角色浮层(并把焦点还回去),再关记忆卡片,最后关菜单 ——
  *  与角色页的查看器同一套规矩 */
 function onKey(e: KeyboardEvent) {
   layerOnEscape(e.key, [
     // 大图压在最上面:它在时先收它,别让一次 Esc 把下面的菜单也带走
     { open: !!zoom.value, close: () => (zoom.value = null) },
     { open: pickerOpen.value, close: () => void closePicker() },
+    { open: memoryOpen.value, close: closeMemory },
     { open: menuOpen.value, close: closeMenu }
   ])
 }
 
 function clearChat() {
   closeMenu()
+  /* 卡片一起收:这段对话(连同记忆)马上就没了,留着一张写着旧记忆的卡片
+     会让人以为它还在。不收还有一处更隐蔽的后果 —— memoryOpen 仍是 true,
+     而这个角色将来重新攒出记忆时,卡片会自己弹开 */
+  closeMemory()
   if (props.active) emit('clear', props.active)
 }
 
-/* 记忆块的入口在消息流最上面,而一进来视口是贴在底部的 ——
-   偏偏"聊得够久"才有记忆,那时它已经被推到很远的上方,要往上翻很久。
-   所以 ⋯ 菜单里再放一个常驻入口:点它直接滚到顶、展开、进入编辑 */
+/* ⋮ 菜单里那条 "Edit memory":打开卡片并直接进编辑态。
+   主入口是头部那枚常驻的 Memory 药丸(一眼看得见),菜单这条是给
+   "手已经在菜单里了"的人留的近路 —— 两条路通向同一张卡片 */
 function editMemoryFromMenu() {
   closeMenu()
-  startEditMemory()
-  streamEl.value?.scrollTo({ top: 0, behavior: 'smooth' })
+  void openMemory(true)
 }
 
 /* 忘掉这段记忆。**一条消息都不删** —— 它只是"角色不再记得",
@@ -612,7 +705,9 @@ function editMemoryFromMenu() {
    否则下一轮压缩会把刚忘掉的那段重新压回来(见 App 的 forgetChatSummary) */
 function forgetMemory() {
   closeMenu()
-  cancelEditMemory()
+  /* 卡片一起收掉:忘完之后头部那枚入口自己也会消失(记忆正文空了),
+     留着一张写着旧内容的卡片会让人以为没忘成 */
+  closeMemory()
   if (props.active) emit('forgetSummary', props.active)
 }
 
@@ -640,23 +735,42 @@ onBeforeUnmount(() => {
     <aside class="chat-rail" aria-label="Characters">
       <p class="rail-eyebrow">Conversations</p>
       <div v-if="characters.length" class="rail-list no-bar">
-        <button
+        <!-- 一行 = 一个"选它"按钮 + 一枚图钉(两个兄弟节点)。
+             **不能把图钉嵌在行按钮里**:按钮不能套按钮,那是无效 HTML,
+             读屏与键盘也会跟着乱 -->
+        <div
           v-for="c in ordered"
           :key="c.id"
-          class="rail-row"
+          class="rail-item"
           :class="{ on: c.id === active }"
-          :aria-current="c.id === active ? 'true' : undefined"
-          @click="pick(c.id)"
         >
-          <span class="rail-ava">
-            <img v-if="avatarOf(c)" :src="avatarOf(c)" alt="" />
-            <PhMaskHappy v-else aria-hidden="true" />
-          </span>
-          <span class="rail-text">
-            <span class="rail-name">{{ c.name }}</span>
-            <span class="rail-last">{{ lastLine(c) }}</span>
-          </span>
-        </button>
+          <button
+            class="rail-row"
+            :aria-current="c.id === active ? 'true' : undefined"
+            @click="pick(c.id)"
+          >
+            <span class="rail-ava">
+              <img v-if="avatarOf(c)" :src="avatarOf(c)" alt="" />
+              <PhMaskHappy v-else aria-hidden="true" />
+            </span>
+            <span class="rail-text">
+              <span class="rail-name">{{ c.name }}</span>
+              <span class="rail-last">{{ lastLine(c) }}</span>
+            </span>
+          </button>
+          <!-- 置顶就在这一行上做:要置顶的念头多半是"在聊天列表里找不到它"
+               的那一刻冒出来的,逼人先切去角色页再回来是绕路。
+               置顶的那一枚常驻(它是状态),其余悬停才浮出 -->
+          <button
+            class="rail-pin"
+            :class="{ 'is-on': c.pinned }"
+            :aria-label="c.pinned ? `Unpin ${c.name}` : `Pin ${c.name}`"
+            :aria-pressed="!!c.pinned"
+            @click="emit('pin', c.id)"
+          >
+            <PhPushPin :weight="c.pinned ? 'fill' : 'regular'" aria-hidden="true" />
+          </button>
+        </div>
       </div>
       <p v-else class="rail-empty">No characters yet.</p>
     </aside>
@@ -715,32 +829,119 @@ onBeforeUnmount(() => {
             </span>
           </span>
 
-          <div ref="menuWrap" class="chat-menu-wrap">
+          <!-- 头部右侧:记忆入口 + ⋮ 菜单。
+               两者一起靠右收在 head-acts 里,窄屏把名字挤省略号时才不会错位 -->
+          <div class="head-acts">
+            <!-- 记忆的常驻入口。它在头部而不再在消息流顶上 ——
+                 那是"它为什么还记得那件事"的解释,却要往上翻几百条才够得着。
+                 只在真有记忆时出现:空着的一枚药丸点开是一片空 -->
             <button
-              class="icob"
-              aria-label="Conversation options"
-              :aria-expanded="menuOpen"
-              @click="menuOpen = !menuOpen"
+              v-if="memory"
+              ref="memoryChip"
+              class="mem-chip"
+              :class="{ on: memoryOpen }"
+              aria-haspopup="dialog"
+              :aria-expanded="memoryOpen"
+              @click="toggleMemoryCard"
             >
-              <PhDotsThree aria-hidden="true" />
+              <PhBrain aria-hidden="true" />
+              <span class="mem-chip-text">Memory</span>
+              <span class="mem-chip-when">{{ memoryWhen }}</span>
             </button>
-            <div v-if="menuOpen" class="chat-menu">
-              <!-- 没有记忆就没东西可改也没东西可忘 ——
-                   点了会滚到顶上撞见一片空,不如不给。
-                   忘记忆排在清空对话前面,三档是"忘一点 / 忘干净"的递进 -->
-              <button v-if="memory" @click="editMemoryFromMenu">
-                <PhPencilSimple aria-hidden="true" />
-                Edit memory
+
+            <div ref="menuWrap" class="chat-menu-wrap">
+              <button
+                class="icob"
+                aria-label="Conversation options"
+                :aria-expanded="menuOpen"
+                @click="menuOpen = !menuOpen"
+              >
+                <PhDotsThree aria-hidden="true" />
               </button>
-              <button v-if="memory" @click="forgetMemory">
-                <PhEraser aria-hidden="true" />
-                Forget memory
-              </button>
-              <button :disabled="!msgs.length" @click="clearChat">
-                <PhTrash aria-hidden="true" />
-                Clear conversation
+              <div v-if="menuOpen" class="chat-menu">
+                <!-- 没有记忆就没东西可改也没东西可忘 ——
+                     点了打开的卡片是空的,不如不给。
+                     忘记忆排在清空对话前面,三档是"忘一点 / 忘干净"的递进 -->
+                <button v-if="memory" @click="editMemoryFromMenu">
+                  <PhPencilSimple aria-hidden="true" />
+                  Edit memory
+                </button>
+                <button v-if="memory" @click="forgetMemory">
+                  <PhEraser aria-hidden="true" />
+                  Forget memory
+                </button>
+                <button :disabled="!msgs.length" @click="clearChat">
+                  <PhTrash aria-hidden="true" />
+                  Clear conversation
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- 记忆卡片。**悬浮在头部下方**,位置固定,与对话多长无关 ——
+               它取代的正是"消息流最上面那一块":内容一样,只是在也够得着 -->
+          <div
+            v-if="memoryOpen && memory"
+            ref="memoryCard"
+            class="mem-card"
+            role="dialog"
+            aria-label="Long-term memory"
+            tabindex="-1"
+            @keydown="onMemoryKey"
+          >
+            <div class="mem-card-head">
+              <PhBrain aria-hidden="true" />
+              <span class="mem-card-title">Memory</span>
+              <span class="mem-card-when">updated {{ memoryWhen }}</span>
+              <button class="mem-x" aria-label="Close memory" @click="closeMemory">
+                <PhX aria-hidden="true" />
               </button>
             </div>
+
+            <!-- 改这里的字,不是改历史 —— 那段对话已经压成这几十个字了,
+                 改它等于给模型换一份"我记得的版本"。改得动,这功能才谈得上可信 -->
+            <template v-if="memoryEditing">
+              <textarea
+                v-model="memoryDraft"
+                class="mem-input"
+                rows="5"
+                aria-label="Edit memory"
+              ></textarea>
+              <p v-if="memoryTooLong" class="mem-warn" role="alert">
+                Over {{ CHAT_MAX_CHARS }} characters. Trim it before saving.
+              </p>
+              <div class="mem-actions">
+                <button
+                  class="save-btn"
+                  :disabled="!memoryDraft.trim() || memoryTooLong"
+                  @click="saveMemory"
+                >
+                  Save
+                </button>
+                <button class="quiet-btn" @click="cancelEditMemory">Cancel</button>
+              </div>
+            </template>
+
+            <template v-else>
+              <p class="mem-text">{{ memory.text }}</p>
+              <p class="mem-note">
+                Written by the model from the older part of this conversation — the messages above
+                the last few. Edit it if it got something wrong; forget it to make
+                {{ current.name }} start over from here.
+              </p>
+              <!-- 改是主操作,忘是次操作 —— 所以忘了的那枚悬停才染成危险色,
+                   平时与"改一改"长得一样安静 -->
+              <div class="mem-actions">
+                <button class="quiet-btn" @click="startEditMemory">
+                  <PhPencilSimple aria-hidden="true" />
+                  Edit memory
+                </button>
+                <button class="quiet-btn danger" @click="forgetMemory">
+                  <PhEraser aria-hidden="true" />
+                  Forget memory
+                </button>
+              </div>
+            </template>
           </div>
         </header>
 
@@ -782,59 +983,10 @@ onBeforeUnmount(() => {
           </div>
 
           <div v-else class="chat-inner">
-            <!-- 长期记忆。摆在最上面是因为它代表"比这些消息更早的那些" ——
-                 顺序上它就该在最早的那条之前 -->
-            <div v-if="memory" class="memory">
-              <button
-                class="memory-head"
-                :aria-expanded="memoryOpen"
-                @click="toggleMemory"
-              >
-                <PhBrain aria-hidden="true" />
-                <span class="memory-label">Memory</span>
-                <span class="memory-when">{{ memoryWhen }}</span>
-                <PhCaretDown class="memory-caret" :class="{ open: memoryOpen }" aria-hidden="true" />
-              </button>
-
-              <template v-if="memoryOpen">
-                <!-- 改这里的字,不是改历史 —— 那段对话已经压成这几十个字了,
-                     改它等于给模型换一份"我记得的版本"。改得动,这功能才谈得上可信 -->
-                <div v-if="memoryEditing" class="memory-edit">
-                  <textarea
-                    v-model="memoryDraft"
-                    class="memory-input"
-                    rows="4"
-                    aria-label="Edit memory"
-                  ></textarea>
-                  <p v-if="memoryTooLong" class="memory-warn" role="alert">
-                    Over {{ CHAT_MAX_CHARS }} characters. Trim it before saving.
-                  </p>
-                  <div class="memory-actions">
-                    <button class="save-btn" :disabled="!memoryDraft.trim() || memoryTooLong" @click="saveMemory">
-                      Save
-                    </button>
-                    <button class="quiet-btn" @click="cancelEditMemory">Cancel</button>
-                  </div>
-                </div>
-
-                <template v-else>
-                  <p class="memory-text">{{ memory.text }}</p>
-                  <!-- 改是主操作,忘是次操作 —— 所以忘了的那枚悬停才染成危险色,
-                       平时与"改"长得一样安静 -->
-                  <div class="memory-actions">
-                    <button class="quiet-btn" @click="startEditMemory">
-                      <PhPencilSimple aria-hidden="true" />
-                      Edit memory
-                    </button>
-                    <button class="quiet-btn danger" @click="forgetMemory">
-                      <PhEraser aria-hidden="true" />
-                      Forget memory
-                    </button>
-                  </div>
-                </template>
-              </template>
-            </div>
-
+            <!-- 记忆**不在这儿**了。它曾经是这上面的一块虚线框 ——
+                 摆在这儿是讲顺序(它代表比这些消息更早的那些),代价是
+                 一进来视口贴着底,聊得越久离它越远,想改一句要往上翻几百条。
+                 现在它是头部那枚 Memory 药丸点开的悬浮卡片(见 chat-head 里那张 mem-card) -->
             <!-- 更早的还在库里,只是没读。这是一枚"往前翻"的入口,
                  不是"加载中" —— 所以措辞里不带任何等待或危险的意味 -->
             <div v-if="hasMore" class="earlier">
@@ -843,7 +995,7 @@ onBeforeUnmount(() => {
 
             <template v-for="r in rows" :key="r.key">
               <p v-if="r.kind === 'sep'" class="sep">{{ r.label }}</p>
-              <div v-else class="msg" :class="r.msg.role">
+              <div v-else class="msg" :class="[r.msg.role, { 'group-first': r.first }]">
                 <!-- 用户附的图。**独立一块,不放进气泡**(文字有文字的框,图有图的位置)。
                      压在文字上面是因为它是那句话的前提:先看图,再读字 -->
                 <button
@@ -855,35 +1007,56 @@ onBeforeUnmount(() => {
                 >
                   <img class="msg-img" :src="imgUrl(r.msg.imageId)" alt="Attached image" />
                 </button>
-                <div class="bubble">
+                <!-- 气泡。**只有图没有字时不渲染它** —— 否则那句话下面会挂出
+                     一个空的圆角小壳(发送时是允许"只发一张图"的),看着像坏了。
+                     流式中的那条必须留着:光标挂在它身上 -->
+                <div v-if="r.msg.content.trim() || r.msg.id === cursorId || !hasAttach(r.msg)" class="bubble">
                   <!-- 说了谁说的。左右对齐和底色是给眼睛的,
                        读屏读不出这两种区别,不补一句就只剩一堆光秃秃的句子 -->
                   <span class="sr-only">
                     {{ r.msg.role === 'user' ? 'You said: ' : `${current.name} said: ` }}
                   </span>
                   {{ r.msg.content }}<span v-if="r.msg.id === cursorId" class="cursor" aria-hidden="true"></span>
-                  <!-- 朗读。贴着气泡外侧下角,绝对定位 —— 它不该挤占气泡的宽度。
+                  <!-- 这一条的两个悬停动作(念 / 删)。整排贴着气泡外侧下角,
+                       绝对定位 —— 它不该挤占气泡的宽度。放进流里(哪怕用
+                       opacity 藏起来)会实打实地把每个气泡压窄 80px。
                        只在悬停时浮出来(触屏没有 hover,那时让它常驻,见样式)。
-                       正在生成的那条不给:半句话念出来只会更难听 -->
-                  <button
-                    v-if="canSpeak && r.msg.role === 'assistant' && r.msg.id !== cursorId"
-                    class="speak-btn"
-                    :class="{
-                      on: speakingId === r.msg.id,
-                      busy: speakingId === r.msg.id && speakingLoading
-                    }"
-                    :aria-label="
-                      speakingId === r.msg.id
-                        ? speakingLoading
-                          ? 'Cancel reading'
-                          : 'Stop reading this out loud'
-                        : `Read ${current.name}’s reply out loud`
-                    "
-                    @click="toggleSpeak(r.msg)"
+                       正在生成的那条两个都不给:半句话念出来只会更难听,
+                       而删一条正在长的消息会与收尾落盘打架 -->
+                  <span
+                    v-if="hasMsgOps(r.msg)"
+                    class="msg-ops"
+                    :class="{ on: speakingId === r.msg.id }"
                   >
-                    <PhStopCircle v-if="speakingId === r.msg.id" aria-hidden="true" />
-                    <PhSpeakerHigh v-else aria-hidden="true" />
-                  </button>
+                    <button
+                      v-if="canSpeakMsg(r.msg)"
+                      class="speak-btn"
+                      :class="{ busy: speakingId === r.msg.id && speakingLoading }"
+                      :aria-label="
+                        speakingId === r.msg.id
+                          ? speakingLoading
+                            ? 'Cancel reading'
+                            : 'Stop reading this out loud'
+                          : `Read ${current.name}’s reply out loud`
+                      "
+                      @click="toggleSpeak(r.msg)"
+                    >
+                      <PhStopCircle v-if="speakingId === r.msg.id" aria-hidden="true" />
+                      <PhSpeakerHigh v-else aria-hidden="true" />
+                    </button>
+                    <button
+                      v-if="canDeleteMsg(r.msg)"
+                      class="del-btn"
+                      :aria-label="
+                        r.msg.role === 'user'
+                          ? 'Delete your message'
+                          : `Delete this reply from ${current.name}`
+                      "
+                      @click="emit('deleteMessage', current.id, r.msg.id)"
+                    >
+                      <PhTrash aria-hidden="true" />
+                    </button>
+                  </span>
                 </div>
                 <!-- 角色发来的图。**也在气泡外面**,垫在它说的话下面:
                      先读它说什么,再看它给你看什么。还没有 photoId = 正在画,
@@ -1022,22 +1195,32 @@ onBeforeUnmount(() => {
       >
         <p class="rail-eyebrow">Conversations</p>
         <div class="rail-list">
-          <button
+          <div
             v-for="c in ordered"
             :key="c.id"
-            class="rail-row"
+            class="rail-item"
             :class="{ on: c.id === active }"
-            @click="pick(c.id)"
           >
-            <span class="rail-ava">
-              <img v-if="avatarOf(c)" :src="avatarOf(c)" alt="" />
-              <PhMaskHappy v-else aria-hidden="true" />
-            </span>
-            <span class="rail-text">
-              <span class="rail-name">{{ c.name }}</span>
-              <span class="rail-last">{{ lastLine(c) }}</span>
-            </span>
-          </button>
+            <button class="rail-row" @click="pick(c.id)">
+              <span class="rail-ava">
+                <img v-if="avatarOf(c)" :src="avatarOf(c)" alt="" />
+                <PhMaskHappy v-else aria-hidden="true" />
+              </span>
+              <span class="rail-text">
+                <span class="rail-name">{{ c.name }}</span>
+                <span class="rail-last">{{ lastLine(c) }}</span>
+              </span>
+            </button>
+            <button
+              class="rail-pin"
+              :class="{ 'is-on': c.pinned }"
+              :aria-label="c.pinned ? `Unpin ${c.name}` : `Pin ${c.name}`"
+              :aria-pressed="!!c.pinned"
+              @click="emit('pin', c.id)"
+            >
+              <PhPushPin :weight="c.pinned ? 'fill' : 'regular'" aria-hidden="true" />
+            </button>
+          </div>
         </div>
       </div>
     </div>
@@ -1104,6 +1287,10 @@ onBeforeUnmount(() => {
   min-height: 0;
   overflow-y: auto;
 }
+/* 一行 = 选它 + 置顶。定位上下文在这一层,图钉才能贴住行右缘 */
+.rail-item {
+  position: relative;
+}
 .rail-row {
   display: flex;
   align-items: center;
@@ -1111,7 +1298,8 @@ onBeforeUnmount(() => {
   width: 100%;
   /* 触控目标 ≥40px */
   min-height: 52px;
-  padding: 6px 8px;
+  /* 右边留出图钉那一格,名字与摘要不会被压在下面 */
+  padding: 6px 42px 6px 8px;
   border: 0;
   border-radius: var(--r-sm);
   background: none;
@@ -1124,8 +1312,50 @@ onBeforeUnmount(() => {
   background: var(--surface-hover);
 }
 /* 选中态只用淡底 + 字重,不用彩色 —— 与站内克制的灰度一致 */
-.rail-row.on {
+.rail-item.on .rail-row {
   background: var(--accent-soft);
+}
+/* 置顶:一枚贴着行右缘的小圆钮。**置顶过的常驻**(它同时是状态),
+   其余悬停才浮出 —— 每一行都挂一枚可见的图钉会把名单弄得很吵 */
+.rail-pin {
+  position: absolute;
+  top: 50%;
+  right: 6px;
+  transform: translateY(-50%);
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border: 0;
+  border-radius: 999px;
+  background: none;
+  color: var(--text-4);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity var(--dur) var(--ease), color var(--dur) var(--ease),
+    background var(--dur) var(--ease);
+}
+.rail-item:hover .rail-pin,
+.rail-item:focus-within .rail-pin {
+  opacity: 1;
+}
+.rail-pin.is-on {
+  opacity: 1;
+  color: var(--text-2);
+}
+.rail-pin:hover {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+.rail-pin svg {
+  width: 14px;
+  height: 14px;
+}
+/* 触屏没有 hover:常驻但压暗一档,免得名单看起来很吵 */
+@media (hover: none) {
+  .rail-pin {
+    opacity: 0.55;
+  }
 }
 .rail-ava {
   flex: none;
@@ -1160,7 +1390,7 @@ onBeforeUnmount(() => {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.rail-row.on .rail-name {
+.rail-item.on .rail-name {
   font-weight: 600;
   color: var(--text);
 }
@@ -1196,6 +1426,53 @@ onBeforeUnmount(() => {
   gap: var(--sp-2);
   padding: var(--sp-3) var(--sp-4);
   border-bottom: 1px solid var(--line);
+  /* 记忆卡片挂在它下面(top: 100%),所以它得是定位上下文 ——
+     这样头部换行变高时卡片跟着下移,不会盖住第一条消息 */
+  position: relative;
+}
+/* 头部右侧那一组:记忆入口 + ⋮。靠右由这一层统一负责,
+   两枚各自再写 margin-left:auto 会把间距算乱 */
+.head-acts {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+  margin-left: auto;
+}
+/* 记忆入口:一枚安静的药丸,与情绪那枚同一个语言(小字 + 圆角底色),
+   但它是可点的 —— 所以悬停、展开态都要有反馈 */
+.mem-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 32px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--bg-elev);
+  color: var(--text-3);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+.mem-chip > svg {
+  font-size: 13px;
+}
+.mem-chip:hover,
+.mem-chip.on {
+  background: var(--accent-soft);
+  color: var(--text-2);
+}
+.mem-chip-when {
+  color: var(--text-4);
+  font-weight: 400;
+}
+/* 窄屏只留图标与时间:名字与身份已经占满了那一行 */
+@media (max-width: 560px) {
+  .mem-chip-text {
+    display: none;
+  }
 }
 /* 宽屏用不可点的 head-solo,窄屏才换成可点的 head-pick ——
    宽屏下左栏就在旁边,再给一个"换角色"的入口是多余的 */
@@ -1298,7 +1575,6 @@ onBeforeUnmount(() => {
 .chat-menu-wrap {
   position: relative;
   flex: none;
-  margin-left: auto;
 }
 .icob {
   display: grid;
@@ -1367,8 +1643,11 @@ onBeforeUnmount(() => {
 .chat-inner {
   display: flex;
   flex-direction: column;
-  /* 两侧都是气泡了,间距就按"两块东西"给 —— 2px 会让相邻两个气泡粘在一起,
-     看着像一个长气泡被切开 */
+  /* 间距分两档(与 .msg.group-first 配合):
+     - 同一个人的连续几条(正文 + 它接着发的话/图)挨紧一点,读起来是一段;
+     - 换了人再让一档,合计 --sp-4(16px)。
+     均匀的 8px 会让整屏发闷、谁在跟谁说也糊成一片 —— 这条链上最要紧的
+     就是"换人"这件事,间距是它的第一个信号(第二个是气泡的方向与底色) */
   gap: var(--sp-2);
   /* 铺满整块面板:不再收在中间一列里。收窄是为了"读起来舒服",
      但这块面板本来就只有一个说话对象,两侧再空出两百多像素,
@@ -1377,9 +1656,17 @@ onBeforeUnmount(() => {
   /* 父级是纵向 flex:不加这一条,内容短时也会被拉着撑高 */
   flex: none;
 }
+/* 换人(或跨过一条时间分隔)的那一条多让出 8px —— 与 gap 相加正好 16px。
+   用 margin 而不是给每一段套一层容器:套容器会把图、气泡、小注拆到不同的
+   层级里,而它们本来就该跟着消息一起排 */
+.msg.group-first {
+  margin-top: var(--sp-2);
+}
 .sep {
   align-self: center;
-  margin: var(--sp-3) 0 var(--sp-2);
+  /* 分隔线自己也要呼吸:上面留得更宽(它开启新的一段),下面留一档窄的 ——
+     紧跟着的那条消息自己还会再带一个 group-first 的上边距 */
+  margin: var(--sp-4) 0 var(--sp-1);
   font-size: var(--fs-micro);
   letter-spacing: 0.04em;
   color: var(--text-4);
@@ -1394,19 +1681,53 @@ onBeforeUnmount(() => {
 .msg.user {
   align-items: flex-end;
 }
-/* 朗读那枚键贴着气泡外侧下角,绝对定位 —— 它**不该占气泡的宽度**。
-   放进流里(哪怕用 opacity 藏起来)会实打实地把每个气泡压窄 40px,
-   而不悬停的时候谁也看不见它,那份窄就成了一份没来由的窄 */
+/* 朗读与删除两枚键贴着气泡外侧下角,绝对定位 —— 它们**不该占气泡的宽度**。
+   放进流里(哪怕用 opacity 藏起来)会实打实地把每个气泡压窄 80px,
+   而不悬停的时候谁也看不见它们,那份窄就成了一份没来由的窄。
+
+   两侧的挂法不同:角色那条挂在气泡右边,自己那条挂在气泡左边 ——
+   自己说的靠右排,右侧再挂东西就出面板了。所以两侧的气泡都要有个
+   定位上下文(.bubble 上的 position: relative,见下面两条规则) */
 .msg.assistant .bubble {
   position: relative;
 }
-.speak-btn {
+.msg.user .bubble {
+  position: relative;
+}
+.msg-ops {
   position: absolute;
-  left: 100%;
   /* 与气泡下沿对齐。40px 的触控目标比一行气泡略高,
-     往上多出来的那 2px 落在消息之间那道 --sp-2 的缝里,不会压到上一条 */
+     往下多出来的那 2px 落在消息之间那道缝里(最窄的一档也有 --sp-2),不会压到上一条 */
   bottom: -2px;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  /* 每条消息都挂着一排按钮会把对话流弄得很吵,所以手指悬上来它才浮出来。
+     触屏没有 hover,那种设备上让它常驻但压暗一档(见下面的媒体查询) */
+  opacity: 0;
+  transition: opacity var(--dur) var(--ease);
+}
+.msg.assistant .msg-ops {
+  left: 100%;
   margin-left: 2px;
+}
+.msg.user .msg-ops {
+  right: 100%;
+  margin-right: 2px;
+}
+.msg:hover .msg-ops {
+  opacity: 1;
+}
+/* 正在念的那条常驻显示:它是"怎么让它停下来"的唯一入口,
+   不该等手指找上来才出现 */
+.msg-ops.on {
+  opacity: 1;
+}
+.msg-ops.on .speak-btn {
+  color: var(--text-2);
+}
+.speak-btn,
+.del-btn {
   display: grid;
   place-items: center;
   width: 40px;
@@ -1416,20 +1737,21 @@ onBeforeUnmount(() => {
   background: none;
   color: var(--text-4);
   cursor: pointer;
-  /* 每条消息都挂着一枚喇叭会把对话流弄得很吵,所以手指悬上来它才浮出来。
-     触屏没有 hover,那种设备上让它常驻但压暗一档(见下面的媒体查询) */
-  opacity: 0;
-  transition: opacity var(--dur) var(--ease), color var(--dur) var(--ease),
-    background var(--dur) var(--ease);
+  transition: color var(--dur) var(--ease), background var(--dur) var(--ease);
 }
-.msg:hover .speak-btn {
-  opacity: 1;
+.speak-btn svg,
+.del-btn svg {
+  font-size: 15px;
 }
-/* 正在念的那条常驻显示:它是"怎么让它停下来"的唯一入口,
-   不该等手指找上来才出现 */
-.speak-btn.on {
-  opacity: 1;
+.speak-btn:hover {
+  background: var(--accent-soft);
   color: var(--text-2);
+}
+/* 删除只在悬停时染成危险色:静止时它与"念一下"同等分量,
+   染红了就会把一次轻声的清理变成整页最抢眼的东西(与 Forget memory 同一分寸) */
+.del-btn:hover {
+  background: var(--accent-soft);
+  color: var(--danger);
 }
 /* 还在等音频。这一档必须看得出来 —— 第三方合成要等几百毫秒到好几秒,
    而在它出声之前,"在等"和"已经念完了"长得一模一样:都是不出声。
@@ -1451,15 +1773,8 @@ onBeforeUnmount(() => {
     animation: none;
   }
 }
-.speak-btn:hover {
-  background: var(--accent-soft);
-  color: var(--text-2);
-}
-.speak-btn svg {
-  font-size: 15px;
-}
 @media (hover: none) {
-  .speak-btn {
+  .msg-ops {
     opacity: 0.5;
   }
 }
@@ -1477,7 +1792,13 @@ onBeforeUnmount(() => {
 /* 角色那一侧:坐在站内已有的"抬起来"的底色上(输入框、标签都是它),
    不额外造一个色。靠说话人那一侧的角收窄,气泡才有"从这个人嘴里出来"的方向感 */
 .msg.assistant .bubble {
-  background: var(--bg-elev);
+  /* 底与边一起给,缺一样都读不出这个块:
+     - --bubble-bg 比面板再抬一档(见 style.css 那个 token 的说明);
+     - 一圈极淡的边用站内既有的 --line —— 卡片、面板、分隔线本来就是这套
+       "分界"语言,不新造颜色。它是**常驻**的(不像聚焦态那样一会儿加一会儿去),
+       所以里面那行字不会挪 */
+  background: var(--bubble-bg);
+  border: 1px solid var(--line);
   border-bottom-left-radius: var(--r-sm);
 }
 /* 自己那一侧:用站内的主动色 —— 与发送键、Primary 按钮同一个 --cta。
@@ -1495,68 +1816,101 @@ onBeforeUnmount(() => {
   font-size: var(--fs-micro);
   color: var(--text-4);
 }
-/* ===== 长期记忆 =====
-   虚线框是有意的:它不是对话的一部分,而是一段"关于这段对话"的派生文本 ——
-   实线框会让人以为它也是一条消息 */
-.memory {
-  margin-bottom: var(--sp-3);
-  border: 1px dashed var(--line);
+/* ===== 记忆卡片 =====
+   它是"关于这段对话"的一段派生文本,不是一条消息 —— 所以它不排在消息流里,
+   而是从头部挂下来的一张卡片。位置固定,与对话多长无关 */
+.mem-card {
+  position: absolute;
+  /* 挂在头部下沿。头部自己量高度,卡片跟着走 ——
+     写死像素的话,窄屏名字换行时它会盖住第一条消息 */
+  top: calc(100% + 6px);
+  right: var(--sp-4);
+  z-index: 30;
+  width: min(420px, calc(100% - var(--sp-4) * 2));
+  max-height: min(60vh, 460px);
+  overflow-y: auto;
+  padding: var(--sp-3);
+  border: 1px solid var(--line);
   border-radius: var(--r);
+  background: var(--surface);
+  box-shadow: var(--sh-md);
+  /* 入场很轻(6px + 淡入):它挂在一个点下去的位置上,动得太远会像弹窗;
+     而完全不动又会让"卡片出现了"这件事被漏掉 */
+  animation: mem-card-in 160ms var(--ease) both;
 }
-.memory-head {
+@keyframes mem-card-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .mem-card {
+    animation: none;
+  }
+}
+.mem-card:focus {
+  outline: none;
+}
+.mem-card-head {
   display: flex;
   align-items: center;
   gap: 6px;
-  width: 100%;
-  min-height: 40px;
-  padding: 0 12px;
-  border: 0;
-  border-radius: var(--r);
-  background: none;
+  margin-bottom: var(--sp-2);
   color: var(--text-3);
   font-size: var(--fs-micro);
-  text-align: left;
-  cursor: pointer;
-  transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
 }
-.memory-head:hover {
-  background: var(--accent-soft);
-  color: var(--text-2);
-}
-.memory-head > svg {
+.mem-card-head > svg {
   font-size: 14px;
 }
-.memory-label {
+.mem-card-title {
   font-weight: 600;
   letter-spacing: var(--ls-eyebrow);
   text-transform: uppercase;
 }
-.memory-when {
+.mem-card-when {
   color: var(--text-4);
+  text-transform: none;
+  letter-spacing: 0;
 }
-.memory-caret {
+.mem-x {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
   margin-left: auto;
-  font-size: 12px;
-  transition: transform var(--dur) var(--ease);
+  margin-right: -6px;
+  border: 0;
+  border-radius: 999px;
+  background: none;
+  color: var(--text-4);
+  cursor: pointer;
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
 }
-.memory-caret.open {
-  transform: rotate(180deg);
+.mem-x:hover {
+  background: var(--accent-soft);
+  color: var(--text-2);
 }
-.memory-text {
+.mem-text {
   margin: 0;
-  padding: 0 12px;
   font-size: var(--fs-sm);
   line-height: 1.6;
   color: var(--text-2);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
-/* 编辑态就地换成一只可写的框,不另起浮层 —— 这里改的只是一段文字,
-   给一套弹窗+确认的仪式感,反而把它抬成了件大事 */
-.memory-edit {
-  padding: 0 12px;
+/* 这一句回答的是"这是什么、改了会怎样"。记忆是有损的,不写清来处,
+   用户看到一段陌生的小传只会更困惑。
+   用 --text-2 而不是更淡的那两档:它是**要读的一句话**,不是装饰 ——
+   --text-4 在白底上只有约 1.9:1,那是禁用档 */
+.mem-note {
+  margin: var(--sp-2) 0 0;
+  font-size: var(--fs-micro);
+  line-height: 1.55;
+  color: var(--text-2);
 }
-.memory-input {
+/* 编辑态:卡片里就地换成一只可写的框,不另起浮层 */
+.mem-input {
   display: block;
   width: 100%;
   padding: 9px 11px;
@@ -1567,29 +1921,30 @@ onBeforeUnmount(() => {
   font: inherit;
   font-size: var(--fs-sm);
   line-height: 1.6;
-  /* 只放纵向:横向拉伸会顶破这张虚线卡 */
+  /* 只放纵向:横向拉伸会顶破这张卡片 */
   resize: vertical;
   transition: box-shadow var(--dur) var(--ease);
 }
-.memory-input:focus {
+.mem-input:focus {
   outline: none;
   box-shadow: 0 0 0 1px var(--line-strong);
 }
 /* 超长只在按下保存的那一刻拦。就贴在按钮上方 ——
    眼睛从框里出来,先撞到的是它 */
-.memory-warn {
+.mem-warn {
   margin: 6px 0 0;
   font-size: var(--fs-xs);
   color: var(--danger);
 }
 /* 动作行。左右留 2px 是补出来的:里头那两枚键各自有 10px 内边距,
    2 + 10 正好让按钮上的字与上面的正文对齐在同一条竖线上 */
-.memory-actions {
+.mem-actions {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: var(--sp-1);
-  padding: 0 2px 4px;
+  margin-top: var(--sp-2);
+  padding: 0 2px;
 }
 /* 保存是这段编辑里唯一的主操作,给它实心。高度与 quiet-btn 齐平,
    两枚并排时下沿在同一条线上 */
@@ -1829,19 +2184,15 @@ onBeforeUnmount(() => {
    整条 .msg 本来就是竖排 flex(user 靠右 / assistant 靠左),
    所以图只要当兄弟节点,就自动落在正确的一边。
    宽度跟着 .bubble 的 76% 走,免得图比气泡还宽、把节奏拉开 */
-.msg-img {
-  display: block;
-  max-width: 76%;
-  max-height: 320px;
-  margin-bottom: 8px;
-  border-radius: 12px;
-  object-fit: cover;
-}
+/* 消息里的一张小图(用户附的那张、角色发来的那张),外面都包一层按钮:
+   鼠标点得开、键盘也点得开 —— 那是可访问的写法。按钮只做容器,
+   不留自己的框线,看起来仍是一张图。
 
-/* 角色发来的那张:占满气泡宽度、垫在文字下方。骨架用同一个方块比例 ——
-   图是异步到的,比例写死才不会在它到达时把整段对话顶下去 */
-/* 图包在按钮里:鼠标是"点开看大图",键盘也点得开(那才是可访问的写法)。
-   按钮只做容器,不留自己的框线 —— 看起来仍是一张图 */
+   **尺寸约束一律挂在按钮这一层,不能挂在 img 上。**
+   挂在 img 上的话,那个 76% 是相对包着它的按钮算的,而按钮的宽度又是由
+   这张图的**自然宽度**撑出来的 —— 于是宽度变成"自然宽度的 76%"(既不是
+   想要的尺寸,小图还会被压小),而且图贴在按钮左边:按钮整体靠右、图却偏左,
+   看起来就是"上传的图片没有右对齐"。 */
 .msg-img-btn {
   display: block;
   padding: 0;
@@ -1849,6 +2200,41 @@ onBeforeUnmount(() => {
   background: none;
   cursor: zoom-in;
 }
+/* 用户那一侧:靠右。高度那一档(max-height)生效时按钮会比图宽,
+   这时把图推到按钮右缘,图与气泡就仍然贴同一条右边线 */
+.msg.user .msg-img-btn {
+  display: flex;
+  justify-content: flex-end;
+  /* 靠右不依赖父级的 align-items:自己的边自己定 */
+  align-self: flex-end;
+  max-width: 76%;
+  /* 手型只给图本身(见 .msg-img):按钮可能比图宽出一截,
+     那一截空白不该显示"可点开"的手型 */
+  cursor: default;
+}
+/* 角色那一侧:宽度上限与它的气泡同一档(320px 封顶)。放在按钮上同样是
+   为了避开上面那条"百分比对着自己算"的回路 —— 否则一张小图会被压到 76% */
+.msg.assistant .msg-img-btn {
+  max-width: min(320px, 76%);
+}
+.msg-img,
+.msg-photo {
+  display: block;
+  /* 宽度交给按钮:它已经被夹住了,这里只负责"填满它"与保住比例 */
+  max-width: 100%;
+  max-height: 320px;
+  width: auto;
+  height: auto;
+}
+.msg-img {
+  margin-bottom: 8px;
+  border-radius: 12px;
+  object-fit: cover;
+  cursor: zoom-in;
+}
+
+/* 角色发来的那张:占满气泡宽度、垫在文字下方。骨架用同一个方块比例 ——
+   图是异步到的,比例写死才不会在它到达时把整段对话顶下去 */
 .zoom {
   position: fixed;
   inset: 0;
@@ -1884,16 +2270,11 @@ onBeforeUnmount(() => {
 .zoom-x:hover {
   background: rgb(255 255 255 / 24%);
 }
+/* 角色的那张:**比例跟着图自己走**。原来这里写死 1:1 再用 object-fit: cover
+   裁,等于把一张横构图切成方的 —— 生成时明明是 auto(交给上游定),
+   到显示这一步又被拽回正方形,白拿一个能用的比例。
+   宽高的上限在按钮那一层(见 .msg.assistant .msg-img-btn),这里只管填满 */
 .msg-photo {
-  display: block;
-  /* **比例跟着图自己走**。原来这里写死 1:1 再用 object-fit: cover 裁,
-     等于把一张横构图切成方的 —— 生成时明明是 auto(交给上游定),
-     到显示这一步又被拽回正方形,白拿一个能用的比例。
-     现在只用最大边兜住尺寸,长宽都由图自己决定 */
-  max-width: min(320px, 76%);
-  max-height: 320px;
-  width: auto;
-  height: auto;
   margin-top: 8px;
   border-radius: 12px;
 }

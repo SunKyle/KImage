@@ -1,6 +1,13 @@
 import type { ApiConfig, EditParams, GenParams, HistoryEntry, PromptItem, ResultItem, ReuseParams, Collection, Character, CharacterDraft, CharacterFields, CharacterPersona, CharacterView, CharacterViewKind, CharacterVoice, ChatMessage, ImportedCharacter, ImportedChat, ImportedChatMessage } from './types'
 import type { PruneResult, CoverRecord, CharRefRecord } from './lib/idb'
 import { titleFromPrompt } from './lib/text'
+/* 角色设定那一份权威定义(键 / 顺序 / 标签 / 必填 / 枚举)住在服务端 ——
+   那边拼起稿提示词用的就是它。前端在这里取用它的读法,
+   于是"提示词里那几行"与"解析回填的那张表"不可能各走各的 */
+import {
+  CHAR_SPEC_LINES,
+  charSpecKeys
+} from '../server/charSpec.js'
 import {
   getAll,
   pruneHistory,
@@ -1375,6 +1382,27 @@ export function extOf(item: ResultItem | undefined): string {
   return 'png'
 }
 
+/** 把一张图原样存下来(单张,不打包)。
+ *
+ *  与批量导出共用同一份扩展名判据(extOf),而"点一下存这张"的实现也只有
+ *  这一处 —— 预览卡里那枚与历史页搜索结果里的"存这一张"都走它,
+ *  两处各写一套迟早改歪一边(扩展名、远端降级都会不一致)。
+ *
+ *  远端图源跨域,download 属性会被浏览器忽略:那种情况新窗口打开,
+ *  让用户自己另存 —— 如实降级,而不是静默存下一个打不开的文件 */
+export function downloadImageUrl(url: string, item: ResultItem | undefined): void {
+  if (!url) return
+  const a = document.createElement('a')
+  a.href = url
+  if (/^https?:/.test(url)) {
+    a.target = '_blank'
+    a.rel = 'noopener'
+  } else {
+    a.download = `kimage-${Date.now()}.${extOf(item)}`
+  }
+  a.click()
+}
+
 /* 读出一张图的字节。统一借 imageSrc 把三种载荷(Blob / data URL / 远端 URL)
    变成可 fetch 的地址,不必在调用点各判一次。
    远端图可能被跨域拦下 —— 返回 undefined 让调用方跳过:导出不该因为一张
@@ -1483,6 +1511,10 @@ type CharacterManifest = {
        而人格恰恰是这个功能里最难重写的一份数据 */
     persona?: CharacterPersona
     refKind?: CharacterViewKind
+    /* 置顶。纯 JSON 的一个布尔,跟着包走 —— 置顶是"我常找这个人",
+       与人格、嗓音同属"这个角色是谁"的一部分,分享时该一起过去。
+       缺省(老包 / 没置顶)一律当未置顶 */
+    pinned?: boolean
     /** zip 内的相对路径。没有这一项就是没有那张图 */
     ref?: string
     /* 第一步上传的那张底图。它不属于五张设定图,所以单独一项 ——
@@ -1562,6 +1594,8 @@ export async function exportCharacter(
     ...(c.desc ? { desc: c.desc } : {}),
     // 没写过的角色不往包里塞一份空壳:四项全空时这两边长得一样,少一项更干净
     ...(hasPersona(c.persona) ? { persona: c.persona } : {}),
+    // 没置顶就不写这一项:老包与"从没置顶过"在读回来时是同一件事
+    ...(c.pinned ? { pinned: true } : {}),
     ...(c.refKind ? { refKind: c.refKind } : {})
   }
 
@@ -1659,7 +1693,17 @@ function coerceImportedChat(raw: unknown): ImportedChat | undefined {
          这里只收紧形状:它会变成文件名,放开就等于把路径交给外部文件 */
       ...(typeof o.imageId === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(o.imageId)
         ? { imageId: o.imageId }
-        : {})
+        : {}),
+      /* 角色发的那张。**这三个字段从前在这里被丢掉了** ——
+         包里有图、消息上的 photoId 却没了,于是导入回来的对话
+         "它给你看过什么"整段是空的(见 types.ts 的 ImportedChatMessage) */
+      ...(typeof o.photoId === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(o.photoId)
+        ? { photoId: o.photoId }
+        : {}),
+      ...(typeof o.photo === 'string' && o.photo.trim()
+        ? { photo: o.photo.replace(/\s+/g, ' ').trim().slice(0, 120) }
+        : {}),
+      ...(o.photoSelf === true ? { photoSelf: true } : {})
     })
   })
   const memory = typeof src.memory === 'string' ? src.memory.trim().slice(0, CHAT_MAX_CHARS) : ''
@@ -1778,6 +1822,9 @@ export async function readCharacterZip(file: File): Promise<ImportedCharacter[]>
       ...(hasPersona(coerceCharPersona(c.persona))
         ? { persona: coerceCharPersona(c.persona) }
         : {}),
+      /* 置顶只认 true:文件里写 "false" / 1 / 别的什么都当没置顶 ——
+         它是一个开关,不是一个能放任意值进去的槽 */
+      ...(c.pinned === true ? { pinned: true } : {}),
       ...(refBytes
         ? { ref: new Blob([refBytes as BlobPart], { type: sniffMime(refBytes) }) }
         : {}),
@@ -1902,31 +1949,22 @@ export function saveCollections(list: Collection[]): void {
    参考图是 Blob,按 id 存在 IndexedDB,读的时候贴回去(与提示词封面同一套做法) */
 export const CHAR_KEY = 'kimage.characters'
 
-/* 面貌特征:跨场景不该变的那九项。这九项会并进每一张成品的提示词 ——
-   只给头发和眼睛时,肤色、脸型、眉形全靠模型自己从零重编,换个场景就不是同一个人了 */
-const CHAR_FACE_FIELDS: Array<keyof CharacterFields> = [
-  /* 性别排在最前:顺序就是这个条件的强弱顺序。它是这张脸最基础的一档,
-     而且只在用户没写、模型也没读到的时候才会出问题 —— 出了就是换一个人 */
-  'gender',
-  'identity',
-  'face',
-  'hair',
-  'brows',
-  'eyes',
-  'noseMouth',
-  'facialHair',
-  'faceMarks'
-]
-/* 只塑造设定图的两项:衣服与装备属于"这一张发生什么",该由场景决定 ——
-   你写"在太空里",前置的 armored jacket 就在跟它打架 */
-const CHAR_SHEET_ONLY_FIELDS: Array<keyof CharacterFields> = ['outfit', 'marks']
+/* —— 字段顺序与分组 ——
 
-/* 字段顺序。顺序固定很重要 —— 顺序一变,上游拿到的条件就变了,一致性也就无从谈起。
-   两组拼在一起就是完整顺序,不含备注(备注单独接在最后) */
-const CHAR_FIELD_ORDER: Array<keyof CharacterFields> = [
-  ...CHAR_FACE_FIELDS,
-  ...CHAR_SHEET_ONLY_FIELDS
-]
+   **这些不再是手写的清单**:键、顺序、哪些只喂设定图,全部来自
+   server/charSpec.js 那份行定义 —— 服务端拼提示词用的也是它。
+   在这之前这里有四份平行的手写清单(面貌特征九项、只喂设定图两项、
+   拼接顺序一份、人格四项),而服务端提示词里还有一份行清单与一份必填枚举。
+   加一栏要同时改六处,漏掉任何一处都不报错 —— 只是那个字段静静地空着。
+
+   顺序固定很重要 —— 顺序一变,上游拿到的条件就变了,一致性也就无从谈起 */
+const CHAR_FIELD_ORDER = charSpecKeys('field') as Array<keyof CharacterFields>
+/* 面貌特征:跨场景不该变的那几项。它们会并进每一张成品的提示词 ——
+   只给头发和眼睛时,肤色、脸型、眉形全靠模型自己从零重编,换个场景就不是同一个人了。
+   outfit / marks 不在其中(见 spec 里的 sheetOnly) */
+const CHAR_FACE_FIELDS = CHAR_FIELD_ORDER.filter(
+  (k) => !CHAR_SPEC_LINES.some((l) => l.key === k && l.sheetOnly)
+)
 
 /* 一份空设定:解析、新建表单、读入老数据都拿它当底。
    由 CHAR_FIELD_ORDER 生成而不是手写十遍 —— 加字段时只有一处要改 */
@@ -1954,19 +1992,17 @@ function coerceCharFields(raw: Partial<CharacterFields> | undefined): CharacterF
   return out
 }
 
-/* 人格的字段顺序。四项都是自由文本,本身没有强弱之分 ——
-   但拼提示词时顺序必须固定:顺序一变,同一个角色每轮拿到的条件就不一样,
+/* 人格的字段顺序,取自 server/charSpec.js 那份行定义 ——
+   拼提示词时顺序必须固定:顺序一变,同一个角色每轮拿到的条件就不一样,
    而聊天最忌讳的正是"同一个人今天一个样明天一个样" */
-const CHAR_PERSONA_KEYS: Array<keyof CharacterPersona> = [
-  'traits',
-  'voice',
-  'address',
-  'boundaries'
-]
+const CHAR_PERSONA_KEYS = charSpecKeys('persona') as Array<keyof CharacterPersona>
 
-/** 一份空人格:新建角色、读入老角色、解析导入包都拿它当底 */
+/** 一份空人格:新建角色、读入老角色、解析导入包都拿它当底。
+ *  由 CHAR_PERSONA_KEYS 生成而不是手写五遍 —— 与 emptyCharFields 同一条理由 */
 export function emptyCharPersona(): CharacterPersona {
-  return { traits: '', voice: '', address: '', boundaries: '' }
+  const out = {} as CharacterPersona
+  for (const k of CHAR_PERSONA_KEYS) out[k] = ''
+  return out
 }
 
 /** 人格里有没有写出内容。四项全空 = 这个角色还没设定过性格,
@@ -2008,10 +2044,14 @@ export function characterDesc(c: Character): string {
   return parts.join(', ')
 }
 
-/* 并进普通创作提示词的只有面貌特征那八项(见 CHAR_FACE_FIELDS)。
-   为什么会细分到眉毛和脸型:只给 hair 和 eyes 时,肤色、骨相、眉形全靠模型
-   自己从零重编,场景一换就不是同一个人了。而 face marks 与 facialHair 之所以
-   也在这里,是因为它们一旦只出现在设定图里、不进创作提示词,就会每张图丢一次。
+/* 并进普通创作提示词的只有面貌特征那些项(见 CHAR_FACE_FIELDS,即行定义里
+   除 outfit / marks 之外的全部)。为什么会细分到眉毛和脸型:只给 hair 和 eyes 时,
+   肤色、骨相、眉形全靠模型自己从零重编,场景一换就不是同一个人了。
+   而 face marks 与 facialHair 之所以也在这里,是因为它们一旦只出现在设定图里、
+   不进创作提示词,就会每张图丢一次。
+   style 与 build 同样是"这个人本身"的一部分,所以也在这条路上 ——
+   只有设定图是动漫、场景图是写实,或者全身图一个身高、场景图另一个身高,
+   都叫不是同一个人。
 
    加结构化字段之前的老角色没有 fields,退回全量描述,总比什么都不送强 */
 export function characterFaceDesc(c: Character): string {
@@ -2138,7 +2178,7 @@ export async function draftCharacterFields(
  * 用识图模型把一张参考图读成角色的结构化设定 —— 上传底图之后的那一步。
  *
  * 与 draftCharacterFields 走同一个代理、同一套鉴权与超时,只是档位不同:
- * 这里发的是多模态消息(图 + 一句中性指令),回的是同一份十二行,
+ * 这里发的是多模态消息(图 + 一句中性指令),回的是同一份行清单,
  * 所以解析也共用 parseCharacterDraft。
  * 用的是「用途 = 识图」那条配置:能画图的模型未必会看图,两者常常不是同一个服务商。
  */
@@ -2169,8 +2209,31 @@ export async function draftCharacterFromImage(
    转成模型认得的 clean-shaven,其余一律清空 */
 const NONE_ISH = /^(none|n\/?a|null|nothing|no|-|—|–)$/i
 
+/* 风格那一栏的"没有"是 **auto** —— 模型可能写成 auto / automatic / default,
+   也可能写成"跟着参考图"的整句。它不是一个画风,清空才是对的:
+   空串在提示词里会被 filter(Boolean) 滤掉,于是那张图就由参考图说了算 */
+const STYLE_AUTO_ISH =
+  /^(auto|automatic|default|unspecified|match(es)?( the)? reference( image)?|follows?( the)? reference( image)?|as in the reference( image)?)$/i
+
+/* 语言那一栏同理:它的默认是"跟着用户走",而模型会用好几种说法表达这件事。
+   写成这些就等于没填 —— 留着"follow the user"这种话塞进提示词只会变成噪声 */
+const LANGUAGE_FOLLOW_ISH =
+  /^(auto|automatic|default|unspecified|same as (the )?user|the user'?s language|user'?s language|follows? (the )?user|matches? (the )?user)$/i
+
+/* 表格只建一次:它由那份行定义生成,内容与请求无关 */
+const DRAFT_FIELD_KEYS: Record<string, keyof CharacterFields> = {}
+const DRAFT_PERSONA_KEYS: Record<string, keyof CharacterPersona> = {}
+for (const l of CHAR_SPEC_LINES) {
+  /* 查表前把标签里的非字母全部去掉,所以 "Nose & mouth" / "Facial hair" /
+     "Face marks" 这类多词标签怎么写都能对上 —— 起稿提示词里用可读的多词标签,
+     比为了迁就解析器写成 "NoseMouth" 好得多(人要能直接读懂回的是什么) */
+  const k = l.label.toLowerCase().replace(/[^a-z]/g, '')
+  if (l.group === 'field') DRAFT_FIELD_KEYS[k] = l.key as keyof CharacterFields
+  else if (l.group === 'persona') DRAFT_PERSONA_KEYS[k] = l.key as keyof CharacterPersona
+}
+
 /**
- * 把模型回的那几行拆成「名字 + 结构化设定」。
+ * 把模型回的那几行拆成「名字 + 结构化设定 + 人格」。
  * 它偶尔会加粗、加项目符号、包代码围栏或写中文冒号,所以先剥掉这些装饰再按前缀认;
  * 认不出来的行直接丢掉,不报错 —— 少一两个字段不该让整次起稿失败。
  * 名字那行不一定有(老版本提示词没有它),缺了就是空串,由调用方决定怎么办。
@@ -2179,30 +2242,10 @@ export function parseCharacterDraft(text: string): CharacterDraft {
   const fields = emptyCharFields()
   const persona = emptyCharPersona()
   let name = ''
-  /* 查表前把标签里的非字母全部去掉,所以 "Nose & mouth" / "Facial hair" /
-     "Face marks" 这类多词标签怎么写都能对上 —— 起稿那条提示里用可读的多词
-     标签,比为了迁就解析器写成 "NoseMouth" 好得多(人要能直接读懂回的是什么) */
-  const keys: Record<string, keyof CharacterFields> = {
-    gender: 'gender',
-    identity: 'identity',
-    face: 'face',
-    hair: 'hair',
-    brows: 'brows',
-    eyes: 'eyes',
-    nosemouth: 'noseMouth',
-    facialhair: 'facialHair',
-    facemarks: 'faceMarks',
-    outfit: 'outfit',
-    marks: 'marks'
-  }
-  /* 人格那四行单独一张表。两张表的键不重合,所以可以各查各的 ——
+  /* 两张表的键不重合,所以可以各查各的 ——
      查不到长相那张就再查这张,不必合成一张大表 */
-  const personaKeys: Record<string, keyof CharacterPersona> = {
-    personality: 'traits',
-    voice: 'voice',
-    address: 'address',
-    boundaries: 'boundaries'
-  }
+  const keys = DRAFT_FIELD_KEYS
+  const personaKeys = DRAFT_PERSONA_KEYS
   for (const raw of text.split('\n')) {
     const line = raw
       // 加粗/斜体/行内代码,以及行首的项目符号与引号
@@ -2221,12 +2264,20 @@ export function parseCharacterDraft(text: string): CharacterDraft {
     const pkey = personaKeys[label]
     if (pkey) {
       /* 人格那几栏没有"none 要换个说法"的情况 —— 写 none 就是留空 */
-      persona[pkey] = NONE_ISH.test(value) ? '' : value
+      if (NONE_ISH.test(value)) persona[pkey] = ''
+      else if (pkey === 'language' && LANGUAGE_FOLLOW_ISH.test(value)) persona[pkey] = ''
+      else persona[pkey] = value
       continue
     }
     const key = keys[label]
     if (!key) continue
-    fields[key] = NONE_ISH.test(value) ? (key === 'facialHair' ? 'clean-shaven' : '') : value
+    if (NONE_ISH.test(value)) {
+      fields[key] = key === 'facialHair' ? 'clean-shaven' : ''
+    } else if (key === 'style' && STYLE_AUTO_ISH.test(value)) {
+      fields[key] = ''
+    } else {
+      fields[key] = value
+    }
   }
   return { name, fields, persona }
 }
@@ -2329,6 +2380,10 @@ export interface ChatStreamResult {
   mood: string
   /* 它这一轮想给你看的画面(场景描述),空串 = 不发图 */
   photo: string
+  /* 这张画面里有没有**它本人**。由模型写在标签里(self: 前缀,见 server/chatTags.js)。
+     true 才把角色设定与设定图发给出图模型 —— 一张风景照带上设定图会被带跑,
+     而一张自拍不带设定图就会画成陌生人 */
+  photoSelf: boolean
 }
 
 /* ===== 长期记忆的节奏 =================================================
@@ -2459,6 +2514,8 @@ export async function chatStream(opts: ChatStreamOpts): Promise<ChatStreamResult
   let mood = ''
   /* 这一轮它想给你看的画面(服务端从正文末尾剪下来的场景描述) */
   let photo = ''
+  /* 这张里有没有它本人。与 photo 同路一起送来 */
+  let photoSelf = false
   try {
     for (;;) {
       const { done, value } = await reader.read()
@@ -2476,6 +2533,7 @@ export async function chatStream(opts: ChatStreamOpts): Promise<ChatStreamResult
           finish?: string
           mood?: string
           photo?: string
+          photoSelf?: boolean
         }
         try {
           evt = JSON.parse(text)
@@ -2490,11 +2548,13 @@ export async function chatStream(opts: ChatStreamOpts): Promise<ChatStreamResult
           return {
             finish: evt.finish || finish,
             mood: evt.mood || mood,
-            photo: evt.photo || photo
+            photo: evt.photo || photo,
+            photoSelf: evt.photoSelf === true || photoSelf
           }
         }
         if (typeof evt.finish === 'string' && evt.finish) finish = evt.finish
         if (typeof evt.mood === 'string' && evt.mood) mood = evt.mood
+        if (evt.photoSelf === true) photoSelf = true
       }
     }
   } finally {
@@ -2502,7 +2562,7 @@ export async function chatStream(opts: ChatStreamOpts): Promise<ChatStreamResult
        不取消这条读流就悬着。已经读完时取消是空操作 */
     reader.cancel().catch(() => {})
   }
-  return { finish, mood, photo }
+  return { finish, mood, photo, photoSelf }
 }
 
 /* ===== 提示词库(收藏) ===== */

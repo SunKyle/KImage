@@ -78,9 +78,100 @@ export function warmUpSpeech(): void {
   ensureReady()
 }
 
-/** 这段该按哪种语言念。提示词没规定角色用什么语言回话 ——
- *  它跟着用户走,所以中英混着来。只做一个够用的二分:有汉字/假名就按中文挑 */
-function langOf(text: string): string {
+/* 角色设了"说哪种语言"时,把它折成系统音色表认的那个 lang 前缀。
+   这一栏是自由文本(用户会写 "English"、"简体中文"、"en-US"),
+   所以三个来源依次认:语言代码 → 它用的文字 → 常见语言名。
+
+   认不出来一律返回空串,**退回按文本猜** —— 拿一个乱猜的语言代码去音色表里挑,
+   比不挑更糟:那是"我明明设了日语,它却用英语念"的另一种形式 */
+const LANG_WORDS: Array<[string, string]> = [
+  ['english', 'en'],
+  ['chinese', 'zh'],
+  ['mandarin', 'zh'],
+  ['japanese', 'ja'],
+  ['korean', 'ko'],
+  ['spanish', 'es'],
+  ['french', 'fr'],
+  ['german', 'de'],
+  ['italian', 'it'],
+  ['portuguese', 'pt'],
+  ['russian', 'ru'],
+  ['arabic', 'ar'],
+  ['hindi', 'hi'],
+  ['thai', 'th'],
+  ['vietnamese', 'vi'],
+  ['turkish', 'tr'],
+  ['dutch', 'nl'],
+  ['polish', 'pl'],
+  ['swedish', 'sv']
+]
+/* 只认两字母的代码(带可选地区后缀):三字母会撞上英文常用词("the"、"you"),
+   而 yue / fil 这类三字母代码在这个场景里基本不会出现 */
+const LANG_CODE_RE = /^([a-z]{2})(?:[-_][a-z]{2,4})?$/
+/** 不带地区时补一个常用地区 —— 只报 "en" 时有些系统挑不出音色 */
+const SPEECH_LOCALES: Record<string, string> = {
+  en: 'en-US',
+  zh: 'zh-CN',
+  ja: 'ja-JP',
+  ko: 'ko-KR',
+  es: 'es-ES',
+  fr: 'fr-FR',
+  de: 'de-DE',
+  it: 'it-IT',
+  pt: 'pt-BR',
+  ru: 'ru-RU',
+  ar: 'ar-SA'
+}
+
+/* 用汉字 / 谚文写出来的**语言名**。它们必须排在"按文字判"之前:
+   用户写「日本語」是在**指一门语言**,而不是在用日语写字 ——
+   而这三个字全是汉字,按文字判会认成中文。
+   (这是这套判断里唯一一处真正的坑,所以它单列一张表、写在前面) */
+const CJK_LANG_NAMES: Array<[string, string]> = [
+  ['日本語', 'ja'],
+  ['日語', 'ja'],
+  ['日语', 'ja'],
+  ['日文', 'ja'],
+  ['中文', 'zh'],
+  ['汉语', 'zh'],
+  ['漢語', 'zh'],
+  ['国语', 'zh'],
+  ['國語', 'zh'],
+  ['粤语', 'zh'],
+  ['粵語', 'zh'],
+  ['한국어', 'ko'],
+  ['한국말', 'ko']
+]
+
+/** 角色设的语言 → 系统音色表认的 lang 前缀。导出是为了测得了 ——
+ *  里面"假名先于汉字"那条顺序是这套判断里唯一容易写反的一步 */
+export function langTagOf(language: string): string {
+  const v = (language || '').trim().toLowerCase()
+  if (!v) return ''
+  const code = LANG_CODE_RE.exec(v)
+  if (code) return code[1]
+  /* 语言名先于"按文字判":见上面那张表的说明 */
+  const named = CJK_LANG_NAMES.find(([name]) => v.includes(name))
+  if (named) return named[1]
+  /* 退一步:写成哪种文字就是哪种语言。**假名要先于汉字判** ——
+     日文里也有汉字,反过来判的话一段日语会被认成中文 */
+  if (/[\u3040-\u30ff]/.test(v)) return 'ja'
+  if (/[\uac00-\ud7af]/.test(v)) return 'ko'
+  if (/[\u3400-\u9fff]/.test(v)) return 'zh'
+  const hit = LANG_WORDS.find(([name]) => v.includes(name))
+  return hit ? hit[1] : ''
+}
+
+/** 这段该按哪种语言念。
+ *
+ *  先看角色自己设的语言(见 CharacterPersona.language)——
+ *  它是用户明确写下的答案,不再需要猜。
+ *  没设才退回原来那条二分:提示词里没有语言这一条时,角色跟着用户走,
+ *  所以中英混着来,只做一个够用的判断:有汉字/假名就按中文挑。
+ *  (三分成 ja / ko 也只在这条兜底路上才谈得上,而那时手里只有文本) */
+function langOf(text: string, language?: string): string {
+  const set = langTagOf(language || '')
+  if (set) return set
   return /[\u3400-\u9fff\u3040-\u30ff]/.test(text) ? 'zh' : 'en'
 }
 
@@ -99,7 +190,12 @@ function nudge(charId: string, salt: string): number {
   return 0.9 + (hash(charId + salt) % 18) / 100
 }
 
-function pickVoice(charId: string, text: string, want?: string): SpeechSynthesisVoice | undefined {
+function pickVoice(
+  charId: string,
+  text: string,
+  want?: string,
+  language?: string
+): SpeechSynthesisVoice | undefined {
   if (!voices.length) return undefined
   /* 用户点名要了哪一把就用哪一把 —— 这时不掺任何哈希,
      否则"我明明选了这个人"和听到的会对不上 */
@@ -107,7 +203,7 @@ function pickVoice(charId: string, text: string, want?: string): SpeechSynthesis
     const named = voices.find((v) => v.name === want)
     if (named) return named
   }
-  const lang = langOf(text)
+  const lang = langOf(text, language)
   /* 先在同语言的音色里挑;一个都没有就用全部 ——
      口音不对也总比一声不吭强 */
   const same = voices.filter((v) => (v.lang || '').toLowerCase().startsWith(lang))
@@ -116,18 +212,25 @@ function pickVoice(charId: string, text: string, want?: string): SpeechSynthesis
 }
 
 /** 浏览器那一条。返回一个 promise,念完(或被停)才 resolve */
-function speakInBrowser(text: string, charId: string, msgId: string, voice?: CharacterVoice) {
+function speakInBrowser(
+  text: string,
+  charId: string,
+  msgId: string,
+  voice?: CharacterVoice,
+  language?: string
+) {
   return new Promise<void>((resolve) => {
     try {
       const u = new SpeechSynthesisUtterance(text)
-      const v = pickVoice(charId, text, voice?.voiceName)
+      const v = pickVoice(charId, text, voice?.voiceName, language)
       if (v) {
         u.voice = v
         u.lang = v.lang
       } else {
         /* 音色表还没到(第一次朗读常常如此):至少把语言报对,
            让浏览器自己挑一个匹配的嗓子 */
-        u.lang = langOf(text) === 'zh' ? 'zh-CN' : 'en-US'
+        const tag = langOf(text, language)
+        u.lang = SPEECH_LOCALES[tag] || tag
       }
       u.rate = typeof voice?.rate === 'number' ? voice.rate : nudge(charId, 'rate')
       u.pitch = typeof voice?.pitch === 'number' ? voice.pitch : nudge(charId, 'pitch')
@@ -323,6 +426,10 @@ export interface SpeakTarget {
   charId: string
   /** 这个角色的嗓音。没有 = 走浏览器 */
   voice?: CharacterVoice
+  /* 这个角色说哪种语言(见 CharacterPersona.language)。
+     空/缺省 = 跟着文本猜,与加这一栏之前的行为一致。
+     它只影响**浏览器那条路**挑哪把嗓子 —— 自带音色的第三方合成由音色本身决定 */
+  language?: string
   /** 走 tts 时用的那条配置。engine 是 tts 而它缺了,就直接走浏览器 */
   cfg?: ApiConfig
 }
@@ -347,7 +454,7 @@ export async function speak(text: string, target: SpeakTarget, msgId: string): P
   if (!wantsTts || !target.cfg) {
     /* 没配 tts,或配了却没给它配置:走浏览器。
        这里**不提醒** —— 用户本来就没打算用第三方 */
-    await speakInBrowser(body, target.charId, msgId, v)
+    await speakInBrowser(body, target.charId, msgId, v, target.language)
     return ''
   }
 
@@ -390,7 +497,7 @@ export async function speak(text: string, target: SpeakTarget, msgId: string): P
        否则用户会以为音色配置生效了,只是"听起来不对" */
     const why = e instanceof Error ? e.message : 'the request failed'
     setState(null)
-    await speakInBrowser(body, target.charId, msgId, v)
+    await speakInBrowser(body, target.charId, msgId, v, target.language)
     return `Using the browser voice — ${why}`
   } finally {
     aborter = null

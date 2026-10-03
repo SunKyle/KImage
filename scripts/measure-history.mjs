@@ -17,7 +17,7 @@
    -------------------------------------------------------------------- */
 
 import { spawn } from 'node:child_process'
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { deflateSync } from 'node:zlib'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -57,6 +57,14 @@ const PROBE_CHAT = args.includes('--probe-chat')
 const PROBE_PARAMS = args.includes('--probe-params')
 /* 探出图编排层:没有可用接口时,那条失败路径也要走完 */
 const PROBE_GEN = args.includes('--probe-gen')
+/* 钉住主题(light / dark)。不钉的话跟随系统偏好 —— 而无头下拿到的往往是
+   宿主机自己的偏好,同一份代码在两台机器上截出来的图不是一套配色。
+   核对"浅色下的对比度"这类事情时必须能固定住某一套 */
+const THEME = arg('theme', '')
+if (THEME && THEME !== 'light' && THEME !== 'dark') {
+  console.error(`--theme 只认 light / dark,收到的是 ${THEME}`)
+  process.exit(1)
+}
 /* 调试端口每轮随机取一个:固定端口会与上一次没退干净的实例撞车,
    而那种撞车表现为"连上了,但连到的是别人",量出来的数看着正常其实全错 */
 const PORT = Number(arg('cdp-port', 0)) || 9300 + Math.floor(Math.random() * 600)
@@ -189,6 +197,29 @@ async function evaluate(fn, ...fnArgs) {
   })
   if (exceptionDetails) throw new Error(exceptionDetails.exception?.description || '页面脚本抛错')
   return result.value
+}
+
+/* —— 截图(可选,`--shot-dir` 才拍)——
+   间距、对齐、留白这类东西**只能用眼睛判断**:它们没有可断言的判据,
+   而恰恰是 UI 改动里最容易翻车的一类。固定视口再拍,是为了让前后两次
+   (改动前 / 改动后)排布可比 —— 窗口大小不同的话截出来的图没法对着看 */
+const SHOT_DIR = arg('shot-dir', '')
+if (SHOT_DIR) mkdirSync(SHOT_DIR, { recursive: true })
+async function shot(name) {
+  if (!SHOT_DIR) return
+  await send('Emulation.setDeviceMetricsOverride', {
+    width: 1280,
+    height: 900,
+    deviceScaleFactor: 1,
+    mobile: false
+  })
+  // 视口一变会重排,等一拍再拍,免得拍到旧的布局
+  await sleep(300)
+  const res = await send('Page.captureScreenshot', { format: 'png' })
+  const file = join(SHOT_DIR, `${name}.png`)
+  writeFileSync(file, Buffer.from(res.data, 'base64'))
+  await send('Emulation.clearDeviceMetricsOverride')
+  console.log(`   📷 ${file}`)
 }
 
 /* 再连一个页面 target(第二个标签页要单独一条通道) */
@@ -352,6 +383,10 @@ async function main() {
   const firstLoad = onceEvent('Page.loadEventFired')
   await send('Page.reload', { ignoreCache: true })
   await firstLoad
+
+  /* 主题要在应用读它之前写好(见 lib/theme.ts 的 savedTheme)——
+     下面每次重载都会带上它 */
+  if (THEME) await evaluate((t) => localStorage.setItem('kimage.theme', t), THEME)
 
   // 应用自己会建库(表结构都在它那儿),所以要等它先跑过一轮
   await waitFor('应用建好 IndexedDB', () =>
@@ -946,6 +981,18 @@ async function main() {
     historyProbe = { steps: [] }
     const settle = () => sleep(350)
     const tileCount = () => evaluate(() => document.querySelectorAll('section.lib .tile').length)
+    /* 页面自己报的总数(标题那行 "N records · M images")。
+       **必须用它而不是渲染出来的图块数**:图墙只渲染前 120 块,
+       `--records 500` 时删掉一条,窗口立刻补上下一块 —— 张数纹丝不动,
+       "删完应该少 1"那条断言就永远不成立(这条探针从前就是这么红的)。
+       图块数仍然量着,只当规模参考,不进判决 */
+    const libTotals = () =>
+      evaluate(() => {
+        const t = document.querySelector('section.lib .lib-sub')?.textContent || ''
+        const rec = /(\d+)\s+records?/.exec(t)
+        const img = /(\d+)\s+images?/.exec(t)
+        return { records: rec ? Number(rec[1]) : -1, images: img ? Number(img[1]) : -1 }
+      })
     try {
       /* 先自己切到历史页再动手。别的探针会把页面切走(canvas / settings),
          而离场页在无头下可能仍留在 DOM 里 —— "section.lib 有图块"并不等于
@@ -969,6 +1016,7 @@ async function main() {
         await sleep(700)
       }
       historyProbe.tilesBefore = await tileCount()
+      historyProbe.totalsBefore = await libTotals()
       // 点第一块砖上的删除(操作排在 DOM 里,悬停才显形,但 .click() 照常触发)
       historyProbe.clickedDelete = await evaluate(() => {
         const b = [...document.querySelectorAll('section.lib button')].find((x) =>
@@ -980,6 +1028,7 @@ async function main() {
       })
       await settle()
       historyProbe.tilesAfterDelete = await tileCount()
+      historyProbe.totalsAfterDelete = await libTotals()
       // 撤销条:把这条放回来
       historyProbe.undoToast = await evaluate(() => !!document.querySelector('.undo .undo-btn'))
       historyProbe.clickedUndo = await evaluate(() => {
@@ -990,6 +1039,7 @@ async function main() {
       })
       await settle()
       historyProbe.tilesAfterUndo = await tileCount()
+      historyProbe.totalsAfterUndo = await libTotals()
 
       /* 新建作品集要从**预览卡**里进:历史页那一行筛选在"一个集都没有"时
          是有意不渲染的(免得空页面多一行噪声),所以空态下它没有入口 ——
@@ -1038,15 +1088,93 @@ async function main() {
         )
       )
 
+      /* —— 搜索:命中记录照旧铺图墙,命中的图片在另一条里单独列出 ——
+         搜 "record 7" 是有意的:它只命中播种数据里的一小撮
+         (record 7 / 70-79…),于是"图墙真的被筛过"这件事能看出来,
+         而搜一个必然存在的词又保证不是空态 */
+      historyProbe.searchTyped = await evaluate(() => {
+        const el = document.querySelector('section.lib input.search-input')
+        if (!el) return 'missing'
+        el.value = 'record 7'
+        el.dispatchEvent(new Event('input', { bubbles: true }))
+        return 'typed'
+      })
+      await settle()
+      historyProbe.search = await evaluate(() => {
+        const note = document.querySelector('section.lib .lib-note')?.textContent?.trim() || ''
+        const rec = /(\d+)\s+records?/.exec(note)
+        const img = /(\d+)\s+images?/.exec(note)
+        return {
+          /* 渲染出来的图块数**不能**当"命中多少"用:它是 120 封顶的窗口,
+             命中 190 张时照样只挂 120 块(与删除那条断言同一个坑)。
+             命中数看页面自己报的那行字 */
+          tiles: document.querySelectorAll('section.lib .wall .tile').length,
+          matchedRecords: rec ? Number(rec[1]) : -1,
+          matchedImages: img ? Number(img[1]) : -1,
+          note,
+          strip: !!document.querySelector('section.lib .strip'),
+          stripCards: document.querySelectorAll('section.lib .strip .scard').length,
+          stripTitle: document.querySelector('section.lib .strip-title')?.textContent?.trim() || '',
+          stripCapped: !!document.querySelector('section.lib .strip-more')
+        }
+      })
+
+      /* 搜一个必然搜不到的词:图墙该空、图片条该收起来、空态要说清找不到 */
+      historyProbe.searchMiss = await evaluate(() => {
+        const el = document.querySelector('section.lib input.search-input')
+        if (!el) return 'missing'
+        el.value = 'zzz-no-such-thing'
+        el.dispatchEvent(new Event('input', { bubbles: true }))
+        return 'typed'
+      })
+      await settle()
+      historyProbe.searchMissState = await evaluate(() => ({
+        tiles: document.querySelectorAll('section.lib .wall .tile').length,
+        strip: !!document.querySelector('section.lib .strip'),
+        noneTitle: document.querySelector('section.lib .none-title')?.textContent?.trim() || ''
+      }))
+
+      // 清掉关键词:图墙该回到原样(切筛子要把渲染窗口收回,这里一并验)
+      historyProbe.clearedSearch = await evaluate(() => {
+        const b = document.querySelector('section.lib button.search-x')
+        if (!b) return 'missing'
+        b.click()
+        return 'clicked'
+      })
+      await settle()
+      historyProbe.tilesAfterClear = await evaluate(
+        () => document.querySelectorAll('section.lib .wall .tile').length
+      )
+
       historyProbe.passed =
         historyProbe.clickedDelete === 'clicked' &&
-        historyProbe.tilesAfterDelete === historyProbe.tilesBefore - 1 &&
+        historyProbe.totalsBefore?.records > 0 &&
+        historyProbe.totalsAfterDelete?.records === historyProbe.totalsBefore.records - 1 &&
         historyProbe.undoToast === true &&
         historyProbe.clickedUndo === 'clicked' &&
-        historyProbe.tilesAfterUndo === historyProbe.tilesBefore &&
+        historyProbe.totalsAfterUndo?.records === historyProbe.totalsBefore.records &&
         historyProbe.clickedNewCollection === 'clicked' &&
         historyProbe.clickedConfirm === 'clicked' &&
-        historyProbe.chipAppeared === true
+        historyProbe.chipAppeared === true &&
+        historyProbe.searchTyped === 'typed' &&
+        historyProbe.search?.strip === true &&
+        historyProbe.search?.stripCards > 0 &&
+        historyProbe.search?.stripCards <= 36 &&
+        /* 封顶提示只在"命中数超过那一条装得下的数量"时才该出现 ——
+           拿小数据跑时命中寥寥无几,要求它出现就是一条**依赖数据规模**的断言
+           (这条一开始只在 --records 500 下跑过,换小数据立刻假红) */
+        (historyProbe.search?.matchedImages <= 36 || historyProbe.search?.stripCapped === true) &&
+        historyProbe.search?.matchedRecords > 0 &&
+        historyProbe.search?.matchedRecords < historyProbe.totalsBefore.records &&
+        historyProbe.search?.matchedImages > 0 &&
+        historyProbe.search?.matchedImages < historyProbe.totalsBefore.images &&
+        /match/.test(historyProbe.search?.note || '') &&
+        historyProbe.searchMiss === 'typed' &&
+        historyProbe.searchMissState?.tiles === 0 &&
+        historyProbe.searchMissState?.strip === false &&
+        /Nothing matches/.test(historyProbe.searchMissState?.noneTitle || '') &&
+        historyProbe.clearedSearch === 'clicked' &&
+        historyProbe.tilesAfterClear === historyProbe.tilesBefore
     } catch (e) {
       historyProbe.error = String(e.message || e)
     }
@@ -1111,14 +1239,50 @@ async function main() {
         input.dispatchEvent(new Event('input', { bubbles: true }))
         return 'filled'
       })
-      /* 性别是必填(Save 的 disabled 同时看名字与性别),它是视觉隐藏的真 radio */
+      /* 性别是必填(Save 的 disabled 同时看名字与性别)。
+         这一栏现在是**原生下拉**(见 CharacterPage 里 .wz-select 那段:一整排胶囊
+         占掉一条 46px 的横档,而这一页其余每行只是"一个灰标签 + 一行字"),
+         所以按 label 文本找到那一栏、设值、再补一次 change ——
+         光改 .value 不会发事件,Vue 那边收不到,Save 会一直是 disabled。
+         按 label 找而不是按 .wz-basics 里的序号:序号会随表单增删错位 */
       charsProbe.pickedGender = await evaluate(() => {
-        const radio = document.querySelector('.wz-sex-opt input')
-        if (!radio) return 'missing'
-        radio.click()
+        const field = [...document.querySelectorAll('.wz-basics .wz-field')].find((f) =>
+          /^Gender/.test((f.querySelector('.wz-label')?.textContent || '').trim())
+        )
+        const sel = field && field.querySelector('select')
+        if (!sel) return 'missing'
+        sel.value = 'female'
+        sel.dispatchEvent(new Event('change', { bubbles: true }))
         return 'clicked'
       })
+      /* 第 1 步这张表单的样子(两栏下拉收成一行之后,行高与基线只能看图)——
+         只在传了 --shot-dir 时才拍 */
+      await settle()
+      await shot('char-wizard-basics')
       /* 又是那个坑:Save 的 disabled 绑在 v-model 上,要等下一拍再点 */
+      await settle()
+      /* 风格那一栏(与性别同一套下拉)。它存的是**值**不是文案:
+         选 "Anime" 之后,库里那条角色的 fields.style 必须是 'anime'。
+         同样按 label 文本找那一栏 */
+      charsProbe.styleOptions = await evaluate(() => {
+        const field = [...document.querySelectorAll('.wz-basics .wz-field')].find((f) =>
+          /^Style/.test((f.querySelector('.wz-label')?.textContent || '').trim())
+        )
+        const sel = field && field.querySelector('select')
+        if (!sel) return 'missing'
+        return [...sel.options].map((o) => o.textContent.trim())
+      })
+      charsProbe.pickedStyle = await evaluate(() => {
+        const field = [...document.querySelectorAll('.wz-basics .wz-field')].find((f) =>
+          /^Style/.test((f.querySelector('.wz-label')?.textContent || '').trim())
+        )
+        const sel = field && field.querySelector('select')
+        const opt = sel && [...sel.options].find((o) => o.textContent.trim() === 'Anime')
+        if (!opt) return 'missing'
+        sel.value = opt.value
+        sel.dispatchEvent(new Event('change', { bubbles: true }))
+        return 'clicked'
+      })
       await settle()
       charsProbe.saved = await evaluate(() => {
         const b = [...document.querySelectorAll('button')].find((x) =>
@@ -1130,8 +1294,87 @@ async function main() {
         return 'clicked'
       })
       await sleep(900)
-      charsProbe.cardAppeared = await evaluate(
-        () => /Probe captain/.test(document.body.textContent || '')
+      /* 存进去的到底是哪个值:界面显示的是 'Anime',而提示词要的是 'anime' ——
+         中间要是有谁做了个大小写转换,这一条会当场抓到 */
+      charsProbe.savedStyle = await evaluate(() => {
+        try {
+          const list = JSON.parse(localStorage.getItem('kimage.characters') || '[]')
+          const c = list.find((x) => x.name === 'Probe captain')
+          return c && c.fields ? c.fields.style : ''
+        } catch {
+          return 'unreadable'
+        }
+      })
+      /* —— 向导第 2 步就是 Voice(第 1 步存完自动落在这儿)——
+             这一段验的是从 CharacterPage 搬进 composables/useCharacterVoice.ts
+             的那块逻辑:引擎/来源切换、提示语随来源变、以及各来源自己的输入框。
+             挑 `.voice-block` 里的 `.voice-note`,不按全局序号 —— 页面上不止一处说明行 */
+      charsProbe.voiceStep = await evaluate(() => {
+        const t = document.querySelector('.wz-group-title')
+        return t ? t.textContent.trim() : ''
+      })
+      charsProbe.pickedEngine = await evaluate(() => {
+        const seg = document.querySelector('[aria-label="Voice engine"]')
+        const btn = seg && [...seg.querySelectorAll('button')].find((b) => /Custom voice/.test(b.textContent))
+        if (!btn) return 'missing'
+        btn.click()
+        return 'clicked'
+      })
+      await settle()
+      charsProbe.sourceState = await evaluate(() => {
+        const seg = document.querySelector('[aria-label="Voice source"]')
+        if (!seg) return null
+        const block = seg.closest('.voice-block')
+        return {
+          labels: [...seg.querySelectorAll('button')].map((b) => b.textContent.trim()),
+          note: (block && block.querySelector('.voice-note')?.textContent.trim()) || ''
+        }
+      })
+      charsProbe.pickedDescribe = await evaluate(() => {
+        const seg = document.querySelector('[aria-label="Voice source"]')
+        const btn = seg && [...seg.querySelectorAll('button')].find((b) => /Describe/.test(b.textContent))
+        if (!btn) return 'missing'
+        btn.click()
+        return 'clicked'
+      })
+      await settle()
+      charsProbe.describeState = await evaluate(() => {
+        const seg = document.querySelector('[aria-label="Voice source"]')
+        const block = seg && seg.closest('.voice-block')
+        return {
+          note: (block && block.querySelector('.voice-note')?.textContent.trim()) || '',
+          hasTextarea: !!document.querySelector('.voice-panel textarea')
+        }
+      })
+      charsProbe.pickedClone = await evaluate(() => {
+        const seg = document.querySelector('[aria-label="Voice source"]')
+        const btn = seg && [...seg.querySelectorAll('button')].find((b) => /Clone/.test(b.textContent))
+        if (!btn) return 'missing'
+        btn.click()
+        return 'clicked'
+      })
+      await settle()
+      charsProbe.cloneState = await evaluate(() => ({
+        hasUpload: !!document.querySelector('.voice-panel input[type="file"]')
+      }))
+      /* 收拾干净:切回默认引擎。不然后面关向导会把这一份"配了一半的自定义音色"
+         存进这个角色(saveFromVoiceStep 就是这么设计的) */
+      charsProbe.backToBrowser = await evaluate(() => {
+        const seg = document.querySelector('[aria-label="Voice engine"]')
+        const btn = seg && [...seg.querySelectorAll('button')].find((b) => /Browser voice/.test(b.textContent))
+        if (!btn) return 'missing'
+        btn.click()
+        return 'clicked'
+      })
+      await settle()
+      /* **只看网格里的卡片名**,不看整页 textContent ——
+         向导右栏在名字敲进去那一刻就显示 "Probe captain" 了,
+         照整页匹配的话"保存成功"这条断言等于没验(实测:把 submit 打断,
+         它照样是 true) */
+      charsProbe.cardAppeared = await evaluate(() =>
+        [...document.querySelectorAll('.ctile .ctile-name')].some((n) =>
+          /Probe captain/.test(n.textContent || '')
+        )
       )
       // 关掉向导回列表
       charsProbe.closed = await evaluate(() => {
@@ -1143,6 +1386,205 @@ async function main() {
         return 'clicked'
       })
       await settle()
+      /* —— 卡片右上角那个 ⋮ 菜单 ——
+            开合、点外收起、以及动作转发(这里点"置顶",它落在角色自己身上,
+            卡上会多一枚图钉角标 —— 一眼看得见,比看 localStorage 可靠) */
+      charsProbe.openedCardMenu = await evaluate(() => {
+        const b = document.querySelector('.ctile .ctile-dots')
+        if (!b) return 'missing'
+        b.click()
+        return 'clicked'
+      })
+      await settle()
+      charsProbe.cardMenu = await evaluate(() => {
+        const menu = document.querySelector('.ctile-menu .menu')
+        if (!menu) return null
+        return [...menu.querySelectorAll('button')].map((b) => b.textContent.trim())
+      })
+      charsProbe.clickedPin = await evaluate(() => {
+        const b = [...document.querySelectorAll('.ctile-menu .menu button')].find((x) =>
+          /^Pin$/.test(x.textContent.trim())
+        )
+        if (!b) return 'missing'
+        b.click()
+        return 'clicked'
+      })
+      await settle()
+      charsProbe.pinnedBadge = await evaluate(() => !!document.querySelector('.ctile-pin'))
+      /* 点别处收起:菜单是低频动作,不该逼用户再点一次 ⋮ 才能走 */
+      charsProbe.menuOpenedAgain = await evaluate(() => {
+        const b = document.querySelector('.ctile .ctile-dots')
+        if (!b) return 'missing'
+        b.click()
+        return 'clicked'
+      })
+      await settle()
+      charsProbe.clickedOutside = await evaluate(() => {
+        document.body.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }))
+        return 'dispatched'
+      })
+      await settle()
+      charsProbe.menuClosed = await evaluate(() => !document.querySelector('.ctile-menu .menu'))
+
+      /* —— 详情页与全屏查看器 ——
+            这两块没有别的探针碰得到(角色探针原来到"卡片出现 → Create"就结束了)。
+            先给它播一张正脸设定图:key 是 `${charId}:front`(见 idb.ts 的 putCharRefs),
+            列表进详情时会按 @open 去读库,所以播完直接点进去就能看见 */
+      charsProbe.seededView = await evaluate(async () => {
+        const chars = JSON.parse(localStorage.getItem('kimage.characters') || '[]')
+        const c = chars.find((x) => /Probe captain/.test(x.name || ''))
+        if (!c) return 'no-char'
+        const blob = await new Promise((res) => {
+          const cv = document.createElement('canvas')
+          cv.width = 48
+          cv.height = 64
+          const g = cv.getContext('2d')
+          g.fillStyle = '#7c5cff'
+          g.fillRect(0, 0, 48, 64)
+          cv.toBlob((b) => res(b), 'image/png')
+        })
+        const db = await new Promise((res, rej) => {
+          const r = indexedDB.open('kimage.db')
+          r.onsuccess = () => res(r.result)
+          r.onerror = () => rej(r.error)
+        })
+        const ok = await new Promise((res, rej) => {
+          const tx = db.transaction('chars', 'readwrite')
+          tx.objectStore('chars').put({ id: c.id + ':front', data: blob })
+          tx.oncomplete = () => res('seeded')
+          tx.onerror = () => rej(tx.error)
+        })
+        db.close()
+        return ok
+      })
+      /* **重载一次再进详情**。charViews 是"读一次就缓存"的(见 loadCharViews 的早退),
+         而更早的步骤已经把它缓存成空数组了 —— 不重载的话,刚播进去的那张正脸
+         永远不会被读到,这一整段就都在验一个空网格 */
+      const reloadForDetail = onceEvent('Page.loadEventFired')
+      await send('Page.reload', { ignoreCache: true })
+      await reloadForDetail
+      await sleep(800)
+      charsProbe.backToChars = await clickNav('Characters')
+      await sleep(600)
+
+      // 进详情:卡片上那层铺满的命中区就是入口
+      charsProbe.openedDetail = await evaluate(() => {
+        const b = document.querySelector('.ctile .ctile-open')
+        if (!b) return 'missing'
+        b.click()
+        return 'clicked'
+      })
+      await sleep(900)
+      charsProbe.detail = await evaluate(() => ({
+        name: document.querySelector('.hero-name')?.textContent?.trim() || '',
+        meta: document.querySelector('.hero-meta')?.textContent?.trim() || '',
+        cells: document.querySelectorAll('.sheet .cell').length,
+        /* 每格都有一个 .cell-img 按钮(空格是"生成"、有图是"看大图"),
+           所以数它没有意义 —— 有图的那一档带 .has-img */
+        filled: document.querySelectorAll('.sheet .cell-img.has-img').length,
+        specRows: document.querySelectorAll('.spec-row, .det-row, .row').length,
+        voiceRows: (document.body.textContent || '').includes('Browser voice')
+      }))
+      /* —— 改嗓音那条入口 ——
+             向导第 2 步的解锁条件是 wizardId,而它只在新建流程里第 1 步存完才有,
+             所以详情页那枚 Edit 进不去嗓音那一步。这一段的全部意义就是钉住
+             "改这条已有角色的嗓子"这条路真的通:点得到、落在第 2 步、存得进库。
+             它只能用探针验:向导那块 composable 里 startEdit 会碰 document,
+             没有 DOM 环境的单测跑不起来(仓里也没装 jsdom) */
+      charsProbe.openedVoiceEdit = await evaluate(() => {
+        const b = [...document.querySelectorAll('button')].find(
+          (x) => (x.textContent || '').trim() === 'Change voice'
+        )
+        if (!b) return 'missing'
+        b.click()
+        return 'clicked'
+      })
+      await settle()
+      charsProbe.voiceEditStep = await evaluate(() => ({
+        title: document.querySelector('.wz-edit-title')?.textContent?.trim() || '',
+        // 落在第 2 步:引擎那一排在场,而设定表单不在
+        onVoiceStep: !!document.querySelector('[aria-label="Voice engine"]'),
+        sawSpecForm: !!document.querySelector('.wz-basics')
+      }))
+      charsProbe.switchedEngine = await evaluate(() => {
+        const seg = document.querySelector('[aria-label="Voice engine"]')
+        const btn = seg && [...seg.querySelectorAll('button')].find((b) => /Custom voice/.test(b.textContent))
+        if (!btn) return 'missing'
+        btn.click()
+        return 'clicked'
+      })
+      await settle()
+      charsProbe.savedVoice = await evaluate(() => {
+        const b = [...document.querySelectorAll('button')].find(
+          (x) => (x.textContent || '').trim() === 'Save'
+        )
+        if (!b) return 'missing'
+        if (b.disabled) return 'disabled'
+        b.click()
+        return 'clicked'
+      })
+      await sleep(900)
+      charsProbe.voiceEditResult = await evaluate(() => {
+        let engine = ''
+        try {
+          const list = JSON.parse(localStorage.getItem('kimage.characters') || '[]')
+          const c = list.find((x) => x.name === 'Probe captain')
+          engine = (c && c.voice && c.voice.engine) || ''
+        } catch {
+          engine = 'unreadable'
+        }
+        return {
+          engine,
+          // 存完该回到详情页,而不是被带去出图那一步
+          backOnDetail: !!document.querySelector('.hero-name') && !document.querySelector('.wizard'),
+          /* 详情页那一块读的是刚存下的那份,所以它得跟着变:
+             改之前那里写的是 "Browser voice",改完该是 "Custom voice"
+             (那一块的标签是 Engine / Source,别按向导里的 aria-label 找) */
+          detailShowsCustom: (document.body.textContent || '').includes('Custom voice')
+        }
+      })
+      /* 详细页那块 Voice 的样子(两枚动作 / 改完之后的摘要)——
+         面板在折叠线以下,所以先把它滚进视野再拍 */
+      await evaluate(() => {
+        const t = [...document.querySelectorAll('.panel-title')].find(
+          (x) => (x.textContent || '').trim() === 'Voice'
+        )
+        const p = t && t.closest('.panel')
+        if (p) p.scrollIntoView({ block: 'center' })
+      })
+      await sleep(400)
+      await shot('char-detail-voice')
+
+      /* 全屏查看器:点那张已经填了的格子。Esc 逐层退里的第一层就是它 */
+      charsProbe.openedViewer = await evaluate(() => {
+        const btn = document.querySelector('.sheet .cell-img.has-img')
+        if (!btn) return 'missing'
+        btn.click()
+        return 'clicked'
+      })
+      await sleep(500)
+      charsProbe.viewer = await evaluate(() => ({
+        open: !!document.querySelector('.viewer'),
+        label: document.querySelector('.viewer-label')?.textContent?.trim() || '',
+        hasImg: !!document.querySelector('.viewer img')
+      }))
+      await send('Input.dispatchKeyEvent', {
+        type: 'keyDown',
+        key: 'Escape',
+        code: 'Escape',
+        windowsVirtualKeyCode: 27
+      })
+      await settle()
+      charsProbe.viewerClosed = await evaluate(() => !document.querySelector('.viewer'))
+      // 回到列表,后面的步骤(拿它开画)照旧
+      charsProbe.backedOut = await evaluate(() => {
+        const b = document.querySelector('button.back')
+        if (!b) return 'missing'
+        b.click()
+        return 'clicked'
+      })
+      await settle()
+
       // 拿这个角色开画
       charsProbe.usedForCreate = await evaluate(() => {
         const btn = [...document.querySelectorAll('.ctile button')].find((b) =>
@@ -1161,7 +1603,56 @@ async function main() {
         charsProbe.clickedNew === 'clicked' &&
         charsProbe.filledName === 'filled' &&
         charsProbe.pickedGender === 'clicked' &&
+        /* 风格那一栏:下拉里六项都在、选得中,而且**存下去的是值不是文案** */
+        charsProbe.styleOptions?.length === 6 &&
+        charsProbe.pickedStyle === 'clicked' &&
+        charsProbe.savedStyle === 'anime' &&
         charsProbe.saved === 'clicked' &&
+        /* 嗓音那一块(从页面搬进 composable 的那部分) */
+        charsProbe.voiceStep === 'Voice' &&
+        charsProbe.pickedEngine === 'clicked' &&
+        charsProbe.sourceState?.labels?.length === 3 &&
+        /A stock voice from your provider/.test(charsProbe.sourceState?.note || '') &&
+        charsProbe.pickedDescribe === 'clicked' &&
+        charsProbe.describeState?.hasTextarea === true &&
+        /No ID and no recording/.test(charsProbe.describeState?.note || '') &&
+        charsProbe.pickedClone === 'clicked' &&
+        charsProbe.cloneState?.hasUpload === true &&
+        charsProbe.backToBrowser === 'clicked' &&
+        /* 改嗓音那条入口:点得到 → 落在第 2 步 → 存得进库 → 回详情 */
+        charsProbe.openedVoiceEdit === 'clicked' &&
+        charsProbe.voiceEditStep?.title === 'Edit Probe captain' &&
+        charsProbe.voiceEditStep?.onVoiceStep === true &&
+        charsProbe.voiceEditStep?.sawSpecForm === false &&
+        charsProbe.switchedEngine === 'clicked' &&
+        charsProbe.savedVoice === 'clicked' &&
+        charsProbe.voiceEditResult?.engine === 'tts' &&
+        charsProbe.voiceEditResult?.backOnDetail === true &&
+        charsProbe.voiceEditResult?.detailShowsCustom === true &&
+        /* 卡片 ⋮ 菜单(切片 4 搬走的那一块) */
+        charsProbe.openedCardMenu === 'clicked' &&
+        charsProbe.cardMenu?.length === 5 &&
+        /Pin/.test(charsProbe.cardMenu?.join(' ') || '') &&
+        /Delete/.test(charsProbe.cardMenu?.join(' ') || '') &&
+        charsProbe.clickedPin === 'clicked' &&
+        charsProbe.pinnedBadge === true &&
+        charsProbe.menuOpenedAgain === 'clicked' &&
+        charsProbe.clickedOutside === 'dispatched' &&
+        charsProbe.menuClosed === true &&
+        /* 详情页与全屏查看器(切片 3 搬走的那一块) */
+        charsProbe.seededView === 'seeded' &&
+        charsProbe.openedDetail === 'clicked' &&
+        charsProbe.detail?.name === 'Probe captain' &&
+        charsProbe.detail?.cells === 5 &&
+        charsProbe.detail?.filled === 1 &&
+        charsProbe.backToChars === true &&
+        /Created/.test(charsProbe.detail?.meta || '') &&
+        charsProbe.detail?.voiceRows === true &&
+        charsProbe.openedViewer === 'clicked' &&
+        charsProbe.viewer?.open === true &&
+        charsProbe.viewer?.hasImg === true &&
+        charsProbe.viewerClosed === true &&
+        charsProbe.backedOut === 'clicked' &&
         charsProbe.cardAppeared === true &&
         charsProbe.usedForCreate === 'clicked' &&
         /Probe captain/.test(charsProbe.pillTip)
@@ -1421,6 +1912,29 @@ async function main() {
   if (PROBE_CHAT) {
     chatProbe = {}
     const settle = () => sleep(350)
+    /* 切页要走**真实鼠标事件**:分段控件是 @pointerdown 驱动的,
+       `element.click()` 在它身上什么都不会发生(第一版探针就栽在这儿 ——
+       重载之后用 click 切页,结果一直停在上一个页面,后面满盘皆输) */
+    const gotoPage = async (label) => {
+      const box = await evaluate((l) => {
+        const b = document.querySelector(`button[aria-label="${l}"]`)
+        if (!b) return null
+        const r = b.getBoundingClientRect()
+        return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
+      }, label)
+      if (!box) return false
+      for (const type of ['mousePressed', 'mouseReleased']) {
+        await send('Input.dispatchMouseEvent', {
+          type,
+          x: box.x,
+          y: box.y,
+          button: 'left',
+          clickCount: 1
+        })
+      }
+      await sleep(900)
+      return true
+    }
     try {
       // ① 播种:一个角色(localStorage 目录) + 一段对话 + 一条记忆(IndexedDB)
       chatProbe.seeded = await evaluate(async () => {
@@ -1435,6 +1949,17 @@ async function main() {
               createdAt: now,
               fields: { gender: 'female', identity: 'probe', outfit: '', marks: '' },
               persona: { traits: 'dry', voice: 'short', address: 'you', boundaries: 'none' }
+            },
+            /* 第二个角色:**置顶、没有一句对话、而且比上面那个建得晚** ——
+               三样都指向"按最近活跃排的话它该在最后",所以左栏里它排第一
+               这件事只可能来自置顶(排序是派生的,不是数组顺序) */
+            {
+              id: 'probe-chat-pinned',
+              name: 'Probe pinned',
+              createdAt: now + 1000,
+              pinned: true,
+              fields: { gender: 'male', identity: 'pinned probe', outfit: '', marks: '' },
+              persona: { traits: 'calm', voice: 'even', address: 'you', boundaries: 'none' }
             }
           ])
         )
@@ -1452,10 +1977,43 @@ async function main() {
           g.fillRect(0, 0, 32, 32)
           c.toBlob((b) => res(b), 'image/png')
         })
+        /* 用户附的那张:64×32 的横图。**刻意不是方的** ——
+           方形看不出"有没有按自己的比例排",而附图右对齐这件事
+           正好在"宽度不是 100%"时才看得出来 */
+        const mk = (w, h, fill) =>
+          new Promise((res) => {
+            const c = document.createElement('canvas')
+            c.width = w
+            c.height = h
+            const g = c.getContext('2d')
+            g.fillStyle = fill
+            g.fillRect(0, 0, w, h)
+            c.toBlob((b) => res(b), 'image/png')
+          })
+        const tall = await mk(180, 320, '#3f7d5a')
+        const banner = await mk(800, 200, '#8a5a3f')
+        const wide = await new Promise((res) => {
+          const c = document.createElement('canvas')
+          c.width = 64
+          c.height = 32
+          const g = c.getContext('2d')
+          g.fillStyle = '#c9a227'
+          g.fillRect(0, 0, 64, 32)
+          c.toBlob((b) => res(b), 'image/png')
+        })
         const msgs = [
           { role: 'user', content: 'Are you awake?', dt: 3 },
           { role: 'assistant', content: 'Barely. It is early.', dt: 2 },
-          { role: 'user', content: 'Same here.', dt: 1 },
+          /* 用户附的图。铺这条是因为它在界面上与本侧的气泡**同一边** ——
+             附图排在气泡上面,右边那道对齐得看得出来才算对 */
+          {
+            role: 'user',
+            content: 'Same here.',
+            dt: 1,
+            imageId: 'probe-user-img'
+          },
+          { role: 'user', content: '', dt: 0.9, imageId: 'probe-user-img2' },
+          { role: 'user', content: 'And a wide one.', dt: 0.8, imageId: 'probe-user-img3' },
           // 已经画好的那张:photoId 指向 chat_images 里的字节
           {
             role: 'assistant',
@@ -1473,7 +2031,8 @@ async function main() {
           content: m.content,
           createdAt: now - m.dt * 60000,
           ...(m.photo ? { photo: m.photo } : {}),
-          ...(m.photoId ? { photoId: m.photoId } : {})
+          ...(m.photoId ? { photoId: m.photoId } : {}),
+          ...(m.imageId ? { imageId: m.imageId } : {})
         }))
         await new Promise((res, rej) => {
           const tx = db.transaction(['chat_messages', 'chat_summaries', 'chat_images'], 'readwrite')
@@ -1484,6 +2043,14 @@ async function main() {
             blob: png,
             createdAt: now
           })
+          // 用户附的那张是另一张图(横的),这样"谁发的"一眼分得出来
+          tx.objectStore('chat_images').put({
+            id: 'probe-user-img',
+            blob: wide,
+            createdAt: now
+          })
+          tx.objectStore('chat_images').put({ id: 'probe-user-img2', blob: tall, createdAt: now })
+          tx.objectStore('chat_images').put({ id: 'probe-user-img3', blob: banner, createdAt: now })
           tx.objectStore('chat_summaries').put({
             charId,
             text: 'They met on a cold morning and agreed to keep it short.',
@@ -1506,24 +2073,7 @@ async function main() {
       await sleep(600)
 
       // ③ 进对话页
-      const navBox = await evaluate(() => {
-        const b = document.querySelector('button[aria-label="Chat"]')
-        if (!b) return null
-        const r = b.getBoundingClientRect()
-        return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
-      })
-      if (navBox) {
-        for (const type of ['mousePressed', 'mouseReleased']) {
-          await send('Input.dispatchMouseEvent', {
-            type,
-            x: navBox.x,
-            y: navBox.y,
-            button: 'left',
-            clickCount: 1
-          })
-        }
-      }
-      await sleep(900)
+      chatProbe.navToChat = await gotoPage('Chat')
       chatProbe.rendered = await evaluate(() => {
         const bubbles = document.querySelectorAll('.bubble, .msg, .chat-msg').length
         /* 配图必须**在文字之后**(垫在下面):比的是两者在气泡里的位置。
@@ -1546,8 +2096,10 @@ async function main() {
           : null
         return {
           bubbles,
-          hasMemory: !!document.querySelector('.memory'),
-          memoryLabel: document.querySelector('.memory-label')?.textContent?.trim() || '',
+          /* 记忆的"在不在"现在看头部那枚入口(它从前是消息流顶上的一块)。
+             两者都量:块不该再出现在消息流里,入口该在 */
+          hasMemory: !!document.querySelector('.mem-chip'),
+          oldMemoryBlock: !!document.querySelector('.chat-stream .memory'),
           charInRail: /Probe talker/.test(document.body.textContent || ''),
           photoRendered: !!document.querySelector('img.msg-photo'),
           photoBelowText: !!order && order.imgAt > order.textAt && order.textAt >= 0,
@@ -1556,9 +2108,67 @@ async function main() {
           /* 实测反馈:"聊天记录里图片太大"。钉住它是个缩略图而不是一面墙 */
           photoWidth: Math.round(
             document.querySelector('img.msg-photo')?.getBoundingClientRect().width || 0
-          )
+          ),
+          /* 最后一条是助手消息,但这里**没有配文本模型**(探针只播了角色目录)——
+             重生成此时发不出去,而它要先删旧回复,所以这枚入口根本不该出现。
+             从前它会照常出现,点一下就永久删掉那条回复(没有撤销窗口)。 */
+          regenWithoutModel: !!document.querySelector('.regen'),
+          /* 左栏第一行是谁。置顶那个没有一句对话、建得也比另一个晚 ——
+             "最近活跃在前"会把它排到最后,所以它排第一只可能是置顶起了作用 */
+          railFirst:
+            document.querySelector('.chat-rail .rail-item .rail-name')?.textContent?.trim() || '',
+          /* 置顶那一行右端的图钉。**看 aria-pressed,不看有没有图标** ——
+             它现在是一枚真按钮(可以直接在左栏置顶/取消) */
+          railPinPressed:
+            document
+              .querySelector('.chat-rail .rail-item .rail-pin')
+              ?.getAttribute('aria-pressed') || '',
+          /* 用户附的图必须贴住**自己那一列的右缘**。
+             这里量的是 **img 自己**的右缘:从前量的是外面那个按钮 ——
+             按钮确实靠右,而图在按钮里靠左,于是漏掉了"图没右对齐"这个 bug */
+          userImagesAligned: (() => {
+            const msgs = [...document.querySelectorAll('.chat-inner .msg.user')].filter((m) =>
+              m.querySelector('img.msg-img')
+            )
+            if (!msgs.length) return null
+            return msgs.every(
+              (m) =>
+                Math.abs(
+                  m.querySelector('img.msg-img').getBoundingClientRect().right -
+                    m.getBoundingClientRect().right
+                ) <= 1
+            )
+          })(),
+          userImageCount: document.querySelectorAll('.chat-inner .msg.user img.msg-img').length,
+          /* 角色发的那张必须贴**左**缘。对称的那一条 —— 两个方向共用过一个
+             CSS 类,把"靠右"写在公共类上时,这一侧的图会被推到右边去 */
+          assistantPhotoLeftAligned: (() => {
+            const m = [...document.querySelectorAll('.chat-inner .msg.assistant')].find((x) =>
+              x.querySelector('img.msg-photo')
+            )
+            if (!m) return null
+            return (
+              Math.abs(
+                m.querySelector('img.msg-photo').getBoundingClientRect().left -
+                  m.getBoundingClientRect().left
+              ) <= 1
+            )
+          })(),
+          /* 只有图没有字的那条不该挂出一个空气泡(那种小壳看着像坏了) */
+          noStubBubble: ![...document.querySelectorAll('.chat-inner .msg')].some((m) => {
+            if (!m.querySelector('img.msg-img')) return false
+            const b = m.querySelector('.bubble')
+            if (!b) return false
+            const own = [...b.childNodes]
+              .filter((n) => n.nodeType === 3)
+              .map((n) => n.textContent)
+              .join('')
+            return !own.trim()
+          })
         }
       })
+
+      await shot('chat-messages')
 
       // ④ 点图开大图 → Esc 收起
       chatProbe.clickedPhoto = await evaluate(() => {
@@ -1581,7 +2191,165 @@ async function main() {
       await settle()
       chatProbe.zoomClosed = await evaluate(() => !document.querySelector('.zoom'))
 
-      // ⑤ 清空对话(菜单里那一项)
+      /* ⑤ 记忆:入口在头部,点开是一张悬浮卡片(从前它是消息流最上面那一块,
+            聊得越久越够不着) */
+      chatProbe.openedMemory = await evaluate(() => {
+        const b = document.querySelector('.mem-chip')
+        if (!b) return 'missing'
+        b.click()
+        return 'clicked'
+      })
+      await settle()
+      chatProbe.memoryCard = await evaluate(() => {
+        const card = document.querySelector('.mem-card')
+        return {
+          open: !!card,
+          text: card?.querySelector('.mem-text')?.textContent?.trim() || '',
+          /* 卡片得挂在头部下方、并且真的在视口里 —— 绝对定位最容易出的两种错:
+             跑到屏幕外,或被消息流的滚动容器裁掉 */
+          inViewport: (() => {
+            if (!card) return false
+            const r = card.getBoundingClientRect()
+            return r.top >= 0 && r.left >= 0 && r.bottom <= window.innerHeight + 1
+          })(),
+          /* 它必须**不在**消息流里(那是这次要改掉的位置) */
+          insideStream: !!document.querySelector('.chat-stream .mem-card')
+        }
+      })
+      await shot('chat-memory-card')
+
+      // Esc 收卡片(逐层退里的那一层)
+      await send('Input.dispatchKeyEvent', {
+        type: 'keyDown',
+        key: 'Escape',
+        code: 'Escape',
+        windowsVirtualKeyCode: 27
+      })
+      await settle()
+      chatProbe.memoryClosed = await evaluate(() => !document.querySelector('.mem-card'))
+
+      /* ⑥ 删单条消息:悬停那一排动作里的一枚。删完气泡少一个、撤销条出现,
+            点撤销又回来 */
+      chatProbe.bubblesBeforeDelete = await evaluate(
+        () => document.querySelectorAll('.chat-inner .msg').length
+      )
+      chatProbe.clickedDeleteMsg = await evaluate(() => {
+        const b = document.querySelector('.chat-inner .del-btn')
+        if (!b) return 'missing'
+        b.click()
+        return 'clicked'
+      })
+      await settle()
+      chatProbe.afterDeleteMsg = await evaluate(() => ({
+        messages: document.querySelectorAll('.chat-inner .msg').length,
+        undoToast: !!document.querySelector('.undo .undo-btn')
+      }))
+      chatProbe.clickedUndoMsg = await evaluate(() => {
+        const b = document.querySelector('.undo .undo-btn')
+        if (!b) return 'missing'
+        b.click()
+        return 'clicked'
+      })
+      await settle()
+      chatProbe.messagesAfterUndo = await evaluate(
+        () => document.querySelectorAll('.chat-inner .msg').length
+      )
+
+      /* ⑦ 在左栏直接置顶:点**第二行**的图钉,那一行应当立刻排到第一。
+            第一行本来就是置顶的,所以这次点的是"未置顶"的那一个 ——
+            它建得更晚、也没有对话,能排到前面只可能是因为刚刚被置顶 */
+      chatProbe.clickedRailPin = await evaluate(() => {
+        const rows = [...document.querySelectorAll('.chat-rail .rail-item')]
+        const btn = rows[1]?.querySelector('.rail-pin')
+        if (!btn) return 'missing'
+        btn.click()
+        return 'clicked'
+      })
+      await settle()
+      chatProbe.afterRailPin = await evaluate(() => ({
+        first:
+          document.querySelector('.chat-rail .rail-item .rail-name')?.textContent?.trim() || '',
+        pressed:
+          document.querySelector('.chat-rail .rail-item .rail-pin')?.getAttribute('aria-pressed') ||
+          '',
+        pinnedRows: document.querySelectorAll('.chat-rail .rail-pin[aria-pressed="true"]').length
+      }))
+
+      /* ⑧ 空正文不进上下文。
+            这一步需要一条**文本配置**(没有它 runChat 第一行就返回),
+            而整轮开头刻意没播它 —— 上面那条"没配模型就不给 Regenerate"
+            的断言要靠"没配置"这个前提。所以在这里才写进去,并重载一次让应用读到。 */
+      chatProbe.seededConfig = await evaluate(() => {
+        localStorage.setItem(
+          'kimage.apiConfigs',
+          JSON.stringify([
+            {
+              id: 'probe-text',
+              name: 'Probe text',
+              baseUrl: 'http://127.0.0.1:9/v1',
+              apiKey: 'probe-key',
+              model: 'probe-model',
+              kind: 'text',
+              vendor: 'openai'
+            }
+          ])
+        )
+        localStorage.setItem('kimage.apiActiveText', 'probe-text')
+        return 'written'
+      })
+      const reload2 = onceEvent('Page.loadEventFired')
+      await send('Page.reload', { ignoreCache: true })
+      await reload2
+      await sleep(900)
+      await gotoPage('Chat')
+      /* 历史里有一条"只有图、一个字没打"的用户消息(probe-user-img2):
+         这里真发一轮、把 fetch 桩掉抓请求体 —— 那条消息必须是 (sent a photo),
+         而不是空串(空串会被上游按"内容为空"拒掉整轮) */
+      chatProbe.stubbedSend = await evaluate(() => {
+        window.__probeSent = ''
+        const real = window.fetch.bind(window)
+        window.fetch = (url, init) => {
+          if (String(url).includes('/api/chat')) {
+            window.__probeSent = init && init.body ? String(init.body) : ''
+            return Promise.reject(new Error('probe: captured, stop here'))
+          }
+          return real(url, init)
+        }
+        const ta = document.querySelector('.compose-box textarea')
+        if (!ta) return 'no-input'
+        ta.value = 'and one from me'
+        ta.dispatchEvent(new Event('input', { bubbles: true }))
+        return 'ready'
+      })
+      await settle()
+      chatProbe.clickedSend = await evaluate(() => {
+        const b = document.querySelector('.send-btn')
+        if (!b) return 'missing'
+        if (b.disabled) return 'disabled'
+        b.click()
+        return 'clicked'
+      })
+      await sleep(800)
+      chatProbe.sentContext = await evaluate(() => {
+        const raw = window.__probeSent || ''
+        if (!raw) return null
+        try {
+          const body = JSON.parse(raw)
+          return {
+            messages: (body.messages || []).map((m) => ({ role: m.role, content: m.content })),
+            hasEmpty: (body.messages || []).some(
+              (m) => typeof m.content === 'string' && !m.content.trim()
+            ),
+            photoPlaceholders: (body.messages || []).filter(
+              (m) => m.content === '(sent a photo)'
+            ).length
+          }
+        } catch {
+          return 'unparsable'
+        }
+      })
+
+      // ⑨ 清空对话(菜单里那一项)
       chatProbe.openedMenu = await evaluate(() => {
         const b = document.querySelector('button[aria-label="Conversation options"]')
         if (!b) return 'missing'
@@ -1605,10 +2373,35 @@ async function main() {
         memoryGone: !document.querySelector('.memory')
       }))
 
+      /* ⑥ 撤销窗口结束后,库里那张附图应当也没了 ——
+         这是本次修复的核心:photoId(角色发的图)从前从来没被回收过,
+         而消息一删就再也问不出它指着哪张图了。判据必须是"库里的键还剩几个":
+         按钮/骨架的显隐在消息删掉那一刻就已经变了,量不出字节有没有走。
+         窗口是 4.5 秒(见 useFeedback 的 UNDO_MS),所以等过它。 */
+      await sleep(5200)
+      chatProbe.imagesAfterPurge = await evaluate(async () => {
+        const db = await new Promise((res, rej) => {
+          const r = indexedDB.open('kimage.db')
+          r.onsuccess = () => res(r.result)
+          r.onerror = () => rej(r.error)
+        })
+        const keys = await new Promise((res, rej) => {
+          const r = db
+            .transaction('chat_images', 'readonly')
+            .objectStore('chat_images')
+            .getAllKeys()
+          r.onsuccess = () => res(r.result)
+          r.onerror = () => rej(r.error)
+        })
+        db.close()
+        return keys.length
+      })
+
       chatProbe.passed =
-        chatProbe.seeded === 5 &&
+        chatProbe.seeded === 7 &&
         chatProbe.rendered?.bubbles >= 3 &&
         chatProbe.rendered?.hasMemory === true &&
+        chatProbe.rendered?.oldMemoryBlock === false &&
         chatProbe.rendered?.charInRail === true &&
         chatProbe.rendered?.photoRendered === true &&
         chatProbe.rendered?.photoBelowText === true &&
@@ -1616,6 +2409,34 @@ async function main() {
         chatProbe.rendered?.photoOutsideBubble === true &&
         chatProbe.rendered?.photoWidth > 0 &&
         chatProbe.rendered?.photoWidth <= 240 &&
+        chatProbe.rendered?.regenWithoutModel === false &&
+        /* 置顶:左栏第一行是那个置顶的(它没有对话、建得也更晚) */
+        /Probe pinned/.test(chatProbe.rendered?.railFirst || '') &&
+        chatProbe.rendered?.railPinPressed === 'true' &&
+        chatProbe.rendered?.userImageCount === 3 &&
+        chatProbe.rendered?.userImagesAligned === true &&
+        chatProbe.rendered?.assistantPhotoLeftAligned === true &&
+        chatProbe.rendered?.noStubBubble === true &&
+        chatProbe.memoryCard?.open === true &&
+        /cold morning/.test(chatProbe.memoryCard?.text || '') &&
+        chatProbe.memoryCard?.inViewport === true &&
+        chatProbe.memoryCard?.insideStream === false &&
+        chatProbe.memoryClosed === true &&
+        chatProbe.clickedDeleteMsg === 'clicked' &&
+        chatProbe.afterDeleteMsg?.messages === chatProbe.bubblesBeforeDelete - 1 &&
+        chatProbe.afterDeleteMsg?.undoToast === true &&
+        chatProbe.clickedUndoMsg === 'clicked' &&
+        chatProbe.messagesAfterUndo === chatProbe.bubblesBeforeDelete &&
+        chatProbe.clickedRailPin === 'clicked' &&
+        chatProbe.seededConfig === 'written' &&
+        chatProbe.navToChat === true &&
+        chatProbe.stubbedSend === 'ready' &&
+        chatProbe.clickedSend === 'clicked' &&
+        chatProbe.sentContext?.hasEmpty === false &&
+        chatProbe.sentContext?.photoPlaceholders === 1 &&
+        /Probe talker/.test(chatProbe.afterRailPin?.first || '') &&
+        chatProbe.afterRailPin?.pressed === 'true' &&
+        chatProbe.afterRailPin?.pinnedRows === 2 &&
         chatProbe.clickedPhoto === 'clicked' &&
         chatProbe.zoom?.open === true &&
         chatProbe.zoom?.isBlob === true &&
@@ -1623,7 +2444,8 @@ async function main() {
         chatProbe.clickedClear === 'clicked' &&
         chatProbe.afterClear?.bubbles === 0 &&
         chatProbe.afterClear?.memoryGone === true &&
-        chatProbe.afterClear?.undoToast === true
+        chatProbe.afterClear?.undoToast === true &&
+        chatProbe.imagesAfterPurge === 0
     } catch (e) {
       chatProbe.error = String(e.message || e)
     }

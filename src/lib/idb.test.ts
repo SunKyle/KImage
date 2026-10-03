@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import {
   isDeadConnectionError,
+  orphanChatImages,
   planPrune,
+  referencedChatImages,
   retryOnDeadConnection,
   shouldCheckStorage,
   type PruneCandidate
@@ -223,5 +225,60 @@ describe('retryOnDeadConnection · 连接死了就重开一次', () => {
     )
     expect(res).toBe('ok')
     expect(opens).toBe(2)
+  })
+})
+
+/* ===== 聊天附图的归属 =====
+   这两个函数决定"删不删用户的字节":清空对话、删角色、空间体检都要用它。
+   从前漏得比较彻底 —— 只收内存里那一档(最近 200 条)的 imageId,
+   而角色发的图(photoId)一张都没回收过。 */
+
+describe('referencedChatImages · 消息还指着哪些图', () => {
+  it('imageId 与 photoId 都算 —— 一个是对方发来的,一个是它给你的', () => {
+    const refs = referencedChatImages([
+      { imageId: 'u1' },
+      { photoId: 'p1' },
+      { imageId: 'u2', photoId: 'p2' }
+    ])
+    expect([...refs].sort()).toEqual(['p1', 'p2', 'u1', 'u2'])
+  })
+
+  it('同一条消息带两张、或两条消息指着同一张,都只算一次', () => {
+    expect([...referencedChatImages([{ imageId: 'x', photoId: 'x' }])]).toEqual(['x'])
+    expect(referencedChatImages([{ imageId: 'x' }, { imageId: 'x' }]).size).toBe(1)
+  })
+
+  it('没有图的、以及空串/undefined 的字段都跳过', () => {
+    expect(referencedChatImages([{}, { imageId: '' }, { photoId: undefined }]).size).toBe(0)
+  })
+
+  it('空列表给空集合(不抛)', () => {
+    expect(referencedChatImages([]).size).toBe(0)
+  })
+})
+
+describe('orphanChatImages · 哪些图已经没人认领', () => {
+  it('只有没人指着的那几张被交出来', () => {
+    const refs = new Set(['keep1', 'keep2'])
+    expect(orphanChatImages(refs, ['keep1', 'gone1', 'keep2', 'gone2'])).toEqual([
+      'gone1',
+      'gone2'
+    ])
+  })
+
+  it('一张都没被引用时,库里那些全是孤儿', () => {
+    expect(orphanChatImages(new Set(), ['a', 'b'])).toEqual(['a', 'b'])
+  })
+
+  it('全都被引用时一个都不删 —— 删了那些对话就只剩一句话', () => {
+    expect(orphanChatImages(new Set(['a', 'b']), ['a', 'b'])).toEqual([])
+  })
+
+  it('库里是空的时什么都不做', () => {
+    expect(orphanChatImages(new Set(['a']), [])).toEqual([])
+  })
+
+  it('保序:交出来的顺序与库里的键一致(便于调用方直接遍历删)', () => {
+    expect(orphanChatImages(new Set(['b']), ['c', 'a', 'b'])).toEqual(['c', 'a'])
   })
 })

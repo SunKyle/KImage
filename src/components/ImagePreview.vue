@@ -27,7 +27,7 @@ import {
   PhCheck,
   PhMaskHappy
 } from '@phosphor-icons/vue'
-import { BACKGROUND_OPTIONS, QUALITY_OPTIONS, extOf, imageSrc, optionLabel, reuseParamsOf, thumbSrc } from '../api'
+import { BACKGROUND_OPTIONS, QUALITY_OPTIONS, downloadImageUrl, imageSrc, optionLabel, reuseParamsOf, thumbSrc } from '../api'
 import type { HistoryEntry, ResultItem, ReuseParams, FavoritePayload, Collection, Character } from '../types'
 import { blobToDataURL } from '../lib/idb'
 // 浮层的公共行为(Tab 圈定 / 点外收起 / Esc 逐层退)
@@ -42,6 +42,9 @@ const props = defineProps<{
   collections: Collection[]
   // 角色目录:用来把记录上的 characterId 翻成名字
   characters: Character[]
+  /* 打开时先落在第几张(从 0 数)。历史页的搜索结果是一张图一块,
+     点第 3 张就该看到第 3 张 —— 默认 0 是"从记录的第一张看起" */
+  startIndex?: number
 }>()
 const emit = defineEmits<{
   (e: 'close'): void
@@ -106,7 +109,11 @@ function onImgLoad(e: Event) {
 
 // 每次打开、或上下翻到另一条记录,都回到初始视图
 function resetView() {
-  active.value = 0
+  /* 落点由调用方给(历史页"点第几张就看第几张"),但要夹进这一条记录的范围:
+     记录被删过图、或调用方给的索引过期时,active 越界会让图片区一片空 */
+  const count = props.entry?.results.length || 0
+  const at = props.startIndex ?? 0
+  active.value = count ? Math.min(Math.max(0, at), count - 1) : 0
   collAdding.value = false
   collNewTitle.value = ''
   copied.value = false
@@ -179,20 +186,11 @@ function next() {
 }
 
 /** 按载荷真实类型推下载扩展名:结果可能是 jpeg / webp,写死 png 名不对。
- *  实现与批量导出共用一份(见 api.ts 的 extOf) */
+ *  实现与批量导出、历史页的单张保存共用一份(见 api.ts 的 downloadImageUrl) */
 function download() {
   const url = imgs.value[active.value]
   if (!url) return
-  const a = document.createElement('a')
-  a.href = url
-  if (/^https?:/.test(url)) {
-    // 远端图源跨域,download 属性会被浏览器忽略:新窗口打开让用户自行另存
-    a.target = '_blank'
-    a.rel = 'noopener'
-  } else {
-    a.download = `kimage-${Date.now()}.${extOf(props.entry?.results[active.value])}`
-  }
-  a.click()
+  downloadImageUrl(url, props.entry?.results[active.value])
 }
 
 async function copyPrompt() {

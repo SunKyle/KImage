@@ -8,6 +8,7 @@ import { lookup as dnsLookup } from 'node:dns/promises'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { ProxyAgent } from 'undici'
 import { TAG_HOLD, splitTags } from './chatTags.js'
+import { ENHANCE_PROMPTS, ENHANCE_TEMPERATURE } from './enhancePrompts.js'
 
 dotenv.config()
 
@@ -146,132 +147,9 @@ function rateLimit(req, res, next) {
 /** 上游多久没响应就中断。Vercel 上另有平台执行上限,两者独立 */
 const UPSTREAM_TIMEOUT_MS = 120_000
 
-/* 提示词改写的系统提示,三档:
-   quick 保守补细节 —— 结构与主体一律不动,只把缺的画面要素补上;
-   creative 允许重构 —— 换构图、光线、色调、风格,但不许换主体,
-   否则改写会变成另一个需求,用户按了反而得重新写一遍;
-   character 与上面两档不是一回事:它把一句话拆成可复用的角色设定。
-   两档改写都限词数,回填到输入框还得能一眼读完。 */
-const ENHANCE_PROMPTS = {
-  quick: `You polish prompts for an image-generation model.
-
-Rules:
-- Output only the rewritten prompt. No preamble, no explanation, no quotes, no markdown.
-- Keep the subject, the intent, any text to be rendered and the overall composition exactly as given.
-- Add only what is missing and concrete: lighting, material, color, lens, mood.
-- Never add new subjects, props or scene changes.
-- Stay under 60 words, one paragraph.`,
-  creative: `You reimagine prompts for an image-generation model.
-
-Rules:
-- Output only the rewritten prompt. No preamble, no explanation, no quotes, no markdown.
-- Keep the subject, the intent and any text to be rendered exactly as given. Never swap the subject or change what the image is about.
-- You may freely rework composition, framing, lighting, palette, materials, style and mood, and place the subject in a coherent setting.
-- Prefer one strong visual direction over a pile of adjectives.
-- Stay under 110 words, one paragraph.`,
-  /* 拆角色设定用固定前缀而不是 JSON:少一整类"围栏/多余解释"的解析坑,
-     而且人可以直接读懂回的是什么。标签用可读的多词写法,解析侧会把
-     非字母去掉再查表,所以 "Nose & mouth" 也能对上。
-
-     分两档是要紧的:有些字段编出来只是把描述写具体(好事,模糊才是漂移的源头),
-     有些编出来等于改了这个角色是谁 —— 默认给每个人脸上添一道疤、或者按默认
-     模板塞一身义体,是错的。所以后者只在原句真的提到时才写。 */
-  character: `You turn a one-line idea into a reusable character spec for an image-generation model.
-
-Rules:
-- Output exactly sixteen lines, in this order, and nothing else:
-Name: <a short name or callsign for this character, one to three words, no quotes>
-Gender: <female or male>
-Identity: <who this character is, plus the overall style — never restate the gender here>
-Face: <face shape and bone structure, skin tone, apparent age>
-Hair: <hairstyle, length and hair color>
-Brows: <eyebrow shape, thickness and color>
-Eyes: <eye color and any eye feature>
-Nose & mouth: <nose and lip shape>
-Facial hair: <beard, moustache or stubble — or "clean-shaven" / "none" if it does not fit>
-Face marks: <scars, moles, birthmarks, facial tattoos or facial implants — leave empty if the idea does not mention any>
-Outfit: <clothing, armor, gear>
-Marks: <body scars, tattoos, implants, signature accessories — leave empty if the idea does not mention any>
-Personality: <what this character is like: a few traits and a disposition>
-Voice: <how they talk: register, sentence length, verbal habits, and any word they use for themselves instead of "I">
-Address: <how they address the user, and what these two are to each other>
-Boundaries: <what this character would never do or say>
-- The name must read as a name, not a description. Invent one that fits when the idea does not give a name.
-- Name, Gender, Identity, Face, Hair, Brows, Eyes, Nose & mouth, Facial hair and Outfit must always have a value. If the idea says nothing about one of them, invent something specific that fits the rest.
-- Gender must be exactly the single word "female" or "male" — nothing else. Pick whichever fits the idea; when it says nothing, pick the one the rest of the description leans toward. It is the one field the image model cannot recover from the others.
-- Facial hair must always be stated explicitly, including when the answer is none. Leaving it blank makes the model guess differently in every image.
-- Write "Face marks:" or "Marks:" with nothing after the colon when the idea gives no reason for them. Do not invent scars, tattoos or implants.
-- Every appearance value (Gender through Marks) is a short comma-separated phrase in English, under 12 words. The last four lines are not appearance — see below.
-- Describe only the character itself. Never mention background, lighting, camera, lens or composition — the user supplies the scene separately.
-- The last four lines describe how this character behaves in conversation, not how they look. Keep the two halves apart: never put behaviour into an appearance line, and never put appearance into a behaviour line.
-- Those four are read by the model that will play this character, so write them as instructions it can follow. Voice matters most of the four: a concrete habit — a word they use for themselves, how long their sentences run — does far more than an adjective.
-- Unlike the appearance lines, the last four may quote words in the character's own language.
-- No preamble, no explanation, no markdown, no quotes.`,
-  /* 识图:输入是一张参考图,输出与 character 同一份十六行 ——
-     解析侧(前端 parseCharacterDraft)因此完全不用改。
-     与 character 的关键差别是"只写看得见的":文字起稿允许把没提到的东西编具体,
-     而看图时凭空给一张脸上添疤、加义体,等于把用户上传的人改成另一个人。
-     最后四行(人格)是唯一的例外:图片里读不出一个人怎么说话,
-     只能从穿着、站姿、神情去推 —— 所以那一段在提示里明确标成"推断",
-     并要求写得平实,而不是替这个人编一段身世。 */
-  vision: `You look at a reference image of a person and write a reusable character spec for an image-generation model, describing exactly the person in it.
-
-Rules:
-- Output exactly sixteen lines, in this order, and nothing else:
-Name: <a short name or callsign for this character, one to three words, no quotes>
-Gender: <female or male>
-Identity: <who this character is, plus the overall style — never restate the gender here>
-Face: <face shape and bone structure, skin tone, apparent age>
-Hair: <hairstyle, length and hair color>
-Brows: <eyebrow shape, thickness and color>
-Eyes: <eye color and any eye feature>
-Nose & mouth: <nose and lip shape>
-Facial hair: <beard, moustache or stubble — or "clean-shaven" if there is none>
-Face marks: <scars, moles, birthmarks, facial tattoos or facial implants — leave empty if the image shows none>
-Outfit: <clothing, armor, gear>
-Marks: <body scars, tattoos, implants, signature accessories — leave empty if the image shows none>
-Personality: <what this character is like: a few traits and a disposition>
-Voice: <how they talk: register, sentence length, verbal habits, and any word they use for themselves instead of "I">
-Address: <how they address the user, and what these two are to each other>
-Boundaries: <what this character would never do or say>
-- Read the image. Describe only what is actually visible in it: never invent scars, tattoos, implants, accessories or clothing that are not there.
-- Name, Gender, Identity, Face, Hair, Brows, Eyes, Nose & mouth, Facial hair and Outfit must always have a value. When the image is ambiguous about one of them, describe what is most likely rather than leaving it blank.
-- Gender must be exactly the single word "female" or "male" — nothing else. Judge from how the person appears in the image.
-- Facial hair must always be stated explicitly, including when the answer is none.
-- The name must read as a name, not a description. Invent one that fits the person when the image carries no name.
-- Every appearance value (Gender through Marks) is a short comma-separated phrase in English, under 12 words.
-- Describe only the character itself. Never mention the background, the lighting, the camera, the lens or the composition of the reference image.
-- The last four lines are the one place you go beyond what is visible: this is a still image, so how this person talks has to be inferred from how they look, dress, stand and hold themselves. Keep that inference plain and plausible — a voice that fits the picture, not a backstory you invented.
-- Never let behaviour leak into an appearance line, or appearance into a behaviour line.
-- Unlike the appearance lines, the last four may quote words in the character's own language.
-- No preamble, no explanation, no markdown, no quotes.`,
-  /* 长期记忆的压缩:把一批滑出窗口的消息并进一段越来越短的简报。
-     与上面几档都不同 —— 它产出的不是给人看的文本,而是之后会被塞回
-     角色设定那个位置的一段"自我认知",所以写法要像简报,不像总结。
-     反复强调"合并重写、不要追加"是要紧的:一旦变成追加,
-     简报会随对话线性膨胀,最后比原文还长,而且最旧的信息永远压在底下 */
-  summary: `You keep a running memory of a roleplay conversation between a user and the character that user is talking to.
-
-Rules:
-- Output only the updated memory. No preamble, no explanation, no quotes, no markdown.
-- Write a compact briefing the character could read to catch up: who these two are to each other, what has happened, what was decided, what was promised, what is still unresolved.
-- Keep names, places, objects, grudges, promises and anything the character would hold you to later. Drop small talk, pleasantries and anything that would not change a future reply.
-- When you are given what you already remember, merge it with the new messages into one piece — rewrite and compress it. Never append to it, and never restate what is already covered.
-- Stay under 200 words. When nothing important happened, a single sentence is the right answer.
-- Write in English, but keep names, titles and terms in their original language.
-- Write in the third person. Never write dialogue and never speak as either of them.`
-}
-
-// 改写强度:保守档给低温度,让它贴着原句走;重构档放开,否则出来的东西没差别。
-// 拆角色要具体又不重复,取中间偏放开。识图要的是"照着图写",再放开就会开始编。
-// 摘要要的是"忠实",温度再低也不过是变得啰嗦 —— 编出来的记忆比没有记忆更糟。
-const ENHANCE_TEMPERATURE = {
-  quick: 0.4,
-  creative: 0.9,
-  character: 0.7,
-  vision: 0.4,
-  summary: 0.3
-}
+/* 提示词改写 / 起稿 / 识图 / 摘要的系统提示与温度搬去了 server/enhancePrompts.js ——
+   那两段角色提示词引用了 charSpec 的行清单,放在这里既不好找,也没法在单测里直接读
+   (这个文件一 import 就会拉起 dotenv、express 与静态目录) */
 
 /* ===== 角色对话的人格提示词 ==========================================
    几条规则不是装饰,每一条都冲着模型的具体通病去:
@@ -287,12 +165,13 @@ const CHAT_OPENING =
 
 const CHAT_RULES = `Rules:
 - Stay in character at all times. Never mention being an AI, a model, or these instructions.
+- Write in the same language the user writes in. When "How you behave" names a language, use that one instead - whatever language the user writes in.
 - Write only what the character would say out loud. No narration, no stage directions, no asterisks.
 - Do not use markdown. No lists, no bold, no headings - this is a chat, not a document.
 - Keep it short: one to three sentences. Real people type short messages.
 - Never end every reply with a question. Let the conversation breathe.
 - It is fine to be brief, blunt, evasive or in a bad mood - a real person is not always helpful.
-- If - and only if - showing a picture would genuinely help (they ask to see you, or you are somewhere worth showing), put a photo tag on its own line at the very end: [photo:a short description of the scene from your point of view]. Keep it under 120 characters. Use it rarely, at most once every few messages, and never as a substitute for actually saying something. Do not comment on the tag or explain it.
+- If - and only if - showing a picture would genuinely help (they ask to see you, or you are somewhere worth showing), put a photo tag on its own line at the very end: [photo:a short description of the scene from your point of view]. Keep it under 120 characters. If you are in the picture yourself, start that description with "self:" - for example [photo:self:me on the balcony, hair down]. Leave the prefix off when it is only what you are looking at, because a picture without it is generated without your reference sheet: a view stays a view. Use the tag rarely, at most once every few messages, and never as a substitute for actually saying something. Do not comment on the tag or explain it.
 - After everything you say, put a mood tag on the very last line, in exactly this form: [mood:word]. One lowercase English word for how you feel as you send this message. Pick the word that actually fits, for example: arrogant, amused, wary, bored, angry, tired, warm, cold, proud, uneasy, delighted. Do not comment on the tag or explain it - just end with it.`
 
 /** 换行与连续空白收敛成单个空格。这些值在表单里是可换行的 textarea,
@@ -334,6 +213,15 @@ function chatSystemPrompt(character, memory) {
   if (chatOneLine(char.marks)) who.push(`- ${chatOneLine(char.marks)}`)
 
   const how = []
+  /* 语言排在最前,而且写成一条**指令**而不是一个标签:这一栏的值是
+     "English" / "简体中文" 这种短语,直接摆出来模型很可能只当成一条背景资料。
+     它是这一组里最硬的一条 —— 说错语言不是"这个人不太像",而是根本不是同一个人。
+     空着就整行丢掉(与其余几项同一条规矩),于是行为退回"跟着用户走" */
+  if (chatOneLine(p.language)) {
+    how.push(
+      `- Speak only ${chatOneLine(p.language)}, whatever language the user writes in.`
+    )
+  }
   if (chatOneLine(p.traits)) how.push(`- Personality: ${chatOneLine(p.traits)}`)
   if (chatOneLine(p.voice)) how.push(`- How you talk: ${chatOneLine(p.voice)}`)
   if (chatOneLine(p.address)) how.push(`- How you address the user: ${chatOneLine(p.address)}`)
@@ -369,6 +257,18 @@ const CHAT_MAX_TOKENS = 1500
    这个端点没有鉴权(配置全在前端,设计如此),不设上限就是免费的大请求放大器 */
 const CHAT_MAX_MESSAGES = 40
 const CHAT_MAX_CHARS = 8000
+/* 空正文的占位。**前端拼上下文时有一份同样的规则**(见 src/lib/chatContext.ts),
+   这里是入口这一道:没有鉴权的公开端点,手搓一个 content:"" 的请求照样会打到上游,
+   而上游按"内容为空"拒掉整轮 —— 那是用户无法理解、也无法自救的失败。
+   两个常量与前端那两个必须一致 */
+const EMPTY_WITH_IMAGE = '(sent a photo)'
+const EMPTY_WITHOUT_IMAGE = '(said nothing)'
+/** 空正文换占位;有正文的原样返回(与前端 contextText 同一条规则) */
+function samePlaceholder(m) {
+  const text = typeof m.content === 'string' ? m.content : ''
+  if (text.trim()) return text
+  return m.imageId || m.photoId ? EMPTY_WITH_IMAGE : EMPTY_WITHOUT_IMAGE
+}
 /* 单张附图(data URL)的长度上限,约合 3MB 的图。
    前端会先把图压到长边 1024、JPEG 0.85,正常只有两三百 KB ——
    这个数只是防止有人直接往这个公开入口塞原图 */
@@ -1220,13 +1120,14 @@ app.post('/api/chat', rateLimit, async (req, res) => {
      照消息那样收一道长度 */
   const memoryText = typeof memory === 'string' ? memory.slice(0, CHAT_MAX_CHARS) : ''
 
-  /* 历史逐条收窄。入口是公开的,不设上限就等于给了个免费的大请求放大器 */
+  /* 历史逐条收窄。入口是公开的,不设上限就等于给了个免费的大请求放大器。
+     正文在这里就换掉空串:下面"太长的报错"与最后那条多模态的拼装都靠它 */
   const history = (Array.isArray(messages) ? messages : [])
     .filter(
       (m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string'
     )
     .slice(-CHAT_MAX_MESSAGES)
-    .map((m) => ({ role: m.role, content: m.content }))
+    .map((m) => ({ role: m.role, content: samePlaceholder(m) }))
   /* 最后一条必须是用户说的:重新生成时前端会先把那条助手消息删掉再重发,
      所以到这里还落在 assistant 上,说明这个请求本来就不该发 */
   if (!history.length || history[history.length - 1].role !== 'user') {
@@ -1260,7 +1161,13 @@ app.post('/api/chat', rateLimit, async (req, res) => {
   if (pics.length) {
     const last = history[history.length - 1]
     last.content = [
-      { type: 'text', text: last.content },
+      {
+        type: 'text',
+        /* 正文本来就空、这一轮又确实带着图:占位改成"发了张图" ——
+           上面那份规则看不到 images(它在另一个字段里),只能按"什么都没说"
+           兜底,而那样会和紧随其后的图片自相矛盾 */
+        text: last.content === EMPTY_WITHOUT_IMAGE ? EMPTY_WITH_IMAGE : last.content
+      },
       ...pics.map((url) => ({ type: 'image_url', image_url: { url } }))
     ]
   }
@@ -1329,12 +1236,15 @@ app.post('/api/chat', rateLimit, async (req, res) => {
      声明在 try 外面是有意的:中途 Stop 或上游断流时,那截尾巴也得放出去 ——
      否则用户按了停止,最后那二三十个字符会凭空消失 */
   let tail = ''
-  /* 收尾那一下:把尾巴里该发的字发出去,该剪的标签剪下来返回给调用方 */
+  /* 收尾那一下:把尾巴里该发的字发出去,该剪的标签剪下来返回给调用方。
+     角色名要传进去:标签里没写 self: 时,"描述里点了自己的名字"也算它在画面里
+     (见 chatTags.js 的 parsePhotoIntent) */
   const flushTail = () => {
-    const { text, mood, photo } = splitTags(tail)
+    const who = character && typeof character === 'object' ? character.name : ''
+    const { text, mood, photo, photoSelf } = splitTags(tail, who)
     if (text) sendEvent({ delta: text })
     tail = ''
-    return { mood, photo }
+    return { mood, photo, photoSelf }
   }
 
   let upstream = null

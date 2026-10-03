@@ -12,6 +12,10 @@
   --bg-elev: #F5F5F2;             /* surface-secondary: 输入/悬浮区 */
   --surface: #FFFFFF;             /* surface: 卡片/面板 */
   --surface-hover: #EFEFEA;       /* surface-hover */
+  /* 角色气泡的底。比 --bg-elev 再抬一档 —— 气泡与面板是**同色面上的同色块**
+     (输入框那种"白面上的浅灰"不一样),照 --bg-elev 给的话两者只差 1.09:1,
+     一句短回复看起来就是浮在背景里的几行字,读不出"这是一个块" */
+  --bubble-bg: #EFEFEA;
   --image-bg: #F0EFEC;            /* 图片画布底,内嵌感 */
   --stage-bg: #F2F2F2;            /* 预览左侧图片区底:衬出图片与 contain 留边 */
   --line: #E8E6E1;                /* 分隔线 */
@@ -122,6 +126,8 @@ html[data-theme="dark"] {
   --bg-elev: #1E1E21;
   --surface: #171719;
   --surface-hover: #232326;
+  /* 见浅色那一段的说明:同色面上的气泡块要比"抬起来一档"再明确一点 */
+  --bubble-bg: #232326;
   --image-bg: #0B0B0D;
   /* 深色下图片区往「内凹」走,比页面底(--bg)再暗一档 */
   --stage-bg: #0B0B0D;

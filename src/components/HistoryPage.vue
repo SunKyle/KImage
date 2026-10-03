@@ -9,13 +9,15 @@ import {
   PhDownloadSimple,
   PhCheckCircle,
   PhCircle,
+  PhMagnifyingGlass,
   PhStack,
   PhPlus,
   PhX
 } from '@phosphor-icons/vue'
-import { exportImages, imageSrc, reuseParamsOf, thumbSrc } from '../api'
+import { exportImages, imageSrc, reuseParamsOf, thumbSrc, downloadImageUrl } from '../api'
 import { blobToDataURL } from '../lib/idb'
 import { titleFromPrompt } from '../lib/text'
+import { matchesHistoryQuery, normalizeQuery, type HistorySearchNames } from '../lib/historySearch'
 import type { Collection, HistoryEntry, ResultItem, ReuseParams } from '../types'
 
 /** 读屏念出来的名字用短标题:整段提示词可能有上百字,念完没人记得住,
@@ -34,10 +36,15 @@ type Tile = { key: string; entry: HistoryEntry; index: number; item: ResultItem 
 const props = defineProps<{
   items: HistoryEntry[]
   collections: Collection[]
+  /* 角色 id → 名字。历史记录里存的是 id,而搜索要按"跟谁那张"找 ——
+     反查表由主界面给(它手上才有角色目录),这一页不碰那份数据 */
+  charNames: Record<string, string>
 }>()
 
 const emit = defineEmits<{
-  (e: 'open', entry: HistoryEntry): void
+  /* index 是"这一条记录里的第几张"。图块是按张摊平的,所以点第 3 张
+     就该看到第 3 张 —— 少了它,预览永远从第一张开始 */
+  (e: 'open', entry: HistoryEntry, index: number): void
   (e: 'use', params: ReuseParams): void
   /* 进自由画布。图块是按张摊平的,所以要连 index 一起给 ——
      一条记录里改第三张,出去的就该是第三张 */
@@ -64,6 +71,25 @@ const tiles = computed<Tile[]>(() =>
 )
 const imageCount = computed(() => tiles.value.length)
 
+/* ===== 搜索 =====
+   三处匹配:提示词正文、角色名、作品集名(见 lib/historySearch)。
+   只搜"画的是什么、跟谁、归在哪个集"—— 尺寸与模型是"怎么生成的",
+   不是用户找图时脑子里的抓手;按图搜图要把每张图喂给视觉模型,
+   成本与延迟都不是搜索该有的。
+
+   搜索与筛选是**两件事**,叠在一起用:搜索回答"哪张",筛子回答
+   "只看收藏的 / 只看这个集"。所以先搜后筛,两块区域(图墙与图片条)
+   用的是同一份结果 —— 两处数量对不上会让人以为漏了。 */
+const query = ref('')
+const searching = computed(() => !!normalizeQuery(query.value))
+const searchNames = computed<HistorySearchNames>(() => ({
+  charNames: props.charNames,
+  collTitles: Object.fromEntries(props.collections.map((c) => [c.id, c.title]))
+}))
+const clearSearch = () => {
+  query.value = ''
+}
+
 // 筛选的是图块,所以数量按张算而不是按条算
 const onlyMarked = ref(false)
 const markedCount = computed(() => tiles.value.filter((t) => t.item.marked).length)
@@ -73,12 +99,34 @@ const activeColl = ref('')
 const shownTiles = computed(() =>
   tiles.value.filter(
     (t) =>
+      matchesHistoryQuery(t.entry, query.value, searchNames.value) &&
       (!onlyMarked.value || t.item.marked) &&
       (!activeColl.value || t.entry.collectionId === activeColl.value)
   )
 )
+// 命中多少条记录(与命中多少张图分开报:用户找的是"那张图",但记录是它的来处)
+const shownRecords = computed(() => new Set(shownTiles.value.map((t) => t.entry.id)).size)
 // 有没有一个筛子在起作用,决定空态文案与「查看全部」的去向
-const filterActive = computed(() => onlyMarked.value || !!activeColl.value)
+const filterActive = computed(() => onlyMarked.value || !!activeColl.value || searching.value)
+
+/* —— 图片条 ——
+   搜索结果里"命中的图"单独排一块。它**不是图墙的缩略复制**,两边答的不是
+   同一件事:图墙是浏览(悬停才出提示词与参数、动作按记录),这一条是
+   "就是这张"(一张一块、动作常驻、标着它从哪条记录来)。
+
+   只在搜索时出现:没有关键词时图墙本来就把全部图铺在那儿了,
+   再来一条一模一样的只会让人以为页面重了。
+   条数封顶:横向滚动能放很多,但没必要为一次搜索挂上几千个节点 ——
+   两者会同时挂在页面上(图墙也在),所以这一条给得比图墙的首批少一档。 */
+const IMG_STRIP_MAX = 36
+const stripTiles = computed(() => shownTiles.value.slice(0, IMG_STRIP_MAX))
+const stripHidden = computed(() => Math.max(0, shownTiles.value.length - stripTiles.value.length))
+
+/** 图片条里的一张:存这一张。走共享实现(见 api.ts 的 downloadImageUrl)——
+ *  扩展名判据与预览卡、批量导出是同一份 */
+function saveTile(t: Tile) {
+  downloadImageUrl(imageSrc(t.item), t.item)
+}
 
 /* —— 分段渲染 ——
    记录是摊平成图砖的,500 条 × 2 张就是 1012 块、两万五千多个节点(实测),
@@ -94,9 +142,9 @@ const wallRemaining = computed(() => Math.max(0, shownTiles.value.length - visib
 function showMore() {
   wallShown.value += WALL_PAGE
 }
-/* 换了筛子要把窗口收回去:否则从「Marked」切回「全部」时,
+/* 换了筛子或关键词要把窗口收回去:否则从「Marked」切回「全部」时,
    窗口还停在上一批的位置,看起来像"全部都在这儿了" */
-watch([onlyMarked, activeColl], () => {
+watch([onlyMarked, activeColl, query], () => {
   wallShown.value = WALL_PAGE
 })
 
@@ -134,6 +182,12 @@ function activeCollTitle() {
   return c?.title ?? ''
 }
 function clearFilter() {
+  /* 空态那枚按钮按"最可能挡住结果的那一个"来:正在搜就先把关键词清掉
+     (搜窄了是更常见的原因),没搜才去动筛子 */
+  if (searching.value) {
+    clearSearch()
+    return
+  }
   onlyMarked.value = false
   activeColl.value = ''
 }
@@ -170,7 +224,7 @@ function endSelect() {
 /* 进入选择后,整块图砖就是勾选框 —— 不再开预览,这里统一出口 */
 function onTileClick(t: Tile) {
   if (selecting.value) toggleSelect(t)
-  else emit('open', t.entry)
+  else emit('open', t.entry, t.index)
 }
 /* 「全选」作用于当前筛出来的那些:切到 Marked 再全选,正好就是标记过的那批 */
 const allShownSelected = computed(
@@ -361,6 +415,21 @@ function fmt(ts: number) {
 
     <!-- 保留规则单独占一行:不写出来,记录被自动清掉时用户会以为丢了 -->
     <div class="lib-tools">
+      <!-- 搜索。放在筛选之前:它回答的是"哪一张",而筛选回答的是"哪一批" ——
+           先想起来的一般是"我记得写过 window" -->
+      <div class="search">
+        <PhMagnifyingGlass class="search-ico" aria-hidden="true" />
+        <input
+          v-model="query"
+          class="search-input"
+          type="search"
+          placeholder="Search prompts, characters, collections…"
+          aria-label="Search history"
+        />
+        <button v-if="searching" class="search-x" aria-label="Clear search" @click="clearSearch">
+          <PhX aria-hidden="true" />
+        </button>
+      </div>
       <div class="filters">
         <div class="mark-filter" role="group" aria-label="Filter">
           <button class="chip" :class="{ on: !onlyMarked }" :aria-pressed="!onlyMarked" @click="onlyMarked = false">
@@ -409,14 +478,71 @@ function fmt(ts: number) {
       </div>
       <p class="lib-note">
         {{
-          selecting
-            ? 'Pick images to download, then hit Download.'
-            : activeColl
-              ? `In “${activeCollTitle()}” — saved here isn't cleared by storage cleanup.`
-              : 'Saved locally. Oldest records are cleared automatically when storage runs low.'
+          searching
+            ? `${shownRecords} ${shownRecords === 1 ? 'record' : 'records'} · ${shownTiles.length} ${shownTiles.length === 1 ? 'image' : 'images'} match “${query.trim()}”`
+            : selecting
+              ? 'Pick images to download, then hit Download.'
+              : activeColl
+                ? `In “${activeCollTitle()}” — saved here isn't cleared by storage cleanup.`
+                : 'Saved locally. Oldest records are cleared automatically when storage runs low.'
         }}
       </p>
     </div>
+
+    <!-- —— 命中的图片:一张一块 ——
+         与下面的图墙分开,是因为两者答的不是同一件事:图墙是浏览
+         (悬停才出提示词与参数,动作按记录),这一条是"就是这张"
+         (动作常驻,标着它从哪条记录来)。只在搜索时出现(见 stripTiles 的说明) -->
+    <section v-if="searching && stripTiles.length" class="strip" aria-label="Matching images">
+      <div class="strip-head">
+        <h2 class="strip-title">Images</h2>
+        <span class="strip-n">{{ shownTiles.length }}</span>
+        <span v-if="stripHidden" class="strip-more">
+          showing the first {{ IMG_STRIP_MAX }} — narrow the search for the rest
+        </span>
+      </div>
+      <ul class="strip-list no-bar">
+        <li v-for="t in stripTiles" :key="t.key" class="scard">
+          <button
+            type="button"
+            class="scard-open"
+            :aria-label="`Open ${titleOf(t.entry)}`"
+            @click="emit('open', t.entry, t.index)"
+          >
+            <img loading="lazy" decoding="async" :src="imageSrc(t.item)" alt="" />
+          </button>
+          <!-- 动作常驻。图墙那边是悬停才出(浏览态要安静),而这里的每一张
+               都是用户刚刚**搜出来**的,他要做的就是在这张上做点什么 -->
+          <div class="scard-ops">
+            <button
+              class="stop"
+              :class="{ 'top-on': t.item.marked }"
+              :aria-label="t.item.marked ? 'Unmark image' : 'Mark image'"
+              :aria-pressed="!!t.item.marked"
+              @click.stop="emit('mark', t.entry, t.index)"
+            >
+              <PhHeart :weight="t.item.marked ? 'fill' : 'regular'" aria-hidden="true" />
+            </button>
+            <button
+              class="stop"
+              :aria-label="`Save this image: ${titleOf(t.entry)}`"
+              @click.stop="saveTile(t)"
+            >
+              <PhDownloadSimple aria-hidden="true" />
+            </button>
+          </div>
+          <div class="scard-foot">
+            <span class="scard-when">{{ fmt(t.entry.createdAt) }}</span>
+            <span v-if="t.entry.characterId" class="scard-who">
+              {{ charNames[t.entry.characterId] || 'Character' }}
+            </span>
+            <span class="scard-of">
+              {{ t.entry.results.length > 1 ? `${t.index + 1} of ${t.entry.results.length}` : '' }}
+            </span>
+          </div>
+        </li>
+      </ul>
+    </section>
 
     <!-- 外层用 template 包一层:图墙与"加载更多"是两件东西,而 v-else 要配在同一层 -->
     <template v-if="shownTiles.length">
@@ -532,33 +658,40 @@ function fmt(ts: number) {
 
     <div v-else class="lib-none">
       <div class="none-ico" aria-hidden="true">
-        <PhStack v-if="activeColl" aria-hidden="true" />
+        <PhMagnifyingGlass v-if="searching" aria-hidden="true" />
+        <PhStack v-else-if="activeColl" aria-hidden="true" />
         <PhHeart v-else-if="onlyMarked" aria-hidden="true" />
         <PhClockCounterClockwise v-else aria-hidden="true" />
       </div>
       <h2 class="none-title">
         {{
-          activeColl
-            ? onlyMarked
-              ? 'No marked images in this collection yet'
-              : 'No images in this collection yet'
-            : onlyMarked
-              ? 'No marked images yet'
-              : 'No generations yet'
+          searching
+            ? `Nothing matches “${query.trim()}”`
+            : activeColl
+              ? onlyMarked
+                ? 'No marked images in this collection yet'
+                : 'No images in this collection yet'
+              : onlyMarked
+                ? 'No marked images yet'
+                : 'No generations yet'
         }}
       </h2>
       <p class="none-sub">
         {{
-          activeColl
-            ? onlyMarked
-              ? 'Open a collection image in the preview and mark it — or drop the mark filter to see the whole collection.'
-              : 'Open any result in the preview and add it to this collection there.'
-            : onlyMarked
-              ? 'Hover an image and click the heart to mark it. Marks are per image, so images in a record stay independent.'
-              : 'Generate from the home page and your results are saved here automatically, ready to revisit and reuse.'
+          searching
+            ? 'Search looks at the prompt, the character and the collection name — not at what is inside the picture.'
+            : activeColl
+              ? onlyMarked
+                ? 'Open a collection image in the preview and mark it — or drop the mark filter to see the whole collection.'
+                : 'Open any result in the preview and add it to this collection there.'
+              : onlyMarked
+                ? 'Hover an image and click the heart to mark it. Marks are per image, so images in a record stay independent.'
+                : 'Generate from the home page and your results are saved here automatically, ready to revisit and reuse.'
         }}
       </p>
-      <button v-if="filterActive" class="none-action" @click="clearFilter">View all</button>
+      <button v-if="filterActive" class="none-action" @click="clearFilter">
+        {{ searching ? 'Clear search' : 'View all' }}
+      </button>
     </div>
   </section>
 </template>
@@ -665,6 +798,184 @@ function fmt(ts: number) {
   flex-wrap: wrap;
   align-items: center;
   gap: var(--sp-3) var(--sp-4);
+}
+/* 搜索框:与胶囊同一行、同一高度档。宽度给到 260px ——
+   再窄一点就看不见自己打了什么,再宽会把筛选挤到第二行 */
+.search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 260px;
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  transition: box-shadow var(--dur) var(--ease);
+}
+/* 聚焦用 box-shadow 补一圈,不切 border —— 切了里面整行会挪一下
+   (与对话页那张输入卡片同一条手法) */
+.search:focus-within {
+  box-shadow: 0 0 0 1px var(--line-strong);
+}
+.search-ico {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  color: var(--text-4);
+}
+.search-input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  font-size: var(--fs-sm);
+}
+.search-input:focus {
+  outline: none;
+}
+.search-input::-webkit-search-cancel-button {
+  display: none;
+}
+.search-x {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border: 0;
+  border-radius: 999px;
+  background: none;
+  color: var(--text-3);
+  cursor: pointer;
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+.search-x:hover {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+.search-x svg {
+  width: 13px;
+  height: 13px;
+}
+
+/* —— 命中的图片:横向一条 ——
+   一条而不是一面墙,是为了与下面的图墙**看起来就是两件事**:
+   横着排、一张一块、动作常驻,扫一眼就知道这是"搜出来的那几张" */
+.strip {
+  padding: var(--sp-4) 0 0;
+}
+.strip-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: var(--sp-2);
+}
+.strip-title {
+  margin: 0;
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--text);
+}
+.strip-n {
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+.strip-more {
+  font-size: var(--fs-micro);
+  color: var(--text-3);
+}
+.strip-list {
+  display: flex;
+  gap: var(--sp-2);
+  margin: 0;
+  padding: 0 0 var(--sp-2);
+  list-style: none;
+  overflow-x: auto;
+  /* 滚动条占位一致:不然鼠标进来时才冒出一条,整条会跳 10px */
+  scrollbar-gutter: stable;
+}
+.scard {
+  position: relative;
+  flex: none;
+  width: 132px;
+}
+.scard-open {
+  display: block;
+  width: 100%;
+  height: 132px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-sm);
+  overflow: hidden;
+  background: var(--image-bg);
+  cursor: pointer;
+}
+.scard-open img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+/* 动作常驻(与图墙相反:那边悬停才出)。这一张是用户刚搜出来的,
+   要做的就是在它身上做点什么,而"再悬停一次"是白多一步 */
+.scard-ops {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: flex;
+  gap: 4px;
+}
+.scard-ops .stop {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 999px;
+  background: rgba(24, 24, 22, 0.42);
+  color: #fbfaf7;
+  backdrop-filter: blur(6px);
+  cursor: pointer;
+  transition: background var(--dur) var(--ease);
+}
+.scard-ops .stop:hover {
+  background: rgba(24, 24, 22, 0.62);
+}
+.scard-ops .stop.top-on {
+  color: #ff7a8a;
+}
+.scard-ops .stop svg {
+  width: 14px;
+  height: 14px;
+}
+.scard-foot {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-top: 4px;
+  font-size: var(--fs-micro);
+  /* 这一条没有暗幕垫底(图墙那份 tile-meta 有),所以字要按"白底上的小字"
+     来选:--text-3 是站内为浅色面上的小字定的那一档(≥4.6:1),
+     --text-4 是禁用档,铺在这儿等于看不见 */
+  color: var(--text-3);
+}
+.scard-when {
+  font-variant-numeric: tabular-nums;
+}
+.scard-who {
+  overflow: hidden;
+  color: var(--text-2);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.scard-of {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
 }
 /* 筛选胶囊与提示词库页的分类胶囊同一套规格 */
 .mark-filter {

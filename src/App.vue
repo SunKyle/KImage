@@ -57,7 +57,7 @@ import {
 import {
   blobToDataURL,
   urlToBlob,
-  // 这几个仍被留下的流式链路与"删角色连带删对话"用着
+  // 这几个仍被留下的流式链路、删角色连带删对话、以及删单条消息的附图回收用着
   deleteChatMessage,
   putChatMessage,
   deleteChatOf,
@@ -70,6 +70,7 @@ import {
 } from './lib/idb'
 import { titleFromPrompt } from './lib/text'
 import { stopSpeaking } from './lib/speech'
+import { contextText } from './lib/chatContext'
 import { NAV_ITEMS } from './lib/nav'
 import { useFeedback } from './composables/useFeedback'
 import { useConfigs } from './composables/useConfigs'
@@ -311,6 +312,15 @@ const {
 type Page = 'home' | 'chars' | 'chat' | 'canvas' | 'lib' | 'history' | 'settings'
 const page = ref<Page>('home')
 const previewEntry = ref<HistoryEntry | null>(null)
+/* 预览打开时落在第几张。与 previewEntry 一起设:历史页是按张摊平的,
+   "点的是哪一张"是打开动作的一部分,不该由预览卡自己从头数 */
+const previewIndex = ref(0)
+
+/** 角色 id → 名字。历史搜索要按"跟谁那张"找,而记录里存的是 id ——
+ *  这份反查表由主界面给历史页(角色目录本来就在这边手上),那一页不碰它 */
+const charNames = computed(() =>
+  Object.fromEntries(characters.value.map((c) => [c.id, c.name]))
+)
 
 /* ===== 自由画布 =====================================================
    它是导航上的一个平级页面,不是一个弹层 —— 所以只把"画布上摆着哪张图"
@@ -963,6 +973,24 @@ async function saveCharFromPage(d: {
   }
 }
 
+/* 置顶 / 取消置顶。
+ *
+ *  与删除、复制不同,**它不进撤销窗口**:置顶只是把这个人挪到列表最前面,
+ *  一眼看得见、再点一次就回去了,没有"说没就没"的风险 ——
+ *  给它配一条撤销条反而会让一次轻量操作显得很重(与标记一张图同一个分寸)。
+ *
+ *  直接落盘:置顶的意义就是下次打开还在最前面,缓冲一步再写没有好处。 */
+async function togglePinChar(id: string) {
+  const c = characters.value.find((x) => x.id === id)
+  if (!c) return
+  c.pinned = !c.pinned
+  /* 取消置顶时把字段删掉而不是写 false:老角色与"从没置顶过"在数据里
+     保持同一种形状,导出的包也才不会被一个 false 撑出一项 */
+  if (!c.pinned) delete c.pinned
+  await saveCharacters(characters.value)
+  notice.value = c.pinned ? `Pinned “${c.name}”.` : `Unpinned “${c.name}”.`
+}
+
 /* 删掉一个角色。与别处(提示词 / 配置 / 历史)同一套:
    立刻从列表消失、几秒内可撤销,真正落盘发生在窗口结束时。
    落盘那一步顺带把它的图一起收走 —— saveCharacters → putCharRefs 是按 key 归属
@@ -1012,15 +1040,12 @@ function deleteChar(id: string) {
       announce('charViews', id)
       announce('chat', id)
       /* 对话跟着角色一起走:人没了,跟他聊的那一段留着也没有对象了。
-         放在这一步(真正落盘)而不是点删除那一刻 —— 撤销回来时对话还得在 */
+         放在这一步(真正落盘)而不是点删除那一刻 —— 撤销回来时对话还得在。
+         **附图不在这里数**:deleteChatOf 会按 charId 把该角色的消息整批读出来,
+         把 imageId 与 photoId 一并收掉。从前这里只遍历内存里那一档(最近 200 条)
+         且只认 imageId —— 更早的附件与角色发的每一张图都成了孤儿 */
       chatControllers.get(id)?.abort()
       chatControllers.delete(id)
-      /* 对话里附过的图也跟着走。**先收 id 再清消息** ——
-         消息一旦从内存里抹掉,就再也问不出它带过哪几张图了,
-         那些图会变成永远没人认领的孤儿 */
-      for (const m of chatMessages.value[id] || []) {
-        if (m.imageId) void deleteChatImage(m.imageId)
-      }
       const chatRest = { ...chatMessages.value }
       delete chatRest[id]
       chatMessages.value = chatRest
@@ -1054,6 +1079,8 @@ async function duplicateChar(id: string) {
     createdAt: Date.now(),
     ...(src.fields ? { fields: { ...src.fields } } : {}),
     ...(src.desc ? { desc: src.desc } : {}),
+    /* 置顶**刻意不拷**:它是"我常找的就是这一个",而不是这个角色的一部分 ——
+       复制出来的是另一个人,不该也占着最前面那一格 */
     /* 人格与嗓音一起拷。它们与设定同属"这个人是谁"——
        复制一个角色的意思本来就是"同一副皮囊、同一个性格,拿去改点别的",
        不拷这两样的话,复制出来的是个没性格也没嗓子的陌生人。
@@ -1387,10 +1414,14 @@ async function runChat(id: string) {
   }
 
   /* 上文现场从内存里取:最近 CHAT_WINDOW 条。
-     被截掉的旧消息**不从库里删** —— 它们还在,只是这一轮不带 */
+     被截掉的旧消息**不从库里删** —— 它们还在,只是这一轮不带。
+
+     正文过一道 contextText:空正文的消息(典型是"只发了一张图、一个字没打")
+     不能以空串发出去 —— 上游会按内容为空拒掉整轮,而这条消息在历史里
+     就是一条普通消息(见 lib/chatContext 的说明) */
   const context = (chatMessages.value[id] || [])
     .slice(-CHAT_WINDOW)
-    .map((m) => ({ role: m.role, content: m.content }))
+    .map((m) => ({ role: m.role, content: contextText(m) }))
   // 最后一句必须是用户说的,否则这一轮本来就不该发
   if (!context.length || context[context.length - 1].role !== 'user') return
 
@@ -1436,6 +1467,9 @@ async function runChat(id: string) {
   let mood = ''
   /* 这一轮它想给你看的画面(场景描述)。空串 = 不发图 */
   let photo = ''
+  /* 这张里有没有它本人(模型写在 [photo:self:…] 里)。
+     它决定出图时带不带设定图:场景照带上会被带跑,自拍不带会画成陌生人 */
+  let photoSelf = false
   try {
     const out = await chatStream({
       character: chatPayloadOf(c),
@@ -1453,6 +1487,7 @@ async function runChat(id: string) {
     finish = out.finish
     mood = out.mood
     photo = out.photo
+    photoSelf = out.photoSelf
   } catch (e) {
     if (isAbort(e)) stopped = true
     else failure = e instanceof Error ? e.message : 'Request failed'
@@ -1475,7 +1510,10 @@ async function runChat(id: string) {
      一句"我画不出来"比什么都不说更打断对话(见 doc/角色配图设计.md) */
   if (photo && !stopped) {
     reply.photo = photo
-    void generateChatPhoto(id, photo).then(async (blob) => {
+    /* 意图一起落在这条消息上:导出这段对话时,对方若想重画这一张,
+       依据该是同一个(是自拍还是只拍了个景) */
+    if (photoSelf) reply.photoSelf = true
+    void generateChatPhoto(id, photo, photoSelf).then(async (blob) => {
       if (!blob) {
         /* 这一条可能已经被删了(清空对话):那就别再往上写 */
         if (chatMessages.value[id]?.some((m) => m.id === reply.id)) reply.photo = ''
@@ -1560,6 +1598,16 @@ async function sendChat(id: string, body: string, image?: Blob) {
  *  要重来的是它的回答,不是让用户再说一遍 */
 async function regenerateChat(id: string) {
   if (chatBusy.value[id]) return
+  /* 先确认这一轮真的发得出去,**再**删旧回复。反过来的话,下面 runChat
+     的每一条提前返回都变成一次静默的数据丢失:旧回复已经删了,新的又没发 ——
+     最容易撞上的是"文本模型被删掉/换设备后还没配",那时界面上还留着
+     Regenerate(消息流不受 compose 的门控),点一下就永久丢一条(没有撤销窗口) */
+  const c = characters.value.find((x) => x.id === id)
+  if (!c) return
+  if (!textConfig.value) {
+    notice.value = 'Add a text model in API settings before chatting.'
+    return
+  }
   const list = chatMessages.value[id] || []
   const last = list[list.length - 1]
   if (!last) return
@@ -1568,6 +1616,10 @@ async function regenerateChat(id: string) {
      那就什么都不用删,直接重发。两种情况共用这一个入口,
      所以"报错之后重试"不需要另写一条链路 */
   if (last.role === 'assistant') {
+    /* 删掉之后底下得有一条用户消息接着问 —— 没有的话这一轮本来就没得重发
+       (runChat 也会直接返回),那就一条都别删。正常对话里走不到这里,
+       但导入的包可以以助手消息开头 */
+    if (list.length < 2 || list[list.length - 2].role !== 'user') return
     /* 这条正要被删掉,它可能还在念 —— 念着一条已经不存在的消息没有道理。
        (不在这里停也不算错:新的回复开始念时会掐掉它,但那中间有几秒) */
     stopSpeaking()
@@ -1583,6 +1635,62 @@ async function regenerateChat(id: string) {
 
 function stopChat(id: string) {
   chatControllers.get(id)?.abort()
+}
+
+/**
+ * 删掉单独一条消息。
+ *
+ *  走撤销条 —— 与清空对话、删角色、清空历史同一套:一条消息也是这段对话的
+ *  一部分,点错了却只能靠"重新生成"来补救是说不过去的。
+ *
+ *  **附图等到窗口结束才收**(purge):撤销要把这条消息原样放回去,
+ *  字节先删了,恢复出来的就是一条指着空图的记录。
+ *
+ *  记忆的游标不用动:它按时间戳走(upToAt),而 covered 只是"已经压过多少条"。
+ *  删掉一条已覆盖的消息之后 covered 会多数一条 —— 那只会让下一轮压缩晚一点
+ *  触发,不会把删掉的东西捞回来(与 Forget 里"宁可算多一点"同一条取舍)。
+ */
+function deleteChatMessageFromPage(id: string, msgId: string) {
+  /* 正在生成时不给删:那条占位的助手消息还没落盘,这一刻删它
+     会与收尾那一步打架(界面上也把按钮收掉了,这里是第二道闸) */
+  if (chatBusy.value[id]) return
+  const list = chatMessages.value[id] || []
+  const at = list.findIndex((m) => m.id === msgId)
+  if (at < 0) return
+  const gone = list[at]
+  // 这条可能正在念:念着一条马上就不存在的消息没有道理
+  stopSpeaking()
+  chatMessages.value = { ...chatMessages.value, [id]: list.filter((m) => m.id !== msgId) }
+  void deleteChatMessage(msgId)
+  /* 左栏那行摘要可能就是这一条,得跟着回退到新的最后一条 */
+  const rest = chatMessages.value[id] || []
+  const last = rest[rest.length - 1]
+  if (last) setChatLast(id, last)
+  else dropChatLast(id)
+
+  scheduleUndo({
+    label: 'Message deleted',
+    undo: () => {
+      /* 放回**原来的位置**:对话的顺序就是它的意思,接到末尾等于改写了上下文。
+         按 at 切,而不是按当前长度 —— 窗口里又说了几句的话,位置也不会错 */
+      const cur = chatMessages.value[id] || []
+      const next = [...cur.slice(0, at), gone, ...cur.slice(at)]
+      chatMessages.value = { ...chatMessages.value, [id]: next }
+      // 落盘要交原始对象:reactive 代理进不了 IndexedDB 的结构化克隆
+      void putChatMessage(toRaw(gone))
+      /* 左栏那行也回退:放回来的这条要是最后一句,它就该重新出现在左栏。
+         重读一趟而不是自己算 —— 库里那份是权威,而这次恢复刚好也落盘了 */
+      void loadChatLast()
+    },
+    purge: () => {
+      /* 到这一步才真的把字节扔掉(理由见上面)。两个字段都要收:
+         imageId 是用户附的,photoId 是角色发的 */
+      if (gone.imageId) void deleteChatImage(gone.imageId)
+      if (gone.photoId) void deleteChatImage(gone.photoId)
+      // 别的一页也要知道这一条没了
+      announce('chat', id)
+    }
+  })
 }
 
 /** 清空一个角色的对话。走撤销条 —— 与删除角色、清空历史同一套规矩:
@@ -1650,7 +1758,11 @@ function fmtDate(ts: number) {
 /* 短标题的派生逻辑在 lib/text.ts:图砖角标与提示词库卡片共用同一个口径。
    完整提示词仍然只挂在 img 的 alt 上(读屏能拿到),角标里不出现,免得挡图 */
 
-function openPreview(entry: HistoryEntry) {
+/* 打开预览。index 是"这条记录里的第几张" —— 历史页的图块与搜索结果是
+   按张摊平的,点第 3 张就该看到第 3 张(不是永远从第一张开始)。
+   默认 0 兼容"从记录进来"的那些入口(角色页作品、首页图砖) */
+function openPreview(entry: HistoryEntry, index = 0) {
+  previewIndex.value = index
   previewEntry.value = entry
 }
 function closePreview() {
@@ -2343,6 +2455,7 @@ function createAssignCollection(title: string) {
         @save="saveCharFromPage"
         @remove="deleteChar"
         @duplicate="duplicateChar"
+        @pin="togglePinChar"
         @export="exportChar"
         @import="importCharFile"
         @open="loadCharViews"
@@ -2371,6 +2484,8 @@ function createAssignCollection(title: string) {
         @send="sendChat"
         @stop="stopChat"
         @regenerate="regenerateChat"
+        @delete-message="deleteChatMessageFromPage"
+        @pin="togglePinChar"
         @edit-summary="editChatSummary"
         @forget-summary="forgetChatSummary"
         @notice="notice = $event"
@@ -2385,6 +2500,7 @@ function createAssignCollection(title: string) {
         v-else-if="page === 'history'"
         :items="history"
         :collections="collections"
+        :char-names="charNames"
         @open="openPreview"
         @use="usePreviewPrompt"
       @remove="removeHistoryEntry"
@@ -2426,6 +2542,7 @@ function createAssignCollection(title: string) {
     <ImagePreview
       :visible="!!previewEntry"
       :entry="previewEntry"
+      :start-index="previewIndex"
       :items="history"
       :collections="collections"
       :characters="characters"

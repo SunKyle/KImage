@@ -6,14 +6,20 @@ import { PHOTO_SCENE_CHARS, TAG_HOLD, cleanScene, splitTags } from '../../server
 
 describe('splitTags 的剪取', () => {
   it('情绪那枚照旧', () => {
-    expect(splitTags('Fine. [mood:warm]')).toEqual({ text: 'Fine.', mood: 'warm', photo: '' })
+    expect(splitTags('Fine. [mood:warm]')).toEqual({
+      text: 'Fine.',
+      mood: 'warm',
+      photo: '',
+      photoSelf: false
+    })
   })
 
   it('发图那枚照旧', () => {
     expect(splitTags('Look at this.\n[photo:standing in the rain]')).toEqual({
       text: 'Look at this.',
       mood: '',
-      photo: 'standing in the rain'
+      photo: 'standing in the rain',
+      photoSelf: false
     })
   })
 
@@ -23,7 +29,8 @@ describe('splitTags 的剪取', () => {
     expect(splitTags('Here.\n[mood:amused]\n[photo:a rooftop at dusk]')).toEqual({
       text: 'Here.',
       mood: 'amused',
-      photo: 'a rooftop at dusk'
+      photo: 'a rooftop at dusk',
+      photoSelf: false
     })
   })
 
@@ -31,7 +38,8 @@ describe('splitTags 的剪取', () => {
     expect(splitTags('Here.\n[photo:a rooftop at dusk]\n[mood:amused]')).toEqual({
       text: 'Here.',
       mood: 'amused',
-      photo: 'a rooftop at dusk'
+      photo: 'a rooftop at dusk',
+      photoSelf: false
     })
   })
 
@@ -48,9 +56,10 @@ describe('splitTags 的半截标签', () => {
     expect(splitTags('Wait, I was going to say [pho')).toEqual({
       text: 'Wait, I was going to say',
       mood: '',
-      photo: ''
+      photo: '',
+      photoSelf: false
     })
-    expect(splitTags('Hmm [moo')).toEqual({ text: 'Hmm', mood: '', photo: '' })
+    expect(splitTags('Hmm [moo')).toEqual({ text: 'Hmm', mood: '', photo: '', photoSelf: false })
   })
 
   /* 但也不能太贪:`[p]` / `[m]` 这种在正经文字里会出现,不该被吃掉 */
@@ -62,6 +71,75 @@ describe('splitTags 的半截标签', () => {
   it('括号还没闭上、但内容已经写了', () => {
     expect(splitTags('[photo:a quiet street').photo).toBe('')
     expect(splitTags('[photo:a quiet street').text).toBe('')
+  })
+})
+
+describe('这一张里有没有它本人', () => {
+  /* 判据决定出图带不带角色的设定图:风景照带上会被带跑,自拍不带会画成陌生人 */
+
+  it('没写前缀 = 场景照(它看到的东西),不带设定', () => {
+    const r = splitTags('Look.\n[photo:rain on the window]')
+    expect(r.photo).toBe('rain on the window')
+    expect(r.photoSelf).toBe(false)
+  })
+
+  it('self: 前缀 = 它在画面里,前缀本身不进场景描述', () => {
+    const r = splitTags('Look.\n[photo:self:me on the balcony, hair down]')
+    expect(r.photo).toBe('me on the balcony, hair down')
+    expect(r.photoSelf).toBe(true)
+  })
+
+  it('前缀写得随意也认:大小写、空格、逗号、破折号', () => {
+    for (const raw of [
+      'SELF: me at the desk',
+      'Self - me at the desk',
+      'self,me at the desk',
+      'myself:me at the desk',
+      'me: at the desk',
+      'me at the desk',
+      "I'm on the balcony",
+      'I am on the balcony'
+    ]) {
+      expect(splitTags(`x\n[photo:${raw}]`).photoSelf, raw).toBe(true)
+    }
+  })
+
+  /* 代词有两副面孔:`self:` 是纯标记(剪掉),而 "me at my desk" 里的 me
+     是描述的主语 —— 剪掉就只剩 "at my desk",画面里少了那个人 */
+  it('纯标记剪掉,代词留着', () => {
+    expect(splitTags('x\n[photo:self:on the balcony]').photo).toBe('on the balcony')
+    expect(splitTags('x\n[photo:me: at the desk]').photo).toBe('at the desk')
+    expect(splitTags('x\n[photo:me at the desk]').photo).toBe('me at the desk')
+    expect(splitTags("x\n[photo:I'm on the balcony]").photo).toBe("I'm on the balcony")
+  })
+
+  /* \b 那一刀:这两个词以 me/self 开头,但不是那个意思 */
+  it('不误判:meeting / selfish 这类词不算', () => {
+    expect(splitTags('x\n[photo:meeting at dawn]').photoSelf).toBe(false)
+    expect(splitTags('x\n[photo:selfish grin on a rooftop]').photoSelf).toBe(false)
+    expect(splitTags('x\n[photo:Imposing cliffs at dawn]').photoSelf).toBe(false)
+  })
+
+  it('模型多写一个 scene: / view: 不算内容,抹掉', () => {
+    const r = splitTags('x\n[photo:scene:an empty harbour]')
+    expect(r.photo).toBe('an empty harbour')
+    expect(r.photoSelf).toBe(false)
+  })
+
+  /* 没写前缀、但描述里点了自己的名字 —— 那种回复显然是在说自己。
+     名字由服务端传进来(它手上有角色卡) */
+  it('描述里点了自己的名字 = 它在画面里(兜底)', () => {
+    const r = splitTags('x\n[photo:Alice leaning on the railing]', 'Alice')
+    expect(r.photoSelf).toBe(true)
+    // 名字不在描述里就还是场景照
+    expect(splitTags('x\n[photo:an empty railing]', 'Alice').photoSelf).toBe(false)
+    // 没传名字时这条兜底不生效
+    expect(splitTags('x\n[photo:Alice leaning on the railing]').photoSelf).toBe(false)
+  })
+
+  it('两枚标签同时出现时同样认前缀', () => {
+    const r = splitTags('Here.\n[mood:warm]\n[photo:self:a rooftop at dusk]')
+    expect(r).toEqual({ text: 'Here.', mood: 'warm', photo: 'a rooftop at dusk', photoSelf: true })
   })
 })
 

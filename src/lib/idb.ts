@@ -556,18 +556,33 @@ export async function deleteChatMessage(id: string): Promise<void> {
   })
 }
 
-/** 清掉某个角色的全部对话痕迹:消息 + 长期记忆。
+/** 清掉某个角色的全部对话痕迹:消息 + 长期记忆 + **消息指着的那几张附图**。
  *
- *  两者必须一起走 —— 消息没了而记忆还留着,下一句开口就会提起一段
- *  用户刚刚清掉的旧事,那比失忆更糟。所以放在同一个事务里,要么都清、要么都没清。 */
+ *  三者必须一起走 —— 消息没了而记忆还留着,下一句开口就会提起一段
+ *  用户刚刚清掉的旧事,那比失忆更糟;而附图是另一回事:
+ *  **消息一删,它带过哪几张图就再也问不出来了**,留下的字节永远没人认领
+ *  (空间体检只认历史那张表,见 pruneHistory)。所以放在同一个事务里,
+ *  要么都清、要么都没清。
+ *
+ *  要按 charId 把**全部**消息读一遍,不是界面上那一档:界面上只装着最近
+ *  CHAT_PAGE(200)条,照它收的话更早的图会全部变成孤儿 —— 这正是修之前
+ *  的漏洞之一。另一个是 photoId(角色发的图)从来没被收过。 */
 export async function deleteChatOf(charId: string): Promise<void> {
   const db = await openDB()
   await new Promise<void>((resolve, reject) => {
-    const tx = db.transaction([CHAT_STORE, SUMMARY_STORE], 'readwrite')
+    const tx = db.transaction([CHAT_STORE, SUMMARY_STORE, CHAT_IMAGE_STORE], 'readwrite')
     const store = tx.objectStore(CHAT_STORE)
-    const keysReq = store.index('charId').getAllKeys(charId)
+    const index = store.index('charId')
+    /* 两个请求都在事务开头发出:读到的都是"动手删之前"的状态,
+       所以下面那个 onsuccess 里问不出空结果 */
+    const keysReq = index.getAllKeys(charId)
+    const msgsReq = index.getAll(charId)
     keysReq.onsuccess = () => {
       for (const k of keysReq.result) store.delete(k)
+    }
+    msgsReq.onsuccess = () => {
+      const imgs = tx.objectStore(CHAT_IMAGE_STORE)
+      for (const id of referencedChatImages(msgsReq.result as ChatMessage[])) imgs.delete(id)
     }
     tx.objectStore(SUMMARY_STORE).delete(charId)
     tx.oncomplete = () => resolve()
@@ -837,7 +852,13 @@ export async function getChatImage(id: string): Promise<ChatImage | undefined> {
   }
 }
 
-/** 删一张附图。删消息、删角色时都要走到这里 */
+/** 删一张附图。
+ *
+ *  **注意:整段对话的回收不走这里,走 deleteChatOf** —— 它按 charId 把消息
+ *  整批读出来、把 imageId 与 photoId 一起收,一个事务里完成。
+ *  从前是在界面上遍历内存里那一档消息逐个调这个函数,于是更早的附件
+ *  与角色发的每一张图都成了孤儿(见 deleteChatOf 的说明)。
+ *  留它是因为按张回收将来用得上(比如"删掉某一条消息"),而不是现在有调用方。 */
 export async function deleteChatImage(id: string): Promise<void> {
   try {
     const db = await openDB()
@@ -850,6 +871,70 @@ export async function deleteChatImage(id: string): Promise<void> {
   } catch {
     /* 删不掉最多是多占一点空间,不该因为一张图打断删消息这件事 */
   }
+}
+
+/* ===== 附图的归属:谁还被指着 =====
+   附图与消息分两张表存,于是"消息删了、字节还在"这件事没有任何外键替我们挡着。
+   两个纯函数把这份判断从 IDB 里拆出来 —— 它们决定"删不删用户的字节",
+   而真正会出错的那条路(清空、删角色、空间体检)平时几乎碰不到,
+   抽出来才能喂构造数据直接断言(与 planPrune 同一条理由)。
+   ------------------------------------------------------------------ */
+
+/** 消息还指着哪些附图。用户的 imageId 与角色发的 photoId 都要算 ——
+ *  两者语义不同(一个"对方发来的",一个"它给你的"),但"还有没有人指着它"
+ *  是同一个问题,回收时不必分开 */
+export function referencedChatImages(
+  msgs: readonly Pick<ChatMessage, 'imageId' | 'photoId'>[]
+): Set<string> {
+  const out = new Set<string>()
+  for (const m of msgs) {
+    if (m?.imageId) out.add(m.imageId)
+    if (m?.photoId) out.add(m.photoId)
+  }
+  return out
+}
+
+/** 库里哪些附图已经没有任何消息指着了。这些字节谁也显示不出来,
+ *  留着只是白占配额 —— 空间体检先拿它们开刀(见 pruneHistory)。
+ *  判据只有"没人指着"这一条:还在消息里的图一张都不动,
+ *  删了它们那段对话就只剩一句话了 */
+export function orphanChatImages(
+  referenced: ReadonlySet<string>,
+  keys: readonly string[]
+): string[] {
+  return keys.filter((k) => !referenced.has(k))
+}
+
+/**
+ * 把没人认领的聊天附图收掉,返回扔掉了几张。
+ *
+ * 为什么需要它:**空间体检量的是整个库,而历史那套清理只动一张表**。
+ * 聊天里的图(用户附的 + 角色发的)从来不参与清理,于是水位被它们顶上去、
+ * 挨删的却是用户的记录 —— 清理删错了对象。先扔掉这些谁都显示不出来的字节,
+ * 往往就够压回水位线以下(调用处见 pruneHistory)。
+ */
+export async function pruneChatImages(): Promise<number> {
+  return retryOnDeadConnection(openDB, resetDB, (db) =>
+    new Promise<number>((resolve, reject) => {
+      const tx = db.transaction([CHAT_STORE, CHAT_IMAGE_STORE], 'readwrite')
+      let removed = 0
+      const msgsReq = tx.objectStore(CHAT_STORE).getAll()
+      msgsReq.onsuccess = () => {
+        const referenced = referencedChatImages(msgsReq.result as ChatMessage[])
+        /* 只要键不要值:附图的值是几百 KB 的 Blob,判归属根本用不着读它们 */
+        const keysReq = tx.objectStore(CHAT_IMAGE_STORE).getAllKeys()
+        keysReq.onsuccess = () => {
+          const imgs = tx.objectStore(CHAT_IMAGE_STORE)
+          for (const id of orphanChatImages(referenced, keysReq.result as string[])) {
+            imgs.delete(id)
+            removed += 1
+          }
+        }
+      }
+      tx.oncomplete = () => resolve(removed)
+      tx.onerror = () => reject(tx.error)
+    })
+  )
 }
 
 async function txStore(mode: IDBTransactionMode): Promise<IDBObjectStore> {
@@ -982,6 +1067,22 @@ export async function pruneHistory(): Promise<PruneResult | null> {
   // 有余量就不动历史
   if (est && usageRatio < HIGH_WATER) return null
 
+  /* 超标了先扔垃圾,再决定要不要动用户的记录 —— 顺序是有意的:
+     聊天里那些没主的附图(角色发图从前从来没回收过、清空时也只收了最近一档)
+     占的正是这份配额,而它们在历史这张表里根本查不到。
+     先清历史的话,挨删的是用户的记录,垃圾一张不动。
+     收不掉也不该挡住后面的体检,所以这里的失败只当没收到 */
+  try {
+    await pruneChatImages()
+  } catch {
+    /* 收不掉垃圾就照旧走下面那条路 */
+  }
+  /* 收完再量一次。可能已经压回水位线以下,那历史一条都不用动 ——
+     这正是这一步想要的结果:垃圾优先于用户的记录 */
+  const est2 = (await storageUsage()) || est
+  const afterRatio = est2 ? est2.usage / est2.quota : 0
+  if (est2 && afterRatio < HIGH_WATER) return null
+
   /* 全表读一遍:要避让挂了作品集的、以及含标记图的记录,只凭 createdAt 键做不到。
      同样走重试:读不出来与"真的没有记录"在调用方看来是一样的 */
   const all = await retryOnDeadConnection(
@@ -1003,7 +1104,7 @@ export async function pruneHistory(): Promise<PruneResult | null> {
       })
   )
   // 配额驱动时按比例清;拿不到配额则退回条数兜底
-  const want = est ? Math.ceil(all.length * PRUNE_RATIO) : Math.max(0, all.length - HARD_LIMIT)
+  const want = est2 ? Math.ceil(all.length * PRUNE_RATIO) : Math.max(0, all.length - HARD_LIMIT)
   const count = Math.min(Math.max(0, all.length - MIN_KEEP), want)
   if (count <= 0) return null
 
@@ -1025,7 +1126,9 @@ export async function pruneHistory(): Promise<PruneResult | null> {
       })
   )
 
-  return { removed: removedIds.length, removedIds, usageRatio, keptMarked }
+  /* 报的是**收完垃圾之后**那个比例:用户看到这条提示时垃圾已经没了,
+     报清理前那个数会把"为什么删我的东西"说成一个当下已经不成立的数 */
+  return { removed: removedIds.length, removedIds, usageRatio: afterRatio, keptMarked }
 }
 
 export async function putOne<T extends { id: string }>(item: T): Promise<void> {

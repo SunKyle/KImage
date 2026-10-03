@@ -13,6 +13,7 @@ import {
   sizeForVendor
 } from '../api'
 import { REF_ARCHIVE_EDGE, REF_IMAGE_EDGE } from '../lib/payload'
+import { planChatPhoto } from '../lib/chatPhoto'
 import { urlToBlob } from '../lib/idb'
 import type { EnhanceMode, Provider } from '../api'
 import type { ApiConfig, Character, HistoryEntry, ResultItem } from '../types'
@@ -305,23 +306,29 @@ function undoEnhance() {
   /** 对话里现场画一张:只在被要求或确实合适时由那一轮的标签触发。
    *  **不进历史**(见 doc/角色配图设计.md):图只活在对话里,
    *  所以这条路刻意不走 persist/recordFor —— 只把 Blob 交给调用方,
-   *  由它塞进 chat_images。角色的设定图当参考图送进去,这是"同一张脸"的保证 */
-  async function generateChatPhoto(charId: string, scene: string): Promise<Blob | undefined> {
+   *  由它塞进 chat_images。
+   *
+   *  `self` = 这一张里有没有**它本人**(见 lib/chatPhoto 的说明):
+   *  有 → 拼上外貌设定、把设定图当参考图,这是"同一张脸"的保证;
+   *  没有 → 提示词只有场景、一张参考图都不发 —— 一张风景照带上设定图,
+   *  模型会被拽着往那个人的脸和衣服上靠,画面就跑偏了 */
+  async function generateChatPhoto(
+    charId: string,
+    scene: string,
+    self: boolean
+  ): Promise<Blob | undefined> {
     const text = String(scene || '').trim().slice(0, CHAT_PHOTO_SCENE_CHARS)
     if (!text || !deps.configured()) return undefined
     /* **认对话里那个角色**,不认创作区选中的那个:设定与参考图都按 charId 取。
        这一点错了就会"一点不像" —— 参考图是空的,等于纯文生图 */
     const who = deps.characters.value.find((c) => c.id === charId)
-    const spec = who ? characterFaceDesc(who) : ''
-    /* 场景在前、角色设定在后(与 composedPrompt 同一顺序):
-       前段权重更高,先说"这一张要画什么" */
-    const prompt = (spec ? `${text}, ${spec}` : text).slice(0, 1200)
-    const refList = await deps.charRefSrcsOf(charId)
+    const plan = planChatPhoto(text, self, who ? characterFaceDesc(who) : '')
+    const refList = plan.useRefs ? await deps.charRefSrcsOf(charId) : []
     const ctrl = new AbortController()
     try {
       const res = await generate(
         {
-          prompt,
+          prompt: plan.prompt,
           /* **对话里的图永远 auto,不跟创作区那个尺寸走**:
              创作区选的是"我这次要多大",而角色发一张照片该由**场景**决定构图 ——
              横着拍的窗、竖着站的人,同一套尺寸设置管不了两件事。

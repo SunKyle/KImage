@@ -190,19 +190,37 @@ export interface Collection {
 /* 角色的结构化设定。生成时按固定顺序拼成一段描述,前置到提示词最前面。
    拆成字段而不是一整段自由文本,是为了让「AI 创建」能逐项填、用户也能逐项校对。
 
-   前九项是"面貌特征",会跟着每一张成品走(见 api.ts 的 characterFaceDesc)——
-   它们回答的是"这个人长什么样",跨场景不该变。后两项只喂给设定图:
-   衣服与装备属于"这一张发生什么",该由场景决定 */
+   **字段顺序以 server/charSpec.js 那份行定义为准**(拼提示词的顺序就是它),
+   这里只是把每个键的语义记下来。前九项是"面貌特征",会跟着每一张成品走
+   (见 api.ts 的 characterFaceDesc)—— 它们回答的是"这个人长什么样",
+   跨场景不该变。后两项只喂给设定图:衣服与装备属于"这一张发生什么",
+   该由场景决定 */
 export interface CharacterFields {
+  /* 风格:用哪种媒介画这个人。取值是那几个固定的词(见 characterSpec 的
+     STYLE_OPTIONS),空串 = Auto,跟着参考图走。
+
+     它排在第一位而不是塞进 identity:以前风格就是被写在 identity 尾巴上的
+     ——起稿提示词的原话是 "plus the overall style" —— 于是用户看不见它、
+     也没法校对,模型写没写、写对没有全靠运气。而它恰恰是五张设定图之间
+     唯一能被文字左右、又必须保持一致的东西。
+     它进每一张成品(在 CHAR_FACE_FIELDS 里):风格也是"这个人"的一部分,
+     只有设定图是动漫、场景图是写实,才叫不是同一个人 */
+  style: string
   /* 性别。"female" / "male"。
-     排在第一位而不是塞进 identity:它是这张脸最基础的一条条件 ——
+     它是一条独立的规格而不是塞进 identity:这是这张脸最基础的一条条件 ——
      不写死的话,同一个角色换个场景就会被重新决定一次性别,
      而 identity 那句话里有没有带性别词、带对了没有,都不可靠 */
   gender: string
-  // 身份 / 职业 / 风格,如 "veteran space smuggler, worn flight jacket"
+  // 身份 / 职业 / 环境,如 "veteran space smuggler, worn flight jacket"。
+  // 风格与性别各有自己的栏位,这一栏不再重复它们
   identity: string
   // 脸型与骨相、肤色、看起来的年龄
   face: string
+  /* 身高、体型与体态。以前没有这一栏:face 只管头,其余几项更局部,
+     而 outfit 是"只喂设定图"的。于是那张 Full body 视图的立意虽然是
+     "交代体型与服装轮廓",体型却没有任何输入 —— 每张图的身材都是模型现编的,
+     这是跨图一致漏得最大的一处 */
+  build: string
   hair: string
   // 眉形、粗细、眉色
   brows: string
@@ -223,10 +241,17 @@ export interface CharacterFields {
    每一张出图的提示词;把性格混进去,等于让"它是什么人"去污染"它长什么样"
    的像素级约束。
 
-   四个字段而不是一整段自由文本:traits 与 voice 必须分开 ——
+   五个字段而不是一整段自由文本:traits 与 voice 必须分开 ——
    "是个什么样的人"和"话怎么说出来"是两件事,写在同一段里会被模型平均掉,
    结果是性格写了、说话方式被稀释成通用口吻。而"像人"主要靠后者 */
 export interface CharacterPersona {
+  /* 这个角色说哪种语言。空串 = 跟着用户走(与加这一栏之前的行为一致)。
+     它与 voice 必须分开:voice 管的是**措辞**(短句、少提问),这一栏管的是
+     **用哪种语言说** —— 而那比性格、语气都更硬,说错语言不是"这个人不太像",
+     而是"根本不是同一个人"。
+     它还兼一个用处:朗读挑音色时以它为准,不必再从回复文本里猜
+     (原来那条"有汉字就按中文"的二分法在日语、韩语角色上全是错的) */
+  language: string
   // 性格:是个什么样的人。如 "guarded, dry humor, slow to trust"
   traits: string
   // 说话方式:怎么说话。如 "short clipped sentences, rarely asks questions"
@@ -272,6 +297,10 @@ export interface ChatMessage {
      它只有几十字节,所以留在消息里;字节在 chat_images */
   photo?: string
   photoId?: string
+  /* 这张画面里有没有**它本人**(模型写在 [photo:self:…] 里,见 server/chatTags.js)。
+     它决定出图时带不带角色的设定图:场景照带上会被带跑,自拍不带会画成陌生人。
+     存下来是为了让"重画这一张"与导出包里的这段对话保持同一个意图 */
+  photoSelf?: boolean
 }
 
 /** 聊天里用户附的那张图。与 ChatMessage 分开存,理由见上面的 imageId */
@@ -404,6 +433,11 @@ export interface Character {
   /* 设定图里正脸以外的视图(Angles、全身、Details、表情)。
      只用于查看与挑选主图、不参与生成,所以不在启动时加载 */
   views?: CharacterView[]
+  /* 置顶。置顶的角色排在角色页列表与对话页左栏的最前面 ——
+     那两处的顺序都是派生的("最近建的在前" / "最近聊的在前"),
+     而派生排序答不了"这几个我常找,别让它沉下去"。
+     可选:加它之前存下来的角色没有这一项,读的时候当未置顶 */
+  pinned?: boolean
 }
 
 /* 从一个角色 zip 里读出来的角色。刻意不带 id ——
@@ -427,6 +461,8 @@ export interface ImportedChatMessage {
   /* 角色发过去的那张。与 imageId 同一处理:字节在 ImportedChat.images 里 */
   photo?: string
   photoId?: string
+  /* 这张里有没有它本人。跟着包走 —— 对方若想重画这一张,依据该是同一个 */
+  photoSelf?: boolean
 }
 
 /* 角色包里带回来的那段对话。**记忆是主,消息是辅** ——

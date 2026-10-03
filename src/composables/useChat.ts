@@ -10,7 +10,6 @@ import {
 import {
   CHAT_PAGE,
   countChatMessages,
-  deleteChatImage,
   deleteChatOf,
   getChatImage,
   getChatMessages,
@@ -87,7 +86,8 @@ async function readChatForExport(id: string): Promise<ImportedChat> {
     /* 角色发的那张也要带走。**两条都要**:漏了 photo 这枚标记,
        导进来的记录会少一张图;漏了 photoId 就只剩一句"我给你看个东西" */
     ...(m.photo ? { photo: m.photo } : {}),
-    ...(m.photoId ? { photoId: m.photoId } : {})
+    ...(m.photoId ? { photoId: m.photoId } : {}),
+    ...(m.photoSelf ? { photoSelf: true } : {})
   }))
   /* 附图一起带走。**缺了它们,对方拿到的是一串"不知道在说什么的回复"** ——
      消息在,而消息指着的那张图不在。读不回来的那张跳过:
@@ -377,12 +377,10 @@ function clearChat(id: string) {
       })()
     },
     purge: () => {
-      /* 附过的图也跟着走(与 deleteChar 同一处说明)。
-         这里用它开头取的那份 list —— purge 执行时 chatMessages 里
-         那一份已经被清空了,问不出来 */
-      for (const m of list) {
-        if (m.imageId) void deleteChatImage(m.imageId)
-      }
+      /* 消息、记忆、**以及它们指着的附图**都由 deleteChatOf 一并收掉。
+         从前这里在界面上数 imageId,只数得到内存里那一档(最近 200 条),
+         而 photoId(角色发的图)一张都没删过 —— 见 idb.ts 的说明。
+         附图的回收必须留在 purge:撤销窗口里那些消息还要原样放回去 */
       void deleteChatOf(id)
       // 到这里这一整段对话才算真的没了 —— 撤销窗口里它还在,另一页不该先清掉
       deps.announce('chat', id)
