@@ -617,9 +617,20 @@ app.post('/api/generate', rateLimit, async (req, res) => {
           /* 不是 JSON 就保持原样 */
         }
       }
+      /* 鉴权被拒时,把"我们实际发出去的东西"也说明白(不含 key 本身)。
+         同一个 401 在桌面上和手机上长得一模一样,成因却常常是两件事:
+         这台设备上**根本没配 key**(配置只存在各自浏览器的 localStorage 里,
+         不跟账号走,也不会从桌面同步过去),或者 key 被手机键盘改过。
+         不说出长度,用户没有任何办法分辨 —— 而这两者的下一步完全不同 */
+      const authTrace =
+        upstream.status === 401 || upstream.status === 403
+          ? apiKey
+            ? ` Sent ${String(apiKey).length} characters to ${PROD_LIKE ? targetUrl.host : target}. If the key on your other device differs in length, this one was typed or pasted wrong.`
+            : ' No API key was sent: the active config in this browser has none. Configs are stored per browser and do not sync across devices — open Interface Settings on this device and add the key.'
+          : ''
       return res.status(upstream.status).json({
         error: `Upstream returned an error (${upstream.status})`,
-        detail
+        detail: detail + authTrace
       })
     }
 

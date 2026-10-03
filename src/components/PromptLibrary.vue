@@ -696,7 +696,14 @@ function onImportFile(e: Event) {
 
           <label class="field">
             <span class="field-label">Model</span>
-            <input v-model="draft.model" class="field-input" placeholder="Not recorded" spellcheck="false" />
+            <input
+              v-model="draft.model"
+              class="field-input"
+              placeholder="Not recorded"
+              autocapitalize="off"
+              autocorrect="off"
+              spellcheck="false"
+            />
           </label>
 
           <div v-if="savedParams(draft)" class="field">

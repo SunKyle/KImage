@@ -529,6 +529,12 @@ export function loadConfigs(): ApiConfig[] {
 function normalizeConfig(c: ApiConfig): ApiConfig {
   return {
     ...c,
+    /* 三项技术值都剪掉首尾空白:它们在手机键盘上很容易被带上一截空格或换行,
+       而肉眼看不出来 —— 表现只是"这个 key 明明是对的,却报 401"。
+       读入口剪一次,已经存坏的那几条也会自己好 */
+    baseUrl: (c.baseUrl || '').trim(),
+    apiKey: (c.apiKey || '').trim(),
+    model: (c.model || '').trim(),
     vendor: c.vendor || inferVendor(c.baseUrl),
     kind:
       c.kind === 'text'

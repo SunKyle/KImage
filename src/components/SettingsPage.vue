@@ -233,7 +233,15 @@ function submit() {
     return
   }
   urlError.value = ''
-  emit('save', { ...draft.value, baseUrl: url })
+  /* 密钥与模型名也顺手去掉首尾空白 —— 手机键盘在粘贴 / 自动补全之后
+     很容易留下一截空格或换行,肉眼看不见,而上游只会回一个 401。
+     这一下不动内容,只剪掉那两条看不见的边 */
+  emit('save', {
+    ...draft.value,
+    baseUrl: url,
+    apiKey: draft.value.apiKey.trim(),
+    model: draft.value.model.trim()
+  })
 }
 
 /* 连通性测试。结果只对"当前这一版草稿"有效:改任何一个字段它都可能不再成立,
@@ -813,7 +821,7 @@ function onImportFile(e: Event) {
                 <input
                   v-model="draft.baseUrl"
                   placeholder="https://example.com/api/v3"
-                  spellcheck="false"
+                  autocapitalize="off" autocorrect="off" spellcheck="false"
                   :aria-invalid="!!urlError"
                   :aria-describedby="urlError ? 'cfg-url-err' : undefined"
                   @input="urlError = ''"
@@ -839,6 +847,9 @@ function onImportFile(e: Event) {
                   v-model="draft.apiKey"
                   :type="showKey ? 'text' : 'password'"
                   autocomplete="off"
+                  autocapitalize="off"
+                  autocorrect="off"
+                  spellcheck="false"
                   placeholder="sk-…  (optional for local services)"
                 />
                 <button
@@ -915,6 +926,8 @@ function onImportFile(e: Event) {
                   :placeholder="
                     purpose === 'image' ? 'doubao-seedream-3-0-t2i' : 'gpt-4o-mini'
                   "
+                  autocapitalize="off"
+                  autocorrect="off"
                   spellcheck="false"
                 />
               </span>

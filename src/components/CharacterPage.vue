@@ -841,6 +841,8 @@ function pickStyle(v: string) {
                           <input
                             v-model="draft.voice.vendorVoice"
                             class="ed-input"
+                            autocapitalize="off"
+                            autocorrect="off"
                             spellcheck="false"
                             placeholder="e.g. zh_female_vv_uranus_bigtts"
                           />
@@ -882,6 +884,8 @@ function pickStyle(v: string) {
                             <input
                               v-model="draft.voice.vendorVoice"
                               class="ed-input"
+                              autocapitalize="off"
+                              autocorrect="off"
                               spellcheck="false"
                               placeholder="e.g. S_xxxxxxxx"
                               @input="onCloneIdTyped"
