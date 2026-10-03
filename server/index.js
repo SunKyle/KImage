@@ -7,6 +7,7 @@ import { randomUUID } from 'node:crypto'
 import { lookup as dnsLookup } from 'node:dns/promises'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { ProxyAgent } from 'undici'
+import { TAG_HOLD, splitTags } from './chatTags.js'
 
 dotenv.config()
 
@@ -291,32 +292,8 @@ const CHAT_RULES = `Rules:
 - Keep it short: one to three sentences. Real people type short messages.
 - Never end every reply with a question. Let the conversation breathe.
 - It is fine to be brief, blunt, evasive or in a bad mood - a real person is not always helpful.
+- If - and only if - showing a picture would genuinely help (they ask to see you, or you are somewhere worth showing), put a photo tag on its own line at the very end: [photo:a short description of the scene from your point of view]. Keep it under 120 characters. Use it rarely, at most once every few messages, and never as a substitute for actually saying something. Do not comment on the tag or explain it.
 - After everything you say, put a mood tag on the very last line, in exactly this form: [mood:word]. One lowercase English word for how you feel as you send this message. Pick the word that actually fits, for example: arrogant, amused, wary, bored, angry, tired, warm, cold, proud, uneasy, delighted. Do not comment on the tag or explain it - just end with it.`
-
-/* 情绪标签:回复最末尾那枚 [mood:xxx]。
-   它是给界面读的元数据,不是角色说的话 —— 所以由服务端负责剪掉,
-   前端永远拿不到它,也就不存在"某天漏出来给用户看见"的可能。
-   容忍空格与 = 号,也容忍后面跟一个句号:模型不总写得一丝不差 */
-const CHAT_MOOD_RE = /\[\s*mood\s*[:=]\s*([a-z][a-z-]{1,19})\s*\]\s*[.!?]?\s*$/i
-/* 收在半截上的标签(用户按了 Stop,或上游断了)。
-   这时候**只擦不取** —— "gu" 不是一个情绪,宁可这一轮不出那枚药丸,
-   也不出一个错的;但留在正文里的半截标签必须擦掉,那纯粹是难看 */
-const CHAT_MOOD_PARTIAL_RE = /\[\s*mood\b[\s\S]*$/i
-/* 扣在手里先不发的尾巴长度。要盖得住一枚标签(`[mood:amused]` 是 13 个字符)
-   再加上可能多出来的空白 —— 标签通常落在最后那一两个增量里,
-   而那时候它前面的字早就发出去了,只能靠这段尾巴把它截住 */
-const CHAT_TAIL = 24
-
-function splitMood(s) {
-  const str = s || ''
-  const m = CHAT_MOOD_RE.exec(str)
-  /* 剪掉标签时要把它前面那个换行一并收了 —— 提示里让模型"把标签写在最后一行",
-     那个换行是给标签用的排版,不是角色说的话 */
-  if (m) return { text: str.slice(0, m.index).trimEnd(), mood: m[1].toLowerCase() }
-  const p = CHAT_MOOD_PARTIAL_RE.exec(str)
-  if (p) return { text: str.slice(0, p.index).trimEnd(), mood: '' }
-  return { text: str, mood: '' }
-}
 
 /** 换行与连续空白收敛成单个空格。这些值在表单里是可换行的 textarea,
  *  换行只是排版,原样拼进提示词会在句子中间插一段空白。
@@ -1348,16 +1325,16 @@ app.post('/api/chat', rateLimit, async (req, res) => {
     }
   }
 
-  /* 扣着还没发的尾巴,专门用来截住末尾那枚情绪标签(见 CHAT_TAIL)。
+  /* 扣着还没发的尾巴,专门用来截住末尾那几枚元数据标签(见 chatTags.js 的 TAG_HOLD)。
      声明在 try 外面是有意的:中途 Stop 或上游断流时,那截尾巴也得放出去 ——
      否则用户按了停止,最后那二三十个字符会凭空消失 */
   let tail = ''
   /* 收尾那一下:把尾巴里该发的字发出去,该剪的标签剪下来返回给调用方 */
   const flushTail = () => {
-    const { text, mood } = splitMood(tail)
+    const { text, mood, photo } = splitTags(tail)
     if (text) sendEvent({ delta: text })
     tail = ''
-    return mood
+    return { mood, photo }
   }
 
   let upstream = null
@@ -1471,7 +1448,7 @@ app.post('/api/chat', rateLimit, async (req, res) => {
         const payload = line.slice(5).trim()
         if (!payload) continue
         if (payload === '[DONE]') {
-          sendEvent({ done: true, finish: finishReason, mood: flushTail() })
+          sendEvent({ done: true, finish: finishReason, ...flushTail() })
           endStream()
           return
         }
@@ -1486,18 +1463,18 @@ app.post('/api/chat', rateLimit, async (req, res) => {
         }
         if (!delta) continue
         gotAny = true
-        /* 扣着尾巴发:只放出超出 CHAT_TAIL 的那部分。
+        /* 扣着尾巴发:只放出超出 TAG_HOLD 的那部分。
            最后一个增量正好落在标签上时,它就被挡在这里没发出去 */
         tail += delta
-        if (tail.length > CHAT_TAIL) {
-          sendEvent({ delta: tail.slice(0, tail.length - CHAT_TAIL) })
-          tail = tail.slice(tail.length - CHAT_TAIL)
+        if (tail.length > TAG_HOLD) {
+          sendEvent({ delta: tail.slice(0, tail.length - TAG_HOLD) })
+          tail = tail.slice(tail.length - TAG_HOLD)
         }
       }
     }
 
     if (gotAny) {
-      sendEvent({ done: true, finish: finishReason, mood: flushTail() })
+      sendEvent({ done: true, finish: finishReason, ...flushTail() })
     } else {
       /* 一个字都没吐出来 —— 上游只回了 role 那一帧就结束,或回了别的东西。
          这时候回 done 会让前端以为"它就是这么沉默",而其实是一次失败 */
