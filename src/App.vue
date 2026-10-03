@@ -92,6 +92,8 @@ import { NAV_ITEMS } from './lib/nav'
 import { syncTargetsOf } from './lib/crossTab'
 // 图片尺寸上限的唯一来源(参考图 / 存档 / 编辑载荷),别再各写一个字面量
 import { REF_ARCHIVE_EDGE, REF_IMAGE_EDGE } from './lib/payload'
+// 浮层的公共行为(点外收起 / Esc 逐层退)
+import { isInside } from './lib/ui'
 import {
   applyTheme,
   currentTheme,
@@ -410,9 +412,7 @@ const paramBarEl = ref<HTMLElement | null>(null)
 const panelEl = ref<HTMLElement | null>(null)
 function onDocPointerDown(e: PointerEvent) {
   if (!openPanel.value) return
-  const t = e.target as Node | null
-  if (!t) return
-  if (paramBarEl.value?.contains(t) || panelEl.value?.contains(t)) return
+  if (isInside(e.target, paramBarEl.value) || isInside(e.target, panelEl.value)) return
   // 这里不回焦:用户是主动点到别处去的,把焦点拽回来反而打断了那一下操作
   openPanel.value = ''
 }

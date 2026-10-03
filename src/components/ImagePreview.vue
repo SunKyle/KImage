@@ -30,6 +30,8 @@ import {
 import { BACKGROUND_OPTIONS, QUALITY_OPTIONS, extOf, imageSrc, optionLabel, reuseParamsOf, thumbSrc } from '../api'
 import type { HistoryEntry, ResultItem, ReuseParams, FavoritePayload, Collection, Character } from '../types'
 import { blobToDataURL } from '../lib/idb'
+// 浮层的公共行为(Tab 圈定 / 点外收起 / Esc 逐层退)
+import { isInside, layerOnEscape, trapTab } from '../lib/ui'
 
 const props = defineProps<{
   visible: boolean
@@ -61,8 +63,7 @@ const collAdding = ref(false)
 const collNewTitle = ref('')
 const collEl = ref<HTMLElement | null>(null)
 function onDocPointerDown(e: PointerEvent) {
-  const t = e.target as Node | null
-  if (collEl.value && t && collEl.value.contains(t)) return
+  if (isInside(e.target, collEl.value)) return
   // 点开输入框又去点别处,当作放弃新建:残留一个半截名字比直接收起更碍事
   if (collAdding.value) {
     collAdding.value = false
@@ -252,38 +253,6 @@ function fmtElapsed(ms: number) {
   return s >= 10 ? `${Math.round(s)}s` : `${s.toFixed(1)}s`
 }
 
-/** 弹层里当前可见的可聚焦元素,供 Tab 循环使用 */
-function focusables(): HTMLElement[] {
-  const root = panelEl.value
-  if (!root) return []
-  return Array.from(
-    root.querySelectorAll<HTMLElement>(
-      'button:not([disabled]), a[href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
-    )
-  ).filter((el) => el.getClientRects().length > 0)
-}
-/** 把 Tab 关在弹层里:走到首/尾时绕回另一端,不让焦点跑到背后的页面 */
-function trapTab(e: KeyboardEvent) {
-  const els = focusables()
-  if (!els.length) return
-  const first = els[0]
-  const last = els[els.length - 1]
-  const cur = document.activeElement as HTMLElement | null
-  /* 容器本身也是一个起点:打开时焦点是被主动放在它上面的(见面板那处 tabindex)。
-     两个方向都得认它 —— 只认 first 的话,第一次正向 Tab 会从容器直接走出去,
-     而它被 teleport 到 body 末尾,后面没有可聚焦的元素了 */
-  const atBox = cur === panelEl.value
-  if (e.shiftKey) {
-    if (cur === first || atBox) {
-      e.preventDefault()
-      last.focus()
-    }
-  } else if (cur === last || atBox) {
-    e.preventDefault()
-    first.focus()
-  }
-}
-
 /** 焦点是不是在一个能打字的地方。进到这里说明不是 Esc、也不是 Tab ——
  *  那剩下的方向键就该归输入框:左右是移光标,上下更糟 ——
  *  它会顺着历史翻到下一条,连带把刚敲的名字与输入态一起清掉 */
@@ -301,13 +270,22 @@ function isTyping(e: KeyboardEvent) {
 // 键盘:左右翻本条的多张图,上下翻历史记录;Esc 分两级,Tab 锁在弹层内
 function onKey(e: KeyboardEvent) {
   if (!props.visible) return
-  if (e.key === 'Escape') {
-    // 作品集的新建框开着先收它,再按一次才关预览
-    if (collAdding.value) {
-      collAdding.value = false
-      collNewTitle.value = ''
-    } else close()
-  } else if (e.key === 'Tab') trapTab(e)
+  if (
+    layerOnEscape(e.key, [
+      // 作品集的新建框开着先收它,再按一次才关预览
+      {
+        open: collAdding.value,
+        close: () => {
+          collAdding.value = false
+          collNewTitle.value = ''
+        }
+      },
+      { open: props.visible, close }
+    ])
+  ) {
+    return
+  }
+  if (e.key === 'Tab') trapTab(panelEl.value, e)
   else if (isTyping(e)) return
   else if (e.key === 'ArrowLeft') prev()
   else if (e.key === 'ArrowRight') next()

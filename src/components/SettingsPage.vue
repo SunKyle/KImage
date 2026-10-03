@@ -15,6 +15,8 @@ import BrandIcon from './BrandIcon.vue'
 import { PROVIDERS, TEXT_PROVIDERS, VISION_PROVIDERS, TTS_GENERATIONS, TTS_MODELS, ttsGenerationOf, getProvider, inferVendor, testConnection } from '../api'
 import type { Provider, TextProvider, TestResult } from '../api'
 import type { ApiConfig } from '../types'
+// 浮层的公共行为(点外收起)
+import { isInside, isInsideSelector } from '../lib/ui'
 
 /* 接口设置:独立页面。
    骨架和提示词库、历史记录一致(标题行 → 内容),只是内容以表单为主。
@@ -70,12 +72,11 @@ const openRow = ref<string | null>(null)
 const showKey = ref(false)
 
 function onDocPointerDown(e: PointerEvent) {
-  const t = e.target as (Element & Node) | null
-  if (menuOpen.value && !(t && menuEl.value?.contains(t))) menuOpen.value = false
+  if (menuOpen.value && !isInside(e.target, menuEl.value)) menuOpen.value = false
   /* 行的菜单:点在菜单里、或点在触发它的 ⋮ 上都不收 —— 后者由那个按钮自己的点击去切换。
      这里按祖先类名判而不是拿一个 ref 存元素:菜单是随行渲染的,
      一个 ref 装不住多行,而类名判断天然只看当前这一棵子树 */
-  if (openRow.value && !(t instanceof Element && t.closest('.row-menu, .row-more'))) {
+  if (openRow.value && !isInsideSelector(e.target, '.row-menu, .row-more')) {
     openRow.value = null
   }
 }

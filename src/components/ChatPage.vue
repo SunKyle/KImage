@@ -23,6 +23,8 @@ import { CHAT_MAX_CHARS, coverSrc, hasPersona } from '../api'
 import { getChatImage } from '../lib/idb'
 // 喂给模型的图长边上限(与首页、画布、角色识图共用同一个数)
 import { REF_IMAGE_EDGE } from '../lib/payload'
+// 浮层的公共行为(Tab 圈定 / 点外收起 / Esc 逐层退)
+import { isInside, layerOnEscape, trapTab } from '../lib/ui'
 import { growTextarea, vGrow } from '../lib/grow'
 import { speak, speechSupported, speakingId, speakingLoading, stopSpeaking, warmUpSpeech } from '../lib/speech'
 
@@ -559,54 +561,25 @@ async function closePicker() {
   pickerTrigger.value = null
 }
 
-/** 把 Tab 圈在浮层里。与角色向导、设定图查看器是同一套写法 ——
- *  浮层里的控件就那么几个,一个循环就够了,不必去动主界面 */
-function trapTab(box: HTMLElement | null, e: KeyboardEvent) {
-  if (!box) return
-  const items = Array.from(
-    box.querySelectorAll<HTMLElement>(
-      'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled])'
-    )
-  )
-  if (!items.length) return
-  const first = items[0]
-  const last = items[items.length - 1]
-  const at = document.activeElement as HTMLElement | null
-  // 焦点还停在容器本身(刚打开时):下一个 Tab 直接进第一个控件
-  if (!at || !items.includes(at)) {
-    e.preventDefault()
-    ;(e.shiftKey ? last : first).focus()
-    return
-  }
-  if (e.shiftKey && at === first) {
-    e.preventDefault()
-    last.focus()
-  } else if (!e.shiftKey && at === last) {
-    e.preventDefault()
-    first.focus()
-  }
-}
-
+/** 选择器浮层里的 Tab 也要圈住。实现与角色向导、设定图查看器共用一份
+ *  (见 lib/ui.ts 的 trapTab)—— 那三处原本各写了一遍,选择器已经开始不一致 */
 function onPickerKey(e: KeyboardEvent) {
   if (e.key === 'Tab') trapTab(pickerBox.value, e)
 }
 
 function onDocPointerDown(e: PointerEvent) {
   if (!menuOpen.value) return
-  const el = e.target as Node | null
-  if (el && menuWrap.value?.contains(el)) return
+  if (isInside(e.target, menuWrap.value)) return
   closeMenu()
 }
 
 /** Esc 是逐层退:先关角色浮层(并把焦点还回去),再关菜单 ——
  *  与角色页的查看器同一套规矩 */
 function onKey(e: KeyboardEvent) {
-  if (e.key !== 'Escape') return
-  if (pickerOpen.value) {
-    void closePicker()
-    return
-  }
-  closeMenu()
+  layerOnEscape(e.key, [
+    { open: pickerOpen.value, close: () => void closePicker() },
+    { open: menuOpen.value, close: closeMenu }
+  ])
 }
 
 function clearChat() {

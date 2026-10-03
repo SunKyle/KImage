@@ -61,6 +61,8 @@ import { vGrow } from '../lib/grow'
 import { deleteVoiceSample, putVoiceSample } from '../lib/idb'
 // 送去模型的参考图长边上限(与首页、画布共用同一个数)
 import { REF_IMAGE_EDGE } from '../lib/payload'
+// 浮层的公共行为(Tab 圈定 / 点外收起 / Esc 逐层退)
+import { isInsideSelector, layerOnEscape, trapTab } from '../lib/ui'
 import { speak, speakingId, stopSpeaking } from '../lib/speech'
 
 /* 角色:网站的重点页面。
@@ -192,8 +194,7 @@ function onMenuLeave(e: PointerEvent) {
    列表里每张卡都挂着一个菜单,一个 ref 挂多处只会拿到最后一个 */
 function onDocPointerDown(e: PointerEvent) {
   if (!openCardMenu.value) return
-  const t = e.target as Element | null
-  if (t && typeof t.closest === 'function' && t.closest('.menu-wrap')) return
+  if (isInsideSelector(e.target, '.menu-wrap')) return
   closeCardMenu()
 }
 
@@ -527,36 +528,6 @@ function closeViewer() {
   nextTick(() => restoreFocus?.focus())
   restoreFocus = null
 }
-/** 把一个浮层里的 Tab 圈在它自己内部。不用 inert 关掉整个应用 —— 那要动主界面,
- *  而浮层里的控件就那么几个,一个循环就够了。
- *  大图里只有按钮,向导里还有起稿框与规格字段的 textarea —— 都得收进来:
- *  漏掉的那些会让焦点落到圈外,被下面的兜底逻辑拽回第一个控件,
- *  于是从 textarea 往后怎么按 Tab 都出不去 */
-function trapTab(box: HTMLElement | null, e: KeyboardEvent) {
-  if (!box) return
-  const items = Array.from(
-    box.querySelectorAll<HTMLElement>(
-      'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled])'
-    )
-  )
-  if (!items.length) return
-  const first = items[0]
-  const last = items[items.length - 1]
-  const at = document.activeElement as HTMLElement | null
-  // 焦点还停在容器本身(刚打开时):下一个 Tab 直接进第一个控件
-  if (!at || !items.includes(at)) {
-    e.preventDefault()
-    ;(e.shiftKey ? last : first).focus()
-    return
-  }
-  if (e.shiftKey && at === first) {
-    e.preventDefault()
-    last.focus()
-  } else if (!e.shiftKey && at === last) {
-    e.preventDefault()
-    first.focus()
-  }
-}
 /** 在大图里前后翻。到头就绕回另一头:只有几张图,循环比禁用更好用 */
 function stepViewer(dir: number) {
   const cur = viewer.value
@@ -576,11 +547,14 @@ function regenerateViewer() {
    开着大图按 Esc 直接退出详情会让人丢掉"我看的是哪个角色"。
    左右键在大图里翻页,和预览卡同一套操作 */
 function onKey(e: KeyboardEvent) {
-  if (e.key === 'Escape') {
-    if (viewer.value) closeViewer()
-    else if (openCardMenu.value) closeCardMenu()
-    else if (editing.value) closeWizard()
-    else if (detailId.value) backToList()
+  if (
+    layerOnEscape(e.key, [
+      { open: !!viewer.value, close: closeViewer },
+      { open: !!openCardMenu.value, close: closeCardMenu },
+      { open: editing.value, close: closeWizard },
+      { open: !!detailId.value, close: backToList }
+    ])
+  ) {
     return
   }
   // 大图与向导都是模态,但同一时刻只会开一个(一个在详情里,一个在列表里)

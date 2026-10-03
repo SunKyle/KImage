@@ -17,6 +17,8 @@ import {
 } from '@phosphor-icons/vue'
 import { BACKGROUND_OPTIONS, QUALITY_OPTIONS, optionLabel, coverSrc } from '../api'
 import { titleFromPrompt } from '../lib/text'
+// 浮层的公共行为(点外收起)
+import { isInsideSelector } from '../lib/ui'
 import type { PromptItem } from '../types'
 
 /* 提示词库:独立页面,分两屏 —— 网格(browse)与表单(新建/编辑)。
@@ -78,8 +80,8 @@ function toggleMenu(key: string, e: MouseEvent) {
    这一页有三个菜单(顶部管理、排序、每张卡各一个),一个 ref 挂多处只会拿到最后一个 */
 function onDocPointerDown(e: PointerEvent) {
   if (!openMenu.value) return
-  const t = e.target as Element | null
-  if (t && typeof t.closest === 'function' && t.closest('.menu-wrap')) return
+  // 菜单随卡片渲染,拿不到稳定的 ref,按祖先类名判
+  if (isInsideSelector(e.target, '.menu-wrap')) return
   openMenu.value = ''
 }
 onMounted(() => document.addEventListener('pointerdown', onDocPointerDown))
