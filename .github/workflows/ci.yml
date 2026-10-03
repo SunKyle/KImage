@@ -66,10 +66,10 @@ jobs:
       # (实测 3,016,阈值 6,000 留一倍余量);
       # 耗时随 runner 快慢浮动,阈值给得很松,只拦"塌方式"的回归。
       # JS 堆不钉:它在不同机器上差得多,钉了只会反复误报。
-      - name: Perf budgets + probes (cross-tab / config / canvas / history / chars)
+      - name: Perf budgets + probes (cross-tab / config / canvas / history / chars / chat)
         run: |
           node scripts/measure-history.mjs \
             --url http://localhost:4173/ \
             --records 500 --images 2 --settle-ms 1500 \
-            --probe-two-tabs --probe-config --probe-canvas --probe-history --probe-chars \
+            --probe-two-tabs --probe-config --probe-canvas --probe-history --probe-chars --probe-chat \
             --max-dom-nodes 6000 --max-ms 5000

@@ -51,6 +51,8 @@ const PROBE_CONFIG = args.includes('--probe-config')
 const PROBE_HISTORY = args.includes('--probe-history')
 /* 探角色那一域:新建一个角色 → 卡片出现 → 拿它开画 */
 const PROBE_CHARS = args.includes('--probe-chars')
+/* 探对话那一域:播种一段对话与记忆 → 渲染 → 清空 */
+const PROBE_CHAT = args.includes('--probe-chat')
 /* 调试端口每轮随机取一个:固定端口会与上一次没退干净的实例撞车,
    而那种撞车表现为"连上了,但连到的是别人",量出来的数看着正常其实全错 */
 const PORT = Number(arg('cdp-port', 0)) || 9300 + Math.floor(Math.random() * 600)
@@ -1164,6 +1166,139 @@ async function main() {
     }
   }
 
+  /* —— 对话域探针 ——
+     真聊一句需要能用的文本模型(要联网、要密钥),这里做不到;但搬走的那一半
+     (读取 / 记忆 / 清空)完全可以验证:把一段对话与一条记忆直接播进库,
+     再看页面认不认、清空能不能撤销。 */
+  let chatProbe = null
+  if (PROBE_CHAT) {
+    chatProbe = {}
+    const settle = () => sleep(350)
+    try {
+      // ① 播种:一个角色(localStorage 目录) + 一段对话 + 一条记忆(IndexedDB)
+      chatProbe.seeded = await evaluate(async () => {
+        const charId = 'probe-chat-char'
+        const now = Date.now()
+        localStorage.setItem(
+          'kimage.characters',
+          JSON.stringify([
+            {
+              id: charId,
+              name: 'Probe talker',
+              createdAt: now,
+              fields: { gender: 'female', identity: 'probe', outfit: '', marks: '' },
+              persona: { traits: 'dry', voice: 'short', address: 'you', boundaries: 'none' }
+            }
+          ])
+        )
+        const db = await new Promise((res, rej) => {
+          const r = indexedDB.open('kimage.db')
+          r.onsuccess = () => res(r.result)
+          r.onerror = () => rej(r.error)
+        })
+        const msgs = [
+          { role: 'user', content: 'Are you awake?', dt: 3 },
+          { role: 'assistant', content: 'Barely. It is early.', dt: 2 },
+          { role: 'user', content: 'Same here.', dt: 1 }
+        ].map((m, i) => ({
+          id: `probe-msg-${i}`,
+          charId,
+          role: m.role,
+          content: m.content,
+          createdAt: now - m.dt * 60000
+        }))
+        await new Promise((res, rej) => {
+          const tx = db.transaction(['chat_messages', 'chat_summaries'], 'readwrite')
+          const store = tx.objectStore('chat_messages')
+          for (const m of msgs) store.put(m)
+          tx.objectStore('chat_summaries').put({
+            charId,
+            text: 'They met on a cold morning and agreed to keep it short.',
+            upToId: 'probe-msg-1',
+            upToAt: now - 2 * 60000,
+            covered: 2,
+            updatedAt: now
+          })
+          tx.oncomplete = res
+          tx.onerror = () => rej(tx.error)
+        })
+        db.close()
+        return msgs.length
+      })
+
+      // ② 重载,让应用从库里读这份播种数据
+      const loaded = onceEvent('Page.loadEventFired')
+      await send('Page.reload', { ignoreCache: true })
+      await loaded
+      await sleep(600)
+
+      // ③ 进对话页
+      const navBox = await evaluate(() => {
+        const b = document.querySelector('button[aria-label="Chat"]')
+        if (!b) return null
+        const r = b.getBoundingClientRect()
+        return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
+      })
+      if (navBox) {
+        for (const type of ['mousePressed', 'mouseReleased']) {
+          await send('Input.dispatchMouseEvent', {
+            type,
+            x: navBox.x,
+            y: navBox.y,
+            button: 'left',
+            clickCount: 1
+          })
+        }
+      }
+      await sleep(900)
+      chatProbe.rendered = await evaluate(() => {
+        const bubbles = document.querySelectorAll('.bubble, .msg, .chat-msg').length
+        return {
+          bubbles,
+          hasMemory: !!document.querySelector('.memory'),
+          memoryLabel: document.querySelector('.memory-label')?.textContent?.trim() || '',
+          charInRail: /Probe talker/.test(document.body.textContent || '')
+        }
+      })
+
+      // ④ 清空对话(菜单里那一项)
+      chatProbe.openedMenu = await evaluate(() => {
+        const b = document.querySelector('button[aria-label="Conversation options"]')
+        if (!b) return 'missing'
+        b.click()
+        return 'clicked'
+      })
+      await settle()
+      chatProbe.clickedClear = await evaluate(() => {
+        const b = [...document.querySelectorAll('.chat-menu button')].find((x) =>
+          /Clear conversation/.test(x.textContent || '')
+        )
+        if (!b) return 'missing'
+        if (b.disabled) return 'disabled'
+        b.click()
+        return 'clicked'
+      })
+      await sleep(600)
+      chatProbe.afterClear = await evaluate(() => ({
+        bubbles: document.querySelectorAll('.bubble, .msg, .chat-msg').length,
+        undoToast: !!document.querySelector('.undo .undo-btn'),
+        memoryGone: !document.querySelector('.memory')
+      }))
+
+      chatProbe.passed =
+        chatProbe.seeded === 3 &&
+        chatProbe.rendered?.bubbles >= 3 &&
+        chatProbe.rendered?.hasMemory === true &&
+        chatProbe.rendered?.charInRail === true &&
+        chatProbe.clickedClear === 'clicked' &&
+        chatProbe.afterClear?.bubbles === 0 &&
+        chatProbe.afterClear?.memoryGone === true &&
+        chatProbe.afterClear?.undoToast === true
+    } catch (e) {
+      chatProbe.error = String(e.message || e)
+    }
+  }
+
   const heap = await evaluate(() => {
     const m = performance.memory
     return m ? { usedMB: +(m.usedJSHeapSize / 1048576).toFixed(1) } : null
@@ -1185,6 +1320,7 @@ async function main() {
     config: configProbe,
     historyDomain: historyProbe,
     chars: charsProbe,
+    chat: chatProbe,
     history,
     heap
   }
@@ -1211,6 +1347,16 @@ async function main() {
       console.log('   ', JSON.stringify(canvas.steps))
       process.exitCode = 1
     }
+  }
+
+  if (chatProbe) {
+    const ok = chatProbe.passed === true
+    console.log(
+      `${ok ? '✅' : '❌'} 对话域(播种对话与记忆 → 渲染 → 清空)${
+        ok ? '' : ` — ${JSON.stringify(chatProbe)}`
+      }`
+    )
+    if (!ok) process.exitCode = 1
   }
 
   if (charsProbe) {
