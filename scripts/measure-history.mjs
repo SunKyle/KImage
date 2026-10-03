@@ -47,6 +47,8 @@ const PROBE_TWO_TABS = args.includes('--probe-two-tabs')
 const PROBE_CANVAS = args.includes('--probe-canvas')
 /* 探接口配置那一域:设置页新增一条 → 回首页看参数行胶囊是不是它 */
 const PROBE_CONFIG = args.includes('--probe-config')
+/* 探历史那一域:删一条 → 撤销把它放回来;再建一个作品集 */
+const PROBE_HISTORY = args.includes('--probe-history')
 /* 调试端口每轮随机取一个:固定端口会与上一次没退干净的实例撞车,
    而那种撞车表现为"连上了,但连到的是别人",量出来的数看着正常其实全错 */
 const PORT = Number(arg('cdp-port', 0)) || 9300 + Math.floor(Math.random() * 600)
@@ -914,6 +916,120 @@ async function main() {
     }
   }
 
+  /* —— 历史域探针 ——
+     删除走的是"立刻生效 + 撤销窗口 + 窗口结束才落盘"这一套(见 useFeedback),
+     单测只能证明 scheduleUndo 自己没错,证明不了"界面上的删除真的接上了它"。 */
+  let historyProbe = null
+  if (PROBE_HISTORY) {
+    historyProbe = { steps: [] }
+    const settle = () => sleep(350)
+    const tileCount = () => evaluate(() => document.querySelectorAll('section.lib .tile').length)
+    try {
+      /* 先自己切到历史页再动手。别的探针会把页面切走(canvas / settings),
+         而离场页在无头下可能仍留在 DOM 里 —— "section.lib 有图块"并不等于
+         "用户正看着这一页"(连跑时踩过:删除点了却什么都没发生) */
+      const navBox = await evaluate(() => {
+        const b = document.querySelector('button[aria-label="History"]')
+        if (!b) return null
+        const r = b.getBoundingClientRect()
+        return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
+      })
+      if (navBox) {
+        for (const type of ['mousePressed', 'mouseReleased']) {
+          await send('Input.dispatchMouseEvent', {
+            type,
+            x: navBox.x,
+            y: navBox.y,
+            button: 'left',
+            clickCount: 1
+          })
+        }
+        await sleep(700)
+      }
+      historyProbe.tilesBefore = await tileCount()
+      // 点第一块砖上的删除(操作排在 DOM 里,悬停才显形,但 .click() 照常触发)
+      historyProbe.clickedDelete = await evaluate(() => {
+        const b = [...document.querySelectorAll('section.lib button')].find((x) =>
+          (x.getAttribute('aria-label') || '').startsWith('Delete:')
+        )
+        if (!b) return 'missing'
+        b.click()
+        return 'clicked'
+      })
+      await settle()
+      historyProbe.tilesAfterDelete = await tileCount()
+      // 撤销条:把这条放回来
+      historyProbe.undoToast = await evaluate(() => !!document.querySelector('.undo .undo-btn'))
+      historyProbe.clickedUndo = await evaluate(() => {
+        const b = document.querySelector('.undo .undo-btn')
+        if (!b) return 'missing'
+        b.click()
+        return 'clicked'
+      })
+      await settle()
+      historyProbe.tilesAfterUndo = await tileCount()
+
+      /* 新建作品集要从**预览卡**里进:历史页那一行筛选在"一个集都没有"时
+         是有意不渲染的(免得空页面多一行噪声),所以空态下它没有入口 ——
+         第一版探针就在这里扑了空 */
+      historyProbe.openedPreview = await evaluate(() => {
+        const b = document.querySelector('section.lib .tile .tile-open')
+        if (!b) return 'missing'
+        b.click()
+        return 'clicked'
+      })
+      await sleep(500)
+      historyProbe.clickedNewCollection = await evaluate(() => {
+        const b = [...document.querySelectorAll('button[aria-label="New collection"]')].pop()
+        if (!b) return 'missing'
+        b.click()
+        return 'clicked'
+      })
+      await settle()
+      historyProbe.typedTitle = await evaluate(() => {
+        const input = [...document.querySelectorAll('input.coll-input')].pop()
+        if (!input) return 'missing'
+        input.value = 'Probe set'
+        input.dispatchEvent(new Event('input', { bubbles: true }))
+        return 'typed'
+      })
+      /* 确认键要**下一拍**再点:它的 disabled 绑的是 v-model,
+         而 Vue 更新 DOM 是异步的 —— 刚派发完 input 的那一刻它还是灰的,
+         点上去等于没点(这个坑在探针里踩过两次了) */
+      await settle()
+      historyProbe.clickedConfirm = await evaluate(() => {
+        const b = [...document.querySelectorAll('button.coll-confirm')].pop()
+        if (!b) return 'missing'
+        if (b.disabled) return 'disabled'
+        b.click()
+        return 'clicked'
+      })
+      await settle()
+      // 关掉预览,回历史页看那一行筛选是否出现了新集
+      await evaluate(() => {
+        document.querySelector('button[aria-label="Close"]')?.click()
+      })
+      await settle()
+      historyProbe.chipAppeared = await evaluate(() =>
+        [...document.querySelectorAll('.coll-chip')].some((c) =>
+          /Probe set/.test(c.textContent || '')
+        )
+      )
+
+      historyProbe.passed =
+        historyProbe.clickedDelete === 'clicked' &&
+        historyProbe.tilesAfterDelete === historyProbe.tilesBefore - 1 &&
+        historyProbe.undoToast === true &&
+        historyProbe.clickedUndo === 'clicked' &&
+        historyProbe.tilesAfterUndo === historyProbe.tilesBefore &&
+        historyProbe.clickedNewCollection === 'clicked' &&
+        historyProbe.clickedConfirm === 'clicked' &&
+        historyProbe.chipAppeared === true
+    } catch (e) {
+      historyProbe.error = String(e.message || e)
+    }
+  }
+
   const heap = await evaluate(() => {
     const m = performance.memory
     return m ? { usedMB: +(m.usedJSHeapSize / 1048576).toFixed(1) } : null
@@ -933,6 +1049,7 @@ async function main() {
     twoTabs,
     canvas,
     config: configProbe,
+    historyDomain: historyProbe,
     history,
     heap
   }
@@ -959,6 +1076,16 @@ async function main() {
       console.log('   ', JSON.stringify(canvas.steps))
       process.exitCode = 1
     }
+  }
+
+  if (historyProbe) {
+    const ok = historyProbe.passed === true
+    console.log(
+      `${ok ? '✅' : '❌'} 历史域(删除 → 撤销放回 → 新建作品集)${
+        ok ? '' : ` — ${JSON.stringify(historyProbe)}`
+      }`
+    )
+    if (!ok) process.exitCode = 1
   }
 
   if (configProbe) {
