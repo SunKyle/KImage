@@ -1,0 +1,33 @@
+name: CI
+
+# 只在 main 与 PR 上跑。这个项目没有测试的那些年,回归全靠手测;
+# 现在至少把「类型 + 单测 + 能构建」这三件机器能判的事交给机器。
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # ci 而不是 install:锁文件必须与 package.json 一致,不一致就当场失败 ——
+      # 这正是我们想要的信号,而不是悄悄装一份不一样的依赖树
+      - run: npm ci
+
+      # 三步分开跑而不是串成一条 build:哪一步红的要一眼看得出来
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Build
+        run: npx vite build

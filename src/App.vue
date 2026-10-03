@@ -2945,9 +2945,14 @@ async function persist(record: HistoryEntry) {
       // 这些图不会再展示了,顺带把 object URL 撤掉,让 Blob 能被回收
       gone.forEach(releaseEntryMedia)
       const pct = Math.round(pruned.usageRatio * 100)
+      /* 标记过的记录不参与自动清理(见 idb.ts 的 planPrune)。既然因此少删了,
+         就得说出来 —— 否则用户会觉得"我标记了图,空间却没腾出来"是坏了 */
+      const kept = pruned.keptMarked
+        ? ` Kept ${pruned.keptMarked} marked ${pruned.keptMarked === 1 ? 'item' : 'items'}.`
+        : ''
       notice.value = pct
-        ? `Local storage is about ${pct}% full. Removed the oldest ${pruned.removed} history ${pruned.removed === 1 ? 'item' : 'items'} to free space.`
-        : `Removed the oldest ${pruned.removed} history ${pruned.removed === 1 ? 'item' : 'items'} to limit local usage.`
+        ? `Local storage is about ${pct}% full. Removed the oldest ${pruned.removed} history ${pruned.removed === 1 ? 'item' : 'items'} to free space.${kept}`
+        : `Removed the oldest ${pruned.removed} history ${pruned.removed === 1 ? 'item' : 'items'} to limit local usage.${kept}`
     }
   } catch {
     // 生成是成功的,失败的只是"存进本地":记录先留在内存里(本次会话仍可见),

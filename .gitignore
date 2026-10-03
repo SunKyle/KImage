@@ -7,3 +7,6 @@ dist
 # 本地调试留下的浏览器 profile / 临时目录
 .tmp-layout-test
 tmp-design
+# npm 缓存在某些机器上不可写(~/.npm 属主不对),改用项目内缓存时的落点
+.npm-cache
+.npm-logs

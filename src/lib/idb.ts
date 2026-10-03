@@ -1,4 +1,4 @@
-import type { ChatImage, ChatMessage, ChatSummary } from '../types'
+import type { ChatImage, ChatMessage, ChatSummary, HistoryEntry } from '../types'
 
 // 极简 IndexedDB 封装:用来持久化历史记录与提示词封面(比 localStorage 容量大得多)
 const DB_NAME = 'kimage.db'
@@ -58,6 +58,8 @@ export interface PruneResult {
   removedIds: string[]
   /** 清理前的占用比例,用于向用户解释为什么会清 */
   usageRatio: number
+  /** 本该被清、但因为"里面有被标记的图"而保下来的记录数 —— 界面据此说明为什么没删得更多 */
+  keptMarked: number
 }
 
 /* ===== 库版本。**只能往上加,永远不要改小** ========================
@@ -802,10 +804,57 @@ async function storageUsage(): Promise<{ usage: number; quota: number } | null> 
 }
 
 /**
+ * 清理的候选资格。**抽成纯函数是有意的** —— 这段逻辑决定「删用户的哪些东西」,
+ * 而它平时几乎不会跑(占用到 80% 才触发),靠手测根本碰不到;
+ * 抽出来之后可以喂构造数据直接断言,不必真的把浏览器撑到 80%(见 idb.test.ts)。
+ */
+export interface PruneCandidate {
+  id: string
+  createdAt: number
+  /** 归属某个作品集 = 用户特意归拢的,不参与自动清理 */
+  collectionId?: string
+  /** 记录里是否有被用户标记过的图(标记按张记,见 types.ts 的 ResultItem) */
+  hasMarked?: boolean
+}
+
+export interface PrunePlan {
+  /** 该清掉的记录 id,从最旧的开始 */
+  removedIds: string[]
+  /** 本该被清、但因含标记图而保下来的记录数(用于向用户解释为什么没删更多) */
+  keptMarked: number
+}
+
+/**
+ * 决定清哪些。规则只有两条:
+ * - 按时间从旧到新,清够 count 条;
+ * - 挂了作品集、或含标记图的记录不进候选,直接跳过。
+ *
+ * keptMarked 的口径:先按时间取出「不看保护、本来会清掉的那 count 条」,
+ * 数其中有多少条是含标记图的 —— 那才是"因为标记而多留了一命"的条数,
+ * 而不是库里一共有多少条标记(那些本来就轮不到被清)。
+ */
+export function planPrune(all: PruneCandidate[], count: number): PrunePlan {
+  const n = Math.max(0, count)
+  if (n === 0) return { removedIds: [], keptMarked: 0 }
+  const byAge = [...all].sort((a, b) => a.createdAt - b.createdAt)
+  const removedIds = byAge
+    .filter((r) => !r.collectionId && !r.hasMarked)
+    .slice(0, n)
+    .map((r) => r.id)
+  const keptMarked = byAge.slice(0, n).filter((r) => r.hasMarked).length
+  return { removedIds, keptMarked }
+}
+
+/**
  * 空间吃紧时清掉最旧的一批历史;还宽裕就原样返回 null。
  * 替代了原来的「按固定条数淘汰」——那个会在空间充裕时就静默删记录。
- * 归属某个作品集(collectionId 不为空)的记录是用户特意归拢的,
- * 绝不在此自动清掉 —— 哪怕它们是同类里最旧的。
+ *
+ * 两类记录不参与自动清理,哪怕它们是同类里最旧的:
+ * - 归属某个作品集(collectionId 不为空):用户特意归拢的作品;
+ * - 里面有一张被标记过的图(marked):标记是用户亲手挑出来的收藏。
+ *   标记按「张」记、清理按「条」删,所以只要有一条被标记就整条避让 ——
+ *   宁可少腾一点空间,也不能删掉用户点名要留下的那张。
+ *
  * 返回清了多少条,交由界面告知用户。
  */
 export async function pruneHistory(): Promise<PruneResult | null> {
@@ -816,35 +865,28 @@ export async function pruneHistory(): Promise<PruneResult | null> {
   // 有余量就不动历史
   if (est && usageRatio < HIGH_WATER) return null
 
-  /* 全表读「id / 归属 / 时间」:要避让挂了作品集的记录,只凭 createdAt 键做不到 */
-  const all = await new Promise<Array<{ id: string; collectionId?: string; createdAt: number }>>(
-    (resolve, reject) => {
-      const req = db.transaction(STORE, 'readonly').objectStore(STORE).getAll()
-      req.onsuccess = () =>
-        resolve(
-          (req.result as Array<{ id: string; collectionId?: string; createdAt: number }>).map(
-            (r) => ({
-              id: r.id,
-              ...(r.collectionId !== undefined ? { collectionId: r.collectionId } : {}),
-              createdAt: r.createdAt
-            })
-          )
-        )
-      req.onerror = () => reject(req.error)
-    }
-  )
+  /* 全表读一遍:要避让挂了作品集的、以及含标记图的记录,只凭 createdAt 键做不到 */
+  const all = await new Promise<PruneCandidate[]>((resolve, reject) => {
+    const req = db.transaction(STORE, 'readonly').objectStore(STORE).getAll()
+    req.onsuccess = () =>
+      resolve(
+        (req.result as HistoryEntry[]).map((r) => ({
+          id: r.id,
+          createdAt: r.createdAt,
+          ...(r.collectionId !== undefined ? { collectionId: r.collectionId } : {}),
+          ...(r.results?.some((x) => x?.marked) ? { hasMarked: true } : {})
+        }))
+      )
+    req.onerror = () => reject(req.error)
+  })
   // 配额驱动时按比例清;拿不到配额则退回条数兜底
   const want = est ? Math.ceil(all.length * PRUNE_RATIO) : Math.max(0, all.length - HARD_LIMIT)
   const count = Math.min(Math.max(0, all.length - MIN_KEEP), want)
   if (count <= 0) return null
 
-  // 从最旧的往新挑,只挑没挂作品集的;挂了的不进候选,空间留给能看到的那批去腾
-  const removedIds = all
-    .filter((r) => !r.collectionId)
-    .sort((a, b) => a.createdAt - b.createdAt)
-    .slice(0, count)
-    .map((r) => r.id)
-  // 全部都在作品集里就什么都不清:宁可空间继续吃紧,也不动用户归拢的作品
+  const { removedIds, keptMarked } = planPrune(all, count)
+  /* 一条都不该清(全在作品集里,或全被标记保护着)就什么都不做:
+     宁可空间继续吃紧,也不动用户特意留下的东西 */
   if (removedIds.length === 0) return null
 
   await new Promise<void>((resolve, reject) => {
@@ -855,7 +897,7 @@ export async function pruneHistory(): Promise<PruneResult | null> {
     tx.onerror = () => reject(tx.error)
   })
 
-  return { removed: removedIds.length, removedIds, usageRatio }
+  return { removed: removedIds.length, removedIds, usageRatio, keptMarked }
 }
 
 export async function putOne<T extends { id: string }>(item: T): Promise<void> {
