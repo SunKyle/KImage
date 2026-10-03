@@ -1,4 +1,3 @@
-import { readdirSync, readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import { SYNC_KEYS, syncTargetsOf } from './crossTab'
 import {
@@ -76,21 +75,24 @@ describe('同步范围 · 与源码里的写入点保持一致', () => {
     THEME_KEY: { key: 'kimage.theme', synced: false }
   }
 
-  function sourceFiles(dir: URL, out: string[] = []): string[] {
-    for (const e of readdirSync(dir, { withFileTypes: true })) {
-      const child = new URL(`${e.name}${e.isDirectory() ? '/' : ''}`, dir)
-      if (e.isDirectory()) sourceFiles(child, out)
-      else if (/\.(ts|vue)$/.test(e.name) && !e.name.endsWith('.test.ts')) {
-        out.push(readFileSync(child, 'utf8'))
-      }
-    }
-    return out
+  /* 用 Vite 的 import.meta.glob 把 src 下的源码按原文读进来,而不是 node:fs ——
+     这个项目没有装 @types/node,而测试本来就跑在 Vite 里,glob 是它的自带能力。
+     顺带省掉一个只在测试里用得上的依赖 */
+  const SOURCES = import.meta.glob('../**/*.{ts,vue}', {
+    query: '?raw',
+    import: 'default',
+    eager: true
+  }) as Record<string, string>
+
+  function sourceFiles(): string[] {
+    return Object.entries(SOURCES)
+      .filter(([path]) => !path.endsWith('.test.ts'))
+      .map(([, code]) => code)
   }
 
   it('每个 localStorage.setItem 用的键都在已知表里,且该同步的确实同步了', () => {
-    const srcDir = new URL('../', import.meta.url)
     const tokens = new Set<string>()
-    for (const code of sourceFiles(srcDir)) {
+    for (const code of sourceFiles()) {
       for (const m of code.matchAll(/localStorage\.setItem\(\s*([A-Za-z_$][\w$]*|'[^']*')/g)) {
         tokens.add(m[1])
       }

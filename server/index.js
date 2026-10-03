@@ -428,9 +428,11 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const DIST = path.resolve(__dirname, '../dist')
 
 const app = express()
+// 单次请求体的上限。别只改这一处,下面还有一条把它翻成人话的错误处理
+const JSON_LIMIT = '15mb'
 // 不挂 cors():前端与 /api 同源(本地走 vite 代理),不需要 CORS;
 // 挂着反而会让任意网站都能借用这个代理发请求
-app.use(express.json({ limit: '15mb' }))
+app.use(express.json({ limit: JSON_LIMIT }))
 
 // 连接层失败的常见原因与排查方向,附在报错里,避免只看到一句 "fetch failed"
 const CONNECT_HINTS = {
@@ -2303,6 +2305,27 @@ app.post('/api/test', rateLimit, async (req, res) => {
   } finally {
     clearTimeout(timer)
   }
+})
+
+/* ===== 请求体解析失败兜底 ============================================
+   express.json 在请求体超限时抛 entity.too.large,而 Express 默认的错误处理
+   会回一整页 HTML(开发模式下还带调用栈)。前端拿到非 JSON 只能显示一句
+   "Request failed (413)" —— 用户根本不知道是"这张图太大",更不知道该做什么。
+   这里翻成一句能照着做的话。
+   放在所有路由之后、静态托管之前:这样 /api/* 的解析错误不会落进 SPA 兜底。
+   -------------------------------------------------------------------- */
+app.use((err, _req, res, next) => {
+  if (err?.type === 'entity.too.large') {
+    return res.status(413).json({
+      error: 'The request body is too large',
+      detail: `This server accepts up to ${JSON_LIMIT} per request. Images are the usual cause: the canvas already shrinks the picture and its mask before sending, so seeing this usually means an unusually large or noisy image. Try cropping it first.`
+    })
+  }
+  if (err instanceof SyntaxError && 'body' in err) {
+    return res.status(400).json({ error: 'The request body is not valid JSON' })
+  }
+  // 其余错误交回 Express 默认处理,不在这里吞掉
+  return next(err)
 })
 
 // 生产模式：托管构建后的前端静态文件（dist 存在时）

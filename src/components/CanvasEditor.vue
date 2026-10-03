@@ -31,6 +31,8 @@ import {
   PhStop
 } from '@phosphor-icons/vue'
 import { editImage, extOf, generateFrom, imageSrc } from '../api'
+// 编辑载荷的体积控制(收窄到上限、按内容选格式、超预算再退档)。见 lib/payload.ts
+import { payloadOverBudget, payloadScaleFor, shrinkScaleFor } from '../lib/payload'
 import { blobToDataURL } from '../lib/idb'
 import type { ApiConfig, EditMode, ResultItem } from '../types'
 
@@ -1278,12 +1280,67 @@ function canvasDataUrl(c: HTMLCanvasElement): Promise<string> {
   })
 }
 
-/** 当前画面编成 data URL。送出去编辑的是它,而不是原图 ——
- *  用户是在"已经裁过、转过"的画面上动的手,送原图等于让他白改一遍 */
-function currentImage(): Promise<string> {
+/* —— 编辑载荷收窄 ——
+   原图与 mask 是整幅位图,而这条请求是 JSON + data URL(base64 再放大三分之一)。
+   实测一张 3840×2160 的照片编成 PNG 之后是 27.8MB,直接超过服务端 15MB 的
+   请求体上限 —— 也就是说"在 4K 图上做局部编辑"过去必然失败。
+   而厂商的编辑结果本身有上限(gpt-image-1 最大 1536,本站给的档位最大 2560),
+   送更大的进去换不到更大的结果。所以这里按上限收窄,再按内容挑格式。 */
+function encodeAt(c: HTMLCanvasElement, scale: number): string {
+  const t = scale >= 1 ? c : newCanvas(c.width * scale, c.height * scale)
+  if (t !== c) {
+    const ctx = t.getContext('2d')
+    if (ctx) {
+      ctx.imageSmoothingQuality = 'high'
+      ctx.drawImage(c, 0, 0, t.width, t.height)
+    }
+  }
+  /* 带透明的只能走 PNG —— JPEG 会把透明压成黑块(与存图、参考图那两处同一个坑)。
+     不透明的走 JPEG:实测同一张 2560 的照片,PNG 要 12.4MB,JPEG 只要 2.7MB。
+     反过来的情形也存在(截图类 PNG 只要 0.02MB 而 JPEG 要 1.1MB),但 1.1MB
+     离预算还远,不值得为它多编一次再比大小 */
+  return hasAlpha(t) ? t.toDataURL('image/png') : t.toDataURL('image/jpeg', 0.92)
+}
+
+/** 把一张已经是 data URL 的图按同一比例缩一次(mask 由各自的生成器按整幅画布
+ *  产出,这里统一收窄 —— 改那三个生成器不如在这一处收口)。
+ *  mask 永远编回 PNG:它是硬边形状,有损编码会把边缘糊掉,而它本来就不大 */
+async function scaleDataUrl(url: string, scale: number): Promise<string> {
+  if (scale >= 1) return url
+  const bmp = await createImageBitmap(await (await fetch(url)).blob())
+  const t = newCanvas(
+    Math.max(1, Math.round(bmp.width * scale)),
+    Math.max(1, Math.round(bmp.height * scale))
+  )
+  const ctx = t.getContext('2d')
+  if (ctx) {
+    ctx.imageSmoothingQuality = 'high'
+    ctx.drawImage(bmp, 0, 0, t.width, t.height)
+  }
+  bmp.close()
+  return t.toDataURL('image/png')
+}
+
+/** 这一次编辑要送出去的两张图。**必须同一个缩放系数** ——
+ *  尺寸对不上上游会直接判参数错误,所以系数只能算一次、两张图共用。
+ *  超预算时再退一档重编(带透明的大图才可能走到,普通照片第一轮就进预算)。
+ *
+ *  送的是**当前画面**而不是原图:用户是在"已经裁过、转过"的画面上动的手,
+ *  送原图等于让他白改一遍 */
+async function editPayload(frame: { width: number; height: number }, maskOf: () => Promise<string>) {
   const c = base
-  if (!c) return Promise.reject(new Error('There is nothing on the canvas to edit'))
-  return canvasDataUrl(c)
+  if (!c) throw new Error('There is nothing on the canvas to edit')
+  let scale = payloadScaleFor(frame.width, frame.height)
+  for (;;) {
+    const image = encodeAt(c, scale)
+    const mask = await scaleDataUrl(await maskOf(), scale)
+    if (!payloadOverBudget([image, mask])) return { image, mask }
+    const next = shrinkScaleFor(scale)
+    /* 缩到下限还是超预算:发出去让服务端明确拒绝(服务端会把 413 翻成人话),
+       总比在本地下再缩一次、把用户的图糊掉强 */
+    if (next === null) return { image, mask }
+    scale = next
+  }
 }
 
 /* 全透明 mask 的缓存。它是"整幅都要重做"那一类的输入(去背景、换背景),
@@ -1431,9 +1488,10 @@ function runEdit(
   prompt?: string
 ) {
   return runJob(mode, label, sub, async (frame, cfg, signal) => {
-    /* 原图与 mask 一起编:两张图互不相干,没必要串成一条。
-       两者都是"这一刻的画面",所以都等到让帧之后才取(见 runJob) */
-    const [image, mask] = await Promise.all([currentImage(), maskOf()])
+    /* 原图与 mask 一起算:两张图互不相干,没必要串成一条。
+       两者都是"这一刻的画面",所以都等到让帧之后才取(见 runJob)。
+       收窄与格式选择都在 editPayload 里,两张图共用同一个缩放系数 */
+    const { image, mask } = await editPayload(frame, maskOf)
     return editImage(
       { image, mask, mode, prompt, size: `${frame.width}x${frame.height}` },
       cfg,
