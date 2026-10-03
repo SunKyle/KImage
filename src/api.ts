@@ -1215,7 +1215,13 @@ export function releaseEntryMedia(entry: HistoryEntry) {
    ------------------------------------------------------------------ */
 const THUMB_EDGE = 128
 /** 老记录补缩略图的上限:只补最近这些条,更早的沉在底部,不值得逐张全尺寸解码 */
-const BACKFILL_MAX = 60
+/* 一次会话最多补多少条。原来是 60,而它和"每条固定等 300ms"叠在一起的结果是:
+   500 条老记录要开九次页面才补得完 —— 实际上等于永远补不完。改成空闲驱动之后
+   浏览器自己会挑"用户没在忙"的时机做,上限也就可以放宽 */
+const BACKFILL_MAX = 400
+/* 空闲回调里留给下一件事的最小余量。比这更少就不再开新的一条,
+   免得把一帧用满 —— 用户滚动时那一帧就没有时间画了 */
+const IDLE_MIN_SLICE_MS = 4
 
 /**
  * 解码一张图,顺带量出真实像素尺寸,并尽量压一张列表缩略图。
@@ -1271,11 +1277,52 @@ export function thumbSrc(e: HistoryEntry): string {
  * 每张之间留一段间隔,免得一上来就把主线程占满;补完落盘,只跑一次。
  * 任何一张失败都跳过,不影响使用。
  */
+/**
+ * 该给哪些记录补缩略图/尺寸。列表是从新到旧排的。
+ *
+ * 先筛后取(而不是"扫前 N 条、遇到不需要的就跳过"):后者在前 N 条都已补好时
+ * 什么也不做,后面的照样缺 —— 而"缺"这件事与它排在第几位无关。
+ */
+export function thumbsToFill(list: HistoryEntry[], max = BACKFILL_MAX): HistoryEntry[] {
+  return list.filter((e) => !(e.thumb && e.w && e.h)).slice(0, max)
+}
+
+/** 这一次空闲回调里还该不该再做一条。余量太少就留给这一帧 */
+export function shouldProcessNow(
+  timeRemaining: number,
+  didTimeout: boolean,
+  minSliceMs = IDLE_MIN_SLICE_MS
+): boolean {
+  // 被 timeout 叫起来的:不做就等于一直不做,所以照做
+  if (didTimeout) return true
+  return timeRemaining >= minSliceMs
+}
+
+/** 等下一次空闲。没有 requestIdleCallback 的环境(Safari 较老版本)退回定时器 */
+function nextIdle(): Promise<IdleDeadline | { timeRemaining: () => number; didTimeout: boolean }> {
+  return new Promise((resolve) => {
+    if (typeof requestIdleCallback === 'function') {
+      requestIdleCallback((d) => resolve(d), { timeout: 1000 })
+      return
+    }
+    setTimeout(() => resolve({ timeRemaining: () => 8, didTimeout: true }), 120)
+  })
+}
+
+/**
+ * 给加缩略图字段之前存下来的老记录补上,顺带量出真实像素尺寸。
+ *
+ * 节奏交给浏览器,不用固定间隔:
+ * - `requestIdleCallback` 只在"这一帧还有空"时回调 —— 用户一滚动、一点击就让位,
+ *   不会跟正在看的东西抢主线程
+ * - 固定 300ms 那条路的毛病不是卡(实测主线程连一个 >50ms 的长任务都没有),
+ *   而是**慢得没有意义**:每条都白等 300ms,60 条就是 18 秒起步,
+ *   于是"补缩略图"这件事在真实使用里几乎从不完成。空闲驱动则是有空就多做几条
+ * - 一次会话的上限仍然留着,避免"开着页面就一直在后台干活"
+ */
 export async function backfillThumbs(list: HistoryEntry[]): Promise<void> {
-  // 列表是从新到旧排的:几百条老记录逐条解码要跑好几分钟,只补最近这一段
-  for (const entry of list.slice(0, BACKFILL_MAX)) {
-    // 缩略图和尺寸都有了就不用再解码(尺寸是后来才加的字段,老记录通常缺)
-    if (entry.thumb && entry.w && entry.h) continue
+  for (const entry of thumbsToFill(list)) {
+    await nextIdle()
     const t = await makeThumb(entry.results?.[0])
     if (!t) continue
     if (t.blob) entry.thumb = t.blob
@@ -1286,7 +1333,6 @@ export async function backfillThumbs(list: HistoryEntry[]): Promise<void> {
     } catch {
       /* 落盘失败就只留内存里这一份,下次打开还会再试 */
     }
-    await new Promise((r) => setTimeout(r, 300))
   }
 }
 

@@ -10,10 +10,12 @@ import {
   seedFor,
   sizeClosestTo,
   sizeForVendor,
+  shouldProcessNow,
   sizeIsFree,
-  sizeOptionsFor
+  sizeOptionsFor,
+  thumbsToFill
 } from './api'
-import type { ApiConfig } from './types'
+import type { ApiConfig, HistoryEntry } from './types'
 
 /* 造一条配置。只有 id 与 kind 参与挑选,其余字段给最小值即可 */
 function cfg(id: string, kind?: ApiConfig['kind']): ApiConfig {
@@ -285,5 +287,65 @@ describe('acceptableSize · 套用历史/库里的尺寸', () => {
     expect(acceptableSize(ark, '1920x1080')).toBe('1920x1080')
     expect(acceptableSize(ark, '1536 × 1024')).toBe('1536x1024')
     expect(acceptableSize(ark, 'weird')).toBeNull()
+  })
+})
+
+describe('thumbsToFill · 该给哪些记录补缩略图', () => {
+  function rec(id: string, hasThumb: boolean): HistoryEntry {
+    return {
+      id,
+      prompt: id,
+      size: '1024x1024',
+      createdAt: 0,
+      results: [],
+      ...(hasThumb ? { thumb: new Blob(['x']), w: 10, h: 10 } : {})
+    } as HistoryEntry
+  }
+
+  it('只挑缺缩略图或尺寸的,并保持原顺序(新→旧)', () => {
+    const list = [rec('a', true), rec('b', false), rec('c', true), rec('d', false)]
+    expect(thumbsToFill(list).map((e) => e.id)).toEqual(['b', 'd'])
+  })
+
+  /* 这条是行为修正:原来是"扫前 N 条、遇到不缺的就跳过",
+     于是前 N 条都补好时什么也不做,后面的照样缺 */
+  it('前面都已补好时,照样去补后面的(先筛后取,不是先取后筛)', () => {
+    const list = [rec('a', true), rec('b', true), rec('c', true), rec('d', false)]
+    expect(thumbsToFill(list, 2).map((e) => e.id)).toEqual(['d'])
+  })
+
+  it('上限只限制"要补的条数",不限制扫描范围', () => {
+    const list = Array.from({ length: 10 }, (_, i) => rec(`e${i}`, false))
+    expect(thumbsToFill(list, 3)).toHaveLength(3)
+  })
+
+  it('都补好了就返回空(不必再逐条解码)', () => {
+    expect(thumbsToFill([rec('a', true)])).toEqual([])
+  })
+
+  it('尺寸缺一项也算缺(图墙按真实比例排版要用)', () => {
+    const half = { ...rec('h', false), thumb: new Blob(['x']) } as HistoryEntry
+    expect(thumbsToFill([half]).map((e) => e.id)).toEqual(['h'])
+  })
+})
+
+describe('shouldProcessNow · 空闲回调的余量判断', () => {
+  it('余量够就做', () => {
+    expect(shouldProcessNow(12, false)).toBe(true)
+    expect(shouldProcessNow(4, false)).toBe(true)
+  })
+
+  it('余量不够就让给这一帧(用户正在滚动时那一帧要拿去画)', () => {
+    expect(shouldProcessNow(3.9, false)).toBe(false)
+    expect(shouldProcessNow(0, false)).toBe(false)
+  })
+
+  it('被 timeout 叫起来的照做 —— 否则一直不做', () => {
+    expect(shouldProcessNow(0, true)).toBe(true)
+  })
+
+  it('阈值可覆盖', () => {
+    expect(shouldProcessNow(5, false, 8)).toBe(false)
+    expect(shouldProcessNow(9, false, 8)).toBe(true)
   })
 })

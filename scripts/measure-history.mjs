@@ -32,6 +32,12 @@ const URL_ = arg('url', 'http://localhost:4173/')
 const RECORDS = Number(arg('records', 500))
 const IMAGES = Number(arg('images', 2))
 const IMG_SIZE = Number(arg('img-size', 256))
+/* 造不带缩略图的老数据:这样 backfillThumbs 才有活干(它只补缺的) */
+const NO_THUMB = args.includes('--no-thumb')
+/* 启动之后观察多久的长任务(毫秒) */
+const SETTLE_MS = Number(arg('settle-ms', 4000))
+/* 顺带量一下编码成本:画布那条路把位图编成 data URL 是不是真的卡主线程 */
+const PROBE_ENCODE = args.includes('--probe-encode')
 /* 调试端口每轮随机取一个:固定端口会与上一次没退干净的实例撞车,
    而那种撞车表现为"连上了,但连到的是别人",量出来的数看着正常其实全错 */
 const PORT = Number(arg('cdp-port', 0)) || 9300 + Math.floor(Math.random() * 600)
@@ -190,7 +196,7 @@ async function main() {
 
   // —— 造数据。直接写 IndexedDB,绕开应用自己的清理逻辑 ——
   const seeded = await evaluate(
-    async (n, images, size) => {
+    async (n, images, size, noThumb) => {
       const c = document.createElement('canvas')
       c.width = c.height = size
       const ctx = c.getContext('2d')
@@ -221,9 +227,8 @@ async function main() {
           model: 'perf-model',
           createdAt: now - i * 60_000,
           results: Array.from({ length: images }, () => ({ type: 'b64', data: blob })),
-          thumb: blob,
-          w: size,
-          h: size
+          // 老记录没有缩略图与尺寸 —— backfillThumbs 要补的正是这两项
+          ...(noThumb ? {} : { thumb: blob, w: size, h: size })
         })
       }
       await new Promise((r) => (tx.oncomplete = r))
@@ -232,8 +237,22 @@ async function main() {
     },
     RECORDS,
     IMAGES,
-    IMG_SIZE
+    IMG_SIZE,
+    NO_THUMB
   )
+
+  /* 长任务观察器要在**页面脚本之前**装好,否则会漏掉启动那一段 ——
+     而"启动之后还在跑的后台活儿"正是 backfillThumbs 那类问题的形状 */
+  await send('Page.addScriptToEvaluateOnNewDocument', {
+    source: `
+      window.__lt = [];
+      try {
+        new PerformanceObserver((l) => {
+          for (const e of l.getEntries()) window.__lt.push(Math.round(e.duration));
+        }).observe({ entryTypes: ['longtask'] });
+      } catch (e) { window.__ltError = String(e); }
+    `
+  })
 
   /* —— 启动路径:重载 → 新文档 load → 首页图墙出现第一块 ——
      必须等 loadEventFired:在此之前量到的 performance.now() 还是**旧文档**的,
@@ -310,6 +329,88 @@ async function main() {
     }
   })
 
+  /* —— 启动之后的后台活儿 ——
+     静置一段时间,看主线程被长任务占了多少(>50ms 的才算),
+     以及多少条老记录被补上了缩略图 */
+  await sleep(SETTLE_MS)
+  const background = await evaluate(async (settleMs) => {
+    const lt = window.__lt || []
+    const stats = {
+      settleMs,
+      longTasks: lt.length,
+      totalBlockingMs: lt.reduce((a, b) => a + b, 0),
+      maxTaskMs: lt.length ? Math.max(...lt) : 0
+    }
+    const db = await new Promise((res, rej) => {
+      const r = indexedDB.open('kimage.db')
+      r.onsuccess = () => res(r.result)
+      r.onerror = () => rej(r.error)
+    })
+    const all = await new Promise((res, rej) => {
+      const r = db.transaction('history', 'readonly').objectStore('history').getAll()
+      r.onsuccess = () => res(r.result)
+      r.onerror = () => rej(r.error)
+    })
+    db.close()
+    stats.records = all.length
+    stats.withThumb = all.filter((r) => r.thumb && r.w && r.h).length
+    return stats
+  }, SETTLE_MS)
+
+  /* —— 编码探针 ——
+     画布那条路要交的是 data URL,而 toDataURL 是**全同步**的:
+     大图那一下会把主线程按住(原地编辑的"点了没反应"多半来自这里)。
+     同尺寸下再量一遍 toBlob + FileReader 那条异步路做对照。 */
+  const encode = PROBE_ENCODE
+    ? await evaluate(async (size) => {
+        const c = document.createElement('canvas')
+        c.width = size
+        c.height = Math.round((size * 9) / 16)
+        const ctx = c.getContext('2d')
+        const g = ctx.createLinearGradient(0, 0, c.width, c.height)
+        g.addColorStop(0, '#2b6cb0')
+        g.addColorStop(1, '#f6ad55')
+        ctx.fillStyle = g
+        ctx.fillRect(0, 0, c.width, c.height)
+        // 撒噪声:纯色图 PNG 只要几十 KB,量不出真实编码成本
+        const px = ctx.getImageData(0, 0, c.width, c.height)
+        for (let i = 0; i < px.data.length; i += 4) px.data[i] = (px.data[i] + Math.random() * 60) % 255
+        ctx.putImageData(px, 0, 0)
+
+        const time = (fn) => {
+          const t = performance.now()
+          const v = fn()
+          return { ms: +(performance.now() - t).toFixed(1), v }
+        }
+        const jpeg = time(() => c.toDataURL('image/jpeg', 0.92))
+        const png = time(() => c.toDataURL('image/png'))
+        const blobStart = performance.now()
+        const blob = await new Promise((r) => c.toBlob(r, 'image/jpeg', 0.92))
+        const blobMs = +(performance.now() - blobStart).toFixed(1)
+        const readStart = performance.now()
+        const url = await new Promise((resolve, reject) => {
+          const fr = new FileReader()
+          fr.onload = () => resolve(String(fr.result))
+          fr.onerror = () => reject(fr.error)
+          fr.readAsDataURL(blob)
+        })
+        const readMs = +(performance.now() - readStart).toFixed(1)
+        return {
+          size: `${c.width}x${c.height}`,
+          // 同步:这两下期间主线程什么都干不了
+          jpegDataUrlSyncMs: jpeg.ms,
+          pngDataUrlSyncMs: png.ms,
+          jpegDataUrlMB: +(jpeg.v.length / 1048576).toFixed(2),
+          pngDataUrlMB: +(png.v.length / 1048576).toFixed(2),
+          // 异步:编码交给浏览器,主线程只在回调时被占用
+          toBlobMs: blobMs,
+          blobToDataUrlMs: readMs,
+          asyncTotalMs: +(blobMs + readMs).toFixed(1),
+          sameBytes: url.length === jpeg.v.length
+        }
+      }, Number(arg('probe-size', 2560)))
+    : null
+
   const heap = await evaluate(() => {
     const m = performance.memory
     return m ? { usedMB: +(m.usedJSHeapSize / 1048576).toFixed(1) } : null
@@ -323,6 +424,8 @@ async function main() {
     imgSizePx: IMG_SIZE,
     // 相对 navigationStart 的毫秒数,可直接对比改动前后
     startup: { msToFeedFirstTile: +startupMs.toFixed(1), navTiming },
+    background,
+    encode,
     history,
     heap
   }
