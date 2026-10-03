@@ -55,6 +55,8 @@ const PROBE_CHARS = args.includes('--probe-chars')
 const PROBE_CHAT = args.includes('--probe-chat')
 /* 探出图参数那一层:尺寸档位、参考图上传与清除 */
 const PROBE_PARAMS = args.includes('--probe-params')
+/* 探出图编排层:没有可用接口时,那条失败路径也要走完 */
+const PROBE_GEN = args.includes('--probe-gen')
 /* 调试端口每轮随机取一个:固定端口会与上一次没退干净的实例撞车,
    而那种撞车表现为"连上了,但连到的是别人",量出来的数看着正常其实全错 */
 const PORT = Number(arg('cdp-port', 0)) || 9300 + Math.floor(Math.random() * 600)
@@ -1168,6 +1170,147 @@ async function main() {
     }
   }
 
+  /* —— 出图编排层探针 ——
+     真正出一张图要能用的接口,这里没有;但**失败路径**照样穿过刚搬走的那套
+     编排:doGenerate 建槽 → runBatch 并发调度 → runSlot 发请求 → 出错收尾。
+     接口故意指向一个不存在的地址,看这条链是不是走完了、状态有没有收干净。 */
+  let genProbe = null
+  if (PROBE_GEN) {
+    genProbe = {}
+    try {
+      // 配一个指向死地址的出图配置(走设置页空态那条快路)
+      const navBox = await evaluate(() => {
+        const b = document.querySelector('button[aria-label="Settings"]')
+        if (!b) return null
+        const r = b.getBoundingClientRect()
+        return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
+      })
+      if (navBox) {
+        for (const type of ['mousePressed', 'mouseReleased']) {
+          await send('Input.dispatchMouseEvent', {
+            type,
+            x: navBox.x,
+            y: navBox.y,
+            button: 'left',
+            clickCount: 1
+          })
+        }
+        await sleep(700)
+      }
+      /* 空态才有 .quick-item;已经配过一条时设置页是列表页 ——
+         连跑时配置探针先建过一条,这里必须能退回"新增"(踩过) */
+      genProbe.openedForm = await evaluate(() => {
+        const quick = document.querySelector('.quick .quick-item')
+        if (quick) {
+          quick.click()
+          return 'quick'
+        }
+        const add = [...document.querySelectorAll('button')].find((b) =>
+          /new config|^add$/i.test(b.textContent.trim())
+        )
+        if (add) {
+          add.click()
+          return 'add'
+        }
+        return 'missing'
+      })
+      await sleep(500)
+      genProbe.filled = await evaluate(() => {
+        const set = (el, v) => {
+          if (!el) return false
+          el.value = v
+          el.dispatchEvent(new Event('input', { bubbles: true }))
+          return true
+        }
+        const inputs = [...document.querySelectorAll('form input')]
+        const url = inputs.find((i) => /^https:\/\/example\.com/.test(i.placeholder || ''))
+        const key = inputs.find((i) => i.type === 'password')
+        return {
+          url: set(url, 'http://10.255.255.1/v1'),
+          key: set(key, 'sk-probe')
+        }
+      })
+      await sleep(300)
+      genProbe.saved = await evaluate(() => {
+        const b = [...document.querySelectorAll('form button')].find((x) =>
+          /^save$/i.test(x.textContent.trim())
+        )
+        if (!b || b.disabled) return 'missing'
+        b.click()
+        return 'clicked'
+      })
+      await sleep(600)
+
+      // 回创作区,写一句提示词,按生成
+      const studio = await evaluate(() => {
+        const b = document.querySelector('button[aria-label="Studio"]')
+        if (!b) return null
+        const r = b.getBoundingClientRect()
+        return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
+      })
+      if (studio) {
+        for (const type of ['mousePressed', 'mouseReleased']) {
+          await send('Input.dispatchMouseEvent', {
+            type,
+            x: studio.x,
+            y: studio.y,
+            button: 'left',
+            clickCount: 1
+          })
+        }
+        await sleep(700)
+      }
+      await evaluate(() => {
+        const ta = document.querySelector('textarea')
+        if (!ta) return 'missing'
+        ta.value = 'probe'
+        ta.dispatchEvent(new Event('input', { bubbles: true }))
+        return 'typed'
+      })
+      await sleep(300)
+      genProbe.clicked = await evaluate(() => {
+        const b = document.querySelector('button[aria-label="Generate"]')
+        if (!b) return 'missing'
+        if (b.disabled) return 'disabled'
+        b.click()
+        return 'clicked'
+      })
+      /* 地址选黑洞(10.255.255.1)而不是 127.0.0.1:9:
+         后者是立刻拒连,骨架一闪而过,取样必然扑空 —— 这也说明它确实在跑,
+         只是跑完了。黑洞地址会挂住,给"正在生成"留出可观测的窗口 */
+      await sleep(1500)
+      genProbe.midFlight = await evaluate(() => ({
+        skel: document.querySelectorAll('.tile-skel').length,
+        // 停止键是**每格一个**(.skel-stop),单槽时没有全局停止键
+        stops: document.querySelectorAll('.skel-stop').length
+      }))
+      // 顺手把"停止"也走一遍(这是刚搬过来的 stopSlot/stopAllSlots)
+      genProbe.clickedStop = await evaluate(() => {
+        const b = document.querySelector('.skel-stop')
+        if (!b) return 'missing'
+        b.click()
+        return 'clicked'
+      })
+      await sleep(1200)
+      genProbe.settled = await evaluate(() => ({
+        skel: document.querySelectorAll('.tile-skel').length,
+        stops: document.querySelectorAll('.skel-stop').length
+      }))
+
+      genProbe.passed =
+        genProbe.openedForm !== 'missing' &&
+        genProbe.saved === 'clicked' &&
+        genProbe.clicked === 'clicked' &&
+        genProbe.midFlight?.skel >= 1 &&
+        genProbe.midFlight?.stops >= 1 &&
+        genProbe.clickedStop === 'clicked' &&
+        genProbe.settled?.skel === 0 &&
+        genProbe.settled?.skel === 0
+    } catch (e) {
+      genProbe.error = String(e.message || e)
+    }
+  }
+
   /* —— 出图参数层探针 ——
      这一层(尺寸 / 张数 / 画质 / 种子 / 参考图)每一格都受能力表约束,
      而能力表是配置域算出来的 —— 单测覆盖不到"点下去界面认不认"。 */
@@ -1426,6 +1569,7 @@ async function main() {
     chars: charsProbe,
     chat: chatProbe,
     params: paramsProbe,
+    gen: genProbe,
     history,
     heap
   }
@@ -1452,6 +1596,16 @@ async function main() {
       console.log('   ', JSON.stringify(canvas.steps))
       process.exitCode = 1
     }
+  }
+
+  if (genProbe) {
+    const ok = genProbe.passed === true
+    console.log(
+      `${ok ? '✅' : '❌'} 出图编排层(死地址:建槽 → 调度 → 失败收尾)${
+        ok ? '' : ` — ${JSON.stringify(genProbe)}`
+      }`
+    )
+    if (!ok) process.exitCode = 1
   }
 
   if (paramsProbe) {

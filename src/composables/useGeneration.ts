@@ -1,16 +1,20 @@
-import { computed, ref, type ComputedRef, type Ref } from 'vue'
+import { computed, ref, toRaw, type ComputedRef, type Ref } from 'vue'
 import {
   acceptableSize,
   enhancePrompt,
   extraParamsFor,
   normalizeSize,
+  characterFaceDesc,
+  generate,
+  makeThumb,
+  uid,
   seedFor,
   sizeForVendor
 } from '../api'
 import { REF_ARCHIVE_EDGE, REF_IMAGE_EDGE } from '../lib/payload'
 import { urlToBlob } from '../lib/idb'
 import type { EnhanceMode, Provider } from '../api'
-import type { ApiConfig } from '../types'
+import type { ApiConfig, Character, HistoryEntry, ResultItem } from '../types'
 
 /* ===== 出图参数：提示词、尺寸、张数、画质、种子、参考图 ================
    这一层的每一条都受"当前生效的那个接口"约束:能力表说不支持,界面上就不该
@@ -37,6 +41,32 @@ export interface GenerationDeps {
     quality?: number,
     force?: boolean
   ) => Promise<string>
+
+  /** 统一的错误出口与中性提示 */
+  notice: Ref<string>
+  /** 落一条历史记录(见 useHistory) */
+  persist: (record: HistoryEntry) => Promise<void>
+  /** 当前角色的图 → data URL,发请求时并进参考图(见 useCharacters) */
+  charRefSrcs: () => Promise<string[]>
+  /** 当前角色:它决定自动并进提示词的那段设定 */
+  activeCharacter: ComputedRef<Character | undefined>
+  /** 这次要跑哪几个模型(见 useConfigs) */
+  selectedConfigs: ComputedRef<ApiConfig[]>
+  /** 参数面板的开合:发起生成时要把它收掉 */
+  openPanel: Ref<string>
+  /** 画布的"这一条接在谁下面"(见 CanvasEditor 的编辑链) */
+  pendingParentId: Ref<string | undefined>
+  /** 当前角色 id:落盘时要把它记进记录里 */
+  activeCharId: Ref<string>
+  /** 一条配置都没有时,发起生成会把人送去设置页(见 useConfigs) */
+  openConfigManager: () => void
+  /** 出图那条配置配好了没有(见 useConfigs) */
+  configured: () => boolean
+  /** 这一批是不是多模型对比(见 useConfigs) */
+  compareMode: ComputedRef<boolean>
+  /** 错误条与"可否重试"(见 useFeedback) */
+  error: Ref<string>
+  canRetry: Ref<boolean>
 }
 
 export function useGeneration(deps: GenerationDeps) {
@@ -268,6 +298,409 @@ function undoEnhance() {
     refImage.value = ''
   }
 
+type GenSlot = {
+  id: string
+  /* 落盘归并键。同一批里同键的槽合成一条历史记录:
+     单模型出 4 张 → 一条记录带 4 张图(与从前一致);
+     对比 3 个模型 → 三条记录(也与从前一致) */
+  recordKey: string
+  /* 这一次点击共用的分组 id,与对比出图沿用同一个字段语义(见 HistoryEntry.groupId) */
+  groupId: string
+  /* —— 发起时锁死的整套条件 ——
+     中途改提示词、尺寸或配置,都不该影响已经发出去的那几张 */
+  config: ApiConfig
+  // 展示用的模型名(槽位上要写清这是哪家)
+  label: string
+  model: string
+  prompt: string
+  size: string
+  extras: Record<string, string>
+  seed?: number
+  refList: string[]
+  // 用户自己挑的那张参考图(角色的不算)。存快照是为了落盘时记下"当时用的哪张"
+  refSrc?: string
+  characterId?: string
+  parentId?: string
+  startedAt: number
+  state: 'running' | 'done' | 'stopped' | 'error'
+  results: ResultItem[]
+  error?: string
+  elapsedMs?: number
+}
+const genSlots = ref<GenSlot[]>([])
+/* 中断手柄按槽各存一个。同一时刻可能有好几批在跑(生成键不再锁死),
+   共用一个手柄的话,停一张会把别张一起掐掉 */
+const slotControllers = new Map<string, AbortController>()
+/* 正在跑的槽。骨架格、忙闲、进度条都读它 —— 只有还没结束的槽才占位 */
+const activeSlots = computed(() => genSlots.value.filter((s) => s.state === 'running'))
+const loading = computed(() => genSlots.value.some((s) => s.state === 'running'))
+/* 这一批是不是在多模型对比(落盘键按模型分,所以键多于一个就是对比)。
+   骨架格上要不要写模型名、进度条上说"Comparing"还是"Generating",都看它 */
+const multiModel = computed(() => new Set(activeSlots.value.map((s) => s.recordKey)).size > 1)
+/* 进度条上那句话。单模型出几张时报个数 —— 用户想知道的是"还有几张在路上" */
+const runLabel = computed(() => {
+  if (multiModel.value) return 'Comparing'
+  const n = activeSlots.value.length
+  return n > 1 ? `Generating ${n} images` : 'Generating'
+})
+/* 会自动并进提示词的那一段(角色设定) */
+const charSpecPrefix = computed(() =>
+  deps.activeCharacter.value ? characterFaceDesc(deps.activeCharacter.value) : ''
+)
+
+/** 这次真正要发出去的提示词:用户自己写的在前,角色设定接在后面。
+ *  顺序不能反 —— 前段权重更高,把固定的那套长相顶在最前面,
+ *  "这一张要画什么"就被压到最后了。角色是加在场景上的,不是反过来 */
+function composedPrompt(): string {
+  const spec = charSpecPrefix.value
+  const text = prompt.value.trim()
+  if (!spec) return prompt.value
+  return text ? `${text}, ${spec}` : spec
+}
+
+async function doGenerate() {
+  /* 这里不再用"正在生成"拦第二次点击:那正是要解决的问题 ——
+     生成键在跑的时候变成暂停键,于是生成中途发不出新的了。
+     现在每次点击各自成批,可以叠着跑 */
+  /* 改写回来时会整体覆盖提示词。此刻发出去的图,用的是改写到一半的内容,
+     而用户看到的输入框马上就要变成另一段文字 —— 这批图会和界面对不上。
+     改写按钮那边也置灰了,这里再拦一道是因为回车也能触发生成 */
+  if (enhancing.value) return
+  if (!prompt.value.trim()) {
+    deps.fail('Enter a prompt first')
+    return
+  }
+  if (!deps.configured()) {
+    /* 用 notice 而不是 fail:这条路径紧接着就跳到设置页,而 fail 写的是 home
+       那条 .err —— 页面已经切走,提示留在不渲染的 DOM 里等于没提示 */
+    deps.notice.value = 'Set an API base URL in Settings first'
+    deps.openConfigManager()
+    return
+  }
+  /* 发出去了,参数面板就没有再开着的理由:它是"发之前调一调"的东西,
+     而这一批的参数此刻已经锁进槽里,面板留着只会挡住下面的图墙 */
+  deps.openPanel.value = ''
+  // 选了多个模型时走另一条链路:一次发给每个模型,结果并排
+  if (deps.compareMode.value) {
+    await doRace()
+    return
+  }
+
+  /* 发起前锁定这一批的参数,后面一律读快照,避免中途改参数串味。
+     套了角色时这里锁的是合成后的提示词 —— 真正发出去的就是它 */
+  const runPrompt = composedPrompt()
+  const runSize = size.value
+  const runN = Math.max(1, n.value)
+  /* 同一次点生成就是一批。group 让生成的结果在图墙上可归拢,
+     和对比出图共用同一个字段语义(见 groupId 注释) */
+  const genGroupId = `gen-${Date.now().toString(36)}`
+  // 扩展参数与参考图同样要快照:它们在 await 期间可能被改动
+  const extras = extraParams()
+  // 种子也是快照的一部分:中途改它不该影响已经发出的这一批
+  const seedNum = seedForConfig()
+  const refSrc = refImage.value
+  /* 参考图可以不止一张:用户自己挑的图 + 角色的那几张一起送 ——
+     单张太弱,多视图才锁得住同一张脸。用户那张排最前,它多半就是这次要改的底图 */
+  const refList: string[] = []
+  if (refSrc) refList.push(refSrc)
+  for (const s of await deps.charRefSrcs()) if (!refList.includes(s)) refList.push(s)
+
+  /* 张数就是槽数。种子要逐张错开:原来一个请求带 n=4 时,上游按序号派生四张;
+     拆成四次请求后如果都传同一个种子,四次会拿到同一张图。
+     填了种子就 S、S+1、S+2 …… —— 指定种子仍然可复现,只是从"上游派生"
+     变成"我们自己接管这件事" */
+  const slots: GenSlot[] = Array.from({ length: runN }, (_, i) => {
+    const s = seedNum === undefined ? undefined : seedNum + i
+    return {
+      id: uid(),
+      // 单模型出几张 = 一条记录带几张图(与拆分前的粒度一致)
+      recordKey: genGroupId,
+      groupId: genGroupId,
+      config: deps.config.value,
+      label: deps.config.value.name || deps.config.value.model || deps.config.value.baseUrl || 'Model',
+      model: deps.config.value.model || '',
+      prompt: runPrompt,
+      size: runSize,
+      extras,
+      ...(s !== undefined ? { seed: s } : {}),
+      refList,
+      refSrc: refSrc || undefined,
+      characterId: deps.activeCharId.value || undefined,
+      parentId: deps.pendingParentId.value,
+      startedAt: Date.now(),
+      state: 'running' as const,
+      results: []
+    }
+  })
+  await runBatch(slots)
+}
+
+/* 同时在跑的请求数上限。拆开之后"张数 = 请求数",一次 10 张原样并发
+   很容易被上游限流(429),而限流的报错长得像"这个模型坏了"。
+   排队只让慢的那几张等一等,不影响结果 */
+const SLOT_CONCURRENCY = 3
+
+/** 按上限并发跑。够用就好的轮子 —— 不引依赖,也不做动态调参 */
+async function runWithLimit<T>(items: T[], limit: number, run: (t: T) => Promise<void>) {
+  const queue = [...items]
+  const workers = Array.from({ length: Math.min(limit, queue.length) }, async () => {
+    for (let next = queue.shift(); next !== undefined; next = queue.shift()) await run(next)
+  })
+  await Promise.all(workers)
+}
+
+/** 跑一批槽,结束再落盘、收尾。单模型多张与多模型对比共用这一条 */
+async function runBatch(slots: GenSlot[]) {
+  genSlots.value = [...genSlots.value, ...slots]
+  deps.error.value = ''
+  deps.notice.value = ''
+  deps.canRetry.value = false
+  /* 跑的是 genSlots 里那份响应式代理,而不是传进来的本地数组。
+     ref 的深层代理只在**读取**时才套上,而 runSlot 直接改原对象的
+     state / results —— 不经过 set trap,逐格的完成与失败就不会触发渲染,
+     整批跑完才一起变(点掉一张的停止键,那格骨架会一直转到最后)。
+     按 id 取回代理,顺序与 slots 一致,下面 persistBatch 照旧读原数组 */
+  const ids = new Set(slots.map((s) => s.id))
+  const live = genSlots.value.filter((s) => ids.has(s.id))
+  try {
+    /* 上限内并发 —— 既不串成一条长队(多张的总耗时等于各张之和),
+       也不一次性全丢出去(自己把自己限流) */
+    await runWithLimit(live, SLOT_CONCURRENCY, runSlot)
+  } finally {
+    await persistBatch(slots)
+    /* 结束的槽立刻撤出图墙:留下的只有图和提示。
+       骨架格一直挂在那儿会让人以为还在跑 */
+    genSlots.value = genSlots.value.filter((s) => !ids.has(s.id))
+  }
+  reportBatch(slots)
+}
+
+/** 一个槽 = 一次请求 = 一张图。异常在这一层吃掉 ——
+ *  一张失败不该拖累同批的其它张,这正是拆开跑最值钱的地方 */
+async function runSlot(slot: GenSlot) {
+  // 排队期间被停掉的:不必再发出去
+  if (slot.state !== 'running') return
+  const ctl = new AbortController()
+  slotControllers.set(slot.id, ctl)
+  try {
+    const res = await generate(
+      {
+        prompt: slot.prompt,
+        size: slot.size,
+        n: 1,
+        ...(slot.refList.length ? { images: slot.refList } : {}),
+        ...(slot.seed !== undefined ? { seed: slot.seed } : {}),
+        // 由厂商能力表决定带哪些扩展参数:auto 与已知不支持的都不发
+        ...slot.extras
+      },
+      slot.config,
+      ctl.signal
+    )
+    slot.results = res
+    slot.state = 'done'
+  } catch (e: any) {
+    // 主动终止不是失败,但要说清是"你停的",不是模型坏了
+    slot.state = e?.name === 'AbortError' ? 'stopped' : 'error'
+    // 上游原文可能很长,槽位里放不下;完整内容留到汇总那条提示里
+    if (slot.state === 'error') {
+      slot.error = String(e?.message || 'Generation failed').slice(0, 300)
+    }
+  } finally {
+    slot.elapsedMs = Date.now() - slot.startedAt
+    slotControllers.delete(slot.id)
+  }
+}
+
+/** 落盘:同一批里按 recordKey 归并。
+ *  单模型的几张合成一条记录(与拆分前一致),对比的每模型一条(也与拆分前一致) */
+async function persistBatch(slots: GenSlot[]) {
+  const groups = new Map<string, GenSlot[]>()
+  for (const s of slots) {
+    const list = groups.get(s.recordKey)
+    if (list) list.push(s)
+    else groups.set(s.recordKey, [s])
+  }
+  for (const group of groups.values()) {
+    const ok = group.filter((s) => s.state === 'done' && s.results.length)
+    if (!ok.length) continue
+    // 条件取第一个槽:同键的这几个除了种子逐张递进,其余完全一样
+    const head = group[0]
+    /* 必须取原始数组:槽上的 results 是响应式代理,而 indexedDB 用结构化克隆
+       写盘,代理克隆不了(DataCloneError),记录会写不进去 —— 界面看着图还在
+       (内存里有),刷新就没了,还会误报"没能保存到本地" */
+    const results = ok.flatMap((s) => toRaw(s.results))
+    const record = await recordFor(results, {
+      prompt: head.prompt,
+      size: head.size,
+      model: head.model || undefined,
+      // 只记真正发出去的扩展参数,免得预览里展示出当时并没生效的档位
+      quality: head.extras.quality,
+      background: head.extras.background,
+      hasRef: !!head.refSrc,
+      groupId: head.groupId,
+      configId: head.config.id,
+      seed: head.seed,
+      refSrc: head.refSrc,
+      /* 「拉自某条记录改一个变量重跑」的出处。普通手写提示词这里是空,不入链 */
+      parentId: head.parentId,
+      // 套了角色就记下是谁 —— 预览里才说得清"这条是照哪个角色出的"
+      characterId: head.characterId,
+      // 一批里各张耗时不同,记最慢的那张 = 这一批总共要等多久
+      elapsedMs: Math.max(...ok.map((s) => s.elapsedMs || 0))
+    })
+    await deps.persist(record)
+  }
+}
+
+/** 这一批跑完说一句。全成败占用错误区(有原文和重试),部分失败走中性的 notice,
+ *  一张都没失败就什么都不说 —— 图自己会出现在图墙里 */
+function reportBatch(slots: GenSlot[]) {
+  const failed = slots.filter((s) => s.state === 'error')
+  if (!failed.length) return
+  /* 同一个模型的几张失败时不必把名字念好几遍:按名字收一遍,
+     一家的报错就用第一条(同一次请求失败,原因通常也只有一个) */
+  const byName = new Map<string, string>()
+  for (const s of failed) if (!byName.has(s.label)) byName.set(s.label, s.error || 'failed')
+  const names = [...byName.keys()].join(', ')
+  if (byName.size === new Set(slots.map((s) => s.label)).size) {
+    deps.fail([...byName].map(([label, err]) => `${label}: ${err}`).join('\n'), true)
+    return
+  }
+  deps.notice.value = `${failed.length} of ${slots.length} failed (${names}) — the rest are in your recent creations`
+}
+
+/* 把一组结果包成一条历史记录,并补上缩略图与真实像素。
+   缩略图要在入列表和落盘之前补上:入列表后拿到的是响应式代理,
+   在代理上改动不会回写到这里的原始对象,而 idb 又只接受原始对象。
+   同时把量到的真实像素写进记录,图墙就能按真实比例排,而不是按所选尺寸 */
+async function recordFor(
+  res: ResultItem[],
+  meta: {
+    prompt: string
+    size: string
+    model?: string
+    quality?: string
+    background?: string
+    hasRef?: boolean
+    groupId?: string
+    /* 这一批是「从某条记录拉下来改的」时的父记录 id。见 pendingParentId */
+    parentId?: string
+    /* 这一批套用的角色 id。见 Character */
+    characterId?: string
+    elapsedMs: number
+    // 完整配方里其余的三项:重跑时要用它们还原当时的条件
+    configId?: string
+    seed?: number
+    // 参考图本体(data URL)。存一份压过的小图,不然"当时用了哪张参考图"就丢了
+    refSrc?: string
+  }
+): Promise<HistoryEntry> {
+  const record: HistoryEntry = {
+    id: Date.now() + Math.random().toString(16).slice(2),
+    prompt: meta.prompt,
+    size: meta.size,
+    model: meta.model,
+    quality: meta.quality,
+    background: meta.background,
+    hasRef: meta.hasRef,
+    groupId: meta.groupId,
+    parentId: meta.parentId,
+    characterId: meta.characterId,
+    configId: meta.configId,
+    seed: meta.seed,
+    elapsedMs: meta.elapsedMs,
+    createdAt: Date.now(),
+    results: res
+  }
+  const t = await makeThumb(res[0])
+  if (t) {
+    record.thumb = t.blob
+    record.w = t.w
+    record.h = t.h
+  }
+  if (meta.refSrc) record.ref = await refThumbOf(meta.refSrc)
+  return record
+}
+
+/* 一条记录:入内存 + 落盘。裁剪与落盘失败的处置只有这一处,
+   生成与对比出图的每条结果都走它 */
+/* —— 对比出图 ——
+   同一提示词并发发给每个选中的模型。单个槽位自己吞掉异常,一个失败不影响其他 ——
+   这正是这个功能最值钱的地方:并排就能看出是"提示词不行"还是"某个模型不行" */
+async function doRace() {
+  // 没地址或没密钥的配置发不出去,先摘掉:参与生成的必须是能真跑的
+  const targets = deps.selectedConfigs.value.filter((c) => c.baseUrl && c.apiKey)
+  if (targets.length < 2) {
+    deps.fail('Pick at least 2 image models with a base URL and an API key to compare')
+    deps.openPanel.value = 'config'
+    return
+  }
+  /* 与单模型那条路一致:套了角色就得把角色设定合成进去。
+     下面参考图与 characterId 都照常备着,提示词少了这一段的话,
+     出的图不像这个角色,记录却声称用了它 —— 预览里重跑还会再错一次 */
+  const runPrompt = composedPrompt()
+  const refSrc = refImage.value
+  /* 角色在对比出图里同样要并进去:那是另一条链路,参考图得在这儿另做一份快照 */
+  const refList: string[] = []
+  if (refSrc) refList.push(refSrc)
+  for (const s of await deps.charRefSrcs()) if (!refList.includes(s)) refList.push(s)
+  const groupId = `race-${Date.now().toString(36)}`
+  /* 尺寸与扩展参数在发起前逐配置定下来:中途改参数不该影响已经发出的这一批,
+     而且各模型的合法尺寸/参数本来就不一样,不能拿一家的能力套所有家。
+     张数固定 1:对比要看的是"哪个模型更好",不是每个模型各来三张 */
+  const slots: GenSlot[] = targets.map((c) => {
+    const s = seedForConfig(c)
+    return {
+      id: uid(),
+      // 每个模型各自成一条记录:这正是对比的意义
+      recordKey: c.id,
+      groupId,
+      config: c,
+      label: c.name || c.model || c.baseUrl,
+      model: c.model || '',
+      prompt: runPrompt,
+      size: sizeFor(c),
+      extras: extraParams(c),
+      ...(s !== undefined ? { seed: s } : {}),
+      refList,
+      refSrc: refSrc || undefined,
+      characterId: deps.activeCharId.value || undefined,
+      parentId: deps.pendingParentId.value,
+      startedAt: Date.now(),
+      state: 'running' as const,
+      results: []
+    }
+  })
+  await runBatch(slots)
+}
+
+/* 停掉一张。只掐这一个槽 —— 同一个模型出的另外几张、
+   以及叠着跑的另一批,都不该被牵连 */
+function stopSlot(id: string) {
+  const ctl = slotControllers.get(id)
+  if (ctl) {
+    ctl.abort()
+    return
+  }
+  /* 还没轮到它发出去(并发上限之外的那些)。不处理的话这一格会一直转 ——
+     用户点了停止却什么都没发生,比按钮没反应更糟 */
+  const slot = genSlots.value.find((s) => s.id === id)
+  if (slot?.state === 'running') slot.state = 'stopped'
+}
+/** 全部停下。骨架格上各自有停止键,这个入口是给"一次跑了十来张、
+ *  不想一个个点"的情况用的 */
+function stopAllSlots() {
+  for (const c of slotControllers.values()) c.abort()
+  // 排队中的那几个没有手柄可掐,得单独标记
+  for (const s of genSlots.value) if (s.state === 'running') s.state = 'stopped'
+}
+
+// 重试:按当前输入再发一次(用户可能已经改过提示词或参数,以界面上的为准)
+function retry() {
+  doGenerate()
+}
+
+
   return {
     prompt,
     enhancing,
@@ -305,6 +738,22 @@ function undoEnhance() {
     doEnhance,
     stopEnhance,
     onEnhanceClick,
-    undoEnhance
+    undoEnhance,
+    genSlots,
+    slotControllers,
+    activeSlots,
+    loading,
+    multiModel,
+    runLabel,
+    charSpecPrefix,
+    composedPrompt,
+    doGenerate,
+    recordFor,
+    runBatch,
+    persistBatch,
+    doRace,
+    stopSlot,
+    stopAllSlots,
+    retry
   }
 }

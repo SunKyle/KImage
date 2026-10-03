@@ -36,8 +36,10 @@ export interface CharacterDeps {
   history: Ref<HistoryEntry[]>
   /** 当前生效的厂商能力:决定设定图能挑哪一档尺寸 */
   provider: ComputedRef<Provider>
-  /** 挑不出合适档位时退回的那个尺寸(创作区当前尺寸) */
-  coverSize: Ref<string>
+  /** 挑不出合适档位时退回的那个尺寸(创作区当前尺寸)。
+   *  **传函数而不是 Ref**:那个尺寸由出图参数域提供,而那一域又要用这里的
+   *  charRefSrcs —— 传 Ref 会让两个 composable 互相等待对方先声明 */
+  coverSize: () => string
   /** 显示级压缩(主界面那份):角色图要给人看,不走"只喂给模型"的那条路 */
   compressImage: (
     dataUrl: string,
@@ -145,7 +147,7 @@ export function useCharacters(deps: CharacterDeps) {
        用的是对数距离(见 api.ts 的 sizeClosestTo)—— 同一件事两套度量。
        统一走那一个:对数距离才是比例该有的比法 */
     const best = sizeClosestTo(allowed === 'free' ? FREE_SIZES : allowed, want)
-    return best || deps.coverSize.value
+    return best || deps.coverSize()
   }
 
   /* —— 角色身上的图 ——
