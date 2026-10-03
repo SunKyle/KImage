@@ -45,6 +45,8 @@ const PROBE_REOPEN = args.includes('--probe-reopen')
 const PROBE_TWO_TABS = args.includes('--probe-two-tabs')
 /* 探画布的操作序列:上传一张图,旋转 → 撤销 → 重做 → 跳步,看步骤条对不对 */
 const PROBE_CANVAS = args.includes('--probe-canvas')
+/* 探接口配置那一域:设置页新增一条 → 回首页看参数行胶囊是不是它 */
+const PROBE_CONFIG = args.includes('--probe-config')
 /* 调试端口每轮随机取一个:固定端口会与上一次没退干净的实例撞车,
    而那种撞车表现为"连上了,但连到的是别人",量出来的数看着正常其实全错 */
 const PORT = Number(arg('cdp-port', 0)) || 9300 + Math.floor(Math.random() * 600)
@@ -809,6 +811,109 @@ async function main() {
     }
   }
 
+  /* —— 接口配置域探针 ——
+     新增一条配置走的是「预设 → 表单 → 保存 → 设为当前」这条链,
+     它横跨 useConfigs 的 saveSettings / 四类挑选 / 主界面参数行胶囊。
+     纯函数单测覆盖不到"点了一遍到底成没成",所以在真页面里走一遍。 */
+  let configProbe = null
+  if (PROBE_CONFIG) {
+    configProbe = { steps: [] }
+    const clickNav = async (label) => {
+      const box = await evaluate((l) => {
+        const b = document.querySelector(`button[aria-label="${l}"]`)
+        if (!b) return null
+        const r = b.getBoundingClientRect()
+        return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
+      }, label)
+      if (!box) return false
+      for (const type of ['mousePressed', 'mouseReleased']) {
+        await send('Input.dispatchMouseEvent', {
+          type,
+          x: box.x,
+          y: box.y,
+          button: 'left',
+          clickCount: 1
+        })
+      }
+      return true
+    }
+    try {
+      configProbe.openedSettings = await clickNav('Settings')
+      await sleep(700)
+      /* 空态给的是"四条能一键预填的入口"(.quick-item),点它会直接进表单并带好
+         地址与模型;已经有配置时才是列表页。两种都认,免得探针只在一种状态下有效 */
+      configProbe.clickedPreset = await evaluate(() => {
+        const quick = document.querySelector('.quick .quick-item')
+        if (quick) {
+          quick.click()
+          return 'quick:' + quick.textContent.trim().slice(0, 20)
+        }
+        const preset = document.querySelector('.presets button.preset')
+        if (preset) {
+          preset.click()
+          return 'preset:' + preset.textContent.trim().slice(0, 20)
+        }
+        // 列表页:点"新增"进表单
+        const add = [...document.querySelectorAll('button')].find((b) =>
+          /new config|add/i.test(b.textContent.trim())
+        )
+        if (add) {
+          add.click()
+          return 'add'
+        }
+        return 'missing'
+      })
+      await sleep(400)
+      configProbe.formShown = await evaluate(() => !!document.querySelector('input[type="url"], input#base-url, form input'))
+      // 填表:v-model 认 input 事件,所以赋值之后要派发一次
+      configProbe.filled = await evaluate(() => {
+        const set = (el, v) => {
+          if (!el) return false
+          el.value = v
+          el.dispatchEvent(new Event('input', { bubbles: true }))
+          return true
+        }
+        /* 这些 input 没有 id,只能按 placeholder 认 —— 表单里还有用途单选框,
+           所以"第 0 个 input"根本不是 Name 那一格(踩过) */
+        const inputs = [...document.querySelectorAll('form input')]
+        const name = inputs.find((i) => /e\.g\. Doubao/.test(i.placeholder || ''))
+        const url = inputs.find((i) => /^https:\/\/example\.com/.test(i.placeholder || ''))
+        const key = inputs.find((i) => i.type === 'password')
+        const okName = set(name, 'Probe config')
+        const okUrl = set(url, 'https://example.com/v1')
+        const okKey = set(key, 'sk-probe')
+        return { okName, okUrl, okKey, count: inputs.length, radios: inputs.filter((i) => i.type === 'radio').length }
+      })
+      await sleep(300)
+      configProbe.saved = await evaluate(() => {
+        const btn = [...document.querySelectorAll('form button')].find((b) =>
+          /^save$/i.test(b.textContent.trim())
+        )
+        if (!btn) return 'missing'
+        btn.click()
+        return 'clicked'
+      })
+      await sleep(600)
+      configProbe.listedAfterSave = await evaluate(() =>
+        /Probe config/.test(document.body.textContent || '')
+      )
+      // 回首页:参数行那个胶囊应当显示刚存的这条(说明"设为当前"这一步生效了)
+      configProbe.backHome = await clickNav('Studio')
+      await sleep(700)
+      configProbe.pillText = await evaluate(() => {
+        const pill = document.querySelector('.param-btn .param-val-name')
+        return pill ? pill.textContent.trim() : ''
+      })
+      configProbe.passed =
+        configProbe.openedSettings === true &&
+        configProbe.saved === 'clicked' &&
+        configProbe.listedAfterSave === true &&
+        configProbe.pillText === 'Probe config'
+    } catch (e) {
+      configProbe.error = String(e.message || e)
+    }
+  }
+
   const heap = await evaluate(() => {
     const m = performance.memory
     return m ? { usedMB: +(m.usedJSHeapSize / 1048576).toFixed(1) } : null
@@ -827,6 +932,7 @@ async function main() {
     reopen,
     twoTabs,
     canvas,
+    config: configProbe,
     history,
     heap
   }
@@ -853,6 +959,16 @@ async function main() {
       console.log('   ', JSON.stringify(canvas.steps))
       process.exitCode = 1
     }
+  }
+
+  if (configProbe) {
+    const ok = configProbe.passed === true
+    console.log(
+      `${ok ? '✅' : '❌'} 接口配置域(设置页新增一条 → 回首页成为当前)${
+        ok ? '' : ` — ${JSON.stringify(configProbe)}`
+      }`
+    )
+    if (!ok) process.exitCode = 1
   }
 
   if (twoTabs) {

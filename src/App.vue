@@ -38,16 +38,6 @@ import {
   enhancePrompt,
   uid,
   loadConfigs,
-  saveConfigs,
-  pickActiveByKind,
-  loadActiveId,
-  saveActiveId,
-  loadActiveTextId,
-  saveActiveTextId,
-  loadActiveVisionId,
-  saveActiveVisionId,
-  loadActiveTtsId,
-  saveActiveTtsId,
   loadHistory,
   mergeHistory,
   addHistoryRecord,
@@ -75,10 +65,7 @@ import {
   getProvider,
   vendorOf,
   allowedSizes,
-  sizeOptionsFor,
-  sizeIsFree,
   acceptableSize,
-  defaultSizeFor,
   sizeClosestTo,
   sizeForVendor,
   normalizeSize,
@@ -100,6 +87,7 @@ import { titleFromPrompt } from './lib/text'
 import { stopSpeaking } from './lib/speech'
 import { NAV_ITEMS } from './lib/nav'
 import { useFeedback } from './composables/useFeedback'
+import { useConfigs } from './composables/useConfigs'
 // 另一个标签页改了 localStorage 里的目录时,本页要跟着重载(见 lib/crossTab.ts)
 import {
   openSyncChannel,
@@ -119,7 +107,7 @@ import {
   watchSystemTheme,
   type Theme
 } from './lib/theme'
-import type { Cap, EnhanceMode, Provider } from './api'
+import type { EnhanceMode } from './api'
 import type { ApiConfig, Collection, FavoritePayload, HistoryEntry, PromptItem, ResultItem, ReuseParams, Character, CharacterFields, CharacterPersona, CharacterStat, CharacterView, CharacterViewKind, CharacterVoice, CharacterWork, ChatMessage, ChatSummary, ImportedCharacter, ImportedChat } from './types'
 
 // —— 状态 ——
@@ -159,6 +147,61 @@ const {
   commitUndo,
   runUndo
 } = useFeedback()
+
+/* 接口配置这一域(列表 / 四类当前生效 / 能力派生 / 增删改与导入导出)收在
+   composables/useConfigs.ts —— 它只依赖「删除的撤销窗口」与「怎么进设置页」两件事 */
+const {
+  configs,
+  config,
+  activeId,
+  textConfig,
+  activeTextId,
+  visionConfig,
+  activeVisionId,
+  ttsConfig,
+  activeTtsId,
+  cfgView,
+  cfgSeed,
+  selectedIds,
+  RACE_MAX,
+  activeConfigName,
+  activeTextName,
+  imageConfigs,
+  textConfigs,
+  visionConfigs,
+  provider,
+  capabilityNote,
+  sizeOptions,
+  sizeFree,
+  defaultSize,
+  selectedConfigs,
+  compareMode,
+  configured,
+  initConfigs,
+  repickActiveImage,
+  repickActiveText,
+  repickActiveVision,
+  repickActiveTts,
+  activateConfig,
+  activateTextConfig,
+  activateVisionConfig,
+  activateTtsConfig,
+  newConfig,
+  duplicateConfig,
+  editConfig,
+  cancelConfig,
+  openConfigManager,
+  saveSettings,
+  removeConfig,
+  importConfigs,
+} = useConfigs({
+  scheduleUndo,
+  // 从参数面板进设置页:切页与收起面板都归主界面
+  enterSettings: () => {
+    page.value = 'settings'
+    openPanel.value = ''
+  }
+})
 
 const history = ref<HistoryEntry[]>([])
 // 作品集目录(只有标题 + id)。归属关系挂在记录上,这里只存目录
@@ -417,26 +460,6 @@ function focusPrompt() {
   promptEl.value?.focus({ preventScroll: true })
 }
 
-// 当前激活配置的名称(未配置时显示占位)
-const activeConfigName = computed(() => config.value.name || config.value.baseUrl || 'Not configured')
-
-/* 文本模型与出图配置并排各占一个胶囊:改写用哪个模型也是一眼该看到的状态。
-   名字优先,没起名字退回模型名 —— 裸地址在胶囊里太长,且对不上"这是哪个模型" */
-const activeTextName = computed(() => {
-  const c = textConfig.value
-  if (!c) return 'Not set'
-  return c.name || c.model || 'Not configured'
-})
-
-/* 参数面板按用途分开列出:出图、改写、识图与朗读各有各的"当前",混在一排里点谁生效说不清,
-   而且文本/识图配置被 activateConfig 选中会顶掉出图用的接口。
-   出图那条要排掉另外三类 —— 它们也走配置列表,但打的是对话端点或语音端点,拿来出图必错 */
-const imageConfigs = computed(
-  () => configs.value.filter((c) => c.kind !== 'text' && c.kind !== 'vision' && c.kind !== 'tts')
-)
-const textConfigs = computed(() => configs.value.filter((c) => c.kind === 'text'))
-const visionConfigs = computed(() => configs.value.filter((c) => c.kind === 'vision'))
-
 // —— 历史图墙(输入框下方,可收起) ——
 const feedOpen = ref(true)
 const FEED_LIMIT = 12
@@ -498,32 +521,6 @@ function onFeedLoad(key: string, entry: HistoryEntry, e: Event) {
   measured.value[key] = Math.min(2, Math.max(0.5, img.naturalWidth / img.naturalHeight))
 }
 
-// 当前生效的厂商:配置里没写就按域名猜(兼容加字段之前存的老配置)
-const vendorId = computed(() => vendorOf(config.value))
-const provider = computed<Provider>(() => {
-  // 带上模型:能力表按 (厂商, 模型) 解析 —— 中转上同一个地址的模型可能走不同协议
-  return getProvider(vendorId.value, config.value.model)
-})
-// 设置页表头那句能力说明:描述的是当前生效的那个接口,不是表单里正在挑的。
-// 界面上的参数门控本来就照生效配置来,说明文字要是跟着草稿走,两者就对不上了
-const capabilityNote = computed(() => {
-  const p = provider.value
-  const t = (c: Cap) => (c === 'yes' ? 'Yes' : c === 'no' ? 'No' : 'Varies')
-  /* Gemini 的图生图没有独立端点:参考图是同一个 :generateContent 里的另一段 parts。
-     照 edit 字段写就会显示成 /images/generations,那是错的 */
-  const i2i =
-    p.protocol === 'gemini'
-      ? ':generateContent'
-      : p.edit === 'edits'
-        ? '/images/edits'
-        : '/images/generations'
-  return `Active API: quality ${t(p.quality)} · background ${t(p.background)} · image-to-image via ${i2i}`
-})
-/* 尺寸候选、是否开放手填、默认档 —— 判断都在 api.ts(它们只看厂商能力表,
-   与界面无关,收在那儿才测得了;见 sizeOptionsFor / sizeIsFree / defaultSizeFor) */
-const sizeOptions = computed(() => sizeOptionsFor(vendorId.value, config.value.model))
-const sizeFree = computed(() => sizeIsFree(vendorId.value, config.value.model))
-const defaultSize = computed(() => defaultSizeFor(sizeOptions.value))
 const moreCustom = computed(
   () =>
     n.value !== 1 ||
@@ -636,45 +633,10 @@ const wordmarkSuffix = computed(() => NAV_ITEMS.find((i) => i.value === page.val
 // 切视图后回到顶部:否则在首页滚到一半再切过去,新页面会停在半空
 watch(navView, () => window.scrollTo({ top: 0 }))
 // 全部已保存的接口配置
-const configs = ref<ApiConfig[]>([])
-// 当前生效的配置:生成请求照它发。它和设置页里的表单草稿是两码事,
-// 改表单不会动它,只有点了保存才会
-const config = ref<ApiConfig>({ id: '', name: '', baseUrl: '', apiKey: '', model: '' })
-const activeId = ref('')
-// 提示词增强用的文本配置:与出图配置同在一个列表里,只是用途为 'text'。
-// 拷贝一份与 config 同理 —— 改设置页表单不会动它,只有存下/设当前才会。
-// null 表示列表里还没有文本配置(增强按钮会提示去设置页配一条)
-const textConfig = ref<ApiConfig | null>(null)
-// 文本类别当前生效配置的 id,与 activeId 各自独立
-const activeTextId = ref(loadActiveTextId())
-/* 识图用的配置:把角色向导里上传的参考图读成设定。三类配置同在 configs 里,
-   只是用途不同 —— 能画图的模型未必会看图,所以它是一条独立的「当前」 */
-const visionConfig = ref<ApiConfig | null>(null)
-const activeVisionId = ref(loadActiveVisionId())
-/* 朗读用的合成配置。前三类打的都是 OpenAI 兼容那套,这一条不是 ——
-   它走 /api/v3/tts/...,还要一个 Resource-Id(见 types.ts 的 ApiConfig.resourceId)。
-   同样是一条独立的「当前」:朗读配置被选中不该顶掉出图或改写 */
-const ttsConfig = ref<ApiConfig | null>(null)
-const activeTtsId = ref(loadActiveTtsId())
-// 接口设置页的视图:'list' = 已保存接口列表,'form' = 新增/编辑接口表单(独立一屏)
-const cfgView = ref<'list' | 'form'>('list')
-// 表单页要编辑/复制的来源;null 表示新增空白。
-// 草稿本身由页面组件持有,这里只给种子 —— 于是「返回列表」是真正的放弃修改
-const cfgSeed = ref<ApiConfig | null>(null)
-
 /* —— 对比出图(Model Race) ——
    把同一句提示词一次发给多个出图配置,并排看结果。这是"自带多家模型"才有的事:
    官方 app 只能跑自家模型。代价是花费按模型数翻倍。
    没有单独的"对比"开关:芯片本来就是多选,选一个 = 平时那样,选两个以上 = 对比 */
-const selectedIds = ref<string[]>([])
-// 一次最多几个:花费线性增长,四个已经排满一屏
-const RACE_MAX = 4
-// 参与这次生成的配置。存 id 不存配置对象:设置页改了名字或地址,这里自动跟着走
-const selectedConfigs = computed(() =>
-  imageConfigs.value.filter((c) => selectedIds.value.includes(c.id))
-)
-// 多选即对比
-const compareMode = computed(() => selectedConfigs.value.length > 1)
 /* —— 生成中的每一张 = 一个槽 ——
    为什么不是"一次点击一个槽"而是一张一个:用户要的是每格能单独停,
    而"一次请求出 4 张"没法停下其中一张 —— 上游回来就是一整包。
@@ -760,51 +722,8 @@ watch(
 )
 
 onMounted(() => {
-  configs.value = loadConfigs()
-  activeId.value = loadActiveId()
-  // 选中激活配置;无激活则取第一条出图配置(文本配置不能顶出图的当前位置)
-  const active = pickActiveByKind(configs.value, 'image', activeId.value)
-  if (active) {
-    config.value = { ...active }
-    // 存着的 activeId 可能指向已被删掉的配置:一并回填成真正选中的那条。
-    // 设置页的「当前」标记就是按 activeId 比的,不同步的话一条都不会亮
-    if (activeId.value !== active.id) {
-      activeId.value = active.id
-      saveActiveId(active.id)
-    }
-    // 选择集合起手就是"当前这一条":单选是常态,多选是用户一个个点出来的
-    selectedIds.value = [active.id]
-  }
-  // 文本配置:按 activeTextId 在列表里找用途为 text 的那条;
-  // 没命中(存着的 id 已被删/被改用途)就退而取第一条文本配置并回填 ——
-  // 只有一条时这是显然的选择,比空着好。一条都没有则保持 null
-  const activeText = pickActiveByKind(configs.value, 'text', activeTextId.value)
-  if (activeText) {
-    textConfig.value = { ...activeText }
-    if (activeTextId.value !== activeText.id) {
-      activeTextId.value = activeText.id
-      saveActiveTextId(activeText.id)
-    }
-  }
-  // 识图配置:与文本那条同一套挑法(按存的 id 找,落空就退到第一条)
-  const activeVision = pickActiveByKind(configs.value, 'vision', activeVisionId.value)
-  if (activeVision) {
-    visionConfig.value = { ...activeVision }
-    if (activeVisionId.value !== activeVision.id) {
-      activeVisionId.value = activeVision.id
-      saveActiveVisionId(activeVision.id)
-    }
-  }
-  // 朗读配置:同一套挑法。没配时 ttsConfig 为 null 是正常的 ——
-  // 朗读会退回浏览器自带的语音(见 lib/speech),不是错误
-  const activeTts = pickActiveByKind(configs.value, 'tts', activeTtsId.value)
-  if (activeTts) {
-    ttsConfig.value = { ...activeTts }
-    if (activeTtsId.value !== activeTts.id) {
-      activeTtsId.value = activeTts.id
-      saveActiveTtsId(activeTts.id)
-    }
-  }
+  // 四类「当前生效」的启动挑选(含「存的 id 已失效 / 用途被改」的回退)
+  initConfigs()
   /* 库封面存在 IndexedDB 里,读取因此是异步的(见 api.ts 的 loadPrompts)。
      不 await —— 首页不必等它,提示词库页挂载时数据早到了 */
   loadPrompts().then((list) => (libItems.value = list))
@@ -967,252 +886,6 @@ async function reloadChatFromDb(id: string) {
   await loadChatLast()
 }
 
-/* 新建一份配置(进入独立的新增接口表单页)。
-   空态的四条入口会带一份预填好的 seed(厂商的地址与模型),不带则是一张空表单 */
-function newConfig(seed?: ApiConfig) {
-  cfgSeed.value = seed ?? null
-  cfgView.value = 'form'
-}
-// 复制已有配置:基于它生成一份新编辑(切到表单页)
-function duplicateConfig(c: ApiConfig) {
-  cfgSeed.value = { ...c, id: '', name: c.name ? `${c.name} copy` : 'Config copy' }
-  cfgView.value = 'form'
-}
-// 编辑已有配置:带入该配置,切到表单页
-function editConfig(c: ApiConfig) {
-  cfgSeed.value = { ...c }
-  cfgView.value = 'form'
-}
-/* 当前生效的出图配置指向了一条已经不存在的(或已经改了用途的)配置时,
-   按用途重挑一条;一条都没有就清空。删除与"改用途"两条路共用它 ——
-   不收拾的话生效值会悬空:界面显示着它,它却已经发不出请求 */
-function repickActiveImage() {
-  const next = pickActiveByKind(configs.value, 'image', activeId.value)
-  if (next) {
-    config.value = { ...next }
-    activeId.value = next.id
-    saveActiveId(next.id)
-  } else {
-    config.value = { id: '', name: '', baseUrl: '', apiKey: '', model: '', vendor: 'custom' }
-    activeId.value = ''
-    saveActiveId('')
-  }
-}
-// 文本侧同理。没有文本配置时 textConfig 为 null 是正常态,增强按钮会提示去配一条
-function repickActiveText() {
-  const next = pickActiveByKind(configs.value, 'text', activeTextId.value)
-  if (next) {
-    activateTextConfig(next)
-  } else {
-    textConfig.value = null
-    activeTextId.value = ''
-    saveActiveTextId('')
-  }
-}
-// 识图侧同理:没有识图配置时 visionConfig 为 null,角色向导里会提示去配一条
-function repickActiveVision() {
-  const next = pickActiveByKind(configs.value, 'vision', activeVisionId.value)
-  if (next) {
-    activateVisionConfig(next)
-  } else {
-    visionConfig.value = null
-    activeVisionId.value = ''
-    saveActiveVisionId('')
-  }
-}
-/* 朗读侧同理。**它与上面三条有一处不同**:ttsConfig 为 null 不是错误态 ——
-   朗读会自动走浏览器自带的语音,只是听起来不是这个角色自己的嗓子 */
-function repickActiveTts() {
-  const next = pickActiveByKind(configs.value, 'tts', activeTtsId.value)
-  if (next) {
-    activateTtsConfig(next)
-  } else {
-    ttsConfig.value = null
-    activeTtsId.value = ''
-    saveActiveTtsId('')
-  }
-}
-
-// 保存表单草稿(新增或更新),并设为对应用途的激活项
-function saveSettings(draft: ApiConfig) {
-  const cfg = {
-    ...draft,
-    id: draft.id || uid(),
-    name: draft.name.trim() || cfgNameFromUrl(draft.baseUrl)
-  }
-  const idx = configs.value.findIndex((c) => c.id === cfg.id)
-  /* 这一条原来是什么用途。表单允许改用途(见设置页的 setPurpose),
-     改过之后它必须从原来那一侧退场 —— 否则那一侧的「当前生效」
-     还留着它改之前的快照:界面说当前用它,实际发出去的却已经不是一回事了 */
-  const prevKind = idx >= 0 ? configs.value[idx].kind : undefined
-  const kind =
-    cfg.kind === 'text'
-      ? 'text'
-      : cfg.kind === 'vision'
-        ? 'vision'
-        : cfg.kind === 'tts'
-          ? 'tts'
-          : 'image'
-  if (idx >= 0) configs.value[idx] = cfg
-  else configs.value.push(cfg)
-  saveConfigs(configs.value)
-
-  // 换了用途 ⇒ 原来那一侧的「当前」必须重挑,不能留着一个已经不属于它的快照
-  if (prevKind && prevKind !== kind) {
-    if (prevKind === 'text') {
-      if (activeTextId.value === cfg.id) repickActiveText()
-    } else if (prevKind === 'vision') {
-      if (activeVisionId.value === cfg.id) repickActiveVision()
-    } else if (prevKind === 'tts') {
-      if (activeTtsId.value === cfg.id) repickActiveTts()
-    } else {
-      if (activeId.value === cfg.id) repickActiveImage()
-      // 它也不再参与出图的选择集合(那个集合决定这次发给哪些模型)
-      selectedIds.value = selectedIds.value.filter((id) => id !== cfg.id)
-      if (!selectedIds.value.length && config.value.id) selectedIds.value = [config.value.id]
-    }
-  }
-
-  /* 按用途分派到各自的「当前生效」:四类各自独立,存一条不该把别类的当前项顶掉
-     (反之亦然)。同步成副本而不是直接用 cfg —— 之后改表单草稿不能再牵动生效值。 */
-  if (kind === 'text') {
-    textConfig.value = { ...cfg }
-    activeTextId.value = cfg.id
-    saveActiveTextId(cfg.id)
-  } else if (kind === 'vision') {
-    visionConfig.value = { ...cfg }
-    activeVisionId.value = cfg.id
-    saveActiveVisionId(cfg.id)
-  } else if (kind === 'tts') {
-    ttsConfig.value = { ...cfg }
-    activeTtsId.value = cfg.id
-    saveActiveTtsId(cfg.id)
-  } else {
-    config.value = { ...cfg }
-    activeId.value = cfg.id
-    saveActiveId(cfg.id)
-    /* 选择集合里必须有"当前"这条,否则参数行胶囊写着它、生成用的却是别的。
-       新建一条时直接收敛成只选它(刚建好就是要用它);改一条已有的,
-       缺了才补上,不能把正在做的多模型对比打散。已经选满则同样收敛 */
-    if (!selectedIds.value.includes(cfg.id)) {
-      selectedIds.value =
-        idx < 0 || selectedIds.value.length >= RACE_MAX ? [cfg.id] : [...selectedIds.value, cfg.id]
-    }
-  }
-  // 留在设置页看列表:刚存下的那条会带「当前」标记,比直接跳走更容易确认
-  cfgView.value = 'list'
-}
-// 从地址推导一个默认名称
-function cfgNameFromUrl(url: string): string {
-  try {
-    return new URL(url).hostname || 'Untitled config'
-  } catch {
-    return 'Untitled config'
-  }
-}
-// 从表单返回列表视图
-function cancelConfig() {
-  cfgView.value = 'list'
-}
-// 从参数面板进入接口设置页
-function openConfigManager() {
-  cfgView.value = configs.value.length ? 'list' : 'form'
-  // 种子清空:空表单页不该带着上一次编辑的内容
-  cfgSeed.value = null
-  page.value = 'settings'
-  openPanel.value = ''
-}
-// 设某条配置为激活
-function activateConfig(c: ApiConfig) {
-  config.value = { ...c }
-  activeId.value = c.id
-  saveActiveId(c.id)
-}
-// 设某条文本配置为当前生效(与 activateConfig 同一套做法,只是走文本那条通道)
-function activateTextConfig(c: ApiConfig) {
-  textConfig.value = { ...c }
-  activeTextId.value = c.id
-  saveActiveTextId(c.id)
-}
-// 设某条识图配置为当前生效(同上,走识图那条通道)
-function activateVisionConfig(c: ApiConfig) {
-  visionConfig.value = { ...c }
-  activeVisionId.value = c.id
-  saveActiveVisionId(c.id)
-}
-// 设某条朗读配置为当前生效(同上,走朗读那条通道)
-function activateTtsConfig(c: ApiConfig) {
-  ttsConfig.value = { ...c }
-  activeTtsId.value = c.id
-  saveActiveTtsId(c.id)
-}
-/* 删除一条配置;若删的是激活项,自动激活剩余第一条。
-   删除本身立刻改列表,但落盘推迟到撤销窗口结束 —— 于是"撤销"只要把这一条
-   放回去、并把「当前生效」的指向恢复即可,不必从磁盘上搬回来。
-   恢复时用的是"当前列表 + 插回这一条",不是整份旧快照:
-   窗口里万一正好改了别的配置,不该被这次撤销一起回滚 */
-function removeConfig(c: ApiConfig) {
-  const at = configs.value.findIndex((x) => x.id === c.id)
-  if (at < 0) return
-  const wasActive = activeId.value === c.id
-  const wasActiveText = activeTextId.value === c.id
-  const wasActiveVision = activeVisionId.value === c.id
-  const wasActiveTts = activeTtsId.value === c.id
-  const wasSelected = selectedIds.value.includes(c.id)
-
-  /* 选择集合里也要摘掉它:被删的那条不再参与生成,但它留在集合里会让
-     长度算错 —— 剩两条其实只剩一条,却仍被当成对比模式。摘完一个不剩就退回当前这条 */
-  configs.value = configs.value.filter((x) => x.id !== c.id)
-  // 占着各自「当前生效」的那条被删掉时,同样要按用途重新挑一条,免得生效值悬空
-  if (wasActiveText) repickActiveText()
-  if (wasActiveVision) repickActiveVision()
-  if (wasActiveTts) repickActiveTts()
-  if (wasActive) repickActiveImage()
-  selectedIds.value = selectedIds.value.filter((id) => id !== c.id)
-  if (!selectedIds.value.length && config.value.id) selectedIds.value = [config.value.id]
-
-  scheduleUndo({
-    label: 'Config deleted',
-    undo: () => {
-      configs.value = [
-        ...configs.value.slice(0, Math.min(at, configs.value.length)),
-        c,
-        ...configs.value.slice(Math.min(at, configs.value.length))
-      ]
-      if (wasSelected && !selectedIds.value.includes(c.id)) {
-        selectedIds.value = [...selectedIds.value, c.id]
-      }
-      // 恢复「当前生效」的指向。它当初是被这次删除夺走的,现在物归原主
-      if (wasActive) {
-        config.value = { ...c }
-        activeId.value = c.id
-        saveActiveId(c.id)
-      }
-      if (wasActiveText) {
-        textConfig.value = { ...c }
-        activeTextId.value = c.id
-        saveActiveTextId(c.id)
-      }
-      if (wasActiveVision) {
-        visionConfig.value = { ...c }
-        activeVisionId.value = c.id
-        saveActiveVisionId(c.id)
-      }
-      if (wasActiveTts) {
-        ttsConfig.value = { ...c }
-        activeTtsId.value = c.id
-        saveActiveTtsId(c.id)
-      }
-      saveConfigs(configs.value)
-    },
-    purge: () => saveConfigs(configs.value)
-  })
-}
-
-function configured() {
-  return !!config.value.baseUrl
-}
-
 /* 套用尺寸(从库取用、或复现某条记录):合不合法由 api.ts 判(见 acceptableSize)。
    原来这里只查了一遍候选列表,漏掉了"auto 不在列表里、而是单独一档能力"——
    于是一条存着 auto 的记录套到豆包那种认枚举尺寸的配置上,会把 auto 原样发出去,
@@ -1310,69 +983,6 @@ async function importLibItems(items: PromptItem[]) {
   }
   libItems.value = [...clean, ...libItems.value]
   await persistLib()
-}
-
-/* 导入的配置来自外部文件,逐条规整:没有 baseUrl 的存下来也发不出请求;
-   id 若和现有的撞了必须换新的,否则列表里两条同 id,渲染和删除都会错乱 */
-function importConfigs(list: ApiConfig[]) {
-  /* 撞 id 就换新的。这里必须维护一份"这次已经用掉的 id",不能只跟现有列表比:
-     map 期间 configs.value 不变,同一个文件里两条同 id 会双双通过 */
-  const seen = new Set(configs.value.map((c) => c.id))
-  const clean: ApiConfig[] = list
-    .filter((c) => c && typeof c.baseUrl === 'string' && c.baseUrl.trim())
-    .map((c) => {
-      let id = typeof c.id === 'string' && c.id ? c.id : uid()
-      if (seen.has(id)) id = uid()
-      seen.add(id)
-      return {
-        id,
-        name: typeof c.name === 'string' && c.name.trim() ? c.name : cfgNameFromUrl(c.baseUrl),
-        baseUrl: c.baseUrl.trim(),
-        apiKey: typeof c.apiKey === 'string' ? c.apiKey : '',
-        model: typeof c.model === 'string' ? c.model : '',
-        vendor: typeof c.vendor === 'string' ? c.vendor : 'custom',
-        // 外部文件的脏数据不该让配置错类:只认得出 text / vision / tts,其余一律当出图
-        kind:
-          c.kind === 'text'
-            ? ('text' as const)
-            : c.kind === 'vision'
-              ? ('vision' as const)
-              : c.kind === 'tts'
-                ? ('tts' as const)
-                : ('image' as const),
-        /* 朗读那条的资源标识。丢掉它的话,导入进来的朗读配置会变成
-           "地址与密钥都对、但每次请求都被上游拒掉(access denied)",
-           而原因藏在一格看不见的字段里 */
-        ...(typeof c.resourceId === 'string' && c.resourceId.trim()
-          ? { resourceId: c.resourceId.trim() }
-          : {})
-      }
-    })
-  if (!clean.length) return
-  // 追加而不是覆盖:导入是补充,不该把现有配置清掉
-  configs.value = [...clean, ...configs.value]
-  saveConfigs(configs.value)
-  // 原本一条都没配(生成会被拦下来)时,顺手把导入里第一条出图配置设为当前,不然导完照样发不出请求
-  if (!configured()) {
-    const first = configs.value.find(
-      (c) => c.kind !== 'text' && c.kind !== 'vision' && c.kind !== 'tts'
-    )
-    if (first) {
-      config.value = { ...first }
-      activeId.value = first.id
-      saveActiveId(first.id)
-    }
-  }
-  // 文本那边同理:还没有当前生效的文本配置时,取导入进来(或现有)的第一条文本配置
-  if (!textConfig.value) {
-    const nextText = configs.value.find((c) => c.kind === 'text')
-    if (nextText) activateTextConfig(nextText)
-  }
-  // 识图那边同理 —— 三类「当前」互不隶属,缺哪一条就补哪一条
-  if (!visionConfig.value) {
-    const nextVision = configs.value.find((c) => c.kind === 'vision')
-    if (nextVision) activateVisionConfig(nextVision)
-  }
 }
 
 // —— 图生图:读取本地图片为 data URL(压缩到最长边 REF_IMAGE_EDGE,避免请求体过大 413) ——
