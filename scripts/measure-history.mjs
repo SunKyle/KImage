@@ -1535,9 +1535,11 @@ async function main() {
         )
         const order = withPhoto
           ? (() => {
+              /* 图外面包了一层按钮(为了键盘也能点开),所以不能只看直接子节点的类名,
+                 要看"哪一个子节点里装着那张图" */
               const nodes = [...withPhoto.children]
               const textAt = nodes.findIndex((n) => n.classList?.contains('bubble'))
-              const imgAt = nodes.findIndex((n) => n.classList?.contains('msg-photo'))
+              const imgAt = nodes.findIndex((n) => !!n.querySelector?.('img.msg-photo'))
               const inBubble = !!withPhoto.querySelector('.bubble')?.querySelector('.msg-photo')
               return { textAt, imgAt, inBubble }
             })()
@@ -1558,7 +1560,28 @@ async function main() {
         }
       })
 
-      // ④ 清空对话(菜单里那一项)
+      // ④ 点图开大图 → Esc 收起
+      chatProbe.clickedPhoto = await evaluate(() => {
+        const b = document.querySelector('button.msg-img-btn')
+        if (!b) return 'missing'
+        b.click()
+        return 'clicked'
+      })
+      await settle()
+      chatProbe.zoom = await evaluate(() => {
+        const z = document.querySelector('.zoom img')
+        return { open: !!z, isBlob: (z?.getAttribute('src') || '').startsWith('blob:') }
+      })
+      await send('Input.dispatchKeyEvent', {
+        type: 'keyDown',
+        key: 'Escape',
+        code: 'Escape',
+        windowsVirtualKeyCode: 27
+      })
+      await settle()
+      chatProbe.zoomClosed = await evaluate(() => !document.querySelector('.zoom'))
+
+      // ⑤ 清空对话(菜单里那一项)
       chatProbe.openedMenu = await evaluate(() => {
         const b = document.querySelector('button[aria-label="Conversation options"]')
         if (!b) return 'missing'
@@ -1593,6 +1616,10 @@ async function main() {
         chatProbe.rendered?.photoOutsideBubble === true &&
         chatProbe.rendered?.photoWidth > 0 &&
         chatProbe.rendered?.photoWidth <= 240 &&
+        chatProbe.clickedPhoto === 'clicked' &&
+        chatProbe.zoom?.open === true &&
+        chatProbe.zoom?.isBlob === true &&
+        chatProbe.zoomClosed === true &&
         chatProbe.clickedClear === 'clicked' &&
         chatProbe.afterClear?.bubbles === 0 &&
         chatProbe.afterClear?.memoryGone === true &&

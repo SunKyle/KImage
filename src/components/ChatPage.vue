@@ -433,6 +433,14 @@ const CHAT_IMAGE_MAX = REF_IMAGE_EDGE
 const imgInput = ref<HTMLInputElement | null>(null)
 const attach = ref<{ blob: Blob; url: string } | null>(null)
 
+/* 点开的大图。**只存 url 不存 id**:URL 是 imgUrl() 那份缓存里的同一个,
+   它本来就活到页面卸载为止,这里再建一次反而要多记一个要回收的东西 */
+const zoom = ref<{ url: string; alt: string } | null>(null)
+function openZoom(id: string, alt: string) {
+  const url = imgUrl(id)
+  if (url) zoom.value = { url, alt }
+}
+
 function clearAttach() {
   if (attach.value) URL.revokeObjectURL(attach.value.url)
   attach.value = null
@@ -577,6 +585,8 @@ function onDocPointerDown(e: PointerEvent) {
  *  与角色页的查看器同一套规矩 */
 function onKey(e: KeyboardEvent) {
   layerOnEscape(e.key, [
+    // 大图压在最上面:它在时先收它,别让一次 Esc 把下面的菜单也带走
+    { open: !!zoom.value, close: () => (zoom.value = null) },
     { open: pickerOpen.value, close: () => void closePicker() },
     { open: menuOpen.value, close: closeMenu }
   ])
@@ -836,12 +846,15 @@ onBeforeUnmount(() => {
               <div v-else class="msg" :class="r.msg.role">
                 <!-- 用户附的图。**独立一块,不放进气泡**(文字有文字的框,图有图的位置)。
                      压在文字上面是因为它是那句话的前提:先看图,再读字 -->
-                <img
+                <button
                   v-if="r.msg.role === 'user' && r.msg.imageId && imgUrl(r.msg.imageId)"
-                  class="msg-img"
-                  :src="imgUrl(r.msg.imageId)"
-                  alt="Attached image"
-                />
+                  type="button"
+                  class="msg-img-btn"
+                  aria-label="Open attached image"
+                  @click="openZoom(r.msg.imageId, 'Attached image')"
+                >
+                  <img class="msg-img" :src="imgUrl(r.msg.imageId)" alt="Attached image" />
+                </button>
                 <div class="bubble">
                   <!-- 说了谁说的。左右对齐和底色是给眼睛的,
                        读屏读不出这两种区别,不补一句就只剩一堆光秃秃的句子 -->
@@ -875,12 +888,19 @@ onBeforeUnmount(() => {
                 <!-- 角色发来的图。**也在气泡外面**,垫在它说的话下面:
                      先读它说什么,再看它给你看什么。还没有 photoId = 正在画,
                      占一个同尺寸的方骨架位,免得图到了把整段对话顶下去 -->
-                <img
+                <button
                   v-if="r.msg.role === 'assistant' && r.msg.photoId && imgUrl(r.msg.photoId)"
-                  class="msg-photo"
-                  :src="imgUrl(r.msg.photoId)"
-                  alt="Photo from the character"
-                />
+                  type="button"
+                  class="msg-img-btn"
+                  :aria-label="`Open the photo from ${current.name}`"
+                  @click="openZoom(r.msg.photoId, 'Photo from the character')"
+                >
+                  <img
+                    class="msg-photo"
+                    :src="imgUrl(r.msg.photoId)"
+                    alt="Photo from the character"
+                  />
+                </button>
                 <span
                   v-else-if="r.msg.role === 'assistant' && r.msg.photo"
                   class="msg-photo msg-photo-skel"
@@ -1022,6 +1042,22 @@ onBeforeUnmount(() => {
       </div>
     </div>
   </div>
+
+    <!-- 大图。点背景或 Esc 收起 —— 与历史页那个查看器同一个交互,
+         但这里只有一张图,不值得为它拉起整套 ImagePreview(那条链绑的是记录) -->
+    <div
+      v-if="zoom"
+      class="zoom"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Image preview"
+      @click.self="zoom = null"
+    >
+      <img :src="zoom.url" :alt="zoom.alt" />
+      <button class="zoom-x" type="button" aria-label="Close" @click="zoom = null">
+        <PhX aria-hidden="true" />
+      </button>
+    </div>
 </template>
 
 <style scoped>
@@ -1804,6 +1840,50 @@ onBeforeUnmount(() => {
 
 /* 角色发来的那张:占满气泡宽度、垫在文字下方。骨架用同一个方块比例 ——
    图是异步到的,比例写死才不会在它到达时把整段对话顶下去 */
+/* 图包在按钮里:鼠标是"点开看大图",键盘也点得开(那才是可访问的写法)。
+   按钮只做容器,不留自己的框线 —— 看起来仍是一张图 */
+.msg-img-btn {
+  display: block;
+  padding: 0;
+  border: 0;
+  background: none;
+  cursor: zoom-in;
+}
+.zoom {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4vmin;
+  background: rgb(0 0 0 / 72%);
+  backdrop-filter: blur(2px);
+}
+.zoom img {
+  max-width: 100%;
+  max-height: 100%;
+  border-radius: 12px;
+  box-shadow: 0 18px 60px rgb(0 0 0 / 45%);
+  cursor: default;
+}
+.zoom-x {
+  position: absolute;
+  top: 18px;
+  right: 18px;
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  border: 0;
+  border-radius: 50%;
+  color: #fff;
+  background: rgb(255 255 255 / 14%);
+  cursor: pointer;
+}
+.zoom-x:hover {
+  background: rgb(255 255 255 / 24%);
+}
 .msg-photo {
   display: block;
   /* **比例跟着图自己走**。原来这里写死 1:1 再用 object-fit: cover 裁,
