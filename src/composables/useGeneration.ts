@@ -322,9 +322,12 @@ function undoEnhance() {
       const res = await generate(
         {
           prompt,
-          /* 过一遍 sizeFor:与创作区那条路同一个口径 —— 万一当前尺寸不是
-             这条配置认的档位(中途换过配置),这里会收敛成合法值 */
-          size: sizeFor(deps.config.value),
+          /* **对话里的图永远 auto,不跟创作区那个尺寸走**:
+             创作区选的是"我这次要多大",而角色发一张照片该由**场景**决定构图 ——
+             横着拍的窗、竖着站的人,同一套尺寸设置管不了两件事。
+             仍然过 sizeForVendor:厂商认 auto 就用 auto,不认(只有固定枚举的
+             那几家)就退到它认的第一档,绝不发一个非法的值出去 */
+          size: sizeForVendor(deps.config.value, 'auto'),
           n: 1,
           ...(refList.length ? { images: refList } : {}),
           ...extraParams()
