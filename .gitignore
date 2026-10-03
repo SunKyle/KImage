@@ -10,3 +10,5 @@ tmp-design
 # npm 缓存在某些机器上不可写(~/.npm 属主不对),改用项目内缓存时的落点
 .npm-cache
 .npm-logs
+# 性能测量的临时 Chrome profile(脚本自己会在 /tmp 下建,这里兜底)
+.perf-profile

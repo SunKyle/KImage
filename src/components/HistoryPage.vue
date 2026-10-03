@@ -80,6 +80,45 @@ const shownTiles = computed(() =>
 // 有没有一个筛子在起作用,决定空态文案与「查看全部」的去向
 const filterActive = computed(() => onlyMarked.value || !!activeColl.value)
 
+/* —— 分段渲染 ——
+   记录是摊平成图砖的,500 条 × 2 张就是 1012 块、两万五千多个节点(实测),
+   而屏幕上一次只看得到十几块。所以先渲染一批,滚到近底部再补一批。
+
+   **选择与导出仍然走完整的 shownTiles / tiles**(见 toggleAll / downloadSelected)——
+   若跟着渲染窗口算,"全选"与"Download all"会静默漏掉还没渲染的那些,
+   而这种漏是看不出来的:计数显示 500,实际只带走 120。 */
+const WALL_PAGE = 120
+const wallShown = ref(WALL_PAGE)
+const visibleTiles = computed(() => shownTiles.value.slice(0, wallShown.value))
+const wallRemaining = computed(() => Math.max(0, shownTiles.value.length - visibleTiles.value.length))
+function showMore() {
+  wallShown.value += WALL_PAGE
+}
+/* 换了筛子要把窗口收回去:否则从「Marked」切回「全部」时,
+   窗口还停在上一批的位置,看起来像"全部都在这儿了" */
+watch([onlyMarked, activeColl], () => {
+  wallShown.value = WALL_PAGE
+})
+
+/* 滚到底部附近自动补一批。用 IntersectionObserver 而不是监听 scroll:
+   后者每次滚动都要读一次布局,而这里只需要知道"哨兵露头了没有"。
+   哨兵与按钮都在 DOM 里(见模板)—— 不做纯无限滚动:
+   键盘用户没有任何"滚到底"的动作,没有按钮就永远看不到后面的图 */
+const wallMoreEl = ref<HTMLElement | null>(null)
+let wallObserver: IntersectionObserver | null = null
+onMounted(() => {
+  if (typeof IntersectionObserver === 'undefined' || !wallMoreEl.value) return
+  wallObserver = new IntersectionObserver(
+    (entries) => {
+      if (entries.some((e) => e.isIntersecting)) showMore()
+    },
+    // 提前一屏开始补,滚到底时下一批已经在了
+    { rootMargin: '600px 0px' }
+  )
+  wallObserver.observe(wallMoreEl.value)
+})
+onBeforeUnmount(() => wallObserver?.disconnect())
+
 // 作品集的新建:一排胶囊后跟一个「+」,点开变成行内小输入框,回车即建
 const adding = ref(false)
 const newTitle = ref('')
@@ -379,14 +418,15 @@ function fmt(ts: number) {
       </p>
     </div>
 
+    <!-- 外层用 template 包一层:图墙与"加载更多"是两件东西,而 v-else 要配在同一层 -->
+    <template v-if="shownTiles.length">
     <div
-      v-if="shownTiles.length"
       class="wall"
       :role="selecting ? 'group' : undefined"
       :aria-label="selecting ? 'Select images to download' : undefined"
     >
       <div
-        v-for="t in shownTiles"
+        v-for="t in visibleTiles"
         :key="t.key"
         class="tile"
         :class="{ picking: selecting, sel: selecting && selected.has(t.key) }"
@@ -474,6 +514,21 @@ function fmt(ts: number) {
         </div>
       </div>
     </div>
+
+    <!-- 还有没渲染的:给出"现在看到多少 / 一共有多少"与一个明确的按钮。
+         哨兵自己不可见、也不占位,只用来触发自动补一批 ——
+         纯无限滚动对键盘用户等于"后面那些永远看不到"。
+         这一块**不能放进 .wall**:那是多列瀑布流,块会掉进某一列里挤成一条 -->
+    <div v-if="wallRemaining" class="wall-more">
+      <p class="wall-count" aria-live="polite">
+        Showing {{ visibleTiles.length }} of {{ shownTiles.length }} images
+      </p>
+      <span ref="wallMoreEl" class="wall-sentinel" aria-hidden="true"></span>
+      <button type="button" class="lib-btn" @click="showMore">
+        Show {{ Math.min(WALL_PAGE, wallRemaining) }} more
+      </button>
+    </div>
+    </template>
 
     <div v-else class="lib-none">
       <div class="none-ico" aria-hidden="true">
@@ -959,5 +1014,26 @@ function fmt(ts: number) {
     width: 100%;
     justify-content: flex-start;
   }
+}
+
+/* —— 分段渲染的尾巴 ——
+   居中一行"看到多少 / 一共多少"加一个按钮。哨兵是空的、不占位:
+   它只承担 IntersectionObserver 的目标,不该在视觉上留下任何痕迹 */
+.wall-more {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-6) 0 var(--sp-2);
+}
+.wall-count {
+  font-size: var(--fs-xs);
+  color: var(--text-3);
+  letter-spacing: var(--ls-wide);
+}
+.wall-sentinel {
+  display: block;
+  width: 1px;
+  height: 1px;
 }
 </style>
