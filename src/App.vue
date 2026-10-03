@@ -39,6 +39,7 @@ import {
   uid,
   loadConfigs,
   saveConfigs,
+  pickActiveByKind,
   loadActiveId,
   saveActiveId,
   loadActiveTextId,
@@ -87,6 +88,8 @@ import { blobToDataURL, urlToBlob, getCharViews, putCharView, getChatMessages, p
 import { titleFromPrompt } from './lib/text'
 import { stopSpeaking } from './lib/speech'
 import { NAV_ITEMS } from './lib/nav'
+// 另一个标签页改了 localStorage 里的目录时,本页要跟着重载(见 lib/crossTab.ts)
+import { syncTargetsOf } from './lib/crossTab'
 import {
   applyTheme,
   currentTheme,
@@ -704,6 +707,7 @@ onMounted(() => {
   window.addEventListener('scroll', onScroll, { passive: true })
 })
 onBeforeUnmount(() => window.removeEventListener('scroll', onScroll))
+onBeforeUnmount(() => window.removeEventListener('storage', onStorageSync))
 
 /* —— 顶部导航(分段控件) ——
    条目清单在 lib/nav.ts(导航与字标共用那一份)。这里只留状态:
@@ -853,9 +857,7 @@ onMounted(() => {
   configs.value = loadConfigs()
   activeId.value = loadActiveId()
   // 选中激活配置;无激活则取第一条出图配置(文本配置不能顶出图的当前位置)
-  const active =
-    configs.value.find((c) => c.id === activeId.value && c.kind !== 'text') ||
-    configs.value.find((c) => c.kind !== 'text')
+  const active = pickActiveByKind(configs.value, 'image', activeId.value)
   if (active) {
     config.value = { ...active }
     // 存着的 activeId 可能指向已被删掉的配置:一并回填成真正选中的那条。
@@ -870,9 +872,7 @@ onMounted(() => {
   // 文本配置:按 activeTextId 在列表里找用途为 text 的那条;
   // 没命中(存着的 id 已被删/被改用途)就退而取第一条文本配置并回填 ——
   // 只有一条时这是显然的选择,比空着好。一条都没有则保持 null
-  const activeText =
-    configs.value.find((c) => c.id === activeTextId.value && c.kind === 'text') ||
-    configs.value.find((c) => c.kind === 'text')
+  const activeText = pickActiveByKind(configs.value, 'text', activeTextId.value)
   if (activeText) {
     textConfig.value = { ...activeText }
     if (activeTextId.value !== activeText.id) {
@@ -881,9 +881,7 @@ onMounted(() => {
     }
   }
   // 识图配置:与文本那条同一套挑法(按存的 id 找,落空就退到第一条)
-  const activeVision =
-    configs.value.find((c) => c.id === activeVisionId.value && c.kind === 'vision') ||
-    configs.value.find((c) => c.kind === 'vision')
+  const activeVision = pickActiveByKind(configs.value, 'vision', activeVisionId.value)
   if (activeVision) {
     visionConfig.value = { ...activeVision }
     if (activeVisionId.value !== activeVision.id) {
@@ -893,9 +891,7 @@ onMounted(() => {
   }
   // 朗读配置:同一套挑法。没配时 ttsConfig 为 null 是正常的 ——
   // 朗读会退回浏览器自带的语音(见 lib/speech),不是错误
-  const activeTts =
-    configs.value.find((c) => c.id === activeTtsId.value && c.kind === 'tts') ||
-    configs.value.find((c) => c.kind === 'tts')
+  const activeTts = pickActiveByKind(configs.value, 'tts', activeTtsId.value)
   if (activeTts) {
     ttsConfig.value = { ...activeTts }
     if (activeTtsId.value !== activeTts.id) {
@@ -921,7 +917,55 @@ onMounted(() => {
        启动时补一趟就够:之后每一句都由 sendChat / runChat 就地更新 */
     void loadChatLast()
   })
+  window.addEventListener('storage', onStorageSync)
 })
+
+/* —— 跨标签页同步 ——
+   localStorage 里的目录都是整份覆盖写的(见 api.ts 的 save* 那几个)。
+   两个标签页同时开着,A 页删掉一个角色,B 页内存里还留着旧目录,
+   于是 B 页下一次保存会把它整个写回去 —— 用户看到的是"删掉的又回来了"。
+   storage 事件只在**其他**标签页写入时触发,正好是我们要的信号。
+   处理方式就是把受影响的那份目录重读一遍(见 lib/crossTab.ts 的取舍说明)。 */
+function onStorageSync(e: StorageEvent) {
+  const targets = syncTargetsOf(e.key)
+  if (!targets.length) return
+  const labels: string[] = []
+
+  if (targets.includes('configs')) {
+    configs.value = loadConfigs()
+    // 重挑四类的「当前生效」:另一个标签页可能把当前那条删了或改了用途
+    repickActiveImage()
+    repickActiveText()
+    repickActiveVision()
+    repickActiveTts()
+    /* 对比出图的选择集合可能指向已消失的配置。单选是常态,所以过滤后
+       空了就退回"当前这一条",不留一个空的比对集 */
+    const alive = new Set(configs.value.map((c) => c.id))
+    selectedIds.value = selectedIds.value.filter((id) => alive.has(id))
+    if (!selectedIds.value.length && activeId.value) selectedIds.value = [activeId.value]
+    labels.push('API settings')
+  }
+  if (targets.includes('characters')) {
+    loadCharacters().then((list) => {
+      characters.value = list.map(normalizeChar)
+      // 目录变了,左栏那行"最后说了什么"也要跟着对齐
+      void loadChatLast()
+    })
+    labels.push('characters')
+  }
+  if (targets.includes('collections')) {
+    collections.value = loadCollections()
+    labels.push('collections')
+  }
+  if (targets.includes('prompts')) {
+    loadPrompts().then((list) => (libItems.value = list))
+    labels.push('prompt library')
+  }
+
+  /* 说一声。不说的话用户只会觉得"我明明没动,列表却变了" ——
+     这是同步本身带来的观感问题,不是噪音 */
+  notice.value = `Updated from another tab — reloaded ${labels.join(' and ')}.`
+}
 
 /* 新建一份配置(进入独立的新增接口表单页)。
    空态的四条入口会带一份预填好的 seed(厂商的地址与模型),不带则是一张空表单 */
@@ -943,7 +987,7 @@ function editConfig(c: ApiConfig) {
    按用途重挑一条;一条都没有就清空。删除与"改用途"两条路共用它 ——
    不收拾的话生效值会悬空:界面显示着它,它却已经发不出请求 */
 function repickActiveImage() {
-  const next = configs.value.find((c) => c.kind !== 'text' && c.kind !== 'vision')
+  const next = pickActiveByKind(configs.value, 'image', activeId.value)
   if (next) {
     config.value = { ...next }
     activeId.value = next.id
@@ -956,7 +1000,7 @@ function repickActiveImage() {
 }
 // 文本侧同理。没有文本配置时 textConfig 为 null 是正常态,增强按钮会提示去配一条
 function repickActiveText() {
-  const next = configs.value.find((c) => c.kind === 'text')
+  const next = pickActiveByKind(configs.value, 'text', activeTextId.value)
   if (next) {
     activateTextConfig(next)
   } else {
@@ -967,7 +1011,7 @@ function repickActiveText() {
 }
 // 识图侧同理:没有识图配置时 visionConfig 为 null,角色向导里会提示去配一条
 function repickActiveVision() {
-  const next = configs.value.find((c) => c.kind === 'vision')
+  const next = pickActiveByKind(configs.value, 'vision', activeVisionId.value)
   if (next) {
     activateVisionConfig(next)
   } else {
@@ -979,7 +1023,7 @@ function repickActiveVision() {
 /* 朗读侧同理。**它与上面三条有一处不同**:ttsConfig 为 null 不是错误态 ——
    朗读会自动走浏览器自带的语音,只是听起来不是这个角色自己的嗓子 */
 function repickActiveTts() {
-  const next = configs.value.find((c) => c.kind === 'tts')
+  const next = pickActiveByKind(configs.value, 'tts', activeTtsId.value)
   if (next) {
     activateTtsConfig(next)
   } else {
