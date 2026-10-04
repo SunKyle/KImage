@@ -1148,7 +1148,12 @@ onBeforeUnmount(() => {
                   role="status"
                 >
                   <PhImageBroken aria-hidden="true" />
-                  <span>Couldn’t generate that image.</span>
+                  <!-- **原因优先于那句笼统的说明**:用户要的是"下一步改什么",
+                       而"生成失败"四个字给不出任何线索(见 ChatMessage.photoError)。
+                       `title` 兜住被 CSS 截断的长原因 —— 上游的原话可能很长 -->
+                  <span :title="r.msg.photoError || undefined">
+                    {{ r.msg.photoError || 'Couldn’t generate that image.' }}
+                  </span>
                   <button
                     type="button"
                     class="photo-retry"
@@ -2428,6 +2433,21 @@ onBeforeUnmount(() => {
 }
 .photo-fail > svg {
   font-size: 14px;
+}
+/* 原因那一格。**必须能截断也能换行** —— 上游的原话可能很长
+   (「Upstream returned an error (401): invalid api key」这种),
+   而它旁边还挤着一枚重试键:
+   `min-width: 0` 让它在窄屏上肯缩(柔性子项默认不肯缩到内容以下),
+   两行截断兜住超长的,完整的那份在 `title` 里 */
+.photo-fail > span {
+  flex: 1 1 12ch;
+  min-width: 0;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow-wrap: anywhere;
 }
 /* 重试是这一行里唯一可点的东西,给它一枚极淡的圆角底(与 .jump-btn 同一语言),
    免得一行小字里的按钮既看不出来也按不着 */

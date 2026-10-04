@@ -8,6 +8,8 @@ import {
   extraParamsFor,
   mergeHistory,
   normalizeSize,
+  PHOTO_ERROR_CHARS,
+  photoFailureText,
   pickActiveByKind,
   seedFor,
   sizeClosestTo,
@@ -424,5 +426,48 @@ describe('mergeHistory · 另一页改了历史之后怎么合', () => {
     mergeHistory(db, mem, new Set(['b']))
     expect(db.map((h) => h.id)).toEqual(['a'])
     expect(mem.map((h) => h.id)).toEqual(['b'])
+  })
+})
+
+/* ===== 出图失败时给用户看哪句话 ======================================
+ *  从前 `generateChatPhoto` 把任何异常都吞成 `undefined`,界面只能说
+ *  "生成失败"。而失败的原因彼此差得很远(配置没填完 / 密钥不对 / 上游 5xx /
+ *  内容被安全策略拦 / 存储满了),每种要用户做的事都不一样。
+ *
+ *  这一层只判两件事,都是**判据**而不是文案:
+ *  中止不算失败、空话不算原因。 */
+
+describe('photoFailureText · 中止与空话都要有说法', () => {
+  it('上游的原话原样透出 —— 那是最有用的一句', () => {
+    expect(photoFailureText(new Error('Upstream returned an error (401)'))).toBe(
+      'Upstream returned an error (401)'
+    )
+  })
+
+  it('**用户按了停止不算失败** —— 说成"生成失败"会让人去查配置', () => {
+    const abort = new Error('The operation was aborted.')
+    abort.name = 'AbortError'
+    expect(photoFailureText(abort)).toContain('Stopped')
+    /* 不能带着"失败"的语气,否则用户会以为是模型坏了 */
+    expect(photoFailureText(abort)).not.toContain('failed')
+  })
+
+  it('没有消息的异常不至于只显示一个空字符串', () => {
+    expect(photoFailureText(new Error(''))).toBe('Generation failed.')
+    expect(photoFailureText(undefined)).toBe('Generation failed.')
+    expect(photoFailureText(null)).toBe('Generation failed.')
+    expect(photoFailureText('   ')).toBe('Generation failed.')
+  })
+
+  it('不是 Error 的值也能说出一句(上游偶尔抛字符串)', () => {
+    expect(photoFailureText('boom')).toBe('boom')
+  })
+
+  it('换行与连续空白压成一个空格 —— 它要渲染成一行', () => {
+    expect(photoFailureText(new Error('line one\n\n  line two'))).toBe('line one line two')
+  })
+
+  it('超长截断 —— 上游的堆栈可能几千字', () => {
+    expect(photoFailureText(new Error('x'.repeat(2000))).length).toBe(PHOTO_ERROR_CHARS)
   })
 })

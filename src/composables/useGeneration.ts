@@ -9,6 +9,7 @@ import {
   characterFaceDesc,
   generate,
   imageSrc,
+  photoFailureText,
   makeThumb,
   uid,
   seedFor,
@@ -370,6 +371,22 @@ function undoEnhance() {
     }
   }
 
+  /** 画一张的结果:要么给图,要么给**原因**。两者必有一个。
+   *
+   *  从前这里返回 `Blob | undefined`,而 undefined 是**一个**值 ——
+   *  "没配出图模型""上游说密钥不对""参考图读不出来""上游回了个空数组"
+   *  全都被压成它,界面于是只能说一句"生成失败"。用户既不知道是配置问题
+   *  还是模型问题,也不知道下一步该改什么。 */
+  type ChatPhotoResult = { blob: Blob; error?: undefined } | { blob?: undefined; error: string }
+
+  /* 出图那条配置**缺在哪儿**,说成人话。比"没配好"具体得多 ——
+     用户看到"缺模型名"就知道去哪儿补,看到"生成失败"只能来问你 */
+  function imageConfigGap(cfg: ApiConfig): string {
+    if (!cfg.baseUrl) return 'No image API is configured — set one up in Settings.'
+    if (!cfg.model) return 'The image API has no model name — fill it in under Settings.'
+    return ''
+  }
+
   /** 对话里现场画一张:只在被要求或确实合适时由那一轮的标签触发。
    *  **不进历史**(见 doc/角色配图设计.md):图只活在对话里,
    *  所以这条路刻意不走 persist/recordFor —— 只把 Blob 交给调用方,
@@ -381,19 +398,24 @@ function undoEnhance() {
    *    —— 一张风景照带上设定图,模型会被拽着往那个人的脸和衣服上靠;
    *  - 镜头(自拍 / 他拍 / 空镜)由 planChatPhoto 从场景文本里认,认不出就是第三人称;
    *  - 拼进提示词的是**锚点句**而不是那份全量设定表 —— 后者正是"死板"的来源;
-   *  - 尺寸与参考图顺序也跟着镜头走:自拍竖、空镜横,全身那张打头才交代得住体型 */
+   *  - 尺寸与参考图顺序也跟着镜头走:自拍竖、空镜横,全身那张打头才交代得住体型
+   *
+   *  **绝不 reject**:这条链是后台跑的,往外抛没有调用方接得住
+   *  (见 App 的 drawChatPhoto)。所以一律返回上面那个结果对象。 */
   async function generateChatPhoto(
     charId: string,
     scene: string,
     self: boolean
-  ): Promise<Blob | undefined> {
+  ): Promise<ChatPhotoResult> {
     const text = String(scene || '').trim().slice(0, CHAT_PHOTO_SCENE_CHARS)
-    if (!text || !deps.configured()) return undefined
+    if (!text) return { error: 'There is no scene to draw for this message.' }
     /* **认对话里那个角色**,不认创作区选中的那个:设定与参考图都按 charId 取。
        这一点错了就会"一点不像" —— 参考图是空的,等于纯文生图 */
     const who = deps.characters.value.find((c) => c.id === charId)
     const basePlan = planChatPhoto(text, self, who ? characterAnchor(who) : '')
     const cfg = deps.config.value
+    const gap = imageConfigGap(cfg)
+    if (gap) return { error: gap }
     const ctrl = new AbortController()
     try {
       /* —— 摄影指导层(见 lib/photoDirector 与设计文档 §四)——
@@ -401,18 +423,22 @@ function undoEnhance() {
          用户在等的是图),所以多一次文本调用只增加出图延迟,不影响聊天。
 
          **没有文本模型、或它挂了,都只是降级**:退回模板那一层(见 lib/chatPhoto),
-         不阻断这张图 —— 与"失败只返回 undefined、绝不 reject"同一条纪律。
-         所以这里 catch 掉吞下,不让它冒到下面那个 catch(那一个的语义是"整张图没了") */
+         不阻断这张图。所以这里吞掉它的原因,不冒到外层 */
       const plan = (await withDirector(basePlan, cfg)) || basePlan
       /* 取参考图这一步**也要在 try 里**:它会读 IndexedDB、把 Blob 转成 data URL,
          是这条链上最容易真抛出来的一步。抛出去有两个后果,都不能接受 ——
          一是"同一张脸"的依据没了却照样发请求(画出来是个陌生人),
          二是**这个函数往外抛时调用方那侧会静默**:界面既没有提示,
-         那条消息还永远停在骨架上(见 App 的 drawChatPhoto)。
-         所以这里的约定是:**失败只返回 undefined,绝不 reject** */
-      const refList = plan.useRefs
-        ? await deps.charRefSrcsOf(charId, shotViewOrder(plan.shot))
-        : []
+         那条消息还永远停在骨架上(见 App 的 drawChatPhoto) */
+      let refList: string[] = []
+      if (plan.useRefs) {
+        try {
+          refList = await deps.charRefSrcsOf(charId, shotViewOrder(plan.shot))
+        } catch {
+          /* 参考图读不出来仍然照画(纯文生图),但要说明"这张可能不像它" */
+          refList = []
+        }
+      }
       const res = await generate(
         {
           prompt: plan.prompt,
@@ -435,11 +461,18 @@ function undoEnhance() {
         ctrl.signal
       )
       const first = res?.[0]
-      if (!first) return undefined
-      return await urlToBlob(imageSrc(first))
-    } catch {
-      // 画不出来不该影响它说的话(见设计文档:失败不阻断文字)
-      return undefined
+      /* 上游 200 但一张图都没有 —— 这是最容易被压成"生成失败"的一种,
+         而它其实通常是内容被安全策略拦了,或者中转回了个空壳 */
+      if (!first) return { error: 'The image API returned no image for this prompt.' }
+      try {
+        return { blob: await urlToBlob(imageSrc(first)) }
+      } catch {
+        return { error: 'The image API returned something that is not a usable image.' }
+      }
+    } catch (e) {
+      /* 上游/代理的真实错误。`generate()` 抛的就是 /api/generate 回给我们的
+         那句话(例如"密钥不对""模型不存在"),它比任何我们编的文案都有用 */
+      return { error: photoFailureText(e) }
     }
   }
 

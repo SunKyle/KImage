@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  chatMessageFromRow,
   isDeadConnectionError,
   orphanChatImages,
   planPrune,
@@ -280,5 +281,39 @@ describe('orphanChatImages · 哪些图已经没人认领', () => {
 
   it('保序:交出来的顺序与库里的键一致(便于调用方直接遍历删)', () => {
     expect(orphanChatImages(new Set(['b']), ['c', 'a', 'b'])).toEqual(['c', 'a'])
+  })
+})
+
+/* ===== 从库里读出来的一行消息 ==========================================
+ *  消息是结构化克隆存的,字段不会丢;但库里的内容可能来自更早的版本、
+ *  被同步工具改过、或被一份手工拼的导入包写坏。而 `photoError` 会被
+ *  **直接渲染在界面上**,一个不是字符串的值就够让那一格显示成
+ *  `[object Object]` 或撑爆布局。 */
+
+describe('chatMessageFromRow · 只收会被渲染的那一项', () => {
+  const base = { id: 'm1', charId: 'c1', role: 'assistant', content: 'hi', createdAt: 1 }
+
+  it('正常的行原样返回,不做多余拷贝', () => {
+    const m = { ...base, photoError: 'Upstream returned 500' }
+    expect(chatMessageFromRow(m)).toBe(m)
+  })
+
+  it('没有这一项时也不新造对象', () => {
+    expect(chatMessageFromRow(base)).toBe(base)
+  })
+
+  it('不是字符串的值被抹掉 —— 它会被渲染出来', () => {
+    expect(chatMessageFromRow({ ...base, photoError: { bad: true } }).photoError).toBeUndefined()
+    expect(chatMessageFromRow({ ...base, photoError: 42 }).photoError).toBeUndefined()
+  })
+
+  it('超长的截断', () => {
+    const long = 'x'.repeat(1000)
+    expect(chatMessageFromRow({ ...base, photoError: long }).photoError?.length).toBe(300)
+  })
+
+  it('退化输入不抛', () => {
+    expect(chatMessageFromRow(null)).toBe(null)
+    expect(chatMessageFromRow(undefined)).toBe(undefined)
   })
 })

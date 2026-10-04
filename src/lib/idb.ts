@@ -474,7 +474,7 @@ export async function getChatMessages(
           resolve()
           return
         }
-        rows.push(cursor.value as ChatMessage)
+        rows.push(chatMessageFromRow(cursor.value))
         cursor.continue()
       }
       req.onerror = () => reject(req.error)
@@ -543,6 +543,24 @@ export async function putChatMessage(msg: ChatMessage): Promise<void> {
     tx.oncomplete = () => resolve()
     tx.onerror = () => reject(tx.error)
   })
+}
+
+/** 一行消息从库里出来时的收口。
+ *
+ *  消息是**结构化克隆**存进去的,所以字段本身不会丢;但库里的内容可能来自
+ *  更早的版本、被同步工具改过、或者被一份手工拼的导入包写坏 ——
+ *  而 `photoError` 会被**直接渲染在界面上**,一个不是字符串的值
+ *  (对象 / 数字 / 超长文本)就够让那一格显示成 `[object Object]` 或撑爆布局。
+ *
+ *  只收这一项:别的字段各自有各的读法(见 useChat 的 settlePhoto),
+ *  在这里顺手改它们等于把判断抄到第二处 */
+export function chatMessageFromRow(row: unknown): ChatMessage {
+  const m = row as ChatMessage
+  if (!m || typeof m !== 'object') return m
+  if (typeof m.photoError !== 'string') {
+    return m.photoError === undefined ? m : { ...m, photoError: undefined }
+  }
+  return m.photoError.length > 300 ? { ...m, photoError: m.photoError.slice(0, 300) } : m
 }
 
 /** 删一条。重新生成时删掉最后那条助手消息用 */
@@ -697,7 +715,7 @@ export async function getChatMessagesToSummarize(
           resolve()
           return
         }
-        rows.push(cursor.value as ChatMessage)
+        rows.push(chatMessageFromRow(cursor.value))
         cursor.continue()
       }
       req.onerror = () => reject(req.error)

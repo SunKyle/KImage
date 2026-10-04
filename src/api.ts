@@ -1220,6 +1220,31 @@ export async function enhancePrompt(
   return out
 }
 
+/* ===== 对话出图失败时，给用户看哪句话 ==============================
+   从前这里没有这一层：`generateChatPhoto` 把任何异常都吞成 `undefined`，
+   界面于是只能说一句"生成失败"。而失败的原因彼此差得很远 ——
+   配置没填完、密钥不对、上游 5xx、内容被安全策略拦、浏览器存储满了 ——
+   每一种要用户做的事都不一样。
+
+   这一层只做两件事，都是**判据**而不是文案：
+   1. 用户自己按了停止不算失败（说成"生成失败"会让人以为模型坏了）；
+   2. 一句空话不算原因 —— 总得给出点什么。
+
+   文案本身沿用 `failureMessage` 的产出：它已经把上游的原话与
+   "401 其实是部署登录墙"这类**特定成因**翻成了人话，比我们在这里另编一套准。
+   -------------------------------------------------------------------- */
+export const PHOTO_ERROR_CHARS = 300
+
+export function photoFailureText(e: unknown): string {
+  /* 中止：用户按了 Stop，或页面走了。这不是"失败"，别让用户去查配置 */
+  if (e && typeof e === 'object' && (e as { name?: string }).name === 'AbortError') {
+    return 'Stopped before the image finished.'
+  }
+  const msg = e instanceof Error ? e.message : String(e ?? '')
+  const clean = msg.replace(/\s+/g, ' ').trim()
+  return clean ? clean.slice(0, PHOTO_ERROR_CHARS) : 'Generation failed.'
+}
+
 /* ===== 图片载荷 → 可渲染的 src =====================================
    新记录是 Blob,渲染时现造 object URL;旧记录是 data URL 字符串,原样返回。
    object URL 用 WeakMap 缓存:同一个 Blob 会被图墙、抽屉、预览同时取用,
@@ -1759,7 +1784,14 @@ function coerceImportedChat(raw: unknown): ImportedChat | undefined {
       ...(typeof o.photo === 'string' && o.photo.trim()
         ? { photo: o.photo.replace(/\s+/g, ' ').trim().slice(0, 120) }
         : {}),
-      ...(o.photoSelf === true ? { photoSelf: true } : {})
+      ...(o.photoSelf === true ? { photoSelf: true } : {}),
+      /* 上一次失败的原因。**这是一句外部输入**(它最初来自上游的报错原文),
+         会被直接渲染在界面上,所以按文案那一道收:去掉控制字符、限长。
+         它不影响"有没有图"这个判断(那由 photoId 定),所以留着是无害的 ——
+         反而让"导进来的这条为什么没有图"仍然说得清 */
+      ...(typeof o.photoError === 'string' && o.photoError.trim()
+        ? { photoError: o.photoError.replace(/\s+/g, ' ').trim().slice(0, 300) }
+        : {})
     })
   })
   const memory = typeof src.memory === 'string' ? src.memory.trim().slice(0, CHAT_MAX_CHARS) : ''

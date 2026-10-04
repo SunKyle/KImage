@@ -183,7 +183,11 @@ function dropChatLast(id: string) {
  * 也可能真的是"正在画",界面正靠它占着骨架位。
  */
 function settlePhoto(m: ChatMessage): ChatMessage {
-  return m.photo && !m.photoId ? { ...m, photoFailed: true } : m
+  if (!m.photo || m.photoId) return m
+  /* 原因也要给上:库里那条可能从没记过原因(旧版本存下来的、或页面正好
+     在画图途中被关掉),界面上不能只留一片空白。**已经有的不覆盖** ——
+     那是上一次失败时记下的真实原因,比这句兜底有用得多 */
+  return { ...m, photoFailed: true, photoError: m.photoError || 'Couldn’t generate that image.' }
 }
 
 /** 取某个角色的对话。与 loadCharViews 同一套懒加载 + 去重:
