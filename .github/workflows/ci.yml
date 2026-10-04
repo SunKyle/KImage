@@ -38,7 +38,7 @@ jobs:
       # —— 扣尾有没有漏半截标签、photo 档有没有被塞进 REF_NOTE、载荷里的
       # size/quality 对不对。不花钱、不联网(上游是本地假服务)。
       - name: Chat photo pipeline probe (end-to-end, fake upstream)
-        run: node scripts/probe-chat-photo.mjs
+        run: npm run probe:chat-photo
 
   # 性能与跨标签页同步的回归门。
   # 与上面那个 job 分开:上面判"对不对"(秒级),这里判"有没有变慢/变胖"(分钟级),

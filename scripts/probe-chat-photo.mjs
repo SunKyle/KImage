@@ -30,6 +30,8 @@ const APP_PORT = 18432
 
 /** 一次 `/api/chat` 要吐出来的正文。由每个用例自己设 */
 let chatReply = ''
+/** 让假上游在出图那一步回 401（用来验失败原因有没有传到浏览器） */
+let FAIL_GENERATE = false
 /** 每个用例要断言的请求：上游收到什么，探针就看什么 */
 const seen = { chat: null, enhance: null, generate: null }
 
@@ -95,6 +97,18 @@ const upstream = http.createServer((req, res) => {
     }
     if (req.url.includes('images/generations') || req.url.includes('image')) {
       seen.generate = json
+      /* 出图失败那条路:让假上游按真上游的样子回一个 401 加一句人话。
+         这一条是"图片生成失败没提示"那次报错的回归 —— 服务端得把
+         `error` 与 `detail` 原样带给浏览器,前端才有东西可显示 */
+      if (FAIL_GENERATE) {
+        res.writeHead(401, { 'Content-Type': 'application/json' })
+        return res.end(
+          JSON.stringify({
+            error: 'Upstream returned an error (401)',
+            detail: 'invalid api key'
+          })
+        )
+      }
       /* 一张 1×1 的 PNG。出图那条路只要求"拿得到一个可转成 Blob 的 src" */
       const px =
         'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=='
@@ -291,6 +305,35 @@ async function main() {
     ok('提示词原样透传（服务端不二次加工）', String(seen.generate?.prompt || '').startsWith('photographic'))
     ok('quality 带上了', seen.generate?.quality === 'high')
     ok('size 是竖幅', seen.generate?.size === '1024x1536', String(seen.generate?.size))
+
+    /* —— 用例 6：出图失败时，原因必须传到浏览器 ——
+       这一条是"图片生成失败根本没有详细提示"那次报错的回归。
+       浏览器那边只显示 `photoFailureText(e.message)`，所以**服务端把原话
+       传没传出来**就是这条链的全部 —— 传丢了，界面上就只剩"生成失败"。 */
+    console.log('\n用例 6 · 出图失败时原因要传到浏览器')
+    FAIL_GENERATE = true
+    r = await post(APP_PORT, '/api/generate', {
+      prompt: 'a rooftop at dawn',
+      size: '1024x1536',
+      n: 1,
+      model: 'fake-img',
+      baseUrl: `http://127.0.0.1:${UPSTREAM_PORT}/v1`,
+      apiKey: 'wrong',
+      vendor: 'openai'
+    })
+    const failBody = await r.json().catch(() => ({}))
+    ok('上游 401 映射成非 200', r.status !== 200, String(r.status))
+    ok(
+      '错误里带上上游的原话（不是一句笼统的"失败"）',
+      String(failBody.error || '').includes('401'),
+      JSON.stringify(failBody).slice(0, 160)
+    )
+    ok(
+      'detail 也带上了（invalid api key）',
+      String(failBody.detail || '').includes('invalid api key'),
+      JSON.stringify(failBody.detail)
+    )
+    FAIL_GENERATE = false
   } finally {
     app.kill()
     upstream.close()
