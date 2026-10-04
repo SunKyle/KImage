@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto'
 import { lookup as dnsLookup } from 'node:dns/promises'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { ProxyAgent } from 'undici'
-import { TAG_HOLD, splitTags } from './chatTags.js'
+import { splitTags, tailHold } from './chatTags.js'
 import { ENHANCE_PROMPTS, ENHANCE_TEMPERATURE } from './enhancePrompts.js'
 
 dotenv.config()
@@ -171,7 +171,8 @@ const CHAT_RULES = `Rules:
 - Keep it short: one to three sentences. Real people type short messages.
 - Never end every reply with a question. Let the conversation breathe.
 - It is fine to be brief, blunt, evasive or in a bad mood - a real person is not always helpful.
-- When a picture would genuinely help (they ask to see you, or you are somewhere worth showing), put a photo tag on its own line at the very end: [photo:a short description of the scene from your point of view]. Keep it under 120 characters. If you are in the picture yourself, start that description with "self:" - for example [photo:self:me on the balcony, hair down]. Leave the prefix off when it is only what you are looking at, because a picture without it is generated without your reference sheet: a view stays a view. Never use the tag as a substitute for actually saying something. Do not comment on the tag or explain it.
+- When a picture would genuinely help (they ask to see you, or you are somewhere worth showing), put a photo tag on its own line at the very end: [photo:a description of the scene from your point of view]. Up to 400 characters, one line. If you are in the picture yourself, start that description with "self:" - for example [photo:self:me on the balcony, hair down]. Leave the prefix off when it is only what you are looking at, because a picture without it is generated without your reference sheet: a view stays a view. Never use the tag as a substitute for actually saying something. Do not comment on the tag or explain it.
+- That description is the only thing the picture is drawn from, and whoever draws it cannot see this conversation. So put in what only you know: what time it is and what the light is doing, the weather, what is around you, and what you are doing right now. "me on the balcony" is not enough; "self:me leaning on the balcony rail at dusk, the rain just stopped, streetlights coming on below, hair still wet" is. Write it as plain description, never as an instruction to a machine.
 - After everything you say, put a mood tag on the very last line, in exactly this form: [mood:word]. One lowercase English word for how you feel as you send this message. Pick the word that actually fits, for example: arrogant, amused, wary, bored, angry, tired, warm, cold, proud, uneasy, delighted. Do not comment on the tag or explain it - just end with it.`
 
 /** 换行与连续空白收敛成单个空格。这些值在表单里是可换行的 textarea,
@@ -929,10 +930,11 @@ app.post('/api/enhance', rateLimit, async (req, res) => {
      认不出来的图按"没给"处理:那时它会退回文本那几档,而不是把一张空图发给上游 */
   const visionRef = typeof image === 'string' && image.startsWith('data:image') ? image : ''
 
-  /* 只认这五档,其余(含老前端不传)一律按保守档处理。
+  /* 只认这几档,其余(含老前端不传)一律按保守档处理。
      character 是"把一句话拆成角色设定",vision 是"把一张图读成角色设定",
      summary 是"把一批滑出窗口的消息压成一段长期记忆",
-     三者都不是在改写出图提示词 */
+     photo 是"给一张对话里的图当摄影指导",
+     四者都不是在改写出图提示词 */
   const enhanceMode =
     mode === 'creative'
       ? 'creative'
@@ -942,13 +944,19 @@ app.post('/api/enhance', rateLimit, async (req, res) => {
           ? 'vision'
           : mode === 'summary'
             ? 'summary'
-            : 'quick'
+            : mode === 'photo'
+              ? 'photo'
+              : 'quick'
 
-  /* 拆角色、识图、压记忆这三档不加图生图说明与目标模型偏好:
-     那两条都是给"改写出图提示词"用的,跟它们无关,
-     加上只会让它们顺手把画面信息也写进去 */
+  /* 拆角色、识图、压记忆、摄影指导这四档都不加图生图说明与目标模型偏好:
+     前三条与"改写出图提示词"无关,加上只会让它们顺手把画面信息也写进去;
+     摄影指导更相反 —— 它补的正是"怎么拍",而 REF_NOTE 那句
+     "不要重新描述整个场景"与它的职责直接冲突 */
   const systemPrompt =
-    enhanceMode === 'character' || enhanceMode === 'vision' || enhanceMode === 'summary'
+    enhanceMode === 'character' ||
+    enhanceMode === 'vision' ||
+    enhanceMode === 'summary' ||
+    enhanceMode === 'photo'
       ? ENHANCE_PROMPTS[enhanceMode]
       : ENHANCE_PROMPTS[enhanceMode] +
         (hasRef ? REF_NOTE : '') +
@@ -1243,7 +1251,7 @@ app.post('/api/chat', rateLimit, async (req, res) => {
     }
   }
 
-  /* 扣着还没发的尾巴,专门用来截住末尾那几枚元数据标签(见 chatTags.js 的 TAG_HOLD)。
+  /* 扣着还没发的尾巴,专门用来截住末尾那几枚元数据标签(见 chatTags.js 的 tailHold)。
      声明在 try 外面是有意的:中途 Stop 或上游断流时,那截尾巴也得放出去 ——
      否则用户按了停止,最后那二三十个字符会凭空消失 */
   let tail = ''
@@ -1384,12 +1392,15 @@ app.post('/api/chat', rateLimit, async (req, res) => {
         }
         if (!delta) continue
         gotAny = true
-        /* 扣着尾巴发:只放出超出 TAG_HOLD 的那部分。
-           最后一个增量正好落在标签上时,它就被挡在这里没发出去 */
+        /* 扣着尾巴发:只放出"不可能再变出标签"的那部分。
+           扣多少由 tailHold 按"最后一个没闭合的 [ "算 —— **不是按长度预留**:
+           标签上限是 400 字,按长度预留就意味着整整 400 多字不流式,
+           比一条回复本身还长(见 chatTags.js 的 tailHold) */
         tail += delta
-        if (tail.length > TAG_HOLD) {
-          sendEvent({ delta: tail.slice(0, tail.length - TAG_HOLD) })
-          tail = tail.slice(tail.length - TAG_HOLD)
+        const release = tailHold(tail)
+        if (release > 0) {
+          sendEvent({ delta: tail.slice(0, release) })
+          tail = tail.slice(release)
         }
       }
     }

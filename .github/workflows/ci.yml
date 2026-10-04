@@ -32,6 +32,14 @@ jobs:
       - name: Build
         run: npx vite build
 
+      # 对话出图那条链的端到端探针:假上游(SSE) + 真的 KImage 服务端,
+      # 把 /api/chat → 剪标签 → /api/enhance(photo 档) → /api/generate 跑一遍。
+      # 放在这个 job 里而不是 perf:它不需要浏览器、不量性能,判的是"接缝对不对"
+      # —— 扣尾有没有漏半截标签、photo 档有没有被塞进 REF_NOTE、载荷里的
+      # size/quality 对不对。不花钱、不联网(上游是本地假服务)。
+      - name: Chat photo pipeline probe (end-to-end, fake upstream)
+        run: node scripts/probe-chat-photo.mjs
+
   # 性能与跨标签页同步的回归门。
   # 与上面那个 job 分开:上面判"对不对"(秒级),这里判"有没有变慢/变胖"(分钟级),
   # 两者红的意义完全不同,混在一个 job 里会让"哪一类坏了"看不出来。

@@ -1,6 +1,8 @@
 import { computed, ref, toRaw, type ComputedRef, type Ref } from 'vue'
 import {
+  FREE_SIZES,
   acceptableSize,
+  allowedSizes,
   enhancePrompt,
   extraParamsFor,
   normalizeSize,
@@ -13,7 +15,9 @@ import {
   sizeForVendor
 } from '../api'
 import { REF_ARCHIVE_EDGE, REF_IMAGE_EDGE } from '../lib/payload'
-import { planChatPhoto } from '../lib/chatPhoto'
+import { characterAnchor, chatPhotoSize, planChatPhoto, shotViewOrder } from '../lib/chatPhoto'
+import type { ChatPhotoPlan } from '../lib/chatPhoto'
+import { DIRECTOR_SLOTS, applyDirector, directorTask, parseDirector, parseDirectorShot } from '../lib/photoDirector'
 import { urlToBlob } from '../lib/idb'
 import type { EnhanceMode, Provider } from '../api'
 import type { ApiConfig, Character, HistoryEntry, ResultItem } from '../types'
@@ -49,9 +53,10 @@ export interface GenerationDeps {
   /** 落一条历史记录(见 useHistory) */
   persist: (record: HistoryEntry) => Promise<void>
   /** 当前角色的图 → data URL,发请求时并进参考图(见 useCharacters) */
-  charRefSrcs: () => Promise<string[]>
-  /** 按 id 取某个角色的图(对话发图要走它,不能认创作区选中的那个) */
-  charRefSrcsOf: (charId: string) => Promise<string[]>
+  charRefSrcs: (order?: string[]) => Promise<string[]>
+  /** 按 id 取某个角色的图(对话发图要走它,不能认创作区选中的那个)。
+   *  order 由这一张的镜头决定(见 lib/chatPhoto 的 shotViewOrder) */
+  charRefSrcsOf: (charId: string, order?: string[]) => Promise<string[]>
   /** 当前角色:它决定自动并进提示词的那段设定 */
   activeCharacter: ComputedRef<Character | undefined>
   /** 全部角色:对话里发图要按**对话中那个角色**取设定与参考图 */
@@ -134,6 +139,14 @@ function extraParams(cfg: ApiConfig = deps.config.value): Record<string, string>
 }
 function sizeFor(cfg: ApiConfig): string {
   return sizeForVendor(cfg, size.value)
+}
+
+/* 一条配置下"可以挑的显式尺寸"。厂商不限尺寸时用应用自己那组常用值 ——
+   与角色设定图那条路(useCharacters 的 viewSize)同一个口径:
+   两边都是"按比例挑最接近的一档",所以两边都吃同一份 FREE_SIZES */
+function sizeChoicesOf(cfg: ApiConfig): string[] {
+  const a = allowedSizes(cfg.vendor, cfg.model || '')
+  return a === 'free' ? FREE_SIZES : a
 }
 
 // 自定义张数:允许手输,失焦/回车时收敛到 1..N_MAX 的整数并回写输入框
@@ -300,18 +313,75 @@ function undoEnhance() {
 
 
   /* 对话里"角色发一张图"的场景描述上限。与 server/chatTags.js 的
-     PHOTO_SCENE_CHARS 同一口径 —— 那边剪下来时已经截过一次,这里是第二道 */
-  const CHAT_PHOTO_SCENE_CHARS = 120
+     PHOTO_SCENE_CHARS 同一口径 —— 那边剪下来时已经截过一次,这里是第二道。
+     2026-10-04 两边一起从 120 提到 400:120 字只装得下"在哪",
+     而时间/天气/周围有什么正是下游摄影指导最缺的输入 */
+  const CHAT_PHOTO_SCENE_CHARS = 400
+
+  /* 摄影指导这一跳最多等多久。它不是用户主动发起的(用户只看到"图在画"),
+     所以超时不能太长 —— 卡住时宁可交一张模板拼的图,也不能让骨架一直转。
+     15 秒是给"思考型"文本模型留的余量:它们会把思考也算进这段时间 */
+  const DIRECTOR_TIMEOUT_MS = 15_000
+
+  /** 让摄影指导写这一张的机位、镜头、光与环境。
+   *
+   *  **失败一律返回 null,绝不抛** —— 调用方据此退回模板那一层。
+   *  这条约定与 generateChatPhoto 的"失败只返回 undefined"同源:
+   *  多出来的一层不许成为"这张图出不来了"的新理由。
+   *
+   *  三处刻意的取舍:
+   *  - **走 /api/enhance 的 photo 档**,不新开端点:它已经解决了上游超时、
+   *    代理直连重试、错误回显这些事,而多一条端点就是多一处要跟着改的地方;
+   *  - **用当前生效的文本配置**,与提示词改写同一个来源。没配就跳过一次 ——
+   *    这不该是这个功能的硬依赖(用户可能只配了出图那条);
+   *  - **等它,但不与出图并行**:它改的就是出图要用的那段提示词。 */
+  async function withDirector(base: ChatPhotoPlan, cfg: ApiConfig): Promise<ChatPhotoPlan | null> {
+    const textCfg = deps.textConfig.value
+    if (!textCfg?.baseUrl || !textCfg.model) return null
+    const ac = new AbortController()
+    const timer = setTimeout(() => ac.abort(), DIRECTOR_TIMEOUT_MS)
+    try {
+      const raw = await enhancePrompt(
+        textCfg,
+        directorTask(base),
+        {
+          mode: 'photo',
+          /* 目标模型那两项在 photo 档不会进系统提示(服务端刻意跳过),
+             但仍然要传:EnhanceOpts 里它们不是可选的 */
+          targetVendor: cfg.vendor || '',
+          targetModel: cfg.model || '',
+          hasRef: false
+        },
+        ac.signal
+      )
+      const written = parseDirector(raw)
+      /* 视角单独取:它不往提示词里填句子,而是换一整套模板(见 photoDirector)。
+         它没判(空串)或判出一个认不出的词时,applyDirector 会保留原视角 */
+      const shot = parseDirectorShot(raw)
+      /* 一位都没解析出来、视角也没判 = 它没按格式回。这时**整层当作不可用**,
+         而不是逐位退回 —— 一个都没认出来说明格式已经崩了,
+         再从碎片里挑可信的只会引入噪声 */
+      if (!shot && !DIRECTOR_SLOTS.some((s) => written[s])) return null
+      return applyDirector(base, { written, shot })
+    } catch {
+      return null
+    } finally {
+      clearTimeout(timer)
+    }
+  }
 
   /** 对话里现场画一张:只在被要求或确实合适时由那一轮的标签触发。
    *  **不进历史**(见 doc/角色配图设计.md):图只活在对话里,
    *  所以这条路刻意不走 persist/recordFor —— 只把 Blob 交给调用方,
    *  由它塞进 chat_images。
    *
-   *  `self` = 这一张里有没有**它本人**(见 lib/chatPhoto 的说明):
-   *  有 → 拼上外貌设定、把设定图当参考图,这是"同一张脸"的保证;
-   *  没有 → 提示词只有场景、一张参考图都不发 —— 一张风景照带上设定图,
-   *  模型会被拽着往那个人的脸和衣服上靠,画面就跑偏了 */
+   *  四个输入都是"这一张怎么拍"的一部分(见 lib/chatPhoto 的文件头):
+   *  - `self` = 这一张里有没有**它本人**。有 → 拼身份锚点、把设定图当参考图,
+   *    这是"同一张脸"的保证;没有 → 提示词里只有场景、一张参考图都不发
+   *    —— 一张风景照带上设定图,模型会被拽着往那个人的脸和衣服上靠;
+   *  - 镜头(自拍 / 他拍 / 空镜)由 planChatPhoto 从场景文本里认,认不出就是第三人称;
+   *  - 拼进提示词的是**锚点句**而不是那份全量设定表 —— 后者正是"死板"的来源;
+   *  - 尺寸与参考图顺序也跟着镜头走:自拍竖、空镜横,全身那张打头才交代得住体型 */
   async function generateChatPhoto(
     charId: string,
     scene: string,
@@ -322,30 +392,46 @@ function undoEnhance() {
     /* **认对话里那个角色**,不认创作区选中的那个:设定与参考图都按 charId 取。
        这一点错了就会"一点不像" —— 参考图是空的,等于纯文生图 */
     const who = deps.characters.value.find((c) => c.id === charId)
-    const plan = planChatPhoto(text, self, who ? characterFaceDesc(who) : '')
+    const basePlan = planChatPhoto(text, self, who ? characterAnchor(who) : '')
+    const cfg = deps.config.value
     const ctrl = new AbortController()
     try {
+      /* —— 摄影指导层(见 lib/photoDirector 与设计文档 §四)——
+         插在"剪完标签"和"发图"之间。这一段本来就是异步的(正文早就可读,
+         用户在等的是图),所以多一次文本调用只增加出图延迟,不影响聊天。
+
+         **没有文本模型、或它挂了,都只是降级**:退回模板那一层(见 lib/chatPhoto),
+         不阻断这张图 —— 与"失败只返回 undefined、绝不 reject"同一条纪律。
+         所以这里 catch 掉吞下,不让它冒到下面那个 catch(那一个的语义是"整张图没了") */
+      const plan = (await withDirector(basePlan, cfg)) || basePlan
       /* 取参考图这一步**也要在 try 里**:它会读 IndexedDB、把 Blob 转成 data URL,
          是这条链上最容易真抛出来的一步。抛出去有两个后果,都不能接受 ——
          一是"同一张脸"的依据没了却照样发请求(画出来是个陌生人),
          二是**这个函数往外抛时调用方那侧会静默**:界面既没有提示,
          那条消息还永远停在骨架上(见 App 的 drawChatPhoto)。
          所以这里的约定是:**失败只返回 undefined,绝不 reject** */
-      const refList = plan.useRefs ? await deps.charRefSrcsOf(charId) : []
+      const refList = plan.useRefs
+        ? await deps.charRefSrcsOf(charId, shotViewOrder(plan.shot))
+        : []
       const res = await generate(
         {
           prompt: plan.prompt,
-          /* **对话里的图永远 auto,不跟创作区那个尺寸走**:
-             创作区选的是"我这次要多大",而角色发一张照片该由**场景**决定构图 ——
-             横着拍的窗、竖着站的人,同一套尺寸设置管不了两件事。
-             仍然过 sizeForVendor:厂商认 auto 就用 auto,不认(只有固定枚举的
-             那几家)就退到它认的第一档,绝不发一个非法的值出去 */
-          size: sizeForVendor(deps.config.value, 'auto'),
+          /* **对话里的图由场景决定尺寸,不跟创作区那个尺寸走** ——
+             创作区选的是"我这次要多大"。从前这里写死 'auto',而它对只认固定
+             枚举的厂商会被 sizeForVendor 退到 allowed[0](通常 1024×1024):
+             横着拍的窗、竖着站的人全被塞进同一个方框。
+             现在按镜头挑最接近的一档比例(见 lib/chatPhoto 的 chatPhotoSize) */
+          size: chatPhotoSize(sizeChoicesOf(cfg), plan.shot, true),
           n: 1,
           ...(refList.length ? { images: refList } : {}),
-          ...extraParams()
+          /* 画质显式给一档。对话这条路此前没有让用户选过 quality,于是
+             extraParamsFor 永远看到 'auto'、永远不发这个参数 —— 等于把画质
+             交给厂商的默认档,而那一档多半是给"快速预览"用的。
+             'high' 与创作区那一档同名同值,不引入新枚举 */
+          ...extraParams(cfg),
+          quality: 'high'
         },
-        deps.config.value,
+        cfg,
         ctrl.signal
       )
       const first = res?.[0]

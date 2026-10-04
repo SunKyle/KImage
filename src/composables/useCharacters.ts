@@ -192,33 +192,40 @@ export function useCharacters(deps: CharacterDeps) {
   /** 当前角色的图 → data URL,发请求时并进参考图。
    *  角色不占表单里的参考图槽 —— 表单上看到的始终是用户自己挑的那张,
    *  角色这几张只在这一刻合进来。
-   *  正面固定排最前:它是唯一的主视图,前段权重更高,脸就定在它上面。
    *  上传的那张底图不在这里:它只为生成正脸服务一次(见 genCharView),
    *  那之后 c.ref 里存的已经是正脸本身,再送一次就是把同一张图送两遍 */
   /** 某个角色的图 → data URL。**按 id 取,不认"当前选中"** ——
    *  对话页可能正跟另一个角色说话,拿创作区那个角色的脸去画,
-   *  画出来当然不像(这是实测反馈里最要紧的一条) */
-  async function charRefSrcsOf(charId: string): Promise<string[]> {
+   *  画出来当然不像(这是实测反馈里最要紧的一条)。
+   *
+   *  @param order 视图的取舍顺序。**对话出图按镜头传**(见 lib/chatPhoto 的
+   *               shotViewOrder):自拍以正面为主,全身像那张打头才交代得住
+   *               体型与服装轮廓。从前这里写死"正面永远排最前",于是拍全身
+   *               也拿一张头像当主参考图 —— 身高体型全靠模型现编。
+   *               不传 = 保持原顺序(创作区那条路照旧) */
+  async function charRefSrcsOf(charId: string, order: string[] = []): Promise<string[]> {
     const c = characters.value.find((x) => x.id === charId)
     if (!c) return []
     // 视图是按需加载的,这里先确保取过一次
     await loadCharViews(c.id)
+    /* 认不出的视图名直接跳过:它指的那张不存在,而这里每 push 一张都要
+       读一次 IndexedDB、转一次 data URL —— 不认识的键就是白读一次 */
+    const wanted = order.length
+      ? Array.from(new Set(order)).filter((k) => CHARACTER_VIEWS.some((v) => v.kind === k))
+      : CHARACTER_VIEWS.map((v) => v.kind as string)
     const out: string[] = []
-    const front = viewOf(c.id, 'front')
-    if (front) out.push(await blobToDataURL(front.data))
-    for (const v of CHARACTER_VIEWS) {
+    for (const kind of wanted) {
       if (out.length >= MAX_CHAR_REFS) break
-      // 正面已经送过,别的视图按顺序补
-      if (v.kind === 'front') continue
-      const view = viewOf(c.id, v.kind)
+      const view = viewOf(c.id, kind as CharacterViewKind)
       if (view) out.push(await blobToDataURL(view.data))
     }
     return out
   }
 
-  /** 创作区当前选中的那个角色(出图面板用) */
-  async function charRefSrcs(): Promise<string[]> {
-    return activeCharId.value ? charRefSrcsOf(activeCharId.value) : []
+  /** 创作区当前选中的那个角色(出图面板用)。
+   *  order 由调用方给:创作区那条路不传,保持"正面打头"的原顺序 */
+  async function charRefSrcs(order: string[] = []): Promise<string[]> {
+    return activeCharId.value ? charRefSrcsOf(activeCharId.value, order) : []
   }
 
   function stopCharView(charId: string, kind: CharacterViewKind) {

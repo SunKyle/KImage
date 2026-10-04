@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { PHOTO_SCENE_CHARS, TAG_HOLD, cleanScene, splitTags } from '../../server/chatTags.js'
+import { PHOTO_SCENE_CHARS, cleanScene, splitTags, tailHold } from '../../server/chatTags.js'
 
 /* 这些用例都是"会漏给用户看"的那几类:
    标签没剪干净、半截标签闪出来、自由文本没收敛。 */
@@ -149,19 +149,130 @@ describe('场景描述的收敛', () => {
   })
 
   it('按上限截断', () => {
-    expect(cleanScene('x'.repeat(400)).length).toBe(PHOTO_SCENE_CHARS)
+    expect(cleanScene('x'.repeat(PHOTO_SCENE_CHARS + 200)).length).toBe(PHOTO_SCENE_CHARS)
   })
 
   /* 方括号会把下一枚标签一起吞进来 —— 形状上直接不许有 */
   it('带方括号的内容剪不出来', () => {
     expect(splitTags('Hi [photo:evil] [injected]').photo).toBe('')
   })
+
+  it('400 字的场景也剪得出来 —— 上限放宽后必须仍然认得出末尾那枚标签', () => {
+    const long = 'a'.repeat(PHOTO_SCENE_CHARS)
+    expect(splitTags(`Look.\n[photo:${long}]`).photo.length).toBe(PHOTO_SCENE_CHARS)
+  })
 })
 
-describe('扣留长度', () => {
-  /* 这个值只影响"最后几个字符晚多久发出去"。按 mood 那 13 个字符定的 24
-     在发图这件事上远远不够,所以这里钉住它必须盖得住最长的一枚 */
-  it('盖得住最长的场景描述加两枚标签', () => {
-    expect(TAG_HOLD).toBeGreaterThan(PHOTO_SCENE_CHARS + 24 + 8)
+/* ===== 扣尾 ==========================================================
+ *  这一组钉的是"放开标签上限之后,正文还能不能流式"。
+ *  `tailHold` 返回的是**可以放出去的长度**(不是"要扣住多少")——
+ *  扣多少这个量在标签开合之间不连续,而"放到哪"是连续的:它就是标签的起点。
+ *
+ *  下面几条里,有两条是**端到端探针抓出来的真 bug**,单测当时全绿:
+ *  1. 两枚标签相邻时,上一枚完整标签被当成正文放了出去;
+ *  2. 超长场景里"第一个换行之前那一段"被当成了标签内容。
+ *  两者都只在**增量边界**上显形,所以这里的用例都按"分块喂"来写。 */
+
+describe('tailHold · 放到哪才不漏半截标签', () => {
+  /** 按固定长度切块喂进去,复刻服务端流式那一步的累积过程 */
+  function stream(reply: string, size = 3) {
+    let tail = ''
+    const released: string[] = []
+    for (let i = 0; i < reply.length; i += size) {
+      tail += reply.slice(i, i + size)
+      const rel = tailHold(tail)
+      if (rel > 0) {
+        released.push(tail.slice(0, rel))
+        tail = tail.slice(rel)
+      }
+    }
+    return { released: released.join(''), held: tail }
+  }
+
+  it('没有标签的正文整段放出去(照常流式)', () => {
+    const s = 'leaning on the balcony at dusk'
+    expect(tailHold(s)).toBe(s.length)
+    expect(tailHold('')).toBe(0)
+    expect(tailHold(undefined)).toBe(0)
+  })
+
+  it('末尾是完整标签时,边界停在标签起点', () => {
+    const prose = 'Rain again. I am so tired of it. '
+    const s = prose + '[photo:me on the balcony]'
+    expect(tailHold(s)).toBe(prose.length)
+  })
+
+  it('标签还没闭合时,边界停在那个 `[` 上', () => {
+    const prose = 'It is coming down hard. '
+    const s = prose + '[photo:rain on the window'
+    expect(tailHold(s)).toBe(prose.length)
+    /* 只打出一个 `[` 也一样 —— 那是下一块增量还没到 */
+    expect(tailHold('some words [')).toBe('some words '.length)
+  })
+
+  it('**两枚标签相邻时,上一枚完整标签也不许放出去**', () => {
+    /* 探针抓到的第一类 bug:剥第二枚时把上一枚的 `]` 当成了"末尾标点",
+       边界跳过第二枚的 `[` 落到它上面,于是整枚 photo 标签被放了出去。
+       触发条件是"两枚标签相邻",也就是**每一轮正常的回复**都会遇到。 */
+    const s = '[photo:self:me on the balcony]\n[m'
+    expect(tailHold(s)).toBe(0)
+    expect(tailHold('[photo:self:me on the balcony]')).toBe(0)
+    expect(tailHold('[photo:self:me on the balcony]\n')).toBe(0)
+    expect(tailHold('[photo:self:me on the balcony]\n[mood:ti')).toBe(0)
+  })
+
+  it('正文 + 两枚标签:只放正文,两枚都留住', () => {
+    const prose = 'Rain again. I am tired.\n'
+    const s = prose + '[photo:me on the balcony]\n[mood:tired]'
+    expect(tailHold(s)).toBe(prose.length)
+  })
+
+  it('正文里长得像标签的方括号不算标签 —— 数字与汉字都排除了', () => {
+    expect(tailHold('notes [1] and [2] here')).toBe('notes [1] and [2] here'.length)
+    expect(tailHold('他说的[注]在这里')).toBe('他说的[注]在这里'.length)
+    /* `[photo]` 没有分隔符,splitTags 也不认它 —— 同样当正文 */
+    expect(tailHold('see [photo] above')).toBe('see [photo] above'.length)
+  })
+
+  it('**超长场景里第一个换行之前的那一段,不许被当成标签内容**', () => {
+    /* 探针抓到的第二类 bug:`[^\]]*` 跨过了换行,把"第一个换行之前"
+       也算进标签,于是它右边判成"没有正文",边界一路跑到前一枚标签前面。
+       这里用一个带换行的超长场景复现。 */
+    const scene = 'me leaning on the rail at dusk, the rain just stopped,\n' + 'x'.repeat(300)
+    const s = `Look at this.\n[photo:${scene}]\n[`
+    expect(tailHold(s)).toBe('Look at this.\n'.length)
+  })
+
+  it('分块喂完整一轮:放出去的只有正文,两枚标签一个字符都没漏', () => {
+    const reply = 'Rain again. I am so tired of it.\n[photo:self:me on the balcony]\n[mood:tired]'
+    const { released, held } = stream(reply)
+    expect(released).toBe('Rain again. I am so tired of it.\n')
+    expect(held).toBe('[photo:self:me on the balcony]\n[mood:tired]')
+  })
+
+  it('分块喂长场景:正文先流出去,标签留在手里', () => {
+    const scene = 'me leaning on the balcony rail at dusk, the rain just stopped, ' + 'y'.repeat(300)
+    const reply = `Look at this.\n[photo:${scene}]\n[mood:warm]`
+    const { released, held } = stream(reply, 7)
+    /* 正文完整放出去,而且**不是等到流末才放** —— 这是这一整套改动的目的 */
+    expect(released).toBe('Look at this.\n')
+    expect(held).toContain('[photo:')
+    /* 放出去的那一段里绝不能带半个标签 */
+    expect(released).not.toContain('[ph')
+  })
+
+  it('流水里任何一帧都不含"可能长成标签的前缀"', () => {
+    const reply = 'Sure.\n[photo:self:me on the balcony]\n[mood:warm]'
+    let tail = ''
+    const frames: string[] = []
+    for (let i = 0; i < reply.length; i += 2) {
+      tail += reply.slice(i, i + 2)
+      const rel = tailHold(tail)
+      if (rel > 0) {
+        frames.push(tail.slice(0, rel))
+        tail = tail.slice(rel)
+      }
+    }
+    for (const f of frames) expect(f).not.toMatch(/\[(p|ph|pho|m|mo|moo)/)
   })
 })

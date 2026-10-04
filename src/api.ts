@@ -1160,8 +1160,17 @@ export async function generateFrom(
 }
 
 /* 改写强度:quick 保守补细节,creative 允许重构构图与风格。
-   档位差异全在服务端的系统提示里,前端只负责把它传下去 */
-export type EnhanceMode = 'quick' | 'creative'
+   档位差异全在服务端的系统提示里,前端只负责把它传下去。
+
+   **界面上那枚改写键只切 quick / creative 两档**(见 useGeneration 的 enhanceMode);
+   其余几档由各自的调用方传进来 —— character / vision 走角色起稿,
+   summary 走长期记忆压缩,photo 走对话出图的摄影指导。
+   收在同一个类型里是因为它们共用这一个端点与同一套上游超时;
+   漏一档不会报错,只会静静地落到默认的 quick 档上 ——
+   而那一档的输出格式与其余几档完全不同 */
+export type EnhanceMode = 'quick' | 'creative' | 'character' | 'vision' | 'summary' | 'photo'
+/** 界面上可切换的那两档 */
+export type EnhanceToggleMode = 'quick' | 'creative'
 
 // 改写请求里除提示词以外的输入。参数已经够多,收成一个对象免得调用点排成一长串
 export interface EnhanceOpts {

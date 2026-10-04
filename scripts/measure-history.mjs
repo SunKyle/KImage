@@ -2022,7 +2022,8 @@ async function main() {
             photo: 'a grey window at dawn',
             photoId: 'probe-photo-1'
           },
-          // 还在画的那张:只有场景描述,没有 photoId → 应当是骨架
+          // 没画完的那张:只有场景描述、没有 photoId。出图只活在内存里,
+          // 所以这条从库里读回来就只可能是"没画出来" → 提示 + 重试键,不是骨架
           { role: 'assistant', content: 'One second.', dt: 0.2, photo: 'still drawing' }
         ].map((m, i) => ({
           id: `probe-msg-${i}`,
@@ -2103,6 +2104,13 @@ async function main() {
           charInRail: /Probe talker/.test(document.body.textContent || ''),
           photoRendered: !!document.querySelector('img.msg-photo'),
           photoBelowText: !!order && order.imgAt > order.textAt && order.textAt >= 0,
+          /* 库里那条只带场景、没有 photoId 的消息,读回来时**不再顶着骨架**:
+             出图只活在内存里,而一次读取发生在页面刚打开(或往前翻)的时候,
+             没有任何出图在跑 —— 所以它只可能是没画出来(见 useChat 的 settlePhoto)。
+             从前这里断言的是骨架,那是"读取也当成正在画"的年代留下的。
+             两个都量:失败提示该在,骨架不该在 */
+          photoFailed: !!document.querySelector('.photo-fail'),
+          photoRetry: !!document.querySelector('.photo-retry'),
           pendingSkeleton: !!document.querySelector('.msg-photo-skel'),
           photoOutsideBubble: !!order && order.inBubble === false,
           /* 实测反馈:"聊天记录里图片太大"。钉住它是个缩略图而不是一面墙 */
@@ -2405,7 +2413,11 @@ async function main() {
         chatProbe.rendered?.charInRail === true &&
         chatProbe.rendered?.photoRendered === true &&
         chatProbe.rendered?.photoBelowText === true &&
-        chatProbe.rendered?.pendingSkeleton === true &&
+        /* 没画出来的那一张:必须说出来、并且给一枚重试键(骨架不该再出现)。
+           这一条兜的是 df9dffa 那次修复 —— 它当时只补了实现,探针还停在旧行为上 */
+        chatProbe.rendered?.photoFailed === true &&
+        chatProbe.rendered?.photoRetry === true &&
+        chatProbe.rendered?.pendingSkeleton === false &&
         chatProbe.rendered?.photoOutsideBubble === true &&
         chatProbe.rendered?.photoWidth > 0 &&
         chatProbe.rendered?.photoWidth <= 240 &&

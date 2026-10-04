@@ -106,18 +106,59 @@ Rules:
 - When you are given what you already remember, merge it with the new messages into one piece — rewrite and compress it. Never append to it, and never restate what is already covered.
 - Stay under 200 words. When nothing important happened, a single sentence is the right answer.
 - Write in English, but keep names, titles and terms in their original language.
-- Write in the third person. Never write dialogue and never speak as either of them.`
-}
+- Write in the third person. Never write dialogue and never speak as either of them.`,
+  /* 摄影指导:对话里"角色发一张图"那一步,把一句短场景描述补成"这张照片怎么拍"。
+     它不是改写出图提示词(那两档管的是用户的输入框),而是补上场景**没说**的
+     摄影要素 —— 这是"生成的图死板、没有光影、自拍画成他拍"的根因所在。
 
+     为什么由模型做而不是查模板:模板对每个场景给的都是同一句话
+     ("directional light with a clear source"),烛光晚餐和雨夜巷口拿到的是同一句。
+     模型才能按**这个**场景写。模板留着当降级路径(见 lib/chatPhoto 的 TEMPLATES)。
+
+     四条规则都不是装饰,每条对着一种具体的失败:
+     - "不要改写场景" —— 这是最容易发生的一种:模型顺手把用户那句话重写一遍,
+       等于把主体换掉了。场景原样保留是硬要求。
+     - "不要编时间/天气" —— 场景没说几点就是没说,编一个"黄昏"会和对话里
+       正在值夜班的它矛盾。光的**方向**可以写,时间不行。
+     - "不要提脸和衣服" —— 那两样由身份锚点与参考图管,两边都写会重复,
+       而且一旦措辞不一致,模型会挑一处丢掉。
+     - "不要写焦段" —— 最容易被编出来的一项(85mm f/1.4 听起来很专业,
+       却和这个场景毫无关系),乱写的焦段只会把构图带偏。
+
+     输出必须是固定四行键值对而不是一段散文:客户端按标签取值、逐位合并
+     (已经说过的那一位不接受覆盖),散文没法做这件事。 */
+  photo: `You are the photographer for one specific shot. You are given a scene description that the image model will render; you decide how that shot is taken and write it down.
+
+Rules:
+- Output exactly these five lines, in this order, and nothing else:
+Shot: <selfie or third>
+Camera: <one short phrase>
+Lens: <one short phrase>
+Light: <one short phrase>
+Environment: <one short phrase>
+- The scene is fixed. Never rewrite it, never restate it, and never change what is happening in it.
+- Shot is the only field where you choose a word. Write exactly "selfie" when the camera would be in the character's own hand — an arm's-length shot, a mirror, a phone held up. Write exactly "third" when somebody else is holding the camera, or when nobody could be. Never write anything else on that line, and never write it when you were told there is no character in the image.
+- You will be told which of the other four the scene already covers. That line must be left completely empty after the colon. Write only the ones the scene does not cover.
+- Do not invent a time of day or weather. If the scene does not say when it is, do not write dawn, dusk, night or any hour — describe only where the light comes from and what it falls on.
+- Never mention the character: not their face, hair, body, clothing or expression. Another layer carries that. Write about the shot, not the person.
+- Never write a focal length in millimetres or an f-number. Describe the framing and the depth of field instead.
+- Each line is one short phrase of under 20 words, comma-separated, in English — even when the scene is written in another language. No quotes, no colons, no full stops, no markdown.
+- Be specific to this scene. A sentence that would fit any scene is worthless here.
+- No preamble, no explanation. The five lines are the entire answer.`
+}
 // 改写强度:保守档给低温度,让它贴着原句走;重构档放开,否则出来的东西没差别。
 // 拆角色要具体又不重复,取中间偏放开。识图要的是"照着图写",再放开就会开始编。
 // 摘要要的是"忠实",温度再低也不过是变得啰嗦 —— 编出来的记忆比没有记忆更糟。
+// 摄影指导取中间偏收敛:格式是硬的(固定四行、说过的那位不许再写),
+// 但同一件事换一种说法是好事 —— 同一个场景用户"再要一张"时,
+// 换一种光比重复同一句光有用得多。
 const ENHANCE_TEMPERATURE = {
   quick: 0.4,
   creative: 0.9,
   character: 0.7,
   vision: 0.4,
-  summary: 0.3
+  summary: 0.3,
+  photo: 0.6
 }
 
 export { ENHANCE_PROMPTS, ENHANCE_TEMPERATURE }

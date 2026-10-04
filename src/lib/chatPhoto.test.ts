@@ -1,53 +1,333 @@
 import { describe, expect, it } from 'vitest'
-import { CHAT_PHOTO_PROMPT_CHARS, planChatPhoto } from './chatPhoto'
+import {
+  CHAT_PHOTO_PROMPT_CHARS,
+  characterAnchor,
+  chatPhotoSize,
+  isSelfie,
+  missingSlots,
+  planChatPhoto,
+  shotRatio,
+  shotViewOrder
+} from './chatPhoto'
 
-/* 这一条决定"角色发的那张图会不会被设定图带跑",而真正的出图要花钱、要联网,
-   靠手测试不全 —— 所以判据放在这里直接断言 */
+/* 这一层现在管四件事:这张里有没有它本人、是自拍还是他拍、拼锚点句还是全量设定表、
+   以及"只补不覆盖"的补全。四件事都是纯字符串处理,而真正的出图要花钱、要联网、
+   靠手测试不全 —— 所以判据全部放在这里直接断言。
+ *
+ * 断言尽量落在**语义**上(某句在不在、先后顺序),而不是整串等于什么:
+ * 模板文案是会调的,把整串写死会让每次微调都变成一次改测试。 */
 
-const FACE = 'oval face, high cheekbones, dark bob, worn flight jacket'
+const ANCHOR = 'oval face, high cheekbones, dark bob'
+/** 一份有人、没说时间的普通场景 —— 好几组用例共用它 */
+const BARE_SCENE = 'leaning on the balcony'
 
-describe('planChatPhoto · 场景照不该带角色设定', () => {
-  it('场景照:提示词只有场景,不发参考图', () => {
-    const p = planChatPhoto('rain on the window at dawn', false, FACE)
-    expect(p.prompt).toBe('rain on the window at dawn')
-    expect(p.useRefs).toBe(false)
+/* ===== 锚点句 ======================================================== */
+
+describe('characterAnchor · 只留不可变的身份特征', () => {
+  const fields = {
+    style: 'photorealistic',
+    gender: 'female',
+    identity: 'a night-shift nurse in a coastal town',
+    face: 'oval face, high cheekbones',
+    build: 'tall and lean',
+    hair: 'black bob',
+    brows: 'straight brows',
+    eyes: 'dark eyes',
+    noseMouth: 'small nose',
+    facialHair: 'clean-shaven',
+    faceMarks: '',
+    outfit: 'worn flight jacket',
+    marks: ''
+  }
+
+  it('风格不进锚点句 —— 它是"用什么媒介画",由模板那一层给', () => {
+    expect(characterAnchor({ fields })).not.toContain('photorealistic')
   })
 
-  it('场景照:哪怕外貌设定写着,也不拼进去 —— 那正是把风景画成人的原因', () => {
-    expect(planChatPhoto('an empty harbour', false, FACE).prompt).not.toContain('cheekbones')
+  it('身份叙事不进锚点句 —— 那是"这个人是谁",不是"长什么样"', () => {
+    const a = characterAnchor({ fields })
+    expect(a).not.toContain('nurse')
+  })
+
+  it('性别不进锚点句 —— 它由参考图和脸型特征决定,写出来只会变成标签', () => {
+    expect(characterAnchor({ fields })).not.toContain('female')
+  })
+
+  it('最多 7 项 —— 再多就退化成那份 token 清单了', () => {
+    /* 数的是"取了几项",不是 split(',') 的段数:字段值自己带逗号
+       ("oval face, high cheekbones" 是一项,却占两段) */
+    const oneEach = {
+      face: 'a', hair: 'b', eyes: 'c', brows: 'd', noseMouth: 'e', facialHair: 'f', build: 'g'
+    }
+    expect(characterAnchor({ fields: oneEach }).split(', ').length).toBe(7)
+  })
+
+  it('按固定顺序取:脸 → 头发 → 眼睛 → 眉毛 → 鼻嘴 → 胡须 → 体型', () => {
+    expect(characterAnchor({ fields })).toBe(
+      'oval face, high cheekbones, black bob, dark eyes, straight brows, small nose, clean-shaven, tall and lean'
+    )
+  })
+
+  it('体型垫在最后 —— 顺序本身就是取舍的优先级', () => {
+    /* 这份设定刚好 7 项可用,所以都进得来;只要再多一项,第一个出局的就是垫底的体型 */
+    const a = characterAnchor({ fields })
+    expect(a.indexOf('clean-shaven')).toBeLessThan(a.indexOf('tall and lean'))
+  })
+
+  it('只给脸和体型两项时,体型仍然进得来', () => {
+    expect(characterAnchor({ fields: { face: 'oval face', build: 'tall and lean' } })).toBe(
+      'oval face, tall and lean'
+    )
+  })
+
+  it('只给脸和体型两项时,体型仍然进得来', () => {
+    expect(characterAnchor({ fields: { face: 'oval face', build: 'tall and lean' } })).toBe(
+      'oval face, tall and lean'
+    )
+  })
+
+  it('没有结构化字段的老角色返回空串,不退回全量描述', () => {
+    expect(characterAnchor(undefined)).toBe('')
+    expect(characterAnchor({})).toBe('')
+    expect(characterAnchor({ fields: undefined })).toBe('')
+  })
+
+  it('字段值不是字符串时不抛 —— 外部导入的包可能被写坏', () => {
+    expect(characterAnchor({ fields: { face: 42, hair: null } })).toBe('')
   })
 })
 
-describe('planChatPhoto · 有它本人的照片要带上设定', () => {
-  it('self:场景在前、外貌在后(前段权重更高)', () => {
-    const p = planChatPhoto('leaning on the balcony at night', true, FACE)
-    expect(p.prompt).toBe(`leaning on the balcony at night, ${FACE}`)
+/* ===== 自拍 / 他拍 =================================================== */
+
+describe('isSelfie · 只认明确是自拍的说法', () => {
+  it.each([
+    'taking a selfie on the balcony',
+    'a quick self-portrait before work',
+    'selfie, hair still wet',
+    '自拍一张给你看',
+    '举着手机拍了一张'
+  ])('认出自拍:%s', (s) => {
+    expect(isSelfie(s)).toBe(true)
+  })
+
+  it.each([
+    'me on the balcony, hair down',
+    'leaning on the railing at night',
+    '我在阳台抽烟',
+    '窗外的雨'
+  ])('不认成自拍:%s', (s) => {
+    expect(isSelfie(s)).toBe(false)
+  })
+
+  it('认不出时的默认是"不是自拍" —— 猜错成自拍的代价更大', () => {
+    expect(isSelfie('a rooftop at dawn')).toBe(false)
+  })
+})
+
+/* ===== 分层拼装 ====================================================== */
+
+/* ===== 视角归谁定 ====================================================
+ *  `shot` 这个参数是"摄影指导判出来的视角"的入口(见 lib/photoDirector)。
+ *  不传时退回 isSelfie 词表 —— 那是**没有摄影指导时的降级路径**,不是主路径。 */
+
+describe('planChatPhoto · 视角', () => {
+  it('传了就用传进来的 —— 覆盖词表的判断', () => {
+    /* 场景里明明写着"自拍",但传进来的视角是第三人称:
+       这是主路径的样子(摄影指导看了整个场景后认为该他拍),
+       词表不该再把它掰回去 */
+    const p = planChatPhoto('taking a selfie by the window', true, ANCHOR, 'third')
+    expect(p.shot).toBe('third')
+    expect(p.prompt).toContain('third-person view')
+    expect(p.prompt).not.toContain('arm\u2019s length')
+  })
+
+  it('不传时退回词表(降级路径)', () => {
+    expect(planChatPhoto('taking a selfie by the window', true, ANCHOR).shot).toBe('selfie')
+    expect(planChatPhoto('leaning on the balcony', true, ANCHOR).shot).toBe('third')
+  })
+
+  it('画面里没有人时,传什么视角都只能是空镜', () => {
+    /* 这道护栏不由摄影指导负责:一张"我看到的东西"里长出一个人,
+       比视角选错严重得多 */
+    const p = planChatPhoto('an empty harbour', false, ANCHOR, 'selfie')
+    expect(p.shot).toBe('scene')
+    expect(p.prompt).toContain('no people in frame')
+  })
+
+  it('self 记在方案上 —— 摄影指导改视角时要靠它重拼模板', () => {
+    expect(planChatPhoto('an empty harbour', false, ANCHOR).self).toBe(false)
+    expect(planChatPhoto(BARE_SCENE, true, ANCHOR).self).toBe(true)
+  })
+})
+
+describe('planChatPhoto · 分层与顺序', () => {
+
+  it('场景照:不拼锚点、不发参考图、镜头是空镜', () => {
+    const p = planChatPhoto('rain on the window at dawn', false, ANCHOR)
+    expect(p.prompt).not.toContain('cheekbones')
+    expect(p.useRefs).toBe(false)
+    expect(p.shot).toBe('scene')
+  })
+
+  it('有它本人时拼锚点、发参考图', () => {
+    const p = planChatPhoto('leaning on the balcony at night', true, ANCHOR)
+    expect(p.prompt).toContain('cheekbones')
     expect(p.useRefs).toBe(true)
   })
 
-  it('没填过外貌设定的角色照样发参考图 —— 参考图是图,不依赖那段文字', () => {
+  it('场景排在锚点之前 —— 前段权重更高,先说要画什么', () => {
+    const p = planChatPhoto('leaning on the balcony', true, ANCHOR)
+    expect(p.prompt.indexOf('balcony')).toBeLessThan(p.prompt.indexOf('cheekbones'))
+  })
+
+  it('镜头句排在锚点之前 —— 没有它,"自拍"只是场景里的一个词', () => {
+    const p = planChatPhoto('taking a selfie by the window', true, ANCHOR)
+    expect(p.prompt.indexOf('front camera')).toBeLessThan(p.prompt.indexOf('cheekbones'))
+  })
+
+  it('空镜模板一个字都不许提到人 —— 那正是"风景里长出一个人"', () => {
+    const p = planChatPhoto('an empty harbour at dawn', false, '')
+    expect(p.prompt).toContain('no people in frame')
+    expect(p.prompt).not.toMatch(/\b(face|subject|figure|shoulders)\b/)
+  })
+
+  it('负面约束垫在最后,挡的是证件照那套默认构图', () => {
+    const p = planChatPhoto('me on the balcony', true, ANCHOR)
+    expect(p.prompt).toContain('not a character sheet')
+    expect(p.prompt).toContain('not a passport or ID photo')
+  })
+
+  it('没填过设定的角色照样发参考图 —— 参考图是图,不依赖那段文字', () => {
     const p = planChatPhoto('me, at my desk', true, '')
     expect(p.useRefs).toBe(true)
-    expect(p.prompt).toBe('me, at my desk')
-  })
-})
-
-describe('planChatPhoto · 边角', () => {
-  it('两端空白先收掉,不留出多余的空格', () => {
-    expect(planChatPhoto('  a rooftop  ', true, '  tall  ').prompt).toBe('a rooftop, tall')
+    expect(p.prompt).toContain('me, at my desk')
   })
 
-  it('空场景给空提示词(调用方据此直接放弃这一张)', () => {
-    expect(planChatPhoto('', true, FACE).prompt).toBe('')
+  it('只写锚点、没有场景时给空提示词(调用方据此直接放弃这一张)', () => {
+    expect(planChatPhoto('', true, ANCHOR).prompt).toBe('')
+    expect(planChatPhoto('   ', true, ANCHOR).useRefs).toBe(false)
   })
 
   it('超长按上限截断', () => {
     const long = 'x'.repeat(CHAT_PHOTO_PROMPT_CHARS + 500)
-    expect(planChatPhoto(long, false, FACE).prompt.length).toBe(CHAT_PHOTO_PROMPT_CHARS)
+    expect(planChatPhoto(long, false, ANCHOR).prompt.length).toBe(CHAT_PHOTO_PROMPT_CHARS)
   })
 
   it('退化输入不抛', () => {
     expect(planChatPhoto(undefined as unknown as string, false, '').prompt).toBe('')
-    expect(planChatPhoto('a', true, undefined as unknown as string).prompt).toBe('a')
+    expect(planChatPhoto('a', true, undefined as unknown as string).prompt).toContain('a')
+  })
+})
+
+/* ===== 只补不覆盖 ====================================================
+ *  这一组是"模板不许和场景打架"的全部依据。场景说过的位,模板一个字都不许再说 ——
+ *  两句光/两个焦段凑在一张提示词里,模型会挑一处当噪声丢掉,或者硬凑成一张怪图。 */
+
+describe('missingSlots · 场景已经说了什么', () => {
+  it('写了光就不补光', () => {
+    expect(missingSlots('a lamp on the desk, warm light').light).toBe(false)
+    expect(missingSlots('窗边一盏灯,暖光').light).toBe(false)
+  })
+
+  it('写了景深/镜头就不补镜头', () => {
+    expect(missingSlots('a portrait, shallow depth of field').lens).toBe(false)
+    expect(missingSlots('背景虚化').lens).toBe(false)
+  })
+
+  it('没写就补', () => {
+    const m = missingSlots('a rooftop at dawn')
+    expect(m.light).toBe(true)
+    expect(m.lens).toBe(true)
+  })
+
+  it('"sunny" 里的 sun 不算写了光 —— 词表必须认词边界', () => {
+    expect(missingSlots('a sunny rooftop').light).toBe(true)
+  })
+})
+
+describe('planChatPhoto · 只补不覆盖', () => {
+  it('场景写了光,模板就不再塞一句自己的光(含中文场景)', () => {
+    const en = planChatPhoto('sitting by the window in warm afternoon light', true, ANCHOR)
+    expect(en.prompt).not.toContain('directional light with a clear source')
+    const zh = planChatPhoto('坐在窗边,午后的光很暖', true, ANCHOR)
+    expect(zh.prompt).not.toContain('directional light with a clear source')
+  })
+
+  it('场景没说光,模板补一句', () => {
+    const p = planChatPhoto('leaning on the balcony', true, ANCHOR)
+    expect(p.prompt).toContain('directional light')
+  })
+
+  it('下雨时补的是"湿处反光",不是一个凭空的晴天光', () => {
+    const p = planChatPhoto('standing on the balcony, rain on the glass', true, ANCHOR)
+    expect(p.prompt).toContain('wet reflections')
+    expect(p.prompt).not.toContain('one side of the face brighter')
+  })
+
+  it('场景已经交代了动作,就不补模板那个"此刻在做什么"', () => {
+    const p = planChatPhoto('sitting on the floor, reading a letter', true, ANCHOR)
+    expect(p.prompt).not.toContain('caught mid-movement')
+  })
+
+  it('纵深是无条件的 —— 它是相机原理,不该被"场景提过窗/桌"挡掉', () => {
+    const p = planChatPhoto('typing at my desk in the study', true, ANCHOR)
+    expect(p.prompt).toContain('layered with depth')
+  })
+})
+
+/* ===== 尺寸与参考图 ================================================== */
+
+describe('shotRatio / shotViewOrder', () => {
+  it('有人竖、空镜横', () => {
+    expect(shotRatio('selfie')).toBeLessThan(1)
+    expect(shotRatio('third')).toBeLessThan(1)
+    expect(shotRatio('scene')).toBeGreaterThan(1)
+  })
+
+  it('自拍以正面为主', () => {
+    expect(shotViewOrder('selfie')[0]).toBe('front')
+  })
+
+  it('他拍以全身那张打头 —— 身高体型不能靠模型现编', () => {
+    expect(shotViewOrder('third')[0]).toBe('full')
+  })
+
+  it('视图名必须是真实存在的枚举 —— 写错只会静静地少一张参考图', () => {
+    const real = new Set(['front', 'detail', 'full', 'closeups', 'expression'])
+    for (const shot of ['selfie', 'third', 'scene'] as const) {
+      for (const k of shotViewOrder(shot)) expect(real.has(k)).toBe(true)
+      expect(new Set(shotViewOrder(shot)).size).toBe(shotViewOrder(shot).length)
+    }
+  })
+})
+
+describe('chatPhotoSize · 按场景挑尺寸,别一律方框', () => {
+  const FIXED = ['1024x1024', '1536x1024', '1024x1536']
+
+  it('有人 → 竖幅那一档', () => {
+    expect(chatPhotoSize(FIXED, 'selfie', false)).toBe('1024x1536')
+    expect(chatPhotoSize(FIXED, 'third', false)).toBe('1024x1536')
+  })
+
+  it('空镜 → 横幅那一档', () => {
+    expect(chatPhotoSize(FIXED, 'scene', false)).toBe('1536x1024')
+  })
+
+  it('在自由尺寸那组里也挑得出竖幅 —— 不挑回 auto', () => {
+    const free = ['auto', '1024x1024', '1024x1792', '1792x1024', '512x512', '2560x1440']
+    expect(chatPhotoSize(free, 'third', true)).toBe('1024x1792')
+    /* 3:2 与 1.75 的距离(0.154)比与 16:9 的(0.170)更近 —— 挑的是比例,
+       不是"数字大的那个" */
+    expect(chatPhotoSize(free, 'scene', true)).toBe('1792x1024')
+  })
+
+  it('一个显式比例都没有时才退回 auto / 第一档', () => {
+    expect(chatPhotoSize(['auto'], 'third', true)).toBe('auto')
+    expect(chatPhotoSize(['1280x720'], 'third', false)).toBe('1280x720')
+  })
+
+  it('空候选不返回空串 —— 空值会被发到上游', () => {
+    expect(chatPhotoSize([], 'selfie', false)).toBe('auto')
+    expect(chatPhotoSize(undefined as unknown as string[], 'selfie', false)).toBe('auto')
   })
 })
