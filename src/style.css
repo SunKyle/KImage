@@ -54,6 +54,12 @@
      而开发机若装了 Inter 还会看到与访客不同的字形。 */
   --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
     "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  /* 衬线那一条**只给沉浸页的台词用**(见 ChatPage 的 .is-immersive)。
+     全站其余部分仍是上面那套系统无衬线 —— 这是这一处唯一的例外,
+     理由是那一页在做的事不同:它要的是"一页剧本",不是"一块界面"。
+     同样不加载任何字体:各端各有自己的衬线(Songti SC / SimSun / Noto Serif) */
+  --font-serif: Georgia, "Times New Roman", "Songti SC", "Noto Serif SC",
+    "Source Han Serif SC", serif;
 
   /* —— 字号:按角色命名 ——
      全站字号只在这里定义,调整时不必去 6 个文件里翻散落的 px。

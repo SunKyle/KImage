@@ -125,6 +125,29 @@ function avatarOf(c: Character): string {
   return coverSrc(c.ref)
 }
 
+/** 沉浸页头部第二行:`场景 · 时间`。
+ *
+ *  场景取自**最后一条带照片意图的消息**（`reply.photo` 就是它当时写的场景描述）——
+ *  也就是说这行字是它自己说的，不是我们编的，零额外调用。
+ *  一条都没发过图时只剩时间。
+ *
+ *  时间读的是**这台机器的钟**（与 T6.1 发出去的那份同一个口径：用户眼前的钟）。
+ *  它是在渲染那一刻算的，页面开着不动一小时这句话会旧一小时 ——
+ *  与"Last spoke"那行同一条取舍：它服务的是"刚回到这一页的那一眼"。 */
+const sceneLine = computed(() => {
+  const clock = () => {
+    const d = new Date()
+    const p = (n: number) => String(n).padStart(2, '0')
+    return `${p(d.getHours())}:${p(d.getMinutes())}`
+  }
+  const list = msgs.value
+  for (let i = list.length - 1; i >= 0; i--) {
+    const p = (list[i].photo || '').replace(/\s+/g, ' ').trim()
+    if (p) return `${p} · ${clock()}`
+  }
+  return clock()
+})
+
 /** 沉浸页背景用的那张。与头像是**同一个** object URL(coverSrc 按 Blob 缓存),
  *  所以它不额外占内存、也不额外发请求。
  *
@@ -987,7 +1010,12 @@ onBeforeUnmount(() => {
                 <span class="head-name">{{ current.name }}</span>
                 <span v-if="mood" :key="mood" class="mood">{{ mood }}</span>
               </span>
-              <span v-if="current.fields?.identity" class="head-sub">
+              <!-- 沉浸态的第二行是**场景 · 时间**,不是那串长相清单。
+                   场景取自它自己最后一张照片意图里写的描述(reply.photo)——
+                   等于它说"我在窗边",这一行就写"在窗边",不是我们编的。
+                   只加在 head-solo 这一份里:沉浸态恒用这一份(见那段 CSS) -->
+              <span v-if="immersive && sceneLine" class="head-scene">{{ sceneLine }}</span>
+              <span v-else-if="current.fields?.identity" class="head-sub">
                 {{ current.fields.identity }}
               </span>
             </span>
@@ -1408,7 +1436,7 @@ onBeforeUnmount(() => {
                 v-model="text"
                 class="no-bar"
                 rows="1"
-                :placeholder="`Message ${current.name}…`"
+                :placeholder="`Tell ${current.name} something…`"
                 :aria-label="`Message ${current.name}`"
                 @keydown="onKeydown"
               ></textarea>
@@ -1518,111 +1546,6 @@ onBeforeUnmount(() => {
 }
 
 /* ===== 左栏 ===== */
-/* ===== 沉浸态 =====
-   这一段的每一条都在做同一件事:**把工具那一层收走,把画面还给角色**
-   (见 doc/沉浸式对话页面设计.md)。判据只有一条 —— 屏幕上每一样东西,
-   是在服务这段话,还是在服务"这个软件的功能" */
-.chat.is-immersive {
-  /* 沉浸页的阅读列宽。**普通页刻意不收窄**(见 .chat-inner 那段注释),
-     这里收窄是因为前提变了:那两侧不再是面板里的留白,而是角色的画面 */
-  --immersive-col: 760px;
-}
-/* 面板的框去掉:对话该浮在场景上,而不是装在一个框里 */
-.chat.is-immersive .chat-main {
-  border: 0;
-  background: none;
-}
-/* 头、消息、输入各自收在同一个宽度里 —— 一条竖直的中轴 */
-.chat.is-immersive .chat-head,
-.chat.is-immersive .chat-inner,
-.chat.is-immersive .chat-empty.is-inside,
-.chat.is-immersive .chat-compose > * {
-  width: 100%;
-  max-width: var(--immersive-col);
-  margin-inline: auto;
-}
-/* 工具层收走:模型/记忆药丸、⋮ 菜单、可点的换人入口。
-   **进出沉浸那枚按钮留着** —— 它是出口,而藏起出口的全屏模式是把用户关在里面 */
-.chat.is-immersive .head-chip,
-.chat.is-immersive .chat-menu-wrap,
-.chat.is-immersive .head-pick {
-  display: none;
-}
-/* 身份照旧显示,变成不可点的那一份(head-solo 的 DOM 本来就在,宽屏用的就是它) */
-.chat.is-immersive .head-solo {
-  display: flex;
-}
-/* 头部那条分隔线也去掉:它属于"面板"那套边界 */
-.chat.is-immersive .chat-head {
-  border-bottom-color: transparent;
-}
-/* 字号上一档:这一页只有对话,没有别的东西要抢层级 */
-.chat.is-immersive .bubble {
-  font-size: var(--fs-md);
-}
-
-/* 背景层。z-index 0 + 上面那两层网格子项各自 z-index 1(见下),
-   不用负 z-index:负值会跑到 body 背景之下,效果随浏览器的绘制顺序而变 */
-.chat-bg {
-  position: fixed;
-  inset: 0;
-  z-index: 0;
-  overflow: hidden;
-  /* 它只是背景:绝不能接走指针事件(消息流在它上面要能滚、能点) */
-  pointer-events: none;
-}
-.chat-bg img {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  /* 放大一点点,免得 blur 在四边露出羽化过的透明边 */
-  transform: scale(1.12);
-  /* 明确的虚化 + 压暗:它要的是"那儿的光与色",不是一张能看清的照片。
-     看清楚了反而会和气泡抢注意力 —— 而这一页要读的是字 */
-  filter: blur(34px) saturate(1.08);
-  /* 2026-10-05:0.55 → 0.72。0.55 那一档在真机上"看不出来有背景"
-     (判据是 `document.querySelector('.chat-bg img').src` 有值 ——
-     图在,只是被蒙版盖没了)。气泡是不透明的,所以提高它不影响读字 */
-  opacity: 0.72;
-}
-/* 压暗蒙版。**对比度是硬约束,不是审美**(设计稿 §4):
-   正文压在这上面也要满足小字可读,所以这一层给得很重 ——
-   正脸只在顶部中间透出来一点 */
-.chat-bg::after {
-  content: '';
-  position: absolute;
-  inset: 0;
-  /* 上重、中轻、下重 —— 因为**压在背景上的那几行字在哪**:
-     顶部是角色名(这一页最先要认出来的东西),底部是输入区那一块提示,
-     中间那一带基本被气泡盖着,可以让出更多画面 */
-  background: linear-gradient(
-    to bottom,
-    color-mix(in srgb, var(--bg) 70%, transparent) 0%,
-    color-mix(in srgb, var(--bg) 42%, transparent) 22%,
-    color-mix(in srgb, var(--bg) 46%, transparent) 70%,
-    color-mix(in srgb, var(--bg) 74%, transparent) 100%
-  );
-}
-/* 窄屏把虚化收小:手机上 GPU 那一档开销更敏感,而屏幕小、半径本来也不必那么大 */
-@media (max-width: 720px) {
-  .chat-bg img {
-    filter: blur(22px) saturate(1.05);
-  }
-}
-/* 沉浸态里那两层网格子项要压在背景之上 */
-.chat.is-immersive .chat-rail,
-.chat.is-immersive .chat-main {
-  position: relative;
-  z-index: 1;
-}
-
-/* 沉浸态:**单列**。
-   注意隐藏左栏本身**不会**让上面那条 `240px` 的轨道塌掉 —— 显式的轨道宽度
-   还在,右边会平白少 240px 再加一道 gap,症状是"右边窄了一截",
-   很容易被当成 padding 问题。所以这一条必须显式写 */
-.chat.is-immersive {
-  grid-template-columns: minmax(0, 1fr);
-}
 .chat-rail {
   display: flex;
   flex-direction: column;
@@ -3022,4 +2945,206 @@ onBeforeUnmount(() => {
     font-size: var(--fs-lg);
   }
 }
+/* ===== 沉浸态的覆盖层 =====
+   放在**整个样式表的最后**是有意的:这一层几乎全是"把上面某条规则改掉",
+   而 CSS 里同等特异度比的是先后 —— 放在前面会被后面的基础规则反压回去
+   (第一版就是这么错的:气泡的底色照旧从 `.msg.assistant .bubble` 漏了出来,
+   屏幕上每句台词都还顶着一块浅灰方块) */
+/* ===== 沉浸态 =====
+   这一段的每一条都在做同一件事:**把工具那一层收走,把画面还给角色**
+   (见 doc/沉浸式对话页面设计.md)。判据只有一条 —— 屏幕上每一样东西,
+   是在服务这段话,还是在服务"这个软件的功能" */
+.chat.is-immersive {
+  /* 沉浸页的阅读列宽。**普通页刻意不收窄**(见 .chat-inner 那段注释),
+     这里收窄是因为前提变了:那两侧不再是面板里的留白,而是角色的画面 */
+  --immersive-col: 760px;
+}
+/* 面板的框去掉:对话该浮在场景上,而不是装在一个框里 */
+.chat.is-immersive .chat-main {
+  border: 0;
+  background: none;
+}
+/* 头、消息、输入各自收在同一个宽度里 —— 一条竖直的中轴 */
+.chat.is-immersive .chat-head,
+.chat.is-immersive .chat-inner,
+.chat.is-immersive .chat-empty.is-inside,
+.chat.is-immersive .chat-compose > * {
+  width: 100%;
+  max-width: var(--immersive-col);
+  margin-inline: auto;
+}
+/* 工具层收走:模型/记忆药丸、⋮ 菜单、可点的换人入口。
+   **进出沉浸那枚按钮留着** —— 它是出口,而藏起出口的全屏模式是把用户关在里面 */
+.chat.is-immersive .head-chip,
+.chat.is-immersive .chat-menu-wrap,
+.chat.is-immersive .head-pick {
+  display: none;
+}
+/* 身份照旧显示,变成不可点的那一份(head-solo 的 DOM 本来就在,宽屏用的就是它) */
+.chat.is-immersive .head-solo {
+  display: flex;
+}
+/* 头部那条分隔线也去掉:它属于"面板"那套边界 */
+.chat.is-immersive .chat-head {
+  border-bottom-color: transparent;
+}
+
+/* ===== 剧本那套:两个声音,没有气泡 =====
+   参考的是"一页剧本压在剧照上"那种排法(见 doc/沉浸式对话页面设计.md §3.3):
+   谁说的**不由左右和底色表达**,由**字体音区**表达 ——
+   角色:大、亮、衬线;你:小、暗、同一个衬线族。
+   两者都不是气泡:没有底色、没有圆角、没有内边距,直接躺在画面/背景上。 */
+.chat.is-immersive .bubble {
+  max-width: 100%;
+  padding: 0;
+  /* **底与边都要收**:上面 `.msg.assistant .bubble` 是"底 + 一圈极淡的边"一起给的,
+     只收底色会留下一圈把每句台词框住的细线(也是靠截图才看出来的) */
+  border: 0;
+  border-radius: 0;
+  background: none;
+  font-family: var(--font-serif);
+  /* 叠一层很轻的投影兜可读性:背景是一张照片,而照片的明暗不可控
+     (与设计稿 §4 那条"对比度是硬约束"是同一件事,这是它在这里的落法) */
+  text-shadow: 0 1px 12px color-mix(in srgb, var(--bg) 55%, transparent);
+}
+.chat.is-immersive .msg {
+  align-items: flex-start;
+}
+.chat.is-immersive .msg.assistant .bubble {
+  font-size: var(--fs-xl);
+  line-height: 1.5;
+  color: var(--text);
+}
+.chat.is-immersive .msg.user .bubble {
+  font-size: var(--fs-md);
+  line-height: 1.45;
+  color: var(--text-2);
+}
+/* 行距放开:这是一段话,不是一串消息 */
+.chat.is-immersive .chat-inner {
+  gap: var(--sp-3);
+}
+/* 逐条的时间分隔在沉浸态收掉 —— 头顶那行已经有"场景 · 时间"了。
+   **只留末尾那条"离开多久了"**:它答的是"我们上次说话是多久以前",
+   而那正是回到这一页时最需要的一句话(见 T6.3) */
+.chat.is-immersive .chat-stream .sep:not(.away) {
+  display: none;
+}
+/* 顶上渐隐:越旧越淡 —— 一页剧本不该有一条能滚到底的消息流。
+   用 mask 而不是给每条算透明度:它不碰 DOM,滚动时也不重排 */
+.chat.is-immersive .chat-stream {
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 56px);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 56px);
+}
+
+/* ===== 头部:居中一行名字 + 一行场景 ===== */
+.chat.is-immersive .chat-head {
+  justify-content: center;
+  padding-top: var(--sp-4);
+}
+/* 头像是多余的:那张脸就是整块背景 */
+.chat.is-immersive .head-ava {
+  display: none;
+}
+.chat.is-immersive .head-text {
+  align-items: center;
+  text-align: center;
+}
+.chat.is-immersive .head-name {
+  font-size: var(--fs-lg);
+  letter-spacing: 0.01em;
+}
+/* 那串写给图像模型的长相清单在这里收掉(见上面 head-scene 的说明) */
+.chat.is-immersive .head-sub {
+  display: none;
+}
+.chat.is-immersive .head-scene {
+  max-width: min(52ch, 62vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-3);
+  font-size: var(--fs-xs);
+}
+/* 出口(收起)钉在右上角:参考图里那个位置放的是 ⋯,也就是"这一页怎么用" */
+.chat.is-immersive .head-acts {
+  position: absolute;
+  top: var(--sp-3);
+  right: var(--sp-2);
+}
+/* 输入区收成一条宽胶囊(参考图里就是一整条半透明胶囊)。
+   圆角用 999 而不是 --r:这一条比别处的卡片更长更扁,
+   16px 会让两端看起来还是"卡片",而这里要的是一根管 */
+.chat.is-immersive .compose-box {
+  border-radius: 999px;
+  padding-left: var(--sp-4);
+  padding-right: 6px;
+}
+.chat.is-immersive .compose-box textarea {
+  font-family: var(--font-serif);
+}
+
+/* 背景层。z-index 0 + 上面那两层网格子项各自 z-index 1(见下),
+   不用负 z-index:负值会跑到 body 背景之下,效果随浏览器的绘制顺序而变 */
+.chat-bg {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  /* 它只是背景:绝不能接走指针事件(消息流在它上面要能滚、能点) */
+  pointer-events: none;
+}
+.chat-bg img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  /* 放大一点点,免得 blur 在四边露出羽化过的透明边 */
+  transform: scale(1.12);
+  /* 明确的虚化 + 压暗:它要的是"那儿的光与色",不是一张能看清的照片。
+     看清楚了反而会和气泡抢注意力 —— 而这一页要读的是字 */
+  filter: blur(34px) saturate(1.08);
+  /* 2026-10-05:0.55 → 0.72。0.55 那一档在真机上"看不出来有背景"
+     (判据是 `document.querySelector('.chat-bg img').src` 有值 ——
+     图在,只是被蒙版盖没了)。气泡是不透明的,所以提高它不影响读字 */
+  opacity: 0.72;
+}
+/* 压暗蒙版。**对比度是硬约束,不是审美**(设计稿 §4):
+   正文压在这上面也要满足小字可读,所以这一层给得很重 ——
+   正脸只在顶部中间透出来一点 */
+.chat-bg::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  /* 上重、中轻、下重 —— 因为**压在背景上的那几行字在哪**:
+     顶部是角色名(这一页最先要认出来的东西),底部是输入区那一块提示,
+     中间那一带基本被气泡盖着,可以让出更多画面 */
+  background: linear-gradient(
+    to bottom,
+    color-mix(in srgb, var(--bg) 70%, transparent) 0%,
+    color-mix(in srgb, var(--bg) 42%, transparent) 22%,
+    color-mix(in srgb, var(--bg) 46%, transparent) 70%,
+    color-mix(in srgb, var(--bg) 74%, transparent) 100%
+  );
+}
+/* 窄屏把虚化收小:手机上 GPU 那一档开销更敏感,而屏幕小、半径本来也不必那么大 */
+@media (max-width: 720px) {
+  .chat-bg img {
+    filter: blur(22px) saturate(1.05);
+  }
+}
+/* 沉浸态里那两层网格子项要压在背景之上 */
+.chat.is-immersive .chat-rail,
+.chat.is-immersive .chat-main {
+  position: relative;
+  z-index: 1;
+}
+
+/* 沉浸态:**单列**。
+   注意隐藏左栏本身**不会**让上面那条 `240px` 的轨道塌掉 —— 显式的轨道宽度
+   还在,右边会平白少 240px 再加一道 gap,症状是"右边窄了一截",
+   很容易被当成 padding 问题。所以这一条必须显式写 */
+.chat.is-immersive {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 </style>
