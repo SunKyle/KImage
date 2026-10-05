@@ -1596,6 +1596,14 @@ async function runChat(id: string) {
     mood = out.mood
     photo = out.photo
     photoSelf = out.photoSelf
+    /* 这一轮到底有没有"发图的意图",以及它想给你看什么。
+     *
+     * **不该靠猜**:标签在服务端就被剪掉了(那是对的,用户不该看见 `[photo:…]`),
+     * 于是"它没打算发图"和"它打算发、但被剪掉了"在界面上长得一模一样 ——
+     * 一旦出现"怎么每句都在发图"的疑问,这一层是唯一能一眼分辨的地方。
+     * 走 console.debug(详细级别,控制台默认不显示),**不落盘、不上报**。
+     * 只在**确实有意图**时打一行 —— 它就是为"太多了"这种问题准备的 */
+    if (photo) console.debug('[chat] photo intent:', photo)
   } catch (e) {
     if (isAbort(e)) stopped = true
     else failure = e instanceof Error ? e.message : 'Request failed'

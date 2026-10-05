@@ -365,12 +365,18 @@ async function main() {
     ok('规则里带着"别每句都报时"', systemOf().includes('it is a clock'))
     /* 这两条是 T6.5 加的软规则。这里断言的只是"它们确实进了 system" ——
        模型照不照做是另一回事(那是提示词类改动,只能手测),别把这条
-       当成"接话题行为已验证" */
+       当成"接话题行为已验证"。
+       "照片别滥用"那一句是 2026-10-05 补的:原来那句"照片之间要连贯"
+       里举了个"上一句在阳台、这一句在雪山"的例子 —— 例子本身就在示范
+       "每句都发图",加上它挤占了规则块的篇幅,模型于是真就每句都发。
+       现在改成"大多数消息里没有图,这是正常的",连贯性收成描述规则末尾
+       的一个从句(断言跟着改成新措辞) */
     ok(
-      '规则里带着"接话题"与"照片要连贯"',
+      '规则里带着"接话题"与"照片别滥用"',
       systemOf().includes('it is on you to carry it') &&
-        systemOf().includes('Keep the pictures consistent'),
-      JSON.stringify(systemOf().split('\n').filter((l) => l.includes('carry it') || l.includes('consistent')))
+        systemOf().includes('Most of your messages have no picture in them') &&
+        systemOf().includes('same place, at the same hour'),
+      JSON.stringify(systemOf().split('\n').filter((l) => l.includes('carry it') || l.includes('picture')))
     )
 
     /* 没给时间（老前端、手搓请求、时钟坏掉）→ 整块不出现，且**不影响这一轮**。
