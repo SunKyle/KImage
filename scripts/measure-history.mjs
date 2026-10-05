@@ -1943,6 +1943,9 @@ async function main() {
         /* 这段对话是 3 天前的。取这个数不是为了仿真,是为了让
            "Last spoke 3 days ago" 那一行有确定的、可断言的文本 */
         const CHAT_AGO = 3 * 24 * 60 * 60 * 1000
+        /* 沉浸偏好开着。重载后应用落在**首页** —— 那时顶栏必须照常显示,
+           "偏好留着、但不在对话页就回普通"正是下面要断言的语义之一 */
+        localStorage.setItem('kimage.immersive', '1')
         localStorage.setItem(
           'kimage.characters',
           JSON.stringify([
@@ -2082,7 +2085,15 @@ async function main() {
       await loaded
       await sleep(600)
 
-      // ③ 进对话页
+      /* ③ 沉浸态:偏好开着,而此刻在**首页** —— 顶栏必须照常显示。
+         这一条是"偏好"与"这一页长什么样"两件事的分界(见 App 的 immersiveOn):
+         顶栏是全站唯一去别的页的入口,只要不在对话页,chrome 就得回来 */
+      chatProbe.homeChrome = await evaluate(() => ({
+        mastVisible: (document.querySelector('.masthead')?.offsetHeight || 0) > 0,
+        pref: localStorage.getItem('kimage.immersive')
+      }))
+
+      // ④ 进对话页
       chatProbe.navToChat = await gotoPage('Chat')
       chatProbe.rendered = await evaluate(() => {
         const bubbles = document.querySelectorAll('.bubble, .msg, .chat-msg').length
@@ -2199,9 +2210,88 @@ async function main() {
         }
       })
 
+      /* ④ 沉浸骨架。偏好开着 + 已经在对话页 ⇒ 这一页该是第二种骨架。
+       *
+       * **先固定一个桌面视口**:探针默认那个无头窗口只有 ~756×356,窄屏媒体查询
+       * 本来就会把左栏藏起来、而 min-height:420px 又盖过了一切高度差 ——
+       * 在那种尺寸上"左栏不在布局里""高度变高了"全是恒真的,等于没测。
+       * 用完立刻 clearDeviceMetricsOverride 撤掉,免得扰动同一个 run 里
+       * 后面那些历史页的测量 */
+      await send('Emulation.setDeviceMetricsOverride', {
+        width: 1280,
+        height: 900,
+        deviceScaleFactor: 1,
+        mobile: false
+      })
+      await settle()
+
+      /* 量一次"普通骨架"当基线:两条轨道、顶栏有高度、面板矮一截 */
+      await evaluate(() => {
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))
+      })
+      await settle()
+      chatProbe.normal = await evaluate(() => {
+        const chat = document.querySelector('.chat')
+        return {
+          cols: getComputedStyle(chat).gridTemplateColumns,
+          railW: Math.round(document.querySelector('.chat-rail')?.getBoundingClientRect().width || 0),
+          mastH: document.querySelector('.masthead')?.offsetHeight || 0,
+          varMast: getComputedStyle(document.documentElement).getPropertyValue('--mast-h').trim(),
+          chatH: Math.round(chat.getBoundingClientRect().height),
+          viewH: window.innerHeight
+        }
+      })
+
+      /* 用头部那枚按钮再进一次 —— 入口本身要能走通(不只靠存下来的偏好) */
+      chatProbe.reImmerse = await evaluate(() => {
+        const b = document.querySelector('[aria-label="Immersive mode"]')
+        if (!b) return 'missing'
+        b.click()
+        return 'clicked'
+      })
+      await settle()
+      chatProbe.immersive = await evaluate(() => {
+        const chat = document.querySelector('.chat')
+        const main = document.querySelector('.chat-main')
+        return {
+          immersiveClass: chat.classList.contains('is-immersive'),
+          pref: localStorage.getItem('kimage.immersive'),
+          mastH: document.querySelector('.masthead')?.offsetHeight || 0,
+          varMast: getComputedStyle(document.documentElement).getPropertyValue('--mast-h').trim(),
+          railW: Math.round(document.querySelector('.chat-rail')?.getBoundingClientRect().width || 0),
+          cols: getComputedStyle(chat).gridTemplateColumns,
+          chatW: Math.round(chat.getBoundingClientRect().width),
+          mainW: Math.round(main.getBoundingClientRect().width),
+          chatH: Math.round(chat.getBoundingClientRect().height),
+          viewH: window.innerHeight
+        }
+      })
+
+      /* ⑤ 一次 Esc 只退一层 ⇒ 回到普通骨架,而**偏好不变**(它记的是意愿) */
+      await evaluate(() => {
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))
+      })
+      await settle()
+      chatProbe.backToNormal = await evaluate(() => {
+        const chat = document.querySelector('.chat')
+        return {
+          immersiveClass: chat.classList.contains('is-immersive'),
+          mastVisible: (document.querySelector('.masthead')?.offsetHeight || 0) > 0,
+          /* 顶栏回来之后 --mast-h 必须**跟着回来**。这一条盯的是
+             "观察者还挂在旧节点上"那种坏法:元素重新挂载了,而变量停在 0,
+             面板于是高出 72px —— 功能全对,只是layout错一截 */
+          varMast: getComputedStyle(document.documentElement).getPropertyValue('--mast-h').trim(),
+          cols: getComputedStyle(chat).gridTemplateColumns,
+          pref: localStorage.getItem('kimage.immersive')
+        }
+      })
+      /* 撤掉视口覆盖(后面那些测量要跑在原来的尺寸上) */
+      await send('Emulation.clearDeviceMetricsOverride')
+      await settle()
+
       await shot('chat-messages')
 
-      // ④ 点图开大图 → Esc 收起
+      // ⑦ 点图开大图 → Esc 收起
       chatProbe.clickedPhoto = await evaluate(() => {
         const b = document.querySelector('button.msg-img-btn')
         if (!b) return 'missing'
@@ -2430,6 +2520,37 @@ async function main() {
 
       chatProbe.passed =
         chatProbe.seeded === 8 &&
+        /* 偏好开着,但首页的 chrome 照常(顶栏在) */
+        chatProbe.homeChrome?.mastVisible === true &&
+        chatProbe.homeChrome?.pref === '1' &&
+        /* 基线与沉浸态必须**真的不一样** —— 否则下面那几条断言全在恒真的地方打转 */
+        chatProbe.normal?.varMast !== '0px' &&
+        chatProbe.normal?.cols.split(' ').length === 2 &&
+        chatProbe.normal?.railW > 0 &&
+        /* 进了对话页才是第二种骨架 */
+        chatProbe.reImmerse === 'clicked' &&
+        chatProbe.immersive?.immersiveClass === true &&
+        chatProbe.immersive?.pref === '1' &&
+        /* 顶栏藏起来 ⇒ offsetHeight 归零 ⇒ --mast-h 自动 0px。
+           **这条就是 v-show/v-if 那个坑的判据**:换成 v-if,这里会停在 72px */
+        chatProbe.immersive?.mastH === 0 &&
+        chatProbe.immersive?.varMast === '0px' &&
+        chatProbe.immersive?.railW === 0 &&
+        /* 单列:左栏隐藏了,但它那条 240px 的轨道若不显式改掉,内容会平白窄一截 */
+        chatProbe.immersive?.cols.split(' ').length === 1 &&
+        chatProbe.immersive?.mainW > chatProbe.immersive?.chatW - 40 &&
+        /* 且**真的把顶栏那份高度还给了面板** —— 比在视口高度上做文章稳:
+           后者会被 .chat 的 min-height 盖过去 */
+        chatProbe.immersive?.chatH >=
+          chatProbe.normal?.chatH + chatProbe.normal?.mastH - 4 &&
+        /* 一次 Esc 只退一层 ⇒ 回到普通骨架。
+           偏好跟着**最后那次明确的选择**走:退出来就是 '0'(下次进对话页直接普通),
+           而"偏好为 1 时在首页不该沉浸"那条由上面的 homeChrome 管 */
+        chatProbe.backToNormal?.immersiveClass === false &&
+        chatProbe.backToNormal?.mastVisible === true &&
+        chatProbe.backToNormal?.cols.split(' ').length === 2 &&
+        chatProbe.backToNormal?.varMast === chatProbe.normal?.varMast &&
+        chatProbe.backToNormal?.pref === '0' &&
         chatProbe.rendered?.bubbles >= 3 &&
         chatProbe.rendered?.hasMemory === true &&
         chatProbe.rendered?.oldMemoryBlock === false &&

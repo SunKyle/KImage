@@ -75,7 +75,11 @@ describe('同步范围 · 与源码里的写入点保持一致', () => {
     COLL_KEY: { key: COLL_KEY, synced: true },
     CHAR_KEY: { key: CHAR_KEY, synced: true },
     LIB_KEY: { key: LIB_KEY, synced: true },
-    THEME_KEY: { key: 'kimage.theme', synced: false }
+    THEME_KEY: { key: 'kimage.theme', synced: false },
+    /* 沉浸模式(见 lib/prefs.ts)。与 THEME_KEY 同一类:它答的是"这台设备上
+       这个人喜欢怎么看界面",丢了不影响任何数据的完整性;另一个标签页切了
+       沉浸跟着一起变,反而突兀 */
+    IMMERSIVE_KEY: { key: 'kimage.immersive', synced: false }
   }
 
   /* 用 Vite 的 import.meta.glob 把 src 下的源码按原文读进来,而不是 node:fs ——

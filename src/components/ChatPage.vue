@@ -3,6 +3,8 @@ import { computed, nextTick, onBeforeUnmount, onMounted, onUpdated, ref, watch }
 import {
   PhArrowDown,
   PhArrowUp,
+  PhArrowsInSimple,
+  PhArrowsOutSimple,
   PhArrowsClockwise,
   PhBrain,
   PhChatCircleDots,
@@ -70,6 +72,9 @@ const props = defineProps<{
   /* 朗读要用的合成配置。没配就退回浏览器自带的语音(见 lib/speech)——
      它是"能用就行"与"这个角色自己的嗓子"之间的那条分界线 */
   ttsConfig?: ApiConfig
+  /* 沉浸态:同一页的第二种骨架(见 doc/沉浸式对话页面设计.md)。
+     **它是显示层的事,页面自己不改任何数据** —— 偏好存盘与外壳那一层归主界面 */
+  immersive?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -104,6 +109,9 @@ const emit = defineEmits<{
   /* 去配那条对话模型。**只交意图**:是回列表还是直接开一张新表单,
      由主界面定(它才知道现在有没有专配的对话配置)—— 见 App 的 openChatConfigSettings */
   (e: 'configureChatModel'): void
+  /* 切骨架(进/出沉浸)。**只交意图** —— 它是偏好,存盘归主界面
+     (与主题切换同一条分工) */
+  (e: 'toggleImmersive'): void
 }>()
 
 /* ===== 取用的那一份 =================================================
@@ -309,8 +317,24 @@ const canRetry = computed(() => {
 })
 const regenLabel = computed(() => (canRetry.value ? 'Try again' : 'Regenerate'))
 
+/* 重新生成 / 重试也在气泡下角那一排里,排在"删"后面 ——
+   它和"念 / 删"是同一类东西:这一条消息顺带能做的事。
+   但它只对**末尾那一条**成立:这个动作就是"把最后一轮再来一次",
+   挂到中间某条消息上,那句话就没有意思了 */
+const tail = computed(() => msgs.value[msgs.value.length - 1])
+function canRegenMsg(m: ChatMessage): boolean {
+  return !!tail.value && tail.value.id === m.id && (canRegenerate.value || canRetry.value)
+}
+/* 末尾那条有没有气泡可挂。**只发了一张图、没有文字**的消息不渲染气泡
+   (见模板里那一条 v-if),那种消息的下角无处可挂 ——
+   这枚按钮退回消息流末尾(见 .regen),不然它就在这条消息上彻底消失了 */
+const tailBubble = computed(() => {
+  const m = tail.value
+  return !!m && (!!m.content.trim() || !hasAttach(m))
+})
+
 /* ===== 每一条消息的悬停动作 ========================================
-   念 / 删。三条判据分开写,是因为它们各自有各自的理由,合成一个大
+   念 / 删 / 重来。四条判据分开写,是因为它们各自有各自的理由,合成一个大
    布尔表达式之后"为什么这条没有那枚按钮"就读不出来了 */
 /** 正在生成的那条不给朗读:半句话念出来只会更难听 */
 function canSpeakMsg(m: ChatMessage): boolean {
@@ -323,7 +347,7 @@ function canDeleteMsg(m: ChatMessage): boolean {
 /** 整排动作有没有东西可放。一个都没有时连外层都不渲染 ——
    空着一排绝对定位的元素会平白多出一块能接收指针的区域 */
 function hasMsgOps(m: ChatMessage): boolean {
-  return canSpeakMsg(m) || canDeleteMsg(m)
+  return canSpeakMsg(m) || canDeleteMsg(m) || canRegenMsg(m)
 }
 /** 这条消息挂着图没有(用户附的、或角色发的)。空气泡的判据要用它 */
 function hasAttach(m: ChatMessage): boolean {
@@ -432,6 +456,23 @@ watch(
   () => {
     closeMemory()
     stopSpeaking()
+  }
+)
+
+/* ===== 进 / 出沉浸 ==================================================
+   一个动作配一次焦点搬运(与"打开浮层把焦点收进去、关掉再还回去"同一条规矩):
+   - 进来把焦点交给输入框 —— 你切到沉浸就是为了说话,不该再点一下;
+   - 出去还给那枚按钮 —— 焦点掉在文档开头是这家仓库一直在修的那类问题。
+
+   顺带:进入时**不收菜单也不收记忆卡片**。它们是浮层,压在沉浸态之上;
+   用户点开的那张卡片不该因为换了个骨架就自己合上。 */
+const immBtnEl = ref<HTMLButtonElement | null>(null)
+watch(
+  () => props.immersive,
+  async (on) => {
+    await nextTick()
+    if (on) inputEl.value?.focus()
+    else immBtnEl.value?.focus()
   }
 )
 
@@ -771,7 +812,11 @@ function onKey(e: KeyboardEvent) {
     { open: !!zoom.value, close: () => (zoom.value = null) },
     { open: pickerOpen.value, close: () => void closePicker() },
     { open: memoryOpen.value, close: closeMemory },
-    { open: menuOpen.value, close: closeMenu }
+    { open: menuOpen.value, close: closeMenu },
+    /* 沉浸是**最外面**那一层:一次 Esc 只退一层 —— 菜单开着时先关菜单,
+       再按一次才退出沉浸。反过来(一次按两下)会让人以为"Esc 把我的菜单和
+       整个模式一起弄没了" */
+    { open: !!props.immersive, close: () => emit('toggleImmersive') }
   ])
 }
 
@@ -823,9 +868,9 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="chat">
+  <div class="chat" :class="{ 'is-immersive': immersive }">
     <!-- —— 左栏:角色。与对话是同一个对象的两个面 —— -->
-    <aside class="chat-rail" aria-label="Characters">
+    <aside v-show="!immersive" class="chat-rail" aria-label="Characters">
       <p class="rail-eyebrow">Conversations</p>
       <div v-if="characters.length" class="rail-list no-bar">
         <!-- 一行 = 一个"选它"按钮 + 一枚图钉(两个兄弟节点)。
@@ -986,6 +1031,19 @@ onBeforeUnmount(() => {
                 </button>
               </div>
             </div>
+
+            <!-- 进出沉浸。放在这一排的最后(与 ⋮ 相邻):两枚都是"这一页怎么用",
+                   而它要去的地方与它自己同一排时,肌肉记忆是连续的 -->
+            <button
+              ref="immBtnEl"
+              class="icob"
+              :aria-label="immersive ? 'Leave immersive mode' : 'Immersive mode'"
+              :aria-pressed="!!immersive"
+              @click="emit('toggleImmersive')"
+            >
+              <PhArrowsInSimple v-if="immersive" aria-hidden="true" />
+              <PhArrowsOutSimple v-else aria-hidden="true" />
+            </button>
           </div>
 
           <!-- 记忆卡片。**悬浮在头部下方**,位置固定,与对话多长无关 ——
@@ -1127,11 +1185,11 @@ onBeforeUnmount(() => {
                     {{ r.msg.role === 'user' ? 'You said: ' : `${current.name} said: ` }}
                   </span>
                   {{ shownText(r.msg) }}<span v-if="r.msg.id === cursorId" class="cursor" aria-hidden="true"></span>
-                  <!-- 这一条的两个悬停动作(念 / 删)。整排贴着气泡外侧下角,
+                  <!-- 这一条顺带能做的事(念 / 删 / 重来)。整排贴着气泡外侧下角,
                        绝对定位 —— 它不该挤占气泡的宽度。放进流里(哪怕用
                        opacity 藏起来)会实打实地把每个气泡压窄 80px。
                        只在悬停时浮出来(触屏没有 hover,那时让它常驻,见样式)。
-                       正在生成的那条两个都不给:半句话念出来只会更难听,
+                       正在生成的那条一个都不给:半句话念出来只会更难听,
                        而删一条正在长的消息会与收尾落盘打架 -->
                   <span
                     v-if="hasMsgOps(r.msg)"
@@ -1165,6 +1223,16 @@ onBeforeUnmount(() => {
                       @click="emit('deleteMessage', current.id, r.msg.id)"
                     >
                       <PhTrash aria-hidden="true" />
+                    </button>
+                    <!-- 重新生成 / 重试:排在"删"后面。两者是同一件事的两种叫法,
+                         只有末尾那一条有(见 canRegenMsg) -->
+                    <button
+                      v-if="canRegenMsg(r.msg)"
+                      class="quiet-btn regen-inline"
+                      @click="emit('regenerate', current.id)"
+                    >
+                      <PhArrowsClockwise aria-hidden="true" />
+                      {{ regenLabel }}
                     </button>
                   </span>
                 </div>
@@ -1222,9 +1290,10 @@ onBeforeUnmount(() => {
               </div>
             </template>
 
-            <!-- 重新生成 / 重试:都只在消息流末尾出现,两者是同一件事的两种叫法。
-                 它是这一页最次要的动作,所以做成一条无底无边的细文字 -->
-            <div v-if="canRegenerate || canRetry" class="regen">
+            <!-- 重新生成 / 重试的**退路**:末尾那条没有气泡可挂时(只发了一张图、
+                 没有文字 —— 那种消息不渲染气泡,下角那排也就没有落脚点)才出现在
+                 这儿。正常情况下它在末尾那条的悬停动作里,排在"删"后面 -->
+            <div v-if="(canRegenerate || canRetry) && !tailBubble" class="regen">
               <button class="quiet-btn" @click="emit('regenerate', current.id)">
                 <PhArrowsClockwise aria-hidden="true" />
                 {{ regenLabel }}
@@ -1416,6 +1485,13 @@ onBeforeUnmount(() => {
 }
 
 /* ===== 左栏 ===== */
+/* 沉浸态:**单列**。
+   注意隐藏左栏本身**不会**让上面那条 `240px` 的轨道塌掉 —— 显式的轨道宽度
+   还在,右边会平白少 240px 再加一道 gap,症状是"右边窄了一截",
+   很容易被当成 padding 问题。所以这一条必须显式写 */
+.chat.is-immersive {
+  grid-template-columns: minmax(0, 1fr);
+}
 .chat-rail {
   display: flex;
   flex-direction: column;
@@ -1858,7 +1934,7 @@ onBeforeUnmount(() => {
 .msg.user {
   align-items: flex-end;
 }
-/* 朗读与删除两枚键贴着气泡外侧下角,绝对定位 —— 它们**不该占气泡的宽度**。
+/* 念 / 删 / 重来这几枚键贴着气泡外侧下角,绝对定位 —— 它们**不该占气泡的宽度**。
    放进流里(哪怕用 opacity 藏起来)会实打实地把每个气泡压窄 80px,
    而不悬停的时候谁也看不见它们,那份窄就成了一份没来由的窄。
 
@@ -1929,6 +2005,18 @@ onBeforeUnmount(() => {
 .del-btn:hover {
   background: var(--accent-soft);
   color: var(--danger);
+}
+/* 那一排里的"重新生成":同排其余两枚是 40×40 的圆点,它是唯一带字的。
+   所以字号压到最小档、左右各收一点 —— 它得读得出自己是什么
+   ("Regenerate"与"Try again"是两件事,不能只剩一个图标),
+   又不能比那两枚圆点更抢眼。可点高度仍与它们齐平(quiet-btn 的 40px) */
+.regen-inline {
+  padding: 0 7px;
+  font-size: var(--fs-micro);
+  white-space: nowrap;
+}
+.regen-inline svg {
+  font-size: 14px;
 }
 /* 还在等音频。这一档必须看得出来 —— 第三方合成要等几百毫秒到好几秒,
    而在它出声之前,"在等"和"已经念完了"长得一模一样:都是不出声。
@@ -2193,8 +2281,9 @@ onBeforeUnmount(() => {
   }
 }
 /* 重新生成是这一页最次要的动作 —— 它不该和对话争视线。
-   做成一枚无底无边的细文字:眼睛扫过去几乎不占用注意力,
-   但可点高度仍给到 40px,手按得着 */
+   平时它挂在末尾那条消息的悬停动作里(见 .regen-inline);只有末尾那条
+   **没有气泡可挂**时才退回这里(自由站一行)。做成一枚无底无边的细文字:
+   眼睛扫过去几乎不占用注意力,但可点高度仍给到 40px,手按得着 */
 .regen {
   display: flex;
   margin-top: var(--sp-1);

@@ -103,6 +103,8 @@ import {
   watchSystemTheme,
   type Theme
 } from './lib/theme'
+/* 界面偏好(不是数据)。与主题同一类:不跨标签页同步,丢了不影响任何东西 */
+import { saveImmersive, savedImmersive } from './lib/prefs'
 import type { ApiConfig, FavoritePayload, HistoryEntry, PromptItem, ResultItem, ReuseParams, Character, CharacterFields, CharacterPersona, CharacterViewKind, CharacterVoice, ChatMessage, ImportedCharacter } from './types'
 
 // —— 状态 ——
@@ -323,6 +325,21 @@ const {
 
 type Page = 'home' | 'chars' | 'chat' | 'canvas' | 'lib' | 'history' | 'settings'
 const page = ref<Page>('home')
+
+/* —— 沉浸式对话页 ——
+   它是**同一个对话页的第二种骨架**,不是第二个页面:状态、消息、输入、流式全复用,
+   只换外层 chrome(见 doc/沉浸式对话页面设计.md)。
+
+   两个状态而不是一个,是因为它们回答的问题不同:
+   - `immersive` 是**用户的偏好**(存盘,离开这一页也不变);
+   - `immersiveOn` 是**此刻这一页长什么样** —— 顶栏是全站唯一去别的页的入口,
+     所以只要不在对话页,chrome 就必须回到普通。偏好留着,下次进对话页直接生效。 */
+const immersive = ref(savedImmersive())
+const immersiveOn = computed(() => immersive.value && page.value === 'chat')
+function toggleImmersive() {
+  immersive.value = !immersive.value
+  saveImmersive(immersive.value)
+}
 const previewEntry = ref<HistoryEntry | null>(null)
 /* 预览打开时落在第几张。与 previewEntry 一起设:历史页是按张摊平的,
    "点的是哪一张"是打开动作的一部分,不该由预览卡自己从头数 */
@@ -2100,13 +2117,21 @@ function createAssignCollection(title: string) {
 </script>
 
 <template>
-  <div class="shell" :class="{ 'shell-wide': page === 'chat' }">
+  <div
+    class="shell"
+    :class="{ 'shell-wide': page === 'chat', 'shell-immersive': immersiveOn }"
+  >
     <!-- 品牌 + 视图切换 + 全局操作 -->
     <!-- 顶部横条:字标、导航与主题开关都在最顶层,每一页都在(画布页也不例外),
          切页时相对位置不动。
          字标是"KImage + 一截手写体",那截就是当前页名 ——
          首页写 Studio,其余页写各自的名字,名字取自导航那份清单(lib/nav.ts) -->
-    <header ref="mastEl" class="masthead" :class="{ scrolled }">
+    <!-- 沉浸态藏起顶栏。**必须用 v-show,不能用 v-if** ——
+         下面那条 ResizeObserver 观察的正是这个元素:`display: none` 时它的
+         offsetHeight 是 0,--mast-h 于是自动变成 0px,而 .chat 的高度算式
+         一个字都不用改。换成 v-if 卸载它,观察就断了,--mast-h 会僵在 72px,
+         症状是"沉浸页底下平白矮一截"—— 功能全对,所以很难被发现 -->
+    <header v-show="!immersiveOn" ref="mastEl" class="masthead" :class="{ scrolled }">
       <div class="wordmark">
         <span class="title">
           KImage
@@ -2692,6 +2717,8 @@ function createAssignCollection(title: string) {
         :chat-borrowed="chatBorrowed"
         :vision-config="visionConfig || undefined"
         :tts-config="ttsConfig || undefined"
+        :immersive="immersiveOn"
+        @toggle-immersive="toggleImmersive"
         @select="chatCharId = $event"
         @send="sendChat"
         @stop="stopChat"
