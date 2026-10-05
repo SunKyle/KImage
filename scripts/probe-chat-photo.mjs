@@ -83,7 +83,6 @@ const upstream = http.createServer((req, res) => {
       if (isDirector) {
         seen.enhance = json
         const out = [
-          'Shot: selfie',
           'Camera: held at arm\u2019s length, slightly above eye level',
           'Lens: shallow focus, the wall soft behind the shoulders',
           'Light: a cool streetlight just off frame to the right, catching the wet rail',
@@ -222,6 +221,7 @@ async function main() {
     ok('正文完整（末句没被扣掉）', out.text.trim().endsWith('tired of it.'), JSON.stringify(out.text))
     ok('photo 剪出来了且 self 前缀被剪掉', out.done?.photo === 'me on the balcony', String(out.done?.photo))
     ok('photoSelf = true', out.done?.photoSelf === true)
+    ok('self: 只说"它在画面里"，相机那一项留空给客户端判', out.done?.photoShot === '', String(out.done?.photoShot))
     ok('mood = tired', out.done?.mood === 'tired', String(out.done?.mood))
     ok(
       '流式期间没有任何一帧露出半截标签',
@@ -270,6 +270,7 @@ async function main() {
     )
     ok('意图照样报上来(图还是要发的)', out.done?.photo === 'me in the car, tired but grinning', String(out.done?.photo))
     ok('self: 也认出来了', out.done?.photoSelf === true)
+    ok('中段那枚同样不带相机信息', out.done?.photoShot === '', String(out.done?.photoShot))
     ok('末尾那枚 mood 照旧', out.done?.mood === 'tired', String(out.done?.mood))
 
     /* —— 用例 2：接近上限的长场景 —— */
@@ -282,7 +283,7 @@ async function main() {
        标记的字符数一变,数下标就会静静地错一位 */
     const sceneText = SCENE_FULL.replace(/^self:/, '')
     ok('长场景整段保住', out.done?.photo === sceneText, `len=${out.done?.photo?.length} 期望 ${sceneText.length}`)
-    ok('photoSelf = true', out.done?.photoSelf === true)
+    ok('photoSelf = true（self: 前缀）', out.done?.photoSelf === true)
     ok('正文里没有标签残留', !/\[photo/.test(out.text))
     ok('正文本身完整', out.text.trim() === 'Look at this.', JSON.stringify(out.text))
     /* 关键：正文必须在场景那 400 字还没写完时就已经到了客户端。
@@ -300,7 +301,27 @@ async function main() {
     out = await readChat(r)
     ok('photo 剪出来了', out.done?.photo === 'rain on the window at dawn')
     ok('photoSelf = false（不写前缀就是它看到的东西）', out.done?.photoSelf === false)
+    ok('画面里没有人，相机那一项自然是空的', out.done?.photoShot === '', String(out.done?.photoShot))
     ok('没有 mood 时 mood 是空串', out.done?.mood === '')
+
+    /* —— 用例 3b：自拍 / 他拍由标签说清（2026-10-05 新增） ——
+       在这之前，视角交给一次只看得到场景的文本调用去猜，猜出来大多是他拍 ——
+       用户的原话是"对于自拍的理解总是不好，老是会生成他拍视角的图片"。
+       现在模型自己写 `selfie:` / `third:`，服务端原样带出来 */
+    console.log('\n用例 3b · 谁拿的相机')
+    chatReply = 'One second, mirror is fogged.\n[photo:selfie:me in the bathroom mirror, hair wet]'
+    r = await post(APP_PORT, '/api/chat', { ...cfg, messages: [{ role: 'user', content: 'hi' }] })
+    out = await readChat(r)
+    ok('photoShot = selfie', out.done?.photoShot === 'selfie', String(out.done?.photoShot))
+    ok('selfie: 前缀也说明它在画面里', out.done?.photoSelf === true)
+    ok('前缀不进场景描述', out.done?.photo === 'me in the bathroom mirror, hair wet', String(out.done?.photo))
+
+    chatReply = 'Caught me off guard.\n[photo:third:me on stage, taken from the crowd]'
+    r = await post(APP_PORT, '/api/chat', { ...cfg, messages: [{ role: 'user', content: 'hi' }] })
+    out = await readChat(r)
+    ok('photoShot = third', out.done?.photoShot === 'third', String(out.done?.photoShot))
+    ok('photoSelf 照样是 true（它在画面里，只是相机在别人手上）', out.done?.photoSelf === true)
+    ok('前缀不进场景描述', out.done?.photo === 'me on stage, taken from the crowd', String(out.done?.photo))
 
     /* —— 用例 4：photo 档确实按五行回 —— */
     console.log('\n用例 4 · /api/enhance 的 photo 档')
@@ -313,8 +334,12 @@ async function main() {
     })
     const enh = await r.json()
     ok('HTTP 200', r.status === 200, JSON.stringify(enh))
-    ok('回了五行', String(enh.prompt || '').trim().split('\n').length === 5, JSON.stringify(enh.prompt))
-    ok('第一行是 Shot', /^Shot: (selfie|third)$/m.test(String(enh.prompt)))
+    ok('回了四行', String(enh.prompt || '').trim().split('\n').length === 4, JSON.stringify(enh.prompt))
+    ok(
+      '不再要它判视角 —— 这一行是"老出他拍"的来源，它已经不写了',
+      !/^\s*Shot\s*:/m.test(String(enh.prompt)),
+      JSON.stringify(enh.prompt)
+    )
     ok('四行标签齐全', ['Camera', 'Lens', 'Light', 'Environment'].every((k) => String(enh.prompt).includes(`${k}:`)))
     ok(
       '系统提示里用的是 photo 档（不是 quick）',

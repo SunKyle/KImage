@@ -1,25 +1,32 @@
 import { describe, expect, it } from 'vitest'
 import {
+  CHARACTER_VIEWS,
   FREE_SIZES,
+  REF_IDENTITY_ONLY,
   acceptableSize,
   asConfigKind,
+  characterViewPrompt,
   configKindOf,
   defaultSizeFor,
   extraParamsFor,
+  getProvider,
   mergeHistory,
   normalizeSize,
   PHOTO_ERROR_CHARS,
   photoFailureText,
   pickActiveByKind,
+  providerBodyFields,
   seedFor,
   sizeClosestTo,
+  sizeFieldFor,
   sizeForVendor,
   shouldProcessNow,
   sizeIsFree,
   sizeOptionsFor,
-  thumbsToFill
+  thumbsToFill,
+  watermarkParamFor
 } from './api'
-import type { ApiConfig, HistoryEntry } from './types'
+import type { ApiConfig, Character, HistoryEntry } from './types'
 
 /* 造一条配置。只有 id 与 kind 参与挑选,其余字段给最小值即可 */
 function cfg(id: string, kind?: ApiConfig['kind']): ApiConfig {
@@ -144,9 +151,15 @@ describe('normalizeSize · 手填尺寸归一', () => {
 })
 
 describe('sizeOptionsFor · 这家厂商认哪些尺寸', () => {
-  it('不认 auto 的厂商要把 auto 摘掉(留着它会显示"自动"却带不了这个参数)', () => {
-    // 豆包 Seedream:autoSize=false 且 sizes=free
-    expect(sizeOptionsFor('ark', 'doubao-seedream-3-0-t2i')).not.toContain('auto')
+  it('豆包也有"让模型自己定"这一档,只是表达方式是**不发** size(见 autoSize)', () => {
+    expect(sizeOptionsFor('ark', 'doubao-seedream-5-0-flash-260915')).toContain('auto')
+  })
+
+  it('豆包那一档排在末位 —— 它的 auto 等于"按上游默认出图"(2K,按像素计费)', () => {
+    // 排头就会被当成兜底档,于是"用户什么都没选"变成"按最贵的那档出图"
+    const opts = sizeOptionsFor('ark', 'x')
+    expect(opts[opts.length - 1]).toBe('auto')
+    expect(opts[0]).toBe('1024x1024')
   })
 
   it('认 auto 的厂商保留它', () => {
@@ -165,10 +178,14 @@ describe('sizeOptionsFor · 这家厂商认哪些尺寸', () => {
   })
 
   it('不限尺寸的厂商拿到的是一组常用值(而不是空列表)', () => {
-    // ark 的 autoSize 是 false:常用值里那份 auto 会被摘掉
-    expect(sizeOptionsFor('ark', 'x')).toEqual(FREE_SIZES.filter((s) => s !== 'auto'))
     // 未知厂商按"认 auto"处理,于是原样拿到整份
     expect(sizeOptionsFor('custom', 'x')).toEqual(FREE_SIZES)
+    // 认不出的厂商(自定义中转)按字面量那套原样给
+    expect(sizeOptionsFor(undefined, 'x')).toEqual(FREE_SIZES)
+  })
+
+  it('没有这一档的厂商被摘掉 auto(留着它会显示"自动"却带不了这个参数)', () => {
+    expect(sizeOptionsFor('dashscope', 'wanx2.1-t2i-turbo')).not.toContain('auto')
   })
 
   it('Gemini 的档位都能干净约成它认的宽高比(约不出来的会被服务端丢掉比例)', () => {
@@ -294,6 +311,101 @@ describe('extraParamsFor · 按能力决定带哪些扩展参数', () => {
   })
 })
 
+/* 水印这件事只有一条规矩要紧:**Ark 必须收到 false**。
+   它的 watermark 默认是 true,不显式关掉,图角那枚"AI生成"就一直在,
+   而提示词里写多少句 no watermark 都管不着上游事后盖上去的那一层。
+   反过来说,别的厂商一项都不该收到:它们没有这个字段,
+   多塞一个未知字段会把本来能用的配置打成 400 */
+describe('watermarkParamFor · 只有认这一项的厂商才收到 false', () => {
+  it('Ark 收到 false(它默认是 true,不发就等于一直带着水印)', () => {
+    expect(watermarkParamFor(imgCfg({ vendor: 'ark', model: 'doubao-seedream-3-0-t2i' }))).toEqual({
+      watermark: false
+    })
+  })
+
+  it('老配置没写 vendor 时,按域名认出 Ark 也照样关', () => {
+    const legacy = imgCfg({
+      vendor: undefined,
+      baseUrl: 'https://ark.cn-beijing.volces.com/api/v3',
+      model: 'doubao-seedream-4-0-250828'
+    })
+    expect(watermarkParamFor(legacy)).toEqual({ watermark: false })
+  })
+
+  it('不认这一项的厂商一项都不带(凭空多一个字段会被拒)', () => {
+    expect(watermarkParamFor(imgCfg({ vendor: 'openai' }))).toEqual({})
+    expect(watermarkParamFor(imgCfg({ vendor: 'gemini' }))).toEqual({})
+  })
+
+  /* 认不出来的地址按 unknown 处理:我们并不知道那家有没有这个字段,
+     而这是**我们**主动塞进去的值,赌错了会把整条请求打 400
+     (与 quality / background 相反 —— 那两个是用户填的,未知厂商如实转发) */
+  it('认不出的自定义中转不赌:宁可有水印,也别把能用的配置打坏', () => {
+    expect(watermarkParamFor(imgCfg({ vendor: 'custom', model: 'some-relay-model' }))).toEqual({})
+    expect(
+      watermarkParamFor(imgCfg({ vendor: undefined, baseUrl: 'https://relay.example.com/v1' }))
+    ).toEqual({})
+  })
+})
+
+/* 豆包那 400 的第二个成因:**Ark 的图片 API 里没有 n**。
+   它的请求体只有 model / prompt / image / size / seed / guidance_scale /
+   watermark / response_format / sequential_image_generation…,多图靠
+   sequential_image_generation 表达。照旧把 n 发过去就是无效参数,整条被拒 ——
+   而且是**每一次**都被拒,不分文生图还是图生图。 */
+describe('providerBodyFields · n 只发给认它的那几家', () => {
+  it('Ark 不带 n(它没有这个字段),水印照关,并改成要 base64', () => {
+    expect(
+      providerBodyFields(imgCfg({ vendor: 'ark', model: 'doubao-seedream-5-0-flash-260915' }), 1)
+    ).toEqual({ responseFormat: 'b64_json', watermark: false })
+  })
+
+  it('OpenAI / 百炼 / 认不出的中转照旧带 n', () => {
+    expect(providerBodyFields(imgCfg({ vendor: 'openai' }), 4)).toEqual({ n: 4 })
+    expect(providerBodyFields(imgCfg({ vendor: 'dashscope' }), 2)).toEqual({ n: 2 })
+    expect(providerBodyFields(imgCfg({ vendor: 'custom' }), 3)).toEqual({ n: 3 })
+  })
+
+  /* Gemini 的原生请求体里同样没有 n,但它由服务端翻成 candidateCount ——
+     所以这一栏要的是"把张数交上去",摘掉才是错的 */
+  it('Gemini 仍要交出张数(服务端拿它当 candidateCount)', () => {
+    expect(providerBodyFields(imgCfg({ vendor: 'gemini' }), 2)).toEqual({ n: 2 })
+  })
+
+  /* 默认回的是**图片链接**,而前端拿到链接还得再跨域拉一次 ——
+     被挡或 24 小时过期就只剩一句"图不可用"(实测豆包就是这一条)。
+     认 response_format 的厂商直接要 base64,省掉那一跳 */
+  it('只有认 response_format 的厂商才被要 base64', () => {
+    expect(providerBodyFields(imgCfg({ vendor: 'ark' }), 1).responseFormat).toBe('b64_json')
+    expect(providerBodyFields(imgCfg({ vendor: 'openai' }), 1).responseFormat).toBeUndefined()
+    expect(providerBodyFields(imgCfg({ vendor: 'gemini' }), 1).responseFormat).toBeUndefined()
+    expect(providerBodyFields(imgCfg({ vendor: 'dashscope' }), 1).responseFormat).toBeUndefined()
+    expect(providerBodyFields(imgCfg({ vendor: 'custom' }), 1).responseFormat).toBeUndefined()
+  })
+
+  it('两项可以同时成立:OpenAI 收 n、不收 watermark', () => {
+    expect(providerBodyFields(imgCfg({ vendor: 'openai' }), 1)).toEqual({ n: 1 })
+  })
+})
+
+/* 参考图的交法也不是全球统一的:OpenAI 的 /images/edits 只收表单文件字段,
+   而 Ark 的 image 是请求体里的 string|string[](data URL)。
+   交错了的表现是"带参考图就报参数错误" —— 纯文生图反而是好的。 */
+describe('能力表 · 参考图走哪种请求体', () => {
+  it('OpenAI 走表单文件字段', () => {
+    expect(getProvider('openai').refs).toBe('multipart')
+  })
+
+  it('豆包走请求体里的 image(data URL),不是文件字段', () => {
+    expect(getProvider('ark').refs).toBe('json')
+  })
+
+  it('认不出的中转保持原样(表单),不替它改道', () => {
+    expect(getProvider('custom').refs).toBe('multipart')
+    expect(getProvider(undefined).refs).toBe('multipart')
+  })
+})
+
 describe('acceptableSize · 套用历史/库里的尺寸', () => {
   it('认枚举的厂商:列表里的能套,列表外的不套(保留当前值)', () => {
     const dallE = imgCfg({ vendor: 'openai', model: 'dall-e-3' })
@@ -306,15 +418,19 @@ describe('acceptableSize · 套用历史/库里的尺寸', () => {
   /* 这一条是补的洞:auto 不在任何列表里,它是"让上游自己定"这一档能力。
      以前只查列表,于是存着 auto 的记录套到豆包那种认枚举尺寸的配置上,
      会把 auto 原样发出去 —— 而它收到枚举外的值直接 400 */
-  it('不认 auto 的厂商:套用 auto 要被拒(豆包、dall-e-3)', () => {
-    expect(acceptableSize(imgCfg({ vendor: 'ark', model: 'doubao-seedream-3-0-t2i' }), 'auto')).toBeNull()
+  it('没有这一档的厂商:套用 auto 要被拒(dall-e-3、百炼)', () => {
     expect(acceptableSize(imgCfg({ vendor: 'openai', model: 'dall-e-3' }), 'auto')).toBeNull()
+    expect(acceptableSize(imgCfg({ vendor: 'dashscope', model: 'wanx2.1-t2i-turbo' }), 'auto')).toBeNull()
   })
 
   it('认 auto 的厂商照常接受', () => {
     expect(acceptableSize(imgCfg({ vendor: 'openai', model: 'gpt-image-1' }), 'auto')).toBe('auto')
     expect(acceptableSize(imgCfg({ vendor: 'gemini', model: 'x' }), 'auto')).toBe('auto')
     expect(acceptableSize(imgCfg({ vendor: 'custom', model: 'x' }), 'auto')).toBe('auto')
+    /* 豆包也在这一档里 —— 它表达 auto 的方式是"不发 size",不是发字面量 */
+    expect(
+      acceptableSize(imgCfg({ vendor: 'ark', model: 'doubao-seedream-5-0-flash-260915' }), 'auto')
+    ).toBe('auto')
   })
 
   it('不限尺寸的厂商:像素值照收,并顺手归一(历史里可能是 1536 × 1024)', () => {
@@ -322,6 +438,59 @@ describe('acceptableSize · 套用历史/库里的尺寸', () => {
     expect(acceptableSize(ark, '1920x1080')).toBe('1920x1080')
     expect(acceptableSize(ark, '1536 × 1024')).toBe('1536x1024')
     expect(acceptableSize(ark, 'weird')).toBeNull()
+  })
+})
+
+/* "让上游自己定尺寸"这一档能力,各家表达的方式不一样。
+   豆包要的是**把 size 字段整个摘掉**(官方请求体里 size 是可选的,不发就走
+   默认档 2K,比例由提示词决定);把字面量 "auto" 发过去是错的 —— 那个取值
+   只属于它的图层分解场景。 */
+describe('sizeFieldFor · "自动"这一档到底发什么', () => {
+  it('豆包:auto 转成空串(代理见到空值就不往请求体里放 size)', () => {
+    const ark = imgCfg({ vendor: 'ark', model: 'doubao-seedream-5-0-flash-260915' })
+    expect(sizeFieldFor(ark, 'auto')).toBe('')
+  })
+
+  it('豆包:显式尺寸原样发', () => {
+    const ark = imgCfg({ vendor: 'ark', model: 'doubao-seedream-5-0-flash-260915' })
+    expect(sizeFieldFor(ark, '1024x1792')).toBe('1024x1792')
+  })
+
+  it('字面量那几家:auto 就是 auto', () => {
+    expect(sizeFieldFor(imgCfg({ vendor: 'openai' }), 'auto')).toBe('auto')
+    expect(sizeFieldFor(imgCfg({ vendor: 'gemini' }), 'auto')).toBe('auto')
+    expect(sizeFieldFor(imgCfg({ vendor: 'custom' }), 'auto')).toBe('auto')
+    expect(sizeFieldFor(imgCfg({ vendor: 'custom' }), '1536x1024')).toBe('1536x1024')
+  })
+
+  it('老配置没写 vendor 时,按域名认出豆包也走摘字段那条', () => {
+    const legacy = imgCfg({
+      vendor: undefined,
+      baseUrl: 'https://ark.cn-beijing.volces.com/api/v3',
+      model: 'doubao-seedream-4-0-250828'
+    })
+    expect(sizeFieldFor(legacy, 'auto')).toBe('')
+  })
+})
+
+describe('defaultSizeFor · 没被选过时不该替用户挑最贵的那档', () => {
+  it('豆包:退到第一档显式尺寸,而不是 auto(它的 auto = 上游默认 2K,按像素计费)', () => {
+    const opts = sizeOptionsFor('ark', 'x')
+    expect(defaultSizeFor(opts, 'omit')).toBe('1024x1024')
+    expect(defaultSizeFor(opts, 'omit')).not.toBe('auto')
+  })
+
+  it('字面量那几家照旧:有 auto 就用 auto', () => {
+    expect(defaultSizeFor(sizeOptionsFor('openai', 'gpt-image-1'), 'literal')).toBe('auto')
+    expect(defaultSizeFor(sizeOptionsFor('openai', 'dall-e-3'), 'literal')).toBe('1024x1024')
+  })
+
+  it('没这一档的厂商退到第一档', () => {
+    expect(defaultSizeFor(sizeOptionsFor('dashscope', 'wanx2.1-t2i-turbo'), 'no')).toBe('1024x1024')
+  })
+
+  it('不给模式时按旧口径(有 auto 就用 auto)', () => {
+    expect(defaultSizeFor(['auto', '1024x1024'])).toBe('auto')
   })
 })
 
@@ -469,5 +638,99 @@ describe('photoFailureText · 中止与空话都要有说法', () => {
 
   it('超长截断 —— 上游的堆栈可能几千字', () => {
     expect(photoFailureText(new Error('x'.repeat(2000))).length).toBe(PHOTO_ERROR_CHARS)
+  })
+})
+
+describe('characterViewPrompt · 设定图的提示词', () => {
+  /* 用户 2026-10-05 报:"上传的参考图是侧面图,则生成的正面图也是侧面的"。
+     根因不是"正面"没写(那句一直在),而是**参考图在 i2i 那条路上是最强的
+     机位来源** —— 一句 front-facing 拗不过它。所以这一组钉两件事:
+     正面要写成可判定的条件 + 三个否定;有参考图时必须说清"它只管脸"。 */
+  const c: Character = {
+    id: 'x',
+    name: 'Nova',
+    createdAt: 0,
+    fields: {
+      style: 'photographic',
+      gender: 'female',
+      identity: 'pilot',
+      face: 'oval face',
+      build: 'tall',
+      hair: 'dark bob',
+      brows: '',
+      eyes: 'dark eyes',
+      noseMouth: '',
+      facialHair: '',
+      faceMarks: '',
+      outfit: 'jacket',
+      marks: ''
+    }
+  }
+
+  it('正面把"朝向镜头"写死:两眼可见、鼻尖朝镜头、头不转不歪', () => {
+    const p = characterViewPrompt(c, 'front', false)
+    expect(p).toMatch(/facing the camera directly/i)
+    expect(p).toMatch(/both eyes level and fully visible/i)
+    expect(p).toMatch(/nose pointing at the camera/i)
+    expect(p).toMatch(/head not turned and not tilted/i)
+    expect(p).toContain(c.fields!.face)
+  })
+
+  it('正面带着那三个否定 —— 侧脸/侧视/四分之三都不许', () => {
+    const p = characterViewPrompt(c, 'front', false)
+    expect(p).toMatch(/not a profile/i)
+    expect(p).toMatch(/not a side view/i)
+    expect(p).toMatch(/not a three-quarter view/i)
+  })
+
+  it('**直接把那个失败场景写进提示词**:参考图是侧的就对了,这张仍然要正着画', () => {
+    const p = characterViewPrompt(c, 'front', false)
+    expect(p).toMatch(/even if the reference image shows the person from the side/i)
+    expect(p).toMatch(/turned front-on/i)
+  })
+
+  it('带参考图时明说"它只管这个人是谁"', () => {
+    const p = characterViewPrompt(c, 'front', true)
+    expect(p).toContain(REF_IDENTITY_ONLY)
+    expect(p).toMatch(/ignore the pose, the camera angle and the lighting in them/i)
+    expect(p).toMatch(/do not copy the direction the person is facing/i)
+  })
+
+  it('那句写成复数 —— 其余四格送的是两张(正脸 + 底图),单数会指错', () => {
+    /* 判据是"这话对一张、两张都成立":`images … them` 而不是 `image … it` */
+    expect(REF_IDENTITY_ONLY).toMatch(/reference images are only about/i)
+    expect(REF_IDENTITY_ONLY).toMatch(/in them/i)
+    expect(REF_IDENTITY_ONLY).not.toMatch(/the attached image is/i)
+  })
+
+  it('不带参考图就不说那句 —— 纯文生图时它会去找一张并不存在的图', () => {
+    expect(characterViewPrompt(c, 'front', false)).not.toContain(REF_IDENTITY_ONLY)
+  })
+
+  it('参考图那句垫在最后:它是"怎么读上面那些话"的元指令,不是这一张的内容', () => {
+    const p = characterViewPrompt(c, 'front', true)
+    expect(p.endsWith(REF_IDENTITY_ONLY)).toBe(true)
+  })
+
+  it('另外四格都带上了"参考图只管脸" —— 它们也送参考图', () => {
+    for (const v of CHARACTER_VIEWS) {
+      expect(characterViewPrompt(c, v.kind, true), v.kind).toContain(REF_IDENTITY_ONLY)
+    }
+  })
+
+  it('转面那一格照旧要四个方向 —— "别抄姿态"不是"别换方向"', () => {
+    const p = characterViewPrompt(c, 'detail', true)
+    expect(p).toMatch(/left side profile/i)
+    expect(p).toMatch(/high angle/i)
+    expect(p).toMatch(/low angle/i)
+  })
+
+  it('认不出的 kind 给空串,不拼半条提示词出去', () => {
+    expect(characterViewPrompt(c, 'nope' as never, true)).toBe('')
+  })
+
+  it('老角色(没有 fields)照旧退回 desc,不因为这一改就没了设定', () => {
+    const legacy: Character = { id: 'y', name: 'Y', createdAt: 0, desc: 'a quiet stranger' }
+    expect(characterViewPrompt(legacy, 'front', false)).toContain('a quiet stranger')
   })
 })

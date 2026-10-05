@@ -128,6 +128,10 @@ export interface FavoritePayload {
 // 可选是为了兼容加这个字段之前存下来的记录。
 export type ResultItem = { type: 'b64' | 'url'; data: string | Blob; marked?: boolean }
 
+/* 一条记录出自对话里的哪条路(见 HistoryEntry.source)。两种都是"聊天聊出来的图",
+   但一个是角色发给你的一张照片,一个是沉浸页给字让位的底 —— 界面上要说清是哪一种 */
+export type HistorySource = 'chat-photo' | 'chat-backdrop'
+
 // 一条生成记录
 export interface HistoryEntry {
   id: string
@@ -162,8 +166,26 @@ export interface HistoryEntry {
      挂了的记录不会被存储清理自动淘汰。可选:老记录与未归类的都没有 */
   collectionId?: string
   /* 这次生成套用的角色预设 id(见 Character)。与 collectionId 同理,
-     只在这条记录确实用了角色时才有;取消角色或手动换参考图都不会留下它 */
+     只在这条记录确实用了角色时才有;取消角色或手动换参考图都不会留下它。
+
+     对话里生成的那两种图(见下面的 source)也写这一项 —— 它们出自哪个角色
+     是确定的,而角色页那面作品墙正是按这个字段聚合的(见 charWorks) */
   characterId?: string
+  /* 这一条是从哪条路来的。缺省 = 工作台里手写提示词的生成。
+     'chat-photo' 是对话里角色发给你的那张,'chat-backdrop' 是沉浸页那张背景。
+     加这一项是为了让历史页、预览、角色作品墙把话说得明白:
+
+     - 这两种记录的 `prompt` 是**真正发给模型的整段**(机位、焦段、光、负面约束
+       都在里面),拿它当标题读起来不像人话;`scene` 才是那句人话;
+     - 它们与"我在工作台里出的图"确实不是一回事 —— 一个是聊出来的,
+       一个是做出来的(界面上那枚角标见 lib/chatWork)。
+
+     可选是为了兼容加这个字段之前存下来的全部记录 */
+  source?: HistorySource
+  /* 对话里那一场戏的描述(只有上面两种记录有)。收窄成一行、原样进提示词的那段
+     (见 server/chatTags.js 与 lib/chatPhoto) —— 它同时是消息上那条 photo,
+     所以"重画这一张"与历史里这张图依据的是同一句话 */
+  scene?: string
   createdAt: number
   // 上游可能返回一张或多张图
   results: ResultItem[]
@@ -309,11 +331,22 @@ export interface ChatMessage {
      现在逐条传出来,界面上直接给原因。
      它也用于**出图之前**那几条校验(那时 photoFailed 还没置上) */
   photoError?: string
-  /* 这张画面里有没有**它本人**(模型写在 [photo:self:…] 里,见 server/chatTags.js)。
+  /* 这张画面里有没有**它本人**(模型写在标签前缀里,见 server/chatTags.js)。
      它决定出图时带不带角色的设定图:场景照带上会被带跑,自拍不带会画成陌生人。
      存下来是为了让"重画这一张"与导出包里的这段对话保持同一个意图 */
   photoSelf?: boolean
+  /* 这一张**谁拿的相机**,由模型写在标签前缀里:`selfie:` / `third:`。
+     空/缺省 = 它没说 —— 那时由 lib/chatPhoto 按场景文本判、再不行**默认自拍**。
+     **单独存一位是有原因的**(2026-10-05):视角曾经交给一次额外的文本调用去猜,
+     而它只看得到一句场景,猜出来大多是他拍 —— 用户报的就是
+     "对于自拍的理解总是不好,老是会生成他拍视角的图片"。
+     存下来,重画与导出才对得起当时那个意图 */
+  photoShot?: ChatShotTag
 }
+
+/** 聊天里那一张图**谁拿的相机**。与 lib/chatPhoto 的 ChatShot 同名同值 ——
+    'scene' 不进这里:画面里没有人时,它由 photoSelf 定死 */
+export type ChatShotTag = 'selfie' | 'third'
 
 /** 聊天里用户附的那张图。与 ChatMessage 分开存,理由见上面的 imageId */
 export interface ChatImage {
@@ -475,6 +508,9 @@ export interface ImportedChatMessage {
   photoId?: string
   /* 这张里有没有它本人。跟着包走 —— 对方若想重画这一张,依据该是同一个 */
   photoSelf?: boolean
+  /* 这一张谁拿的相机(见 ChatMessage.photoShot)。与 photoSelf 同一条理由:
+     跟着包走,重画才画得出同一个视角 */
+  photoShot?: ChatShotTag
 }
 
 /* 角色包里带回来的那段对话。**记忆是主,消息是辅** ——

@@ -16,7 +16,8 @@ describe('splitTags 的剪取', () => {
       text: 'Fine.',
       mood: 'warm',
       photo: '',
-      photoSelf: false
+      photoSelf: false,
+      photoShot: ''
     })
   })
 
@@ -25,7 +26,8 @@ describe('splitTags 的剪取', () => {
       text: 'Look at this.',
       mood: '',
       photo: 'standing in the rain',
-      photoSelf: false
+      photoSelf: false,
+      photoShot: ''
     })
   })
 
@@ -36,7 +38,8 @@ describe('splitTags 的剪取', () => {
       text: 'Here.',
       mood: 'amused',
       photo: 'a rooftop at dusk',
-      photoSelf: false
+      photoSelf: false,
+      photoShot: ''
     })
   })
 
@@ -45,7 +48,8 @@ describe('splitTags 的剪取', () => {
       text: 'Here.',
       mood: 'amused',
       photo: 'a rooftop at dusk',
-      photoSelf: false
+      photoSelf: false,
+      photoShot: ''
     })
   })
 
@@ -63,9 +67,16 @@ describe('splitTags 的半截标签', () => {
       text: 'Wait, I was going to say',
       mood: '',
       photo: '',
-      photoSelf: false
+      photoSelf: false,
+      photoShot: ''
     })
-    expect(splitTags('Hmm [moo')).toEqual({ text: 'Hmm', mood: '', photo: '', photoSelf: false })
+    expect(splitTags('Hmm [moo')).toEqual({
+      text: 'Hmm',
+      mood: '',
+      photo: '',
+      photoSelf: false,
+      photoShot: ''
+    })
   })
 
   /* 但也不能太贪:`[p]` / `[m]` 这种在正经文字里会出现,不该被吃掉 */
@@ -93,6 +104,59 @@ describe('这一张里有没有它本人', () => {
     const r = splitTags('Look.\n[photo:self:me on the balcony, hair down]')
     expect(r.photo).toBe('me on the balcony, hair down')
     expect(r.photoSelf).toBe(true)
+  })
+
+  /* —— 谁拿的相机(2026-10-05 新增) ——
+     `self:` 只说"它在画面里",相机那一项它没说;`selfie:` / `third:` 才回答。
+     这一位是用户报的那个毛病的解药:"老是会生成他拍视角的图片" ——
+     因为在此之前,视角交给一个只看得到一句场景的模型去猜。 */
+  it('selfie: 前缀 = 相机在它自己手上', () => {
+    const r = splitTags('Here.\n[photo:selfie:me leaning on the balcony rail, hair down]')
+    expect(r.photo).toBe('me leaning on the balcony rail, hair down')
+    expect(r.photoSelf).toBe(true)
+    expect(r.photoShot).toBe('selfie')
+  })
+
+  it('third: 前缀 = 相机在别人手上', () => {
+    const r = splitTags('Here.\n[photo:third:me on stage, taken from the crowd]')
+    expect(r.photo).toBe('me on stage, taken from the crowd')
+    expect(r.photoSelf).toBe(true)
+    expect(r.photoShot).toBe('third')
+  })
+
+  it('third 那几种写法都认(大小写、连字符、person)', () => {
+    for (const raw of ['THIRD: me at the desk', 'third-person:me at the desk', 'Third person - me at the desk']) {
+      const r = splitTags(`x\n[photo:${raw}]`)
+      expect(r.photoShot, raw).toBe('third')
+      expect(r.photoSelf, raw).toBe(true)
+    }
+  })
+
+  it('selfie 那几种写法都认,self-portrait 不会被 self 那条吃掉一半', () => {
+    for (const raw of ['SELFIE: me in the mirror', 'self-portrait:me by the window']) {
+      const r = splitTags(`x\n[photo:${raw}]`)
+      expect(r.photoShot, raw).toBe('selfie')
+      expect(r.photoSelf, raw).toBe(true)
+    }
+    /* `self` 那条若先匹配,`self-portrait:me by the window` 会被剪成
+       "portrait:me by the window" —— 剪错了前缀还留在场景里 */
+    expect(splitTags('x\n[photo:self-portrait:me by the window]').photo).toBe('me by the window')
+  })
+
+  it('self: 与代词那几种 = 在画面里,但**没说**谁拿的相机', () => {
+    for (const raw of ['self: me at the desk', 'me: at the desk', 'me at the desk', "I'm on the balcony"]) {
+      expect(splitTags(`x\n[photo:${raw}]`).photoShot, raw).toBe('')
+    }
+  })
+
+  it('没写前缀 = 画面里没有人,更谈不上相机', () => {
+    expect(splitTags('x\n[photo:rain on the window]').photoShot).toBe('')
+  })
+
+  it('点了自己的名字(兜底)也不算说了相机', () => {
+    const r = splitTags('x\n[photo:Alice leaning on the railing]', 'Alice')
+    expect(r.photoSelf).toBe(true)
+    expect(r.photoShot).toBe('')
   })
 
   it('前缀写得随意也认:大小写、空格、逗号、破折号', () => {
@@ -145,7 +209,13 @@ describe('这一张里有没有它本人', () => {
 
   it('两枚标签同时出现时同样认前缀', () => {
     const r = splitTags('Here.\n[mood:warm]\n[photo:self:a rooftop at dusk]')
-    expect(r).toEqual({ text: 'Here.', mood: 'warm', photo: 'a rooftop at dusk', photoSelf: true })
+    expect(r).toEqual({
+      text: 'Here.',
+      mood: 'warm',
+      photo: 'a rooftop at dusk',
+      photoSelf: true,
+      photoShot: ''
+    })
   })
 })
 

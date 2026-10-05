@@ -20,6 +20,7 @@ import {
   PhSquare,
   PhTimer,
   PhCalendarBlank,
+  PhChatCircleDots,
   PhDownloadSimple,
   PhPencilSimple,
   PhTrash,
@@ -30,6 +31,9 @@ import {
 import { BACKGROUND_OPTIONS, QUALITY_OPTIONS, downloadImageUrl, imageSrc, optionLabel, reuseParamsOf, thumbSrc } from '../api'
 import type { HistoryEntry, ResultItem, ReuseParams, FavoritePayload, Collection, Character } from '../types'
 import { blobToDataURL } from '../lib/idb'
+/* 对话里生成的那两种图的"出处那句话"(见 lib/chatWork)。
+   没有它,预览卡上那段提示词是一整串机位与光,读不出这张画的是什么 */
+import { chatWorkLabel } from '../lib/chatWork'
 // 浮层的公共行为(Tab 圈定 / 点外收起 / Esc 逐层退)
 import { isInside, layerOnEscape, trapTab } from '../lib/ui'
 
@@ -357,6 +361,11 @@ const specs = computed<{ icon: Component; k: string; v: string }[]>(() => {
   const out: { icon: Component; k: string; v: string }[] = [
     { icon: PhCrop, k: 'Aspect Ratio', v: e.size === 'auto' ? 'Auto' : e.size.replace('x', '×') }
   ]
+  /* 对话里生成的那两种图:它是**聊出来的**,与工作台里手写提示词做出来的
+     不是一回事。这一行说清来路 —— 上面那段提示词是整段摄影指令,
+     没有这一行用户会奇怪"我什么时候写过这种提示词" */
+  const src = chatWorkLabel(e.source)
+  if (src) out.unshift({ icon: PhChatCircleDots, k: 'From', v: src })
   if (e.quality) out.push({ icon: PhSparkle, k: 'Quality', v: optionLabel(QUALITY_OPTIONS, e.quality) })
   if (e.background)
     out.push({ icon: PhSquare, k: 'Background', v: optionLabel(BACKGROUND_OPTIONS, e.background) })
@@ -510,12 +519,22 @@ watch(collAdding, async (v) => {
               </div>
 
               <!-- 提示词:侧栏的主角,独占一张可滚的卡 ——
-                   与下面几张信息卡同一套外观,复制/存库贴在正文下方 -->
+                   与下面几张信息卡同一套外观,复制/存库贴在正文下方。
+                   对话里生成的那两种图上面先给一段"场景"(见 lib/chatWork):
+                   它们真正发出去的是一整段摄影指令,而用户读得懂的是那句场景 -->
               <section class="block card">
                 <header class="card-head">
                   <span class="card-title">Prompt</span>
+                  <span v-if="chatWorkLabel(entry.source)" class="card-chip">
+                    {{ chatWorkLabel(entry.source) }}
+                  </span>
                 </header>
                 <div class="prompt-scroll">
+                  <p v-if="entry.scene" class="prompt-scene">{{ entry.scene }}</p>
+                  <!-- 标一句"下面是完整提示词":Copy 与 Save to library 动的都是它,
+                       而不是上面那句场景 —— 不写清的话,用户读完场景去点 Copy,
+                       拿到的却是另一段文字 -->
+                  <p v-if="entry.scene" class="prompt-cap">Full prompt</p>
                   <p class="prompt">{{ entry.prompt }}</p>
                 </div>
                 <div class="prompt-acts">
@@ -961,6 +980,19 @@ watch(collAdding, async (v) => {
   font-weight: 600;
   color: var(--text);
 }
+/* 卡头右边那枚出处胶囊(只有对话里生成的那两种图有,见 lib/chatWork)。
+   推到最右,与标题拉开 —— 它说的是"这条从哪来",不是标题的一部分 */
+.card-chip {
+  flex: none;
+  margin-left: auto;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--bg-elev);
+  color: var(--text-2);
+  font-size: var(--fs-micro);
+  font-weight: 500;
+  white-space: nowrap;
+}
 /* —— 生成信息 —— */
 /* 两列规格:每项一个小图标 + 「标签 / 值」两行 */
 .gen-grid {
@@ -1091,6 +1123,33 @@ watch(collAdding, async (v) => {
   line-height: 1.75;
   color: var(--text);
   white-space: pre-wrap;
+}
+/* 对话里生成的那两种图先给一句"场景"(见 lib/chatWork)。它才是人读的那句;
+   紧跟其后的整段摄影指令退到次级色与小一档 —— 那是要复现时才读的,
+   两者平铺会让人以为这是两段并列的提示词 */
+.prompt-scene {
+  margin-bottom: 8px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+  font-size: var(--fs-md);
+  line-height: 1.7;
+  color: var(--text);
+  white-space: pre-wrap;
+}
+/* 那行小注:横在场景与完整提示词之间,说明下面那段是什么 */
+.prompt-cap {
+  margin-bottom: 4px;
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  letter-spacing: var(--ls-eyebrow);
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+/* 那行小注之后的那段:整段摄影指令退到次级色与小一档 ——
+   要复现时才读它,与上面那句场景平铺会让人以为这是两段并列的提示词 */
+.prompt-cap + .prompt {
+  font-size: var(--fs-sm);
+  color: var(--text-2);
 }
 /* 提示词不再折叠:内容长了就在 .prompt-scroll 里滚,不必先点一次「展开」 */
 /* 底部操作并排,等分侧栏宽度,和顶部的胶囊形成一轻一重的收尾。

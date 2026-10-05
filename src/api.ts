@@ -66,14 +66,26 @@ export interface Provider {
   background: Cap
   /** 允许的尺寸;'free' 表示由接口自行决定 */
   sizes: string[] | 'free'
-  /* 上游有没有"自己决定尺寸"这一档。
-     size: "auto" 是一个真实取值(让模型按 prompt 定比例),不等于"不发这个参数" ——
-     不发时上游用自己的默认尺寸,多数就是 1:1。所以只有认 auto 的厂商才给这一档,
-     其余厂商的候选列表里不能出现 auto,否则界面在骗人,发出去的请求跟没选一样 */
-  autoSize: boolean
+  /* 上游有没有"尺寸由它自己定"这一档,**以及怎么表达**。
+     'literal' = 直接发 size:"auto" 就是那个意思(OpenAI、Gemini 那套);
+     'omit'    = 有,但表达方式是**不发这个字段**。豆包是这一家:它的 size 只认
+                 分辨率档位(1K/1.5K/2K)或像素值,字面量 "auto" 是图层分解那个
+                 场景才有的取值;而不发 size 时走它的默认档(5.0 pro/flash 是 2K),
+                 比例由提示词里怎么描述决定 —— 于是"让模型自己定"在这里
+                 就等于把字段摘掉(见 sizeFieldFor);
+     'no'      = 没有这一档,候选列表里不能出现 auto,
+                 否则界面在骗人,发出去的请求跟没选一样 */
+  autoSize: 'literal' | 'omit' | 'no'
   /** 图生图打哪个端点 */
   edit: 'generations' | 'edits'
   protocol: Protocol
+  /* 接口认不认 `response_format`(图是"给链接"还是"给 base64")。
+     不是可有可无的一项:**默认值是 url**,而那张链接是给浏览器之外的地方下载的 ——
+     前端拿到它还得再跨域拉一次,被挡或过期就只剩一句"图不可用"(实测豆包就是这样)。
+     认这一项的厂商要显式要 `b64_json`,图跟着响应一起回来,没有第二跳。
+     OpenAI 的 gpt-image-1 标 'no':它本来就只回 b64_json,而这个参数它不收
+     (发了会被拒),和 quality/background 一样属于"另一套 API 才有的字段" */
+  responseFormat: Cap
   /* 接口认不认 seed。OpenAI 的 Images API 没有这个参数,标 'no' ——
      界面就不会给出一个填了也白发、甚至被 400 拒掉的输入框。
      未知的按 'unknown' 处理:填了就照发,由上游自己决定收不收 */
@@ -83,6 +95,35 @@ export interface Provider {
      而不是发两张过去把整个请求弄失败。
      未知的按"能发就发"处理,与上面几项一致:这里只拦明确知道的单图模型 */
   multiImage: Cap
+  /* 接口认不认 `watermark` 这一项 —— 也就是"这枚水印我盖不盖"的开关。
+     它和上面几项有个要命的差别:**上游的默认值是"盖"**。Ark(豆包 Seedream)
+     不回 watermark 就在图角留下一枚"AI生成",而提示词里写多少句
+     no watermark 都管不着它 —— 那句是给画画的模型看的,管不了上游在出图
+     之后自己盖上去的那一层。
+
+     取值只标求证过的:'yes' = 有这一项、且默认开着(必须显式传 false 才不盖);
+     'no' = 求证过没有(OpenAI 的 Images API 与 Gemini 原生协议都没有这个字段,
+     发了会被拒);'unknown' = 不知道。
+
+     **只有 'yes' 才发** —— 这一项的取舍与 quality/background 正好相反:
+     那两个值是用户自己填的,未知厂商按"填了就发"如实转发;而 watermark 是
+     **我们**主动塞进去的,平白给一家未必认它的中转多塞一个字段,会把本来
+     能用的配置打成 400(服务端对 unknown parameter 的那句解释就是为此) */
+  watermark: Cap
+  /* 接口认不认 `n`(一次要几张)。Ark 的图片 API 里没有这个字段 ——
+     它的多图是 sequential_image_generation,所以标 'no' 的那一家只能摘掉,
+     暂时一次只出一张(要真接上,得按模型分档:4.0/4.5/5.0-lite 支持 sequential,
+     5.0 pro/flash 连它也不支持)。
+
+     注意这里问的是"要不要把 n 交给这一条路",不是"上游 schema 里有没有 n":
+     Gemini 的原生请求体里同样没有 n,但它由服务端翻成 candidateCount,
+     所以那一栏是 'yes' —— 摘掉了就等于把"要几张"整个丢掉 */
+  n: Cap
+  /* 参考图怎么交给上游。'multipart' = 表单里的文件字段(OpenAI 的 /images/edits
+     只认这个);'json' = 请求体里的 image 字段,收 data URL 或公网 URL
+     (Ark 的 image 就是 string|string[])。
+     这是**如实上报厂商的规矩**,由代理按它决定拼哪种请求体 —— 与 protocol 同理 */
+  refs: 'json' | 'multipart'
 }
 
 // 兜底项:baseUrl 认不出来时的归宿
@@ -95,6 +136,14 @@ const CUSTOM: Provider = {
   quality: 'unknown',
   background: 'unknown',
   seed: 'unknown',
+  /* 认不出来的地址不猜:万一是家中转,多塞一个它不认的字段就整条 400,
+     而它默认盖不盖水印我们并不知道。真想关,把厂商那一栏选成 Ark */
+  watermark: 'unknown',
+  /* 认不出来的地址不猜:见 watermark 那段 —— 未知厂商不塞我们没验证过的字段 */
+  responseFormat: 'unknown',
+  /* 认不出的地址按 OpenAI 兼容那套(它本来就是这里的兜底对象) */
+  n: 'unknown',
+  refs: 'multipart',
   /* 未知厂商按"发"处理:中转站背后多数是能收多张的 OpenAI / Gemini 系,
      真发错了上游会报错说清楚,而静默退回单图是用户看不见的信息损失 */
   multiImage: 'unknown',
@@ -102,7 +151,7 @@ const CUSTOM: Provider = {
   /* 未知厂商按"认 auto"处理:这里的兜底对象就是 OpenAI 兼容代理,
      如实转发比静默降级好 —— 真发错了会报错提示,而静默丢掉参数只会让人
      以为模型没按 prompt 定比例 */
-  autoSize: true,
+  autoSize: 'literal',
   edit: 'generations',
   protocol: 'openai'
 }
@@ -131,6 +180,15 @@ const GEMINI: Provider = {
   seed: 'unknown',
   // 原生请求体的 parts 里可以并列多段 inlineData,多张参考图是它本来就认的形态
   multiImage: 'yes',
+  // 原生协议里没有"水印开关"这个字段,它是另一套(OpenAI 形状)请求体的事
+  watermark: 'no',
+  // 原生协议回的是 inlineData,没有 response_format 这一项
+  responseFormat: 'no',
+  /* 原生请求体里没有 n,但服务端会把它翻成 generationConfig.candidateCount,
+     所以这一栏要的是"把张数交上去" */
+  n: 'yes',
+  // 参考图在原生协议里是 parts 里的 inlineData,不走表单文件字段
+  refs: 'json',
   /* 给的都是能干净约分成 Gemini 认的宽高比的档位(见 server 的 GEMINI_RATIOS):
      1024x1024→1:1、1536x1024→3:2、1024x1536→2:3、1536x864→16:9、864x1536→9:16。
      约不出来的值不发这个参数,不做隐式近似。
@@ -140,7 +198,7 @@ const GEMINI: Provider = {
      这个参数根本不发,Gemini 退回它自己的 16:9 默认值。换掉它们。 */
   sizes: ['auto', '1024x1024', '1536x1024', '1024x1536', '1536x864', '864x1536'],
   /* 实测:不发宽高比时它自己给 16:9,所以 auto 是实打实的"模型自决",不是空话 */
-  autoSize: true,
+  autoSize: 'literal',
   /* 这个字段只对 OpenAI 那条路有意义(决定打 /images/edits 还是 /images/generations)。
      Gemini 的图生图不是换端点,而是在同一个 :generateContent 的 parts 里多给一段
      inlineData,由代理按协议分支处理,所以这里填什么都用不上 */
@@ -160,8 +218,16 @@ export const PROVIDERS: Provider[] = [
     seed: 'no',
     // /images/edits 的 image[] 本来就收多张;dall-e-2 时代只收一张,但那条路已经不用了
     multiImage: 'yes',
+    // gpt-image 的请求体里没有 watermark 这一项(它的水印是走 C2PA 元数据另说的)
+    watermark: 'no',
+  // gpt-image-1 只回 b64_json,且不收 response_format(发了会被拒)
+  responseFormat: 'no',
+    // Images API 收 n(gpt-image-1 实际上只出 1 张,但字段本身在)
+    n: 'yes',
+    // /images/edits 的参考图必须是表单里的文件字段,data URL 会被拒
+    refs: 'multipart',
     sizes: ['auto', '1024x1024', '1536x1024', '1024x1536'],
-    autoSize: true,
+    autoSize: 'literal',
     edit: 'edits',
     protocol: 'openai'
   },
@@ -176,9 +242,25 @@ export const PROVIDERS: Provider[] = [
     seed: 'unknown',
     // Seedream 的图像编辑只收一张参考图
     multiImage: 'no',
+    /* Ark 的图片生成请求体里有 watermark,**默认 true** —— 不显式传 false,
+       出图右下角就一定挂着一枚"AI生成"。这是上游盖的,与提示词无关 */
+    watermark: 'yes',
+  /* 默认就回链接(url),而那张链接前端还得再跨域拉一次 —— 要显式换成 base64 */
+  responseFormat: 'yes',
+    /* Ark 的请求体里**没有 n**:多图走 sequential_image_generation
+       (且只有 4.0/4.5/5.0-lite 支持)。发 n 过去就是无效参数,整条 400 ——
+       摘掉之后这一家一次只出一张,"张数"那一栏对它暂时无效 */
+    n: 'no',
+    /* 参考图走请求体里的 image 字段:官方写的是 string|string[],
+       内容是 data:image/...;base64,... 或公网 URL。
+       **它不收表单文件字段** —— 从前的 multipart 那条路对它是打不通的 */
+    refs: 'json',
     sizes: 'free',
-    // Ark 的 size 是枚举,收到 "auto" 会直接报错;它也没有"模型自定比例"这一档
-    autoSize: false,
+    /* Ark **认**"尺寸由它自己定"这一档,但表达方式是**不发 size**:官方请求体里
+       size 是可选的,不发就走默认档(5.0 pro/flash 是 2K,4.0 是 2048x2048),
+       比例由提示词里怎么描述决定。字面量 "auto" 只属于图层分解那个场景,
+       发到普通出图上不是被忽略就是报错 —— 所以这里是 'omit' 不是 'literal' */
+    autoSize: 'omit',
     edit: 'generations',
     protocol: 'openai'
   },
@@ -193,9 +275,18 @@ export const PROVIDERS: Provider[] = [
     seed: 'unknown',
     // 万相的图像编辑同样是单图
     multiImage: 'no',
+    /* 万相也有 watermark,但它**默认就是 false** —— 没有要去掉的东西,
+       也就不必发;没实测过它的字段名,标成 unknown 正好不发 */
+    watermark: 'unknown',
+  // 万相那边同样没实测过,不塞未知字段
+  responseFormat: 'unknown',
+    // 万相收 n(1~4 张)
+    n: 'yes',
+    // 参考图交法与 OpenAI 那套一致(表单文件字段),暂不改动
+    refs: 'multipart',
     sizes: 'free',
     // 万相的 size 同样是枚举,没有 auto 档
-    autoSize: false,
+    autoSize: 'no',
     edit: 'generations',
     protocol: 'openai'
   },
@@ -286,7 +377,16 @@ export function normalizeSize(raw: string): string | null {
 export function sizeOptionsFor(vendorId: string | undefined, model: string): string[] {
   const list = allowedSizes(vendorId, model)
   const base = Array.isArray(list) ? list : FREE_SIZES
-  return getProvider(vendorId, model).autoSize ? base : base.filter((s) => s !== 'auto')
+  const mode = getProvider(vendorId, model).autoSize
+  if (mode === 'no') return base.filter((s) => s !== 'auto')
+  /* 'omit' 那种厂商把 auto 摆在**末位**:它在豆包那儿的意思不是"随手上游"，
+     而是"我一个字段都不发,按上游默认出图" —— 而那个默认是 2K。出图按像素
+     计费,2K 差不多是 1024×1024 的**四倍**。排头会被当成兜底档(候选对不上时
+     界面取第一档),那就成了"用户什么都没选,却按最贵的那档出图" */
+  if (mode === 'omit') {
+    return base.includes('auto') ? [...base.filter((s) => s !== 'auto'), 'auto'] : [...base]
+  }
+  return base
 }
 
 /** 尺寸是否由上游自定(= 界面上开放手填)。固定候选的厂商不开放手填:
@@ -318,9 +418,30 @@ export function acceptableSize(cfg: ApiConfig, want: string | undefined): string
 
 /** 默认尺寸:有 auto 档就用 auto,否则用第一档。
  *  基线不能用字面量 'auto' —— dall-e-3 不开放 auto,初始化会被换成它的第一档,
- *  拿 'auto' 当基线会让这家厂商一进页面参数行就亮着 */
-export function defaultSizeFor(options: string[]): string {
+ *  拿 'auto' 当基线会让这家厂商一进页面参数行就亮着。
+ *
+ *  `omit` 那种厂商例外(豆包):它的 auto 是"不发 size、按上游默认出图",而那个
+ *  默认是 2K —— 出图按像素计费,差不多是 1024×1024 的四倍。用户没选过就不该
+ *  替他选最贵的那档,所以退到第一档**显式**尺寸。 */
+export function defaultSizeFor(
+  options: string[],
+  autoMode: Provider['autoSize'] = 'literal'
+): string {
+  if (autoMode === 'omit') return options.find((s) => s !== 'auto') || options[0] || 'auto'
   return options.includes('auto') ? 'auto' : options[0] || 'auto'
+}
+
+/**
+ * 交给上游的 size 值。
+ *
+ * 界面上的 `'auto'` 是"尺寸让上游自己定"这一档**能力**,而各家表达它的方式不一样:
+ * 'literal' 的厂商就发字面量 "auto";'omit' 的厂商(豆包)要的是**把字段摘掉** ——
+ * 发空串,代理见到空值就不往请求体里放 size(见 server 的 `...(size ? {size} : {})`)。
+ * 把 "auto" 原样发过去是错的:那个字面量只属于它的图层分解场景。
+ */
+export function sizeFieldFor(cfg: ApiConfig, size: string): string {
+  const caps = getProvider(vendorOf(cfg), cfg.model)
+  return size === 'auto' && caps.autoSize === 'omit' ? '' : size
 }
 
 /**
@@ -387,6 +508,49 @@ export function extraParamsFor(
   if (caps.quality !== 'no' && quality !== 'auto') out.quality = quality
   if (caps.background !== 'no' && background !== 'auto') out.background = background
   return out
+}
+
+/**
+ * 上游自己盖在图角上的那枚水印,要不要请它别盖。
+ *
+ * 只有明确知道"有这一项、且默认开着"的厂商才发(见能力表的 watermark):
+ * Ark(豆包 Seedream)是这一类,不回它就在右下角挂一枚"AI生成"。
+ * 其余厂商一律不发 —— 我们不知道那个字段存不存在,而为一个开关把整条请求
+ * 打成 400 不划算(这与 quality/background 的取舍相反:那两个是用户填的值,
+ * 未知厂商如实转发)。
+ *
+ * 返回的是要并进请求体的那几项,形状与 extraParamsFor 一致,便于在
+ * generate 一处摊开。
+ */
+export function watermarkParamFor(cfg: ApiConfig): Record<string, boolean> {
+  const caps = getProvider(vendorOf(cfg), cfg.model)
+  return caps.watermark === 'yes' ? { watermark: false } : {}
+}
+
+/**
+ * 请求体里那几项"要按厂商决定带不带"的字段。
+ *
+ * 与 `extraParamsFor` 的取舍不同:quality/background 是**用户填的**扩展项,
+ * 不填就不发;而这里几项是**每次请求都会带上去**的固定字段 —— 上游不认,
+ * 整条请求就是 400。所以判据必须硬:只有确认对方有这个字段才发。
+ * (Ark 的图片 API 里既没有 `quality` 也没有 `n`,这两样都栽过。)
+ *
+ * @param n 一次要几张。各家表达方式不一样:OpenAI/百炼收 `n`,
+ *          Ark 用 `sequential_image_generation`(目前没接),
+ *          Gemini 由服务端翻成 candidateCount —— 所以它要的仍是这个数。
+ */
+export function providerBodyFields(cfg: ApiConfig, n: number): Record<string, unknown> {
+  const caps = getProvider(vendorOf(cfg), cfg.model)
+  return {
+    /* 没有这个字段的那一家就摘掉,而不是留一个它不认的键把请求打坏。
+       代价写在能力表的 n 上:Ark 那边"张数"暂时只会出一张 */
+    ...(caps.n === 'no' ? {} : { n }),
+    /* 要 base64,不要链接。上游默认回的是**图片链接**(豆包就是 url),
+       那张链接前端还得再跨域拉一次 —— 被挡或过期就只剩一句"图不可用"。
+       显式要 b64_json 就没有第二跳了(见能力表的 responseFormat) */
+    ...(caps.responseFormat === 'yes' ? { responseFormat: 'b64_json' } : {}),
+    ...watermarkParamFor(cfg)
+  }
 }
 
 /* ===== 对话模型预设(提示词增强 + 角色对话) ==========================
@@ -973,11 +1137,26 @@ export async function generate(
   config: ApiConfig,
   signal?: AbortSignal
 ): Promise<ResultItem[]> {
+  const caps = getProvider(vendorOf(config), config.model)
+  /* n 单独摘出来:不是每家都有这个字段,要不要发由能力表说了算(见
+     providerBodyFields)。留在 params 里摊开的话,摘都摘不掉 ——
+     Ark 收到一个它没有的 n 会整条 400 */
+  const { n, ...rest } = params
   const resp = await fetch('/api/generate', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      ...params,
+      ...rest,
+      /* size 也过一道:豆包那一档"让模型自己定"的表达方式是**不发这个字段**
+         (见 sizeFieldFor),转成空串,由代理把它挡在请求体外面 */
+      size: sizeFieldFor(config, rest.size),
+      /* 水印与张数在这里统一定,而不是在各个调用点各写一遍:出图有创作区、
+         角色设定图、对话里的照片与背景图好几条路,漏掉任何一条都会让人以为
+         "同一套配置有时行有时不行"。认不认这些字段由厂商能力表说了算 */
+      ...providerBodyFields(config, n),
+      /* 参考图怎么交给上游也如实上报(表单文件字段 vs 请求体里的 image),
+         由代理按它拼请求体。认错了的表现是上传的参考图被上游整条拒掉 */
+      refUpload: caps.refs,
       baseUrl: config.baseUrl,
       apiKey: config.apiKey,
       model: config.model || undefined,
@@ -986,7 +1165,7 @@ export async function generate(
          两者分开是因为中转站上"厂商"和"协议"并不一一对应 ——
          同一个 custom 地址,Gemini 系模型必须走原生协议 */
       vendor: config.vendor || inferVendor(config.baseUrl),
-      protocol: getProvider(config.vendor || inferVendor(config.baseUrl), config.model).protocol
+      protocol: caps.protocol
     }),
     signal
   })
@@ -1235,8 +1414,14 @@ export async function enhancePrompt(
 
    文案本身沿用 `failureMessage` 的产出：它已经把上游的原话与
    "401 其实是部署登录墙"这类**特定成因**翻成了人话，比我们在这里另编一套准。
+
+   **上限要容得下"原话"那一截**：服务端那句人话(约 280 字)后面接的是上游
+   原始响应(它自己截到 600 字)。从前这里只留 300 字 —— 恰好在我们自己那句
+   解释把额度用光的地方断掉，上游真正点名的那个字段("...the parameter `n`...")
+   一个字也看不见。用户拿着半边错误来问，只能靠猜。
+   900 = 我们那句 + 上游那句，两截都完整。
    -------------------------------------------------------------------- */
-export const PHOTO_ERROR_CHARS = 300
+export const PHOTO_ERROR_CHARS = 900
 
 export function photoFailureText(e: unknown): string {
   /* 中止：用户按了 Stop，或页面走了。这不是"失败"，别让用户去查配置 */
@@ -1788,6 +1973,12 @@ function coerceImportedChat(raw: unknown): ImportedChat | undefined {
         ? { photo: o.photo.replace(/\s+/g, ' ').trim().slice(0, 120) }
         : {}),
       ...(o.photoSelf === true ? { photoSelf: true } : {}),
+      /* 这一张谁拿的相机。**只认那两个词** —— 它会流进提示词模板的选择
+         (见 lib/chatPhoto),外部文件里写别的等于让它替出图那一层挑模板。
+         缺省(老包)就是"没说",由客户端按场景判、再不行默认自拍 */
+      ...(o.photoShot === 'selfie' || o.photoShot === 'third'
+        ? { photoShot: o.photoShot }
+        : {}),
       /* 上一次失败的原因。**这是一句外部输入**(它最初来自上游的报错原文),
          会被直接渲染在界面上,所以按文案那一道收:去掉控制字符、限长。
          它不影响"有没有图"这个判断(那由 photoId 定),所以留着是无害的 ——
@@ -2167,6 +2358,29 @@ export function characterFaceDesc(c: Character): string {
    另外不写 "filling the frame":那是"把主体塞满画面"的意思,配上 headshot
    会让模型的头顶直接顶到画面上沿 —— 发型轮廓、头饰、帽子这些认人的线索
    第一个被切掉。改成"完整入画 + 头顶留白":要的是主体在框内,且框里有余量 */
+/**
+ * 参考图是"这个人是谁"的凭据,**不是"这一张怎么拍"的模板**。
+ *
+ * 用户 2026-10-05 报的那个毛病就是这个:上传的底图是**侧脸**,于是生成的正脸
+ * 也是侧脸。根因不是"正面"这两个字没写 —— 那句一直在(见下面 front 的 suffix)——
+ * 而是**参考图在图像编辑那条路上是最强的机位来源**:i2i 的默认行为就是保住输入
+ * 的姿态,一句 "front-facing headshot" 拗不过它。这正是
+ * [角色配图构图与光影设计.md](../doc/角色配图构图与光影设计.md) 决定五里写的
+ * "参考图同时是同一张脸的唯一保证,又是最强的机位与光线污染源" ——
+ * 而那一条当时**只落进了提示词改写那条路**(`REF_NOTE`),没落到设定图上。
+ *
+ * 所以这里明说三件事,顺序也就是它们的重要性:
+ * 1. 参考图管什么(脸、特征、头发、体型);
+ * 2. 参考图**不管**什么(姿态、机位、光);
+ * 3. 它朝哪边,不许跟着抄。
+ *
+ * **写成复数是有意的**(2026-10-05):正脸那一格只送一张(底图),而其余四格
+ * 送两张(正脸 + 底图,见 App 的 genCharView)。单数那句到了那四格就成了
+ * 一句对不上号的指令。
+ */
+export const REF_IDENTITY_ONLY =
+  'reference images are only about who this person is: their face, features, hair and build; ignore the pose, the camera angle and the lighting in them, and do not copy the direction the person is facing there'
+
 export const CHARACTER_VIEWS: Array<{
   kind: CharacterViewKind
   label: string
@@ -2177,8 +2391,15 @@ export const CHARACTER_VIEWS: Array<{
   {
     kind: 'front',
     label: 'Front',
+    /* 正面那一张是整条链的锚:其余四张都以它为参考图,它一歪全歪
+       (侧脸的"正脸"会让后面每一张都把侧脸当基准)。
+
+       所以"正面"不写成 front-facing 就完 —— 那个词对侧脸输入不够硬(见
+       REF_IDENTITY_ONLY 那段)。这里把它拆成**可判定**的几个条件:
+       两眼都可见且齐平、鼻尖朝向镜头、头不转不歪;末尾再补三个否定
+       (profile / side view / three-quarter)。 */
     suffix:
-      'single front-facing headshot of one person, head and shoulders fully in frame with headroom above the head, neutral expression, plain background, centered',
+      'single front-facing headshot of one person, head and shoulders fully in frame with headroom above the head, facing the camera directly with both eyes level and fully visible and the nose pointing at the camera, head not turned and not tilted, neutral expression, plain background, centered, not a profile, not a side view, not a three-quarter view, the face turned front-on even if the reference image shows the person from the side',
     framing: 'square'
   },
   {
@@ -2232,6 +2453,34 @@ export const CHARACTER_VIEWS: Array<{
     framing: 'square'
   }
 ]
+
+/**
+ * 一张设定图真正要发出去的提示词:角色设定 + 这一格的取景要求
+ * (+ 有参考图时那句"参考图只管脸")。
+ *
+ * 抽成纯函数是为了能直接断言 —— 这一条的判据是**词**,不是画面:
+ * "正面"必须写成可判定的几个条件、且带着那三个否定;有参考图时必须带上
+ * "别抄它的姿态"。真正的出图要花钱、要联网,靠手测试不全
+ * (用户报"上传的参考图是侧面,生成的正脸也是侧面"时,这两句一句都没有)。
+ *
+ * @param hasRef 这一次请求带不带参考图。带才说那句话 —— 纯文生图的路说了
+ *               反而是噪声(模型会去找一张并不存在的图)
+ */
+export function characterViewPrompt(
+  c: Character,
+  kind: CharacterViewKind,
+  hasRef = false
+): string {
+  const view = CHARACTER_VIEWS.find((v) => v.kind === kind)
+  if (!view) return ''
+  /* 顺序:设定 → 取景 → 参考图那句。
+     参考图那句压在最末是有意的,与对话出图那条路的排版同源
+     (见 lib/chatPhoto 的 negative 垫在最后):它是**怎么读上面那些话**的元指令,
+     不是这一张的内容,排在内容后面才不会把"画什么"挤下去 */
+  return [characterDesc(c), view.suffix, hasRef ? REF_IDENTITY_ONLY : '']
+    .filter(Boolean)
+    .join(', ')
+}
 
 /**
  * 用文本模型把一句话拆成角色的结构化设定。
@@ -2471,10 +2720,13 @@ export interface ChatStreamResult {
   mood: string
   /* 它这一轮想给你看的画面(场景描述),空串 = 不发图 */
   photo: string
-  /* 这张画面里有没有**它本人**。由模型写在标签里(self: 前缀,见 server/chatTags.js)。
+  /* 这张画面里有没有**它本人**。由模型写在标签前缀里(见 server/chatTags.js)。
      true 才把角色设定与设定图发给出图模型 —— 一张风景照带上设定图会被带跑,
      而一张自拍不带设定图就会画成陌生人 */
   photoSelf: boolean
+  /* 这一张**谁拿的相机**:'selfie' / 'third' / 空串(模型没说)。
+     客户端按"它 → 场景文本 → 默认自拍"定下最终视角(见 lib/chatPhoto) */
+  photoShot: string
 }
 
 /* ===== 长期记忆的节奏 =================================================
@@ -2615,6 +2867,8 @@ export async function chatStream(opts: ChatStreamOpts): Promise<ChatStreamResult
   let photo = ''
   /* 这张里有没有它本人。与 photo 同路一起送来 */
   let photoSelf = false
+  /* 这一张谁拿的相机(见 ChatStreamResult.photoShot)。与 photo 同路 */
+  let photoShot = ''
   try {
     for (;;) {
       const { done, value } = await reader.read()
@@ -2633,6 +2887,7 @@ export async function chatStream(opts: ChatStreamOpts): Promise<ChatStreamResult
           mood?: string
           photo?: string
           photoSelf?: boolean
+          photoShot?: string
         }
         try {
           evt = JSON.parse(text)
@@ -2648,12 +2903,14 @@ export async function chatStream(opts: ChatStreamOpts): Promise<ChatStreamResult
             finish: evt.finish || finish,
             mood: evt.mood || mood,
             photo: evt.photo || photo,
-            photoSelf: evt.photoSelf === true || photoSelf
+            photoSelf: evt.photoSelf === true || photoSelf,
+            photoShot: evt.photoShot || photoShot
           }
         }
         if (typeof evt.finish === 'string' && evt.finish) finish = evt.finish
         if (typeof evt.mood === 'string' && evt.mood) mood = evt.mood
         if (evt.photoSelf === true) photoSelf = true
+        if (typeof evt.photoShot === 'string' && evt.photoShot) photoShot = evt.photoShot
       }
     }
   } finally {
@@ -2661,7 +2918,7 @@ export async function chatStream(opts: ChatStreamOpts): Promise<ChatStreamResult
        不取消这条读流就悬着。已经读完时取消是空操作 */
     reader.cancel().catch(() => {})
   }
-  return { finish, mood, photo, photoSelf }
+  return { finish, mood, photo, photoSelf, photoShot }
 }
 
 /* ===== 提示词库(收藏) ===== */

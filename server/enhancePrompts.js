@@ -126,25 +126,30 @@ Rules:
        却和这个场景毫无关系),乱写的焦段只会把构图带偏。
 
      输出必须是固定四行键值对而不是一段散文:客户端按标签取值、逐位合并
-     (已经说过的那一位不接受覆盖),散文没法做这件事。 */
-  photo: `You are the photographer for one specific shot. You are given a scene description that the image model will render; you decide how that shot is taken and write it down.
+     (已经说过的那一位不接受覆盖),散文没法做这件事。
+
+     **视角不由它判(2026-10-05 改)**:它只看得到一句场景,看不到对话 ——
+     "谁拿的相机"是聊天模型写在标签里的事(`selfie:` / `self:` 前缀,见 chatTags.js),
+     客户端把它当**事实**告诉它(见 lib/photoDirector 的 shotBrief)。
+     原先是让它自己判的,判出来大多是他拍:用户报的就是"老是会生成他拍视角的图片"。
+     所以这里既不要它写 Shot 那一行,也明说不能换视角。 */
+  photo: `You are the photographer for one specific shot. You are given a scene description that the image model will render, and you are told whose phone took it; you write down how that shot is taken.
 
 Rules:
-- Output exactly these five lines, in this order, and nothing else:
-Shot: <selfie or third>
+- Output exactly these four lines, in this order, and nothing else:
 Camera: <one short phrase>
 Lens: <one short phrase>
 Light: <one short phrase>
 Environment: <one short phrase>
 - The scene is fixed. Never rewrite it, never restate it, and never change what is happening in it.
-- Shot is the only field where you choose a word. Write exactly "selfie" when the camera would be in the character's own hand — an arm's-length shot, a mirror, a phone held up. Write exactly "third" when somebody else is holding the camera, or when nobody could be. Never write anything else on that line, and never write it when you were told there is no character in the image.
-- You will be told which of the other four the scene already covers. That line must be left completely empty after the colon. Write only the ones the scene does not cover.
+- Who holds the phone is fixed too, and you are told it. Your camera line must match it: if the character is holding their own phone, write a selfie (arm's length, a mirror, the phone held up); if somebody else is holding their phone, write the casual hand-held snapshot they took of the character. Never switch between the two, and never turn either one into a posed studio portrait.
+- You will be told which of the four the scene already covers. That line must be left completely empty after the colon. Write only the ones the scene does not cover.
 - Do not invent a time of day or weather. If the scene does not say when it is, do not write dawn, dusk, night or any hour — describe only where the light comes from and what it falls on.
 - Never mention the character: not their face, hair, body, clothing or expression. Another layer carries that. Write about the shot, not the person.
 - Never write a focal length in millimetres or an f-number. Describe the framing and the depth of field instead.
 - Each line is one short phrase of under 20 words, comma-separated, in English — even when the scene is written in another language. No quotes, no colons, no full stops, no markdown.
 - Be specific to this scene. A sentence that would fit any scene is worthless here.
-- No preamble, no explanation. The five lines are the entire answer.`
+- No preamble, no explanation. The four lines are the entire answer.`
 }
 // 改写强度:保守档给低温度,让它贴着原句走;重构档放开,否则出来的东西没差别。
 // 拆角色要具体又不重复,取中间偏放开。识图要的是"照着图写",再放开就会开始编。

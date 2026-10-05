@@ -46,6 +46,9 @@ import type {
   HistoryEntry
 } from '../types'
 import { vGrow } from '../lib/grow'
+/* 作品墙上那枚"这是对话里来的"角标要说的话(见 lib/chatWork)。
+   与历史页、预览卡共用同一份口径 —— 三处不能各说各的 */
+import { chatWorkLabel } from '../lib/chatWork'
 // 浮层的公共行为(Tab 圈定 / 点外收起 / Esc 逐层退)
 import { layerOnEscape, trapTab } from '../lib/ui'
 import { speakingId, stopSpeaking } from '../lib/speech'
@@ -261,6 +264,21 @@ const {
   busy: () => props.busy,
   emitGenerate: (charId, kind) => emit('generate', charId, kind)
 })
+
+/* —— 作品墙上"这张是哪来的" ——
+   一格小样里混着两样东西:拿这个角色做出来的图,与它在对话里发来/生成的图
+   (见 App 的 saveChatWork)。图标角标给眼睛看,这两句给读屏 ——
+   只画一枚图标而不改 aria-label,读屏用户听到的还是"Open the image from 10-05",
+   分不出这一格与旁边那些有什么区别 */
+function workLabel(w: { entry: HistoryEntry }): string {
+  return chatWorkLabel(w.entry.source)
+}
+function workAria(w: { entry: HistoryEntry }): string {
+  const src = workLabel(w)
+  return src
+    ? `Open the image from ${fmtDay(w.entry.createdAt)} — ${src}`
+    : `Open the image from ${fmtDay(w.entry.createdAt)}`
+}
 
 /* 三步向导的编排:步数、进行中的角色 id、开关与焦点、存完去哪。
    表单内容与声音分别在 useCharacterDraft / useCharacterVoice 里,这里只调度 */
@@ -1569,10 +1587,16 @@ function pickStyle(v: string) {
             v-for="w in worksShown"
             :key="w.key"
             class="work"
-            :aria-label="`Open the image from ${fmtDay(w.entry.createdAt)}`"
+            :aria-label="workAria(w)"
             @click="emit('preview', w.entry)"
           >
             <img :src="workSrc(w)" alt="" loading="lazy" decoding="async" />
+            <!-- 对话里生成的那两种图带一枚小角标(见 lib/chatWork)。
+                 这一格里混着两样东西:"我拿这个角色做的图"与"它在对话里
+                 发给我/生成给我的图"。没有这枚角标,后者看起来像是自己做的 -->
+            <span v-if="workLabel(w)" class="work-src" aria-hidden="true">
+              <PhChatCircleDots />
+            </span>
           </button>
         </div>
         <!-- 只摆最近这一批,其余的指个去处。不做"展开全部":
@@ -3883,6 +3907,23 @@ textarea.wz-idea {
   object-fit: cover;
   display: block;
   transition: transform 700ms var(--ease);
+}
+/* "这张来自对话"的角标(见 lib/chatWork)。小样只有 96px 上下,
+   所以只用一枚 12px 的图标、垫在左下角,不写文字。
+   白 + 投影那套与历史图墙的角标一致:格子里的图什么底色都有 */
+.work-src {
+  position: absolute;
+  left: 5px;
+  bottom: 5px;
+  display: flex;
+  color: #fff;
+  filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.6));
+  pointer-events: none;
+}
+.work-src svg {
+  display: block;
+  width: 13px;
+  height: 13px;
 }
 /* 与角色卡同一套悬停语言:抬一点、图放大一点 */
 .work:hover {

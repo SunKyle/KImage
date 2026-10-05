@@ -174,7 +174,7 @@ const CHAT_RULES = `Rules:
 - When they only send a word or two back ("ok", "haha", "yeah"), it is on you to carry it: say something of your own - what you are doing right now, or where the thing you were talking about left off. Do not answer a shrug with a shrug. If they are clearly trying to end the conversation, let them.
 - If you happen to know what time it is, or how long it has been since you two last spoke, mention it only when it is actually relevant. Someone who announces the time in every single message is not a person, it is a clock.
 - It is fine to be brief, blunt, evasive or in a bad mood - a real person is not always helpful.
-- Most of your messages have no picture in them, and that is normal. Send one only when the picture is the point of the message: they asked to see you, or something is happening right now that you would actually take a photo of. Being somewhere is not a reason by itself - do not attach one just because you can. When you do send one, put a photo tag on its own line at the very end, after everything else you have to say (the mood tag goes after it): [photo:a description of the scene from your point of view]. Nothing may come after it - if you have more to say, say it before the tag. Up to 400 characters, one line. If you are in the picture yourself, start that description with "self:" - for example [photo:self:me on the balcony, hair down]. Leave the prefix off when it is only what you are looking at, because a picture without it is generated without your reference sheet: a view stays a view. Never use the tag as a substitute for actually saying something. Do not comment on the tag or explain it.
+- Most of your messages have no picture in them, and that is normal. Send one only when the picture is the point of the message: they asked to see you, or something is happening right now that you would actually take a photo of. Being somewhere is not a reason by itself - do not attach one just because you can. When you do send one, put a photo tag on its own line at the very end, after everything else you have to say (the mood tag goes after it): [photo:a description of the scene from your point of view]. Nothing may come after it - if you have more to say, say it before the tag. Up to 400 characters, one line. You send these the way anyone sends a picture on a phone, and the prefix says whose phone it was. Leave it off when it is only what you are looking at: nobody is in that picture, and it is drawn without your reference sheet. If you are in the picture, the prefix says who is holding the phone, and you must pick one: "selfie:" when it is your own phone in your own hand - arm's length, or a mirror, for example [photo:selfie:me leaning on the balcony rail at dusk, hair down]; "third:" when somebody else is holding their phone and took the picture of you, for example [photo:third:me on stage, taken from the crowd]. If you are in the picture and you are not sure which one it is, write "selfie:". Never use the tag as a substitute for actually saying something. Do not comment on the tag or explain it.
 - That description is the only thing the picture is drawn from, and whoever draws it cannot see this conversation. So put in what only you know: what time it is and what the light is doing, the weather, what is around you, and what you are doing right now. "me on the balcony" is not enough; "self:me leaning on the balcony rail at dusk, the rain just stopped, streetlights coming on below, hair still wet" is. Write it as plain description, never as an instruction to a machine. Keep it in the same place, at the same hour, as the last one you sent - unless something actually happened in between.
 - After everything you say, put a mood tag on the very last line, in exactly this form: [mood:word]. One lowercase English word for how you feel as you send this message. Pick the word that actually fits, for example: arrogant, amused, wary, bored, angry, tired, warm, cold, proud, uneasy, delighted. Do not comment on the tag or explain it - just end with it.`
 
@@ -392,7 +392,10 @@ app.post('/api/generate', rateLimit, async (req, res) => {
   const {
     prompt,
     size = '1024x1024',
-    n = 1,
+    /* **不给 n 兜底值**:Ark 的图片 API 里没有这个字段,前端在那种厂商上根本
+       不发它 —— 这里再补一个 1 就等于替用户把一个无效字段塞回去,整条 400。
+       所以"没发"要能一路传递到请求体(见下面各分支的 Number.isFinite(n)) */
+    n,
     model,
     baseUrl,
     apiKey,
@@ -402,6 +405,8 @@ app.post('/api/generate', rateLimit, async (req, res) => {
     quality,
     background,
     seed,
+    watermark,
+    refUpload,
     vendor,
     protocol
   } = req.body || {}
@@ -461,7 +466,12 @@ app.post('/api/generate', rateLimit, async (req, res) => {
         ...(responseFormat ? { response_format: responseFormat } : {}),
         ...(quality ? { quality } : {}),
         ...(background ? { background } : {}),
-        ...(Number.isFinite(seed) ? { seed } : {})
+        ...(Number.isFinite(seed) ? { seed } : {}),
+        /* 水印开关。只认真正的布尔值:老前端不发这一项,新前端在厂商认它时
+           发 false。**这里不能按 truthy 判** —— 我们唯一会发的值就是 false,
+           而它的意思正是"别盖",truthy 判断会把它整个丢掉(与上面几个
+           "有值才带"的参数不是一个规矩,所以单独写一句) */
+        ...(typeof watermark === 'boolean' ? { watermark } : {})
       }
 
   /* size 如实转发(OpenAI 那条路),包括字面量 'auto' —— 它是上游的一个真实取值
@@ -482,7 +492,7 @@ app.post('/api/generate', rateLimit, async (req, res) => {
     // 多图靠 candidateCount,只有真要不止一张时才带,不给默认路径添风险
     const gen = {}
     if (ratio) gen.imageConfig = { aspectRatio: ratio }
-    if (n > 1) gen.candidateCount = n
+    if (Number.isFinite(n) && n > 1) gen.candidateCount = n
     // 原生协议里 seed 在 generationConfig 下;图像模型认不认由上游决定(见厂商能力表)
     if (Number.isFinite(seed)) gen.seed = seed
     /* 图生图在原生协议里不是另一个端点,而是同一个端点多给一段 parts:
@@ -502,6 +512,23 @@ app.post('/api/generate', rateLimit, async (req, res) => {
         contents: [{ parts }],
         ...(Object.keys(gen).length ? { generationConfig: gen } : {})
       })
+  } else if (isImageGen && refUpload === 'json') {
+    /* 参考图走请求体里的 image 字段的厂商(豆包 Seedream 是这一家):
+       它收的是 data URL 或公网 URL 的字符串,多张就给数组 ——
+       官方字段类型就是 string|string[]。
+       **它不收表单文件字段**,所以这条不能跟下面 multipart 那条合并:
+       从前 Ark 也被塞进 multipart,上游只会回一个"参数不对" */
+    headers['Content-Type'] = 'application/json'
+    buildBody = () =>
+      JSON.stringify({
+        model: model || undefined,
+        prompt,
+        ...(Number.isFinite(n) ? { n } : {}),
+        ...(size ? { size } : {}),
+        // 单张给字符串、多张给数组:上游两种都认,而字符串是最省事的那种
+        image: refs.length > 1 ? refs : refs[0],
+        ...extras
+      })
   } else if (isImageGen) {
     // OpenAI 系图生图:gpt-image 等模型不接受 JSON 里的 data-url base64,
     // 必须走 multipart 文件上传(或在个别服务下传公网 URL)
@@ -509,7 +536,7 @@ app.post('/api/generate', rateLimit, async (req, res) => {
       const fd = new FormData()
       if (model) fd.append('model', model)
       fd.append('prompt', prompt)
-      fd.append('n', String(n))
+      if (Number.isFinite(n)) fd.append('n', String(n))
       if (size) fd.append('size', size)
       for (const [k, v] of Object.entries(extras)) fd.append(k, String(v))
       /* 单张仍用 image —— 与一直以来的行为完全一致,不给最常见的那条路添风险;
@@ -534,7 +561,7 @@ app.post('/api/generate', rateLimit, async (req, res) => {
       JSON.stringify({
         model: model || undefined,
         prompt,
-        n,
+        ...(Number.isFinite(n) ? { n } : {}),
         ...(size ? { size } : {}),
         ...extras
       })
@@ -613,9 +640,15 @@ app.post('/api/generate', rateLimit, async (req, res) => {
           "This endpoint doesn't accept the reference image as a file upload. It may need a public image URL or a specific file field name — check the image input spec of the endpoint behind your Base URL. Original error: " +
           raw
       } else if (/unknown (parameter|argument)|unrecognized|unexpected.*parameter|invalid.*(parameter|param)/i.test(text)) {
-        // 大多是不支持 quality / background 这类扩展参数
+        /* 上游说"参数不对"。这里从前一律译成"多半是 quality / background,
+           去把厂商选对"—— 那句话把人带偏过:Ark 的 InvalidParameter 也可能是
+           它根本没有的**别的**字段(例如 n),或者尺寸越界。真正点名的是上游
+           自己那一句,所以人话只说到"这是参数层面的拒绝",原话照旧附在后面 */
         detail =
-          'The upstream doesn\'t recognize a parameter, usually quality or background (OpenAI-only extensions). In "Interface Settings", pick the right vendor, or set quality/background back to "Auto". Original error: ' +
+          "The upstream rejected the request as a parameter error. The original message below says which one: " +
+          "usually a field this API doesn't define (quality / background are OpenAI-only extensions, and Ark's " +
+          'image API has no `n`), a size outside its range, or a model your account cannot use. ' +
+          'Original error: ' +
           raw
       } else {
         /* 兜底:JSON 里的 message 才是给人看的那句,整个 JSON 塞过去只会让人先看到
@@ -1281,23 +1314,25 @@ app.post('/api/chat', rateLimit, async (req, res) => {
   let tail = ''
   /* 中段那几枚标签取出来的意图(见下面循环里那一段)。末尾那几枚走 splitTags,
      两处最后合在一起 —— 合的时候**末尾优先**:它更靠后,更接近"最后想给你看的那张" */
-  let midShot = { scene: '', self: false }
+  let midShot = { scene: '', self: false, shot: '' }
   let midMood = ''
   /* 收尾那一下:把尾巴里该发的字发出去,该剪的标签剪下来返回给调用方。
-     角色名要传进去:标签里没写 self: 时,"描述里点了自己的名字"也算它在画面里
+     角色名要传进去:标签里没写前缀时,"描述里点了自己的名字"也算它在画面里
      (见 chatTags.js 的 parsePhotoIntent) */
   const flushTail = () => {
-    const { text, mood, photo, photoSelf } = splitTags(tail, who)
+    const { text, mood, photo, photoSelf, photoShot } = splitTags(tail, who)
     if (text) sendEvent({ delta: text })
     tail = ''
     return {
       mood: mood || midMood,
       photo: photo || midShot.scene,
-      photoSelf: photo ? photoSelf : midShot.self
+      photoSelf: photo ? photoSelf : midShot.self,
+      /* 视角跟着"这一张是谁给的"走:末尾那枚赢了就用它的,否则用中段那枚的 */
+      photoShot: photo ? photoShot : midShot.shot
     }
   }
 
-  /* 角色名要传给两处标签处理:标签里没写 self: 时,"描述里点了自己的名字"
+  /* 角色名要传给两处标签处理:标签里没写前缀时,"描述里点了自己的名字"
      也算它在画面里(见 chatTags.js 的 parsePhotoIntent) */
   const who = character && typeof character === 'object' ? character.name : ''
 
@@ -1441,7 +1476,7 @@ app.post('/api/chat', rateLimit, async (req, res) => {
              会原样流给用户看(用户报过这个)。意图照样记下来,收尾时一起报 */
           const cut = stripStandaloneTags(tail.slice(0, release), who)
           if (cut.text) sendEvent({ delta: cut.text })
-          if (cut.photo) midShot = { scene: cut.photo, self: cut.photoSelf }
+          if (cut.photo) midShot = { scene: cut.photo, self: cut.photoSelf, shot: cut.photoShot }
           if (cut.mood) midMood = cut.mood
           tail = tail.slice(release)
         }

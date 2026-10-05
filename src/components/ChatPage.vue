@@ -82,7 +82,8 @@ const props = defineProps<{
      **它是显示层的事,页面自己不改任何数据** —— 偏好存盘与外壳那一层归主界面 */
   immersive?: boolean
   /* 这一场戏的**背景图**(单独生成、单独存的那一张)的地址。
-     空 = 还没画出来,退到剧照/首图。读库与编排归主界面(见 App 的 ensureBackdrop) */
+     空 = 还没画出来,退到剧照/首图。读库与出图编排都归主界面
+     (见 App 的 loadBackdrop 与 drawBackdrop —— **只有用户点 New background 才画**) */
   backdrop?: string
   /** 正在画这一场的背景。界面据它说一句"正在画"(它是一次真调用,用户该知道) */
   backdropBusy?: boolean
@@ -896,8 +897,12 @@ function onKey(e: KeyboardEvent) {
   ])
 }
 
-/** 手动要一张新的背景图(见 App 的 ensureBackdrop)。它同时把菜单收起来 —— 
- *  菜单开着的时候点它,下一步想看的是画面,不是菜单 */
+/** 手动要一张新的背景图(见 App 的 drawBackdrop)。它同时把菜单收起来 ——
+ *  菜单开着的时候点它,下一步想看的是画面,不是菜单。
+ *
+ *  **这是背景图唯一的出图入口**:进沉浸页与换戏都只把库里那张读回来铺上,
+ *  不再自动生成(用户 2026-10-05 的要求)。
+ *  这一页仍然只是发意图:配没配接口、场景够不够、画完存哪,全归主界面 */
 function askBackdrop() {
   closeMenu()
   emit('newBackdrop')

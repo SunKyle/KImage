@@ -37,7 +37,9 @@ import {
   generate,
   uid,
   loadConfigs,
-  characterDesc,
+  /* 设定图的提示词由 api.ts 那份纯函数拼(设定 + 取景 + 参考图那句)——
+     它是那五格提示词的唯一出处,单测直接断言 */
+  characterViewPrompt,
   chatPayloadOf,
   CHAT_WINDOW,
   chatStream,
@@ -72,7 +74,9 @@ import {
   putChatImage,
   getChatImage
 } from './lib/idb'
-import { titleFromPrompt } from './lib/text'
+/* 历史记录"叫什么、读哪一句"的唯一口径。对话里生成的那两张图没有它就只能
+   拿一整段摄影提示词当标题(见 lib/chatWork) */
+import { workTitle } from './lib/chatWork'
 import { stopSpeaking } from './lib/speech'
 import { contextText } from './lib/chatContext'
 /* 对话左栏的顺序:进对话页替用户挑一个时,与 ChatPage 铺左栏时用的是同一份规则 */
@@ -114,7 +118,7 @@ import {
   putChatBackdrop,
   type ChatBackdrop
 } from './lib/idb'
-import type { ApiConfig, FavoritePayload, HistoryEntry, PromptItem, ResultItem, ReuseParams, Character, CharacterFields, CharacterPersona, CharacterViewKind, CharacterVoice, ChatMessage, ImportedCharacter } from './types'
+import type { ApiConfig, FavoritePayload, HistoryEntry, HistorySource, PromptItem, ResultItem, ReuseParams, Character, CharacterFields, CharacterPersona, CharacterViewKind, CharacterVoice, ChatMessage, ImportedCharacter } from './types'
 
 // —— 状态 ——
 /* 反馈三通道(错误 / 中性提示 / 删除撤销)收在 composables/useFeedback.ts ——
@@ -355,12 +359,15 @@ function toggleImmersive() {
    沉浸页铺满屏幕的那一张,**与设定图、参考图、消息里的图各存各的**
    (用户特意交代过)。它按"当前这一场戏"画:戏换了就该换一张。
 
-   三条刻意的取舍:
-   - **进沉浸页时才画**(不是每次进对话页):那一页要它,别的时候不花这个钱;
-   - **一场戏只画一次**:记录里带着画它时用的那段场景,与当前这一场一致就直接用,
-     反复进出不会重复付费;
-   - **失败静默**:退回剧照/首图,下一次进沉浸页再试 —— 与记忆压缩同一条规矩
-     (它不该为一个背景弹一句技术错误)。用户手动点"重画"时才如实说原因 */
+   三条刻意的取舍(**2026-10-05 改过一次,见下**):
+   - **只有用户点 `⋮` 里的 New background 才画**。原先写的是"进沉浸页时才画 ——
+     那一页要它,别的时候不花这个钱",但"进页面"本身不是花钱的理由:
+     用户 2026-10-05 明确说"不需要每次进入沉浸页面就自动生图,只有我点击的时候
+     才重新生成"。所以进沉浸页、换角色、对话里换了一场戏,一律**只把库里那张
+     读回来铺上**,不再自动出图;
+   - **一场戏一张,存在库里**:画过的留在 `chat_backdrops`,下次进来直接铺,
+     反复进出不会重复付费;想换一张就再点一次;
+   - **失败如实说**:它现在是一条用户主动触发的动作,静默失败会让人以为按钮坏了 */
 const backdrops = ref<Record<string, ChatBackdrop>>({})
 const backdropBusy = ref<Record<string, boolean>>({})
 
@@ -375,23 +382,32 @@ function currentScene(id: string): string {
   return ''
 }
 
-/** 需要就画一张背景。`force` 是用户手动点的"重画这一场" */
-async function ensureBackdrop(id: string, force = false) {
-  if (!id) return
+/** 用户手动要一张新的背景图(沉浸页 `⋮` 里那条 New background)。
+ *
+ *  **这是唯一会为背景图花钱的入口**(见上面那段)。所以几处提前收手都要
+ *  说清原因 —— 点一下什么都没发生,比失败更让人摸不着头脑:
+ *  - 还没有场景(它还没发过图):告诉他先让它发一张;
+ *  - 没配出图那条接口:与别的出图入口同一句话;
+ *  - 正在画:不叠第二次,静默(界面那一刻本来就写着"Drawing…")。 */
+async function drawBackdrop(id: string) {
+  if (!id || backdropBusy.value[id]) return
   const scene = currentScene(id)
-  /* 没有戏可画就别画 —— 一张没有场景的人像当背景,不如用它的剧照/首图 */
-  if (!scene) return
-  const had = backdrops.value[id]
-  if (!force && had && had.scene === scene) return
-  if (backdropBusy.value[id]) return
-  if (!config.value?.baseUrl) return
+  if (!scene) {
+    notice.value = 'Nothing to draw from yet — let it send you a photo first.'
+    return
+  }
+  const cfg = config.value
+  if (!cfg.baseUrl) {
+    notice.value = 'Set an image API in Settings first.'
+    return
+  }
 
+  const had = backdrops.value[id]
   backdropBusy.value = { ...backdropBusy.value, [id]: true }
   try {
     const out = await generateChatBackdrop(id, scene)
     if (!out.blob) {
-      /* 静默(见上面那条),但用户手动要的那一次必须说清为什么没有 */
-      if (force) notice.value = out.error || 'Could not draw a background for this scene.'
+      notice.value = out.error || 'Could not draw a background for this scene.'
       return
     }
     /* 换掉旧的那张:它不再被界面引用,连同 objectURL 一起放掉 */
@@ -400,6 +416,10 @@ async function ensureBackdrop(id: string, force = false) {
     backdrops.value = { ...backdrops.value, [id]: rec }
     await putChatBackdrop(rec)
     if (stale && stale !== rec.blob) releaseSrc(stale)
+    /* 背景图也进历史(见 saveChatWork):它同样是这个角色的一张作品。
+       从前它只活在库里那一条记录上 —— 换一场戏就被下一张顶掉,
+       画它花的钱也就跟着没了,用户再也找不回来 */
+    await saveChatWork(id, out, 'chat-backdrop', scene)
   } finally {
     const rest = { ...backdropBusy.value }
     delete rest[id]
@@ -407,25 +427,19 @@ async function ensureBackdrop(id: string, force = false) {
   }
 }
 
-/** 进沉浸页时按需画一张;戏换了也补一张 */
+/* 进沉浸页 / 换角色:把库里那张背景读回来铺上。
+   **只读不画** —— 要新的得自己点 New background(见 drawBackdrop)。
+   没有现成的就退到剧照 → 正脸 → 底图 → 主题色(见 ChatPage 的 bgSrc) */
 watch(immersiveOn, (on) => {
   if (!on || !chatCharId.value) return
-  void loadBackdrop(chatCharId.value).then(() => ensureBackdrop(chatCharId.value))
+  void loadBackdrop(chatCharId.value)
 })
-/* 换角色:把这个角色库里那张读回来(沉浸态时还要看要不要补一张) */
 watch(chatCharId, (id) => {
   if (!id) return
-  void loadBackdrop(id).then(() => {
-    if (immersiveOn.value) void ensureBackdrop(id)
-  })
+  void loadBackdrop(id)
 })
-/* 对话里又出了一张新剧照 —— 那就是"换了一场戏" */
-watch(
-  () => currentScene(chatCharId.value),
-  () => {
-    if (immersiveOn.value && chatCharId.value) void ensureBackdrop(chatCharId.value)
-  }
-)
+/* 对话里又出了一张新剧照 = 换了一场戏。**这里刻意什么都不做** ——
+   自动重画正是用户 2026-10-05 要去掉的那件事 */
 /* 进页面时把库里那张读回来(每个角色一张,一次读完不心疼) */
 async function loadBackdrop(id: string) {
   if (!id || backdrops.value[id]) return
@@ -1413,9 +1427,13 @@ async function genCharView(charId: string, kind: CharacterViewKind): Promise<boo
   charViewControllers.set(charViewKey(charId, kind), ctl)
   let ok = false
   try {
-    const prompt = [characterDesc(c), view.suffix].filter(Boolean).join(', ')
+    /* 提示词由 api.ts 那份 `characterViewPrompt` 拼:设定 + 这一格的取景
+       (+ 有参考图时那句"参考图只管脸、别抄它的姿态")。
+       从前是在这里手拼 `[characterDesc(c), view.suffix]` —— 于是"参考图只管脸"
+       那一句根本不存在,而底图是侧脸时生成的正脸也就跟着是侧脸(用户 2026-10-05 报) */
     const images: string[] = []
     for (const b of refBlobs) images.push(await blobToDataURL(b))
+    const prompt = characterViewPrompt(c, kind, images.length > 0)
     const res = await generate(
       {
         prompt,
@@ -1657,9 +1675,13 @@ async function runChat(id: string) {
   let mood = ''
   /* 这一轮它想给你看的画面(场景描述)。空串 = 不发图 */
   let photo = ''
-  /* 这张里有没有它本人(模型写在 [photo:self:…] 里)。
+  /* 这张里有没有它本人(模型写在标签前缀里)。
      它决定出图时带不带设定图:场景照带上会被带跑,自拍不带会画成陌生人 */
   let photoSelf = false
+  /* 这一张谁拿的相机:'selfie' / 'third' / 空串(它没说)。
+     由模型在标签前缀里说(selfie: / third:,见 server/chatTags.js)——
+     它是**唯一**知道"我在描述自己举着手机拍,还是别人给我拍"的那一层 */
+  let photoShot = ''
   /* 打字节奏。它只决定"什么时候放",不决定"放什么" ——
      所以这里最要紧的不是节奏好不好看,而是**一个字都不能丢**:
      收尾(马上要落盘)、按 Stop、页面被切走三处都必须把手里剩下的冲出来,
@@ -1734,6 +1756,7 @@ async function runChat(id: string) {
     mood = out.mood
     photo = out.photo
     photoSelf = out.photoSelf
+    photoShot = out.photoShot
     /* 这一轮到底有没有"发图的意图",以及它想给你看什么。
      *
      * **不该靠猜**:标签在服务端就被剪掉了(那是对的,用户不该看见 `[photo:…]`),
@@ -1776,8 +1799,9 @@ async function runChat(id: string) {
   if (photo && !stopped) {
     reply.photo = photo
     /* 意图一起落在这条消息上:导出这段对话时,对方若想重画这一张,
-       依据该是同一个(是自拍还是只拍了个景) */
+       依据该是同一个(在不在画面里、谁拿的相机) */
     if (photoSelf) reply.photoSelf = true
+    if (photoShot === 'selfie' || photoShot === 'third') reply.photoShot = photoShot
     drawChatPhoto(id, reply)
   }
   if (!reply.content.trim() && !stopped) {
@@ -1804,6 +1828,68 @@ async function runChat(id: string) {
   /* 收尾之后顺手看一眼要不要压记忆。放在最末是有意的:
      它是后台整理,不该挡在用户看到回复之前,也不该挤进上面那两句提示 */
   void maybeSummarize(id)
+}
+
+/**
+ * 对话里画出来的一张图 → 也存一条历史记录。
+ *
+ * **用户 2026-10-05 的要求**:对话过程中生成的所有图都要进历史,
+ * 生成的那张对话背景图也算;并且要归到角色名下(见 `characterId`)。
+ * 从前这条链是明确"不进历史"的(见 doc/角色配图设计.md)—— 图只活在对话里,
+ * 于是关掉对话页之后它就再也翻不到了,而画它同样花了钱。
+ *
+ * 字节是**两处各留一份**,这是有意的:
+ * - `chat_images` / `chat_backdrops` 那份是**对话自己在用**的 ——
+ *   消息要显示它、清空对话要把它一并回收(见 idb.ts 的 deleteChatOf);
+ * - `history` 这份是**作品** —— 历史页、角色作品墙、批量导出读的都是它。
+ *
+ * 两处生命周期不同,所以不做"互相引用":历史被存储清理淘汰时,对话里那张还在;
+ * 清空对话时,历史里这张也还在。代价是同一张图占两份配额 ——
+ * 换的是两边都不会因为对方的删除而裂掉(清空对话不该抹掉你的作品,
+ * 清理旧记录也不该让聊天记录里那张图变成一个空框)。
+ *
+ * **绝不往外抛**:它跑在出图那条 `.then` 里,抛出去会被那个 catch
+ * 当成"这张图画失败了" —— 而图其实已经拿到、已经在对话里了。
+ * 历史那份没写成只是少一件作品,不该影响已经画好的这一张。
+ */
+async function saveChatWork(
+  charId: string,
+  out: {
+    blob: Blob
+    prompt: string
+    size: string
+    model: string
+    configId: string
+    elapsedMs: number
+  },
+  source: HistorySource,
+  scene: string
+) {
+  try {
+    /* 走 recordFor 而不是自己拼一条:缩略图与真实像素这些图墙要用的字段
+       由它一并补齐,口径与工作台出的图一致 */
+    const record = await recordFor([{ type: 'b64', data: out.blob }], {
+      /* `prompt` 记**真正发出去的那一整段**(含机位、焦段、光、负面约束)——
+         以后从历史里 Reuse 重跑,依据才与当时一致;人话那句(场景)
+         记在 `scene` 上,界面读它当标题与正文(见 lib/chatWork) */
+      prompt: out.prompt,
+      scene,
+      source,
+      size: out.size,
+      model: out.model || undefined,
+      configId: out.configId,
+      /* 归到角色名下 —— 角色页那面 "Made with this character" 作品墙
+         与用量都是按这个字段聚合的(见 useCharacters 的 charWorks) */
+      characterId: charId,
+      elapsedMs: out.elapsedMs
+    })
+    await persist(record)
+  } catch {
+    /* recordFor 那一步(量缩略图)真抛出来时在这里收口。persist 自己不会抛:
+       它内部把落盘失败变成了提示(见 useHistory)。这句只是让"作品墙里没有它"
+       有个说法 —— 它不会盖掉出图本身已经给出的提示 */
+    notice.value = 'The image is in the conversation, but was not saved to history.'
+  }
 }
 
 /**
@@ -1838,7 +1924,7 @@ function drawChatPhoto(id: string, reply: ChatMessage) {
     await putChatMessage(toRaw(reply)).catch(() => {})
   }
 
-  void generateChatPhoto(id, scene, !!reply.photoSelf)
+  void generateChatPhoto(id, scene, !!reply.photoSelf, reply.photoShot)
     .then(async (out) => {
       if (!chatMessages.value[id]?.some((m) => m.id === reply.id)) return
       if (!out.blob) return markFailed(out.error)
@@ -1852,10 +1938,14 @@ function drawChatPhoto(id: string, reply: ChatMessage) {
       }
       reply.photoId = photoId
       reply.photoError = ''
-      /* 落库只是把这条消息补全:图不进历史,所以这里走的不是 persist,
-         而是"把这一条改写回去"。失败也不回滚界面 —— 失败那一路见上,
+      /* 落库只是把这条消息补全。失败也不回滚界面 —— 失败那一路见上,
          成功的这一路写不进去也不该把已经画好的图从界面上撤掉 */
       await putChatMessage(toRaw(reply)).catch(() => {})
+      /* 再落一份进历史(见 saveChatWork)。**排在消息之后**是有意的:
+         这一张图先要在对话里出现,历史是第二件事 —— 历史那份写不成
+         不该让对话里这张也跟着没了。它自己不抛,所以下面那个 catch
+         不会把一次成功误报成失败 */
+      await saveChatWork(id, out, 'chat-photo', scene)
     })
     /* 兜一层。generateChatPhoto 约定"绝不 reject",但真抛出来了也必须落到
        同一个出口 —— 漏出去这条消息就一直停在骨架上,连那行提示都不会有 */
@@ -2547,6 +2637,13 @@ function createAssignCollection(title: string) {
                       <!-- 对比模式下一家只出一张(见 doRace),这里如实说明并收起选项 ——
                            留着能点但改了没用的胶囊,比看不到更糟 -->
                       <span v-if="compareMode" class="pp-note">One image per model in compare mode</span>
+                      <!-- 同一把尺子量这一条:豆包那类请求体里**没有 n**
+                           (见 api.ts 能力表的 n —— 它的多图是另一套字段,还没接),
+                           发过去就是无效参数、整条被拒 400。所以这里也出一张,
+                           并把胶囊收起来,而不是留一排点了没反应的档位 -->
+                      <span v-else-if="provider.n === 'no'" class="pp-note">
+                        One image per request on this API
+                      </span>
                       <template v-else>
                         <button
                           v-for="c in 4"
@@ -2771,13 +2868,13 @@ function createAssignCollection(title: string) {
                     loading="lazy"
                     decoding="async"
                     :src="imageSrc(t.item)"
-                    :alt="t.entry.prompt"
+                    :alt="workTitle(t.entry)"
                     @load="onFeedLoad(t.key, t.entry, $event)"
                   />
                   <!-- 悬停浮出短标题与元信息:提示词动辄两三行,压在缩略图上把图挡掉大半,
                        而这块砖是用来扫图的;要读完整提示词点开预览即可 -->
                   <span class="tile-veil">
-                    <span class="tile-name">{{ titleFromPrompt(t.entry.prompt) }}</span>
+                    <span class="tile-name">{{ workTitle(t.entry) }}</span>
                     <span class="tile-meta">{{ fmtDate(t.entry.createdAt) }} · {{ sizeLabel(t.entry.size) }}</span>
                   </span>
                 </button>
@@ -2842,7 +2939,7 @@ function createAssignCollection(title: string) {
         :backdrop="backdropSrc"
         :backdrop-busy="!!backdropBusy[chatCharId]"
         @toggle-immersive="toggleImmersive"
-        @new-backdrop="ensureBackdrop(chatCharId, true)"
+        @new-backdrop="drawBackdrop(chatCharId)"
         @select="chatCharId = $event"
         @send="sendChat"
         @stop="stopChat"

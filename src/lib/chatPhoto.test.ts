@@ -5,6 +5,7 @@ import {
   characterAnchor,
   chatPhotoSize,
   isSelfie,
+  isThirdShot,
   missingSlots,
   planChatPhoto,
   shotRatio,
@@ -107,8 +108,11 @@ describe('isSelfie · 只认明确是自拍的说法', () => {
     'taking a selfie on the balcony',
     'a quick self-portrait before work',
     'selfie, hair still wet',
+    'me in the mirror, phone up',
+    'an arm\u2019s length shot of my own face',
     '自拍一张给你看',
-    '举着手机拍了一张'
+    '举着手机拍了一张',
+    '对镜自拍'
   ])('认出自拍:%s', (s) => {
     expect(isSelfie(s)).toBe(true)
   })
@@ -122,9 +126,28 @@ describe('isSelfie · 只认明确是自拍的说法', () => {
     expect(isSelfie(s)).toBe(false)
   })
 
-  it('认不出时的默认是"不是自拍" —— 猜错成自拍的代价更大', () => {
+  it('认不出就是认不出 —— 它只回答"场景里写没写自拍",不再兼任默认值', () => {
     expect(isSelfie('a rooftop at dawn')).toBe(false)
   })
+})
+
+describe('isThirdShot · 只认明说了"别人拍的"', () => {
+  it.each([
+    'me on stage, taken by a friend in the crowd',
+    'she took this photo of me at the party',
+    'a candid of me at the market',
+    '别人拍的我',
+    '这张是偷拍的'
+  ])('认成他拍:%s', (s) => {
+    expect(isThirdShot(s)).toBe(true)
+  })
+
+  it.each(['me on the balcony', 'taking a selfie by the window', '我在阳台'])(
+    '不认成他拍:%s',
+    (s) => {
+      expect(isThirdShot(s)).toBe(false)
+    }
+  )
 })
 
 /* ===== 分层拼装 ====================================================== */
@@ -134,32 +157,79 @@ describe('isSelfie · 只认明确是自拍的说法', () => {
  *  不传时退回 isSelfie 词表 —— 那是**没有摄影指导时的降级路径**,不是主路径。 */
 
 describe('planChatPhoto · 视角', () => {
-  it('传了就用传进来的 —— 覆盖词表的判断', () => {
-    /* 场景里明明写着"自拍",但传进来的视角是第三人称:
-       这是主路径的样子(摄影指导看了整个场景后认为该他拍),
-       词表不该再把它掰回去 */
+  it('标签说 selfie 就是自拍', () => {
+    const p = planChatPhoto('leaning on the balcony', true, ANCHOR, 'selfie')
+    expect(p.shot).toBe('selfie')
+    expect(p.prompt).toContain('front camera')
+  })
+
+  it('标签说 third 就是他拍,哪怕场景里写着"自拍"', () => {
+    /* 两处矛盾时以标签为准:它是模型对"谁拿的相机"的直接回答,
+       而场景只是一句散文 */
     const p = planChatPhoto('taking a selfie by the window', true, ANCHOR, 'third')
     expect(p.shot).toBe('third')
     expect(p.prompt).toContain('third-person view')
     expect(p.prompt).not.toContain('arm\u2019s length')
   })
 
-  it('不传时退回词表(降级路径)', () => {
+  it('标签没说:场景写着自拍就是自拍', () => {
     expect(planChatPhoto('taking a selfie by the window', true, ANCHOR).shot).toBe('selfie')
-    expect(planChatPhoto('leaning on the balcony', true, ANCHOR).shot).toBe('third')
+  })
+
+  it('标签没说、场景也没说:**默认自拍**', () => {
+    /* 这一条是用户 2026-10-05 报的那个毛病("老是会生成他拍视角的图片")的根:
+       原来的默认是他拍,而聊天模型写场景时通常不写"自拍"两个字 ——
+       设计文档里的例子就是 `[photo:self:me on the balcony, hair down]` */
+    const p = planChatPhoto('me on the balcony, hair down', true, ANCHOR)
+    expect(p.shot).toBe('selfie')
+    expect(p.prompt).toContain('front camera')
+    expect(p.prompt).toContain('own hand')
+  })
+
+  it('场景明说是别人拍的那就他拍', () => {
+    const p = planChatPhoto('me on stage, taken by a friend in the crowd', true, ANCHOR)
+    expect(p.shot).toBe('third')
+    expect(p.prompt).toContain('third-person view')
   })
 
   it('画面里没有人时,传什么视角都只能是空镜', () => {
-    /* 这道护栏不由摄影指导负责:一张"我看到的东西"里长出一个人,
+    /* 这道护栏不由标签负责:一张"我看到的东西"里长出一个人,
        比视角选错严重得多 */
     const p = planChatPhoto('an empty harbour', false, ANCHOR, 'selfie')
     expect(p.shot).toBe('scene')
     expect(p.prompt).toContain('no people in frame')
   })
 
-  it('self 记在方案上 —— 摄影指导改视角时要靠它重拼模板', () => {
+  it('self 记在方案上', () => {
     expect(planChatPhoto('an empty harbour', false, ANCHOR).self).toBe(false)
     expect(planChatPhoto(BARE_SCENE, true, ANCHOR).self).toBe(true)
+  })
+
+  it('每一档都带一条硬约束层(pin)—— 换得掉机位,换不掉它', () => {
+    /* 三档各一句,而且是同一层:这是"这一张不可让渡的那件事" */
+    const selfie = planChatPhoto('me on the balcony', true, ANCHOR)
+    expect(selfie.layers.find(([slot]) => slot === 'pin')?.[1]).toContain('own hand')
+
+    const third = planChatPhoto('me on stage, taken by a friend', true, ANCHOR)
+    expect(third.layers.find(([slot]) => slot === 'pin')?.[1]).toContain('somebody else')
+
+    const scene = planChatPhoto('an empty harbour', false, ANCHOR)
+    expect(scene.layers.find(([slot]) => slot === 'pin')?.[1]).toContain('no people in frame')
+  })
+
+  it('**两档读出来都是"手机拍的"** —— 只是拿手机的人不同', () => {
+    /* 用户 2026-10-05 的原始要求:"要能理解自己用手机拍摄的视角,
+       和别人用手机拍摄的视角"。两者都要像手机照,而不是"一张照片" */
+    const selfie = planChatPhoto('me on the balcony', true, ANCHOR)
+    expect(selfie.prompt).toMatch(/phone front camera/i)
+    expect(selfie.prompt).toMatch(/holding the phone/i)
+
+    const third = planChatPhoto('me on stage, taken by a friend', true, ANCHOR)
+    expect(third.prompt).toMatch(/snapshot taken on a phone by somebody else/i)
+    expect(third.prompt).toMatch(/hand-held phone snapshot/i)
+    /* 不能读成影棚/肖像那一路 */
+    expect(third.prompt).not.toMatch(/studio portrait of|posed portrait/i)
+    expect(third.prompt).toContain('phone photo rather than a studio portrait')
   })
 })
 
@@ -250,15 +320,17 @@ describe('missingSlots · 场景已经说了什么', () => {
 
 describe('planChatPhoto · 只补不覆盖', () => {
   it('场景写了光,模板就不再塞一句自己的光(含中文场景)', () => {
+    /* 这几条场景都没有"自拍/他拍"的字眼,所以落回**默认视角 = 自拍** ——
+       判据要拿自拍那一档模板的光句来比(见下面"视角"那一组) */
     const en = planChatPhoto('sitting by the window in warm afternoon light', true, ANCHOR)
-    expect(en.prompt).not.toContain('directional light with a clear source')
+    expect(en.prompt).not.toContain('natural light falling on the face')
     const zh = planChatPhoto('坐在窗边,午后的光很暖', true, ANCHOR)
-    expect(zh.prompt).not.toContain('directional light with a clear source')
+    expect(zh.prompt).not.toContain('natural light falling on the face')
   })
 
   it('场景没说光,模板补一句', () => {
     const p = planChatPhoto('leaning on the balcony', true, ANCHOR)
-    expect(p.prompt).toContain('directional light')
+    expect(p.prompt).toContain('natural light falling on the face')
   })
 
   it('下雨时补的是"湿处反光",不是一个凭空的晴天光', () => {
@@ -274,7 +346,7 @@ describe('planChatPhoto · 只补不覆盖', () => {
 
   it('纵深是无条件的 —— 它是相机原理,不该被"场景提过窗/桌"挡掉', () => {
     const p = planChatPhoto('typing at my desk in the study', true, ANCHOR)
-    expect(p.prompt).toContain('layered with depth')
+    expect(p.prompt).toContain('right behind the shoulders')
   })
 })
 

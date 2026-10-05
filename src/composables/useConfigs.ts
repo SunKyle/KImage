@@ -125,7 +125,9 @@ export function useConfigs(deps: ConfigDeps) {
   // 尺寸候选、是否开放手填、默认档 —— 判断都在 api.ts（见 T2.3）
   const sizeOptions = computed(() => sizeOptionsFor(vendorId.value, config.value.model))
   const sizeFree = computed(() => sizeIsFree(vendorId.value, config.value.model))
-  const defaultSize = computed(() => defaultSizeFor(sizeOptions.value))
+  /* 默认档也要知道"这一家的 auto 是什么意思":豆包的 auto 是"按上游默认出图"
+     (默认 2K,按像素计费,约等于 1024×1024 的四倍),不能当没被选过的基线 */
+  const defaultSize = computed(() => defaultSizeFor(sizeOptions.value, provider.value.autoSize))
 
   const selectedConfigs = computed(() =>
     selectedIds.value

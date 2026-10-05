@@ -3,9 +3,9 @@
  *  抽成纯函数是因为它是"用户能不能找到那张图"的全部依据,而真到界面上试
  *  要造几百条记录、试好几种输入才碰得到边界(与 planPrune 同一条理由)。
  *
- *  匹配三处:提示词正文、角色名、作品集名 —— 这三样正是用户脑子里
- *  "哪张图"的抓手("我写过 window" / "跟 Alice 那张" / "在「夜班」那个集里")。
- *  名字都是 id,所以要把反查表喂进来。
+ *  匹配四处:提示词正文、对话里那段场景、角色名、作品集名 —— 这四样正是
+ *  用户脑子里"哪张图"的抓手("我写过 window" / "它当时说在阳台" /
+ *  "跟 Alice 那张" / "在「夜班」那个集里")。名字都是 id,所以要把反查表喂进来。
  *
  *  **不做**按图搜图(那要把每张图喂给视觉模型,成本与延迟都不是搜索该有的),
  *  也不搜尺寸、模型这些参数 —— 它们是"怎么生成的",不是"画的是什么"。
@@ -22,6 +22,10 @@ export interface HistorySearchNames {
 /** 记录里参与匹配的那几项。刻意收窄成这个形状,便于直接喂构造数据测试 */
 export interface SearchableEntry {
   prompt: string
+  /* 对话里生成的那两种图另有一段"画的是什么"(见 lib/chatWork):
+     它们的 prompt 是整段摄影指令(机位、焦段、光全在里面),
+     而用户找图时想起的是那段场景 —— 所以场景也要进匹配 */
+  scene?: string
   characterId?: string
   collectionId?: string
 }
@@ -47,6 +51,8 @@ export function matchesHistoryQuery(
   if (!q) return true
   const who = entry.characterId ? names.charNames[entry.characterId] || '' : ''
   const where = entry.collectionId ? names.collTitles[entry.collectionId] || '' : ''
-  const hay = `${entry.prompt || ''} ${who} ${where}`.toLowerCase()
+  /* 场景与提示词并列进同一段:用户不会去想"这句在 prompt 里还是 scene 里",
+     他只知道自己记得那个词。场景缺省时是空串,拼进去不影响 */
+  const hay = `${entry.prompt || ''} ${entry.scene || ''} ${who} ${where}`.toLowerCase()
   return q.split(/\s+/).every((token) => hay.includes(token))
 }

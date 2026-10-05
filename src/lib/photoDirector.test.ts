@@ -6,12 +6,15 @@ import {
   directorBrief,
   directorTask,
   parseDirector,
-  parseDirectorShot
+  shotBrief
 } from './photoDirector'
 
 /* 这一层是"把一句短场景交给文本模型补成怎么拍"。而自由文本会以三种方式
    破坏已经拼好的提示词(改写场景 / 编时间 / 写焦段),这三种都**不会报错**,
-   只会让画面变味。所以断言几乎全落在验收、护栏与降级上。 */
+   只会让画面变味。所以断言几乎全落在验收、护栏与降级上。
+
+   还有一条同样重要(2026-10-05 起):**它改不了视角**。
+   视角由聊天模型写在标签里、由 planChatPhoto 定为模板,它只被告知。 */
 
 const ANCHOR = 'oval face, dark bob'
 /** 一份"什么都没说"的场景:四位都得补 */
@@ -20,17 +23,17 @@ const BARE = 'leaning on the balcony'
 const COVERED = 'leaning on the balcony, warm lamp light, shallow depth of field'
 
 const ANSWER = [
-  'Shot: third',
   'Camera: hand-held at chest height, slightly below eye level',
   'Lens: shallow focus, the railing soft in the foreground',
   'Light: a warm lamp just off frame to the left, grazing the wall',
   'Environment: the city below falling away into haze'
 ].join('\n')
 
-/** 把一段原始输出走完整条解析 + 合并,与 useGeneration 里的顺序一致 */
-function merge(scene: string, self: boolean, raw: string) {
-  const plan = planChatPhoto(scene, self, ANCHOR)
-  return applyDirector(plan, { written: parseDirector(raw), shot: parseDirectorShot(raw) })
+/** 把一段原始输出走完整条解析 + 合并,与 useGeneration 里的顺序一致。
+ *  `shot` 是**标签**给的那一项(不是摄影指导判的 —— 它已经没有这个权力了) */
+function merge(scene: string, self: boolean, raw: string, shot?: 'selfie' | 'third') {
+  const plan = planChatPhoto(scene, self, ANCHOR, shot)
+  return applyDirector(plan, parseDirector(raw))
 }
 
 describe('parseDirector · 认固定几行', () => {
@@ -42,8 +45,11 @@ describe('parseDirector · 认固定几行', () => {
     expect(w.env).toContain('falling away into haze')
   })
 
-  it('Shot 那行不进这四位 —— 它换的是模板,不是提示词里的一句话', () => {
+  it('Shot 那行不进这四位 —— 它已经不写了,写了也不作数', () => {
     expect(parseDirector('Shot: selfie')).toEqual({})
+    /* 混在一起时也不影响别的行 */
+    const w = parseDirector('Shot: selfie\nCamera: low angle')
+    expect(w).toEqual({ camera: 'low angle' })
   })
 
   it('标签大小写与空格都不计较 —— 模型不总写得一丝不差', () => {
@@ -74,25 +80,6 @@ describe('parseDirector · 认固定几行', () => {
   it('空值行不算补上 —— 模型用空行表示"这一位留空"', () => {
     expect(parseDirector('Camera: \nLight: none')).toEqual({})
     expect(parseDirector('Camera: n/a\nLight: -')).toEqual({})
-  })
-})
-
-describe('parseDirectorShot · 视角只认两个词', () => {
-  it('selfie / third 各认几种写法', () => {
-    expect(parseDirectorShot('Shot: selfie')).toBe('selfie')
-    expect(parseDirectorShot('shot: Selfie')).toBe('selfie')
-    expect(parseDirectorShot('Shot: self-portrait')).toBe('selfie')
-    expect(parseDirectorShot('Shot: third')).toBe('third')
-    expect(parseDirectorShot('Shot: third person')).toBe('third')
-    expect(parseDirectorShot('View: external')).toBe('third')
-  })
-
-  it('认不出的词当"没判",不替它猜 —— 归一化近义词等于替模型判断', () => {
-    expect(parseDirectorShot('Shot: portrait')).toBe('')
-    expect(parseDirectorShot('Shot: close-up')).toBe('')
-    expect(parseDirectorShot('Shot: ')).toBe('')
-    expect(parseDirectorShot('Camera: low angle')).toBe('')
-    expect(parseDirectorShot('')).toBe('')
   })
 })
 
@@ -131,28 +118,44 @@ describe('parseDirector · 三条验收(每一条都丢整行)', () => {
   })
 })
 
-describe('applyDirector · 视角归它判', () => {
-  it('它判 selfie,就换成自拍那一整套模板', () => {
-    const p = merge(BARE, true, 'Shot: selfie')
+describe('applyDirector · 视角它一个字都改不了', () => {
+  /* 2026-10-05 改:视角原先归它判,现在归聊天模型的标签(见 planChatPhoto)。
+     这几条钉的是"改不了"这件事 —— 它是用户报的那个毛病的根:
+     只看得到一句场景的模型,猜"谁拿的相机"永远猜成他拍。 */
+
+  it('标签说 selfie,它那套机位盖不住这件事 —— 自拍那句硬约束还在', () => {
+    const p = merge(BARE, true, ANSWER, 'selfie')
+    expect(p.shot).toBe('selfie')
+    expect(p.prompt).toContain('in the subject\u2019s own hand')
+    expect(p.prompt).toContain('front camera')
+    /* 机位那一句仍然听它的(那是它该管的事) */
+    expect(p.prompt).toContain('chest height')
+  })
+
+  it('它自己写一行 Shot: selfie 也改不了他拍那一套', () => {
+    const p = merge(BARE, true, 'Shot: selfie\nCamera: low angle', 'third')
+    expect(p.shot).toBe('third')
+    /* 机位那句被它自己换掉了,所以判据落在他拍模板独有的那几层上 */
+    expect(p.prompt).toContain('casual snapshot taken on a phone by somebody else')
+    expect(p.prompt).toContain('layered with depth')
+    expect(p.prompt).not.toContain('front camera')
+    expect(p.prompt).not.toContain('in the subject\u2019s own hand')
+  })
+
+  it('标签没说时按场景判:场景写着自拍就是自拍', () => {
+    const p = merge('taking a selfie by the window', true, 'Camera: low angle')
     expect(p.shot).toBe('selfie')
     expect(p.prompt).toContain('front camera')
-    expect(p.prompt).toContain('arm\u2019s length')
   })
 
-  it('它判 third,就换成第三人称那一套', () => {
-    const p = merge(BARE, true, 'Shot: third')
-    expect(p.shot).toBe('third')
-    expect(p.prompt).toContain('third-person view')
-    expect(p.prompt).not.toContain('arm\u2019s length')
+  it('标签没说、场景也没说:默认自拍(原来的默认是他拍,那正是用户报的毛病)', () => {
+    const p = merge(BARE, true, 'Camera: low angle')
+    expect(p.shot).toBe('selfie')
+    expect(p.prompt).toContain('front camera')
   })
 
-  it('它没判(没写 Shot 或写了个认不出的词)时保留原视角', () => {
-    expect(merge('taking a selfie by the window', true, 'Camera: low angle').shot).toBe('selfie')
-    expect(merge(BARE, true, 'Shot: portrait').shot).toBe('third')
-  })
-
-  it('**画面里没有人时它判 selfie 也不算** —— 空镜里长出一个人最严重', () => {
-    const p = merge('an empty harbour at dawn', false, 'Shot: selfie\nCamera: low angle')
+  it('**画面里没有人时空镜不变** —— 空镜里长出一个人最严重', () => {
+    const p = merge('an empty harbour', false, 'Shot: selfie\nCamera: low angle', 'selfie')
     expect(p.shot).toBe('scene')
     expect(p.prompt).toContain('no people in frame')
     /* 机位仍然听它的(空镜也要有人定机位),但绝不能出现自拍那套词 */
@@ -161,16 +164,8 @@ describe('applyDirector · 视角归它判', () => {
     expect(p.prompt).not.toContain('front camera')
   })
 
-  it('换视角会连媒介一起换 —— 不能留着"手机前置"却说第三人称', () => {
-    /* 这是"重拼"而不是"打补丁"的理由:视角决定的是一整套,不只 camera 那一句 */
-    const selfie = merge(BARE, true, 'Shot: selfie')
-    const third = applyDirector(selfie, { written: {}, shot: 'third' })
-    expect(third.prompt).toContain('third-person view')
-    expect(third.prompt).not.toContain('shot on a phone front camera')
-  })
-
-  it('换视角不会丢掉身份锚点', () => {
-    expect(merge(BARE, true, 'Shot: selfie').prompt).toContain(ANCHOR)
+  it('它换掉机位也不会把身份锚点弄丢', () => {
+    expect(merge(BARE, true, ANSWER, 'selfie').prompt).toContain(ANCHOR)
   })
 })
 
@@ -207,14 +202,15 @@ describe('applyDirector · 逐位合并与降级', () => {
     const p = merge(COVERED, true, 'Camera: low angle')
     expect(p.prompt).toContain('low angle')
     expect(p.prompt).toContain('warm lamp light')
-    expect(p.prompt).toContain('layered with depth')
+    /* 没人写纵深,就用这一档模板自己的那句(默认自拍 ⇒ 是自拍那一句) */
+    expect(p.prompt).toContain('right behind the shoulders')
   })
 
   it('护栏丢掉的行,那一位退回模板', () => {
     const p = merge(BARE, true, 'Light: at dusk\nCamera: low angle')
     expect(p.prompt).toContain('low angle')
     expect(p.prompt).not.toContain('dusk')
-    expect(p.prompt).toContain('directional light')
+    expect(p.prompt).toContain('natural light falling on the face')
   })
 
   it('场景原文、锚点句、负面约束一个字都不许动', () => {
@@ -226,7 +222,7 @@ describe('applyDirector · 逐位合并与降级', () => {
 
   it('空镜:摄影指导换得掉机位,却换不掉"画面里没有人"', () => {
     /* 防回归:那句约束原先是并进 camera 那一层的,而 applyDirector 会替换 camera ——
-       于是空镜失去了唯一挡人的防线。现在它是独立一层(ShotTemplate.noPeople) */
+       于是空镜失去了唯一挡人的防线。现在它是独立一层(ShotTemplate.pin) */
     const p = merge('an empty harbour at dawn', false, ANSWER)
     expect(p.prompt).toContain('no people in frame')
     expect(p.prompt).toContain('chest height')
@@ -244,13 +240,12 @@ describe('applyDirector · 逐位合并与降级', () => {
 
   it('退化输入不抛(模型什么都没写)', () => {
     const plan = planChatPhoto(BARE, true, ANCHOR)
-    expect(applyDirector(plan, { written: {} }).prompt).toBe(plan.prompt)
-    expect(applyDirector(plan, { written: {}, shot: '' }).shot).toBe(plan.shot)
+    expect(applyDirector(plan, {}).prompt).toBe(plan.prompt)
   })
 
   it('没场景时不动它(空计划没有层可换)', () => {
     const empty = planChatPhoto('', true, ANCHOR)
-    expect(applyDirector(empty, { written: parseDirector(ANSWER), shot: 'selfie' }).prompt).toBe('')
+    expect(applyDirector(empty, parseDirector(ANSWER)).prompt).toBe('')
   })
 })
 
@@ -259,17 +254,30 @@ describe('directorTask / directorBrief · 告诉模型该干什么', () => {
     expect(directorTask(planChatPhoto(BARE, true, ANCHOR))).toContain(BARE)
   })
 
-  it('只交代"画面里有没有人",不替它定视角', () => {
-    /* 这一条记的是分工:视角是它要判的那件事,不是我们给它的前提。
-       告诉它"这是自拍,别改"等于把它唯一有权做的判断收回来 */
-    const withPerson = directorTask(planChatPhoto(BARE, true, ANCHOR))
-    expect(withPerson).toContain('The character is in this image')
-    expect(withPerson).not.toContain('This is a selfie')
-    expect(withPerson).not.toContain('third-person shot')
-    expect(withPerson).toContain('Decide Shot yourself')
+  it('**把视角当事实告诉它** —— 它没有判的权力,但机位那句要与之相符', () => {
+    const selfie = directorTask(planChatPhoto(BARE, true, ANCHOR, 'selfie'))
+    expect(selfie).toContain('The character is in this image')
+    expect(selfie).toContain('own hand')
+    expect(selfie).toContain('do not switch to a third-person view')
+    /* 不再要它自己判 —— 那句话是上一版的,正是"老出他拍"的来源 */
+    expect(selfie).not.toContain('Decide Shot yourself')
+
+    const third = directorTask(planChatPhoto(BARE, true, ANCHOR, 'third'))
+    expect(third).toContain('Somebody else is holding the phone')
+    expect(third).toContain('not a selfie')
+    expect(third).not.toContain('own hand')
 
     const scene = directorTask(planChatPhoto('an empty harbour', false, ''))
     expect(scene).toContain('no character in this image')
+  })
+
+  it('shotBrief 三档各说各的一句(空镜那档不提人)', () => {
+    expect(shotBrief('selfie')).toContain('own hand')
+    expect(shotBrief('selfie')).toContain('do not switch to a third-person view')
+    expect(shotBrief('third')).toContain('Somebody else is holding the phone')
+    expect(shotBrief('third')).toContain('casual hand-held look')
+    expect(shotBrief('scene')).toContain('set down or held steady')
+    expect(shotBrief('scene')).not.toContain('selfie')
   })
 
   it('场景已经覆盖的位要明确告诉它留空', () => {

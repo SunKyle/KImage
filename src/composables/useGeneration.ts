@@ -25,10 +25,10 @@ import {
   shotViewOrder
 } from '../lib/chatPhoto'
 import type { ChatPhotoPlan } from '../lib/chatPhoto'
-import { DIRECTOR_SLOTS, applyDirector, directorTask, parseDirector, parseDirectorShot } from '../lib/photoDirector'
+import { DIRECTOR_SLOTS, applyDirector, directorTask, parseDirector } from '../lib/photoDirector'
 import { urlToBlob } from '../lib/idb'
 import type { EnhanceMode, Provider } from '../api'
-import type { ApiConfig, Character, HistoryEntry, ResultItem } from '../types'
+import type { ApiConfig, Character, HistoryEntry, HistorySource, ResultItem } from '../types'
 
 /* ===== 出图参数：提示词、尺寸、张数、画质、种子、参考图 ================
    这一层的每一条都受"当前生效的那个接口"约束:能力表说不支持,界面上就不该
@@ -96,8 +96,11 @@ const enhancing = ref(false)
 const enhanceController = ref<AbortController | null>(null)
 // 改写前的原稿,空串表示当前没有可撤销的内容。只在点 Undo 或再次改写时更新
 const preEnhance = ref('')
-// 默认交给上游自决:'auto' 在大多数字段里是"最不会错"的一档,选错尺寸比不选更糟
-const size = ref('auto')
+/* 起始尺寸取**这条配置的默认档**(见 api.ts 的 defaultSizeFor),而不是写死 'auto':
+   'auto' 对多数厂商是"最不会错"的一档,但对豆包不是 —— 它的 auto 是"不发 size,
+   按上游默认出图",而那个默认是 2K,按像素计费,约等于 1024×1024 的四倍。
+   写死 'auto' 会让"刚打开页面什么都没选"变成按最贵的那档出图 */
+const size = ref(deps.defaultSize.value)
 const n = ref(1)
 // 'auto' 表示交给上游自己决定,请求时不带这个参数
 const quality = ref('auto')
@@ -137,6 +140,22 @@ const N_MAX = 10
 // 'auto' 是给上游的值,界面上叫"自动"
 function sizeLabel(s: string) {
   return s === 'auto' ? 'Auto' : s.replace(/x/g, '×')
+}
+
+/**
+ * 上游确实回了一张图,我们却把它落不成 Blob 时该说什么。
+ *
+ * 最典型的一种是**它回的是图片链接**:豆包的 response_format 默认就是 `url`,
+ * 而那张链接是给浏览器之外的地方下载的 —— 前端拿到 url 还得再跨域拉一次,
+ * 被 CORS 挡住、或 24 小时过期,拉不动就是拉不动。
+ * 这时说"上游没给可用的图"会把人送去查模型,而该查的是响应格式 ——
+ * 所以两种情形分开说(见 api.ts 能力表的 responseFormat:认这一项的厂商
+ * 我们已经直接要 base64 了)。
+ */
+function unusableImageText(first: ResultItem): string {
+  return first.type === 'url'
+    ? 'The upstream returned an image link this browser could not download — blocked cross-origin, or the link has expired. Check the vendor in API Settings: providers that can return base64 are asked for it, and that removes the second hop.'
+    : 'The image API returned something that is not a usable image.'
 }
 
 /* 扩展参数与逐模型尺寸也只看能力表(见 api.ts 的 extraParamsFor / sizeForVendor)。
@@ -363,19 +382,36 @@ function undoEnhance() {
         ac.signal
       )
       const written = parseDirector(raw)
-      /* 视角单独取:它不往提示词里填句子,而是换一整套模板(见 photoDirector)。
-         它没判(空串)或判出一个认不出的词时,applyDirector 会保留原视角 */
-      const shot = parseDirectorShot(raw)
-      /* 一位都没解析出来、视角也没判 = 它没按格式回。这时**整层当作不可用**,
+      /* 一位都没解析出来 = 它没按格式回。这时**整层当作不可用**,
          而不是逐位退回 —— 一个都没认出来说明格式已经崩了,
-         再从碎片里挑可信的只会引入噪声 */
-      if (!shot && !DIRECTOR_SLOTS.some((s) => written[s])) return null
-      return applyDirector(base, { written, shot })
+         再从碎片里挑可信的只会引入噪声。
+         **视角不在它那几位里**(2026-10-05 起它不判视角,只被告知),
+         所以这里只看那四位 */
+      if (!DIRECTOR_SLOTS.some((s) => written[s])) return null
+      return applyDirector(base, written)
     } catch {
       return null
     } finally {
       clearTimeout(timer)
     }
+  }
+
+  /** 聊天里画出来的那张图**连同它的配方**一起交回调用方。
+   *
+   *  从前只交一个 Blob。现在这两张图也要落进历史(见 App 的 saveChatWork),
+   *  而历史记录里那几项(提示词、尺寸、模型、配置)全是在这一层定下来的 ——
+   *  调用方手上没有,不交回去就只能记个大概,而"配方记不全"等于以后没法复现。
+   *  `elapsedMs` 同理:出图耗时的表在这里,调用方那边已经是一段 await 之后了 */
+  type ChatWorkOut = {
+    blob: Blob
+    /** 真正发给上游的那一整段(含机位、焦段、光、负面约束) */
+    prompt: string
+    /** 真正发出去的尺寸。由这一张的镜头定(见 chatPhotoSize),不由创作区决定 */
+    size: string
+    model: string
+    /** 当时那条出图配置的 id。配置被改/被删之后仍能说清这张是谁出的 */
+    configId: string
+    elapsedMs: number
   }
 
   /** 画一张的结果:要么给图,要么给**原因**。两者必有一个。
@@ -384,7 +420,7 @@ function undoEnhance() {
    *  "没配出图模型""上游说密钥不对""参考图读不出来""上游回了个空数组"
    *  全都被压成它,界面于是只能说一句"生成失败"。用户既不知道是配置问题
    *  还是模型问题,也不知道下一步该改什么。 */
-  type ChatPhotoResult = { blob: Blob; error?: undefined } | { blob?: undefined; error: string }
+  type ChatPhotoResult = ChatWorkOut | { blob?: undefined; error: string }
 
   /* 出图那条配置**缺在哪儿**,说成人话。比"没配好"具体得多 ——
      用户看到"缺模型名"就知道去哪儿补,看到"生成失败"只能来问你 */
@@ -395,15 +431,18 @@ function undoEnhance() {
   }
 
   /** 对话里现场画一张:只在被要求或确实合适时由那一轮的标签触发。
-   *  **不进历史**(见 doc/角色配图设计.md):图只活在对话里,
-   *  所以这条路刻意不走 persist/recordFor —— 只把 Blob 交给调用方,
-   *  由它塞进 chat_images。
+   *  **画出来的图由调用方落两处**(见 App 的 saveChatWork 与 drawChatPhoto):
+   *  一处进 chat_images(消息要显示它、清空对话要回收它),一处进历史
+   *  (它也是一张作品,该被翻到、该归到角色名下)。这一层仍然不碰存储 ——
+   *  它只把 Blob 连同配方一起交出去,免得生成这一层去认 IndexedDB。
    *
    *  四个输入都是"这一张怎么拍"的一部分(见 lib/chatPhoto 的文件头):
    *  - `self` = 这一张里有没有**它本人**。有 → 拼身份锚点、把设定图当参考图,
    *    这是"同一张脸"的保证;没有 → 提示词里只有场景、一张参考图都不发
    *    —— 一张风景照带上设定图,模型会被拽着往那个人的脸和衣服上靠;
-   *  - 镜头(自拍 / 他拍 / 空镜)由 planChatPhoto 从场景文本里认,认不出就是第三人称;
+   *  - `shot` = **谁拿的相机**,由聊天模型写在标签前缀里(selfie: / third:)。
+   *    它才是知道这件事的那一层(见 lib/chatPhoto 的 planChatPhoto);
+   *    空串 = 它没说,由场景文本判、再不行默认自拍;
    *  - 拼进提示词的是**锚点句**而不是那份全量设定表 —— 后者正是"死板"的来源;
    *  - 尺寸与参考图顺序也跟着镜头走:自拍竖、空镜横,全身那张打头才交代得住体型
    *
@@ -412,14 +451,18 @@ function undoEnhance() {
   async function generateChatPhoto(
     charId: string,
     scene: string,
-    self: boolean
+    self: boolean,
+    shot = ''
   ): Promise<ChatPhotoResult> {
     const text = String(scene || '').trim().slice(0, CHAT_PHOTO_SCENE_CHARS)
     if (!text) return { error: 'There is no scene to draw for this message.' }
     /* **认对话里那个角色**,不认创作区选中的那个:设定与参考图都按 charId 取。
        这一点错了就会"一点不像" —— 参考图是空的,等于纯文生图 */
     const who = deps.characters.value.find((c) => c.id === charId)
-    const basePlan = planChatPhoto(text, self, who ? characterAnchor(who) : '')
+    /* 视角只认标签给的那两个词 —— 它是库里的字段、也是模型写的自由文本,
+       认不出的当"没说",由 planChatPhoto 按场景判(见那个函数的说明) */
+    const wantShot = shot === 'selfie' || shot === 'third' ? shot : undefined
+    const basePlan = planChatPhoto(text, self, who ? characterAnchor(who) : '', wantShot)
     const cfg = deps.config.value
     const gap = imageConfigGap(cfg)
     if (gap) return { error: gap }
@@ -446,6 +489,12 @@ function undoEnhance() {
           refList = []
         }
       }
+      /* 尺寸在这里定一次、两处用:发请求用它,落历史也用它。从前它只出现在
+         请求体里,记录那边就无从知道这一张究竟多大(与工作台记录的 size 同义) */
+      const usedSize = chatPhotoSize(sizeChoicesOf(cfg), plan.shot, true)
+      /* 计时从真正发请求这一刻起:取参考图与摄影指导那一段不是用户在等的
+         "出图时间"(与工作台里的 elapsedMs 同口径) */
+      const startedAt = Date.now()
       const res = await generate(
         {
           prompt: plan.prompt,
@@ -454,15 +503,18 @@ function undoEnhance() {
              枚举的厂商会被 sizeForVendor 退到 allowed[0](通常 1024×1024):
              横着拍的窗、竖着站的人全被塞进同一个方框。
              现在按镜头挑最接近的一档比例(见 lib/chatPhoto 的 chatPhotoSize) */
-          size: chatPhotoSize(sizeChoicesOf(cfg), plan.shot, true),
+          size: usedSize,
           n: 1,
           ...(refList.length ? { images: refList } : {}),
           /* 画质显式给一档。对话这条路此前没有让用户选过 quality,于是
              extraParamsFor 永远看到 'auto'、永远不发这个参数 —— 等于把画质
              交给厂商的默认档,而那一档多半是给"快速预览"用的。
-             'high' 与创作区那一档同名同值,不引入新枚举 */
-          ...extraParams(cfg),
-          quality: 'high'
+             'high' 与创作区那一档同名同值,不引入新枚举。
+
+             **但"显式给一档"仍要走能力表**:从前这里是先摊 extraParams 再写死
+             `quality: 'high'`,后写的把前者的门控整个盖掉 —— 豆包/万相这些
+             请求体里没有 quality 的厂商照样收到它,整条请求 400(实测) */
+          ...extraParamsFor(cfg, 'high', background.value)
         },
         cfg,
         ctrl.signal
@@ -472,9 +524,16 @@ function undoEnhance() {
          而它其实通常是内容被安全策略拦了,或者中转回了个空壳 */
       if (!first) return { error: 'The image API returned no image for this prompt.' }
       try {
-        return { blob: await urlToBlob(imageSrc(first)) }
+        return {
+          blob: await urlToBlob(imageSrc(first)),
+          prompt: plan.prompt,
+          size: usedSize,
+          model: cfg.model || '',
+          configId: cfg.id,
+          elapsedMs: Date.now() - startedAt
+        }
       } catch {
-        return { error: 'The image API returned something that is not a usable image.' }
+        return { error: unusableImageText(first) }
       }
     } catch (e) {
       /* 上游/代理的真实错误。`generate()` 抛的就是 /api/generate 回给我们的
@@ -494,11 +553,10 @@ function undoEnhance() {
    *   而它正好压在"进沉浸页"这条路上 —— 那条路该尽量短。
    *
    * 与 `generateChatPhoto` 同一条约定：**失败只返回 error，绝不往外抛**。
+   * 返回的形状也一并对齐（连配方一起交回去）—— 背景图同样要落进历史，
+   * 理由与那张照片一样（见 ChatWorkOut）。
    */
-  async function generateChatBackdrop(
-    charId: string,
-    scene: string
-  ): Promise<{ blob?: Blob; error?: string }> {
+  async function generateChatBackdrop(charId: string, scene: string): Promise<ChatPhotoResult> {
     const who = deps.characters.value.find((c) => c.id === charId)
     const plan = planChatBackdrop(scene, who ? characterAnchor(who) : '')
     if (!plan.prompt) return { error: 'There is no scene to draw a background for yet.' }
@@ -514,16 +572,20 @@ function undoEnhance() {
         /* 参考图读不出来仍然照画（纯文生图），背景不像它总好过一片空 */
         refList = []
       }
+      /* 横构图。复用"空镜"那一档比例（3:2）—— 它比人像档宽，
+         又比 16:9 更容易在各家的档位表里找到。
+         定一次、两处用（请求 + 落历史），与那张照片同一条 */
+      const usedSize = chatPhotoSize(sizeChoicesOf(cfg), 'scene', true)
+      const startedAt = Date.now()
       const res = await generate(
         {
           prompt: plan.prompt,
-          /* 横构图。复用"空镜"那一档比例（3:2）—— 它比人像档宽，
-             又比 16:9 更容易在各家的档位表里找到 */
-          size: chatPhotoSize(sizeChoicesOf(cfg), 'scene', true),
+          size: usedSize,
           n: 1,
           ...(refList.length ? { images: refList } : {}),
-          ...extraParams(cfg),
-          quality: 'high'
+          /* 与那张照片同一条规矩:画质显式给 'high',但仍过能力表 ——
+             没有 quality 字段的厂商(豆包/万相)一个字节都不发 */
+          ...extraParamsFor(cfg, 'high', background.value)
         },
         cfg,
         ctrl.signal
@@ -531,9 +593,16 @@ function undoEnhance() {
       const first = res?.[0]
       if (!first) return { error: 'The image API returned no image for this prompt.' }
       try {
-        return { blob: await urlToBlob(imageSrc(first)) }
+        return {
+          blob: await urlToBlob(imageSrc(first)),
+          prompt: plan.prompt,
+          size: usedSize,
+          model: cfg.model || '',
+          configId: cfg.id,
+          elapsedMs: Date.now() - startedAt
+        }
       } catch {
-        return { error: 'The image API returned something that is not a usable image.' }
+        return { error: unusableImageText(first) }
       }
     } catch (e) {
       return { error: photoFailureText(e) }
@@ -840,6 +909,13 @@ async function recordFor(
     seed?: number
     // 参考图本体(data URL)。存一份压过的小图,不然"当时用了哪张参考图"就丢了
     refSrc?: string
+    /* —— 下面两项只有对话里生成的那两张图会带(见 types.ts 的 HistoryEntry.source)——
+       工作台这条路不传,于是记录上就没有这两个字段(与老记录一致) */
+    // 来自对话里的哪条路
+    source?: HistorySource
+    /* 对话里那一场戏的描述。它是这两张图"画的是什么"那句人话,
+       而 prompt 是整段摄影指令 —— 界面上读的是它(见 lib/chatWork) */
+    scene?: string
   }
 ): Promise<HistoryEntry> {
   const record: HistoryEntry = {
@@ -859,6 +935,8 @@ async function recordFor(
     createdAt: Date.now(),
     results: res
   }
+  if (meta.source) record.source = meta.source
+  if (meta.scene) record.scene = meta.scene
   const t = await makeThumb(res[0])
   if (t) {
     record.thumb = t.blob

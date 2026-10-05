@@ -16,14 +16,16 @@ import {
 } from '@phosphor-icons/vue'
 import { exportImages, imageSrc, reuseParamsOf, thumbSrc, downloadImageUrl } from '../api'
 import { blobToDataURL } from '../lib/idb'
-import { titleFromPrompt } from '../lib/text'
+/* "叫什么、读哪一句、从哪来"的唯一口径。对话里生成的那两张图没有它,
+   就只能拿一整段摄影提示词当标题(见 lib/chatWork) */
+import { chatWorkLabel, workText, workTitle } from '../lib/chatWork'
 import { matchesHistoryQuery, normalizeQuery, type HistorySearchNames } from '../lib/historySearch'
 import type { Collection, HistoryEntry, ResultItem, ReuseParams } from '../types'
 
 /** 读屏念出来的名字用短标题:整段提示词可能有上百字,念完没人记得住,
- *  也与图砖角标、提示词库卡片的口径对不上(那份口径见 lib/text) */
+ *  也与图砖角标、提示词库卡片的口径对不上(那份口径见 lib/chatWork) */
 function titleOf(entry: HistoryEntry) {
-  return titleFromPrompt(entry.prompt)
+  return workTitle(entry)
 }
 
 /* 历史记录:独立页面。
@@ -265,7 +267,9 @@ async function downloadSelected() {
      回头核对时不用在两张表之间找对应 */
   const picks = tiles.value
     .filter((t) => selected.value.has(t.key))
-    .map((t) => ({ prompt: t.entry.prompt, item: t.item }))
+    /* 文件名用"画的是什么"那句(对话里生成的图读的是场景,见 lib/chatWork)——
+       拆包出来是一堆摄影指令当文件名,回头谁也认不出哪张是哪张 */
+    .map((t) => ({ prompt: workText(t.entry), item: t.item }))
 
   exporting.value = true
   exportMsg.value = ''
@@ -531,6 +535,11 @@ function fmt(ts: number) {
               <PhDownloadSimple aria-hidden="true" />
             </button>
           </div>
+          <!-- 出处那句压在图上,而不是塞进下面那一行:这一条只有 132px 宽,
+               日期 + 出处 + 角色名 + "1 of 2" 挤不下 —— 宁可让它在图上占一角 -->
+          <span v-if="chatWorkLabel(t.entry.source)" class="scard-src" aria-hidden="true">
+            {{ chatWorkLabel(t.entry.source) }}
+          </span>
           <div class="scard-foot">
             <span class="scard-when">{{ fmt(t.entry.createdAt) }}</span>
             <span v-if="t.entry.characterId" class="scard-who">
@@ -586,6 +595,16 @@ function fmt(ts: number) {
         <span v-if="t.item.marked" class="tile-mark" aria-hidden="true">
           <PhHeart weight="fill" aria-hidden="true" />
         </span>
+        <!-- 来源角标:对话里生成的那两种图(见 lib/chatWork)。常驻而不是悬停才出,
+             因为它回答的是"这张是哪来的" —— 而图墙正是靠扫的。
+             选择态让位给左上角那枚勾选圈(两枚都在左上,同一处不叠两个符号) -->
+        <span
+          v-if="!selecting && chatWorkLabel(t.entry.source)"
+          class="tile-src"
+          aria-hidden="true"
+        >
+          {{ chatWorkLabel(t.entry.source) }}
+        </span>
         <!-- 勾选角标只在选择态出现,放左上角,与右上的收藏角标各占一隅。
              两态同为圆形轮廓,只差中间有没有那枚勾 —— 不垫底、不换形状 -->
         <span v-if="selecting" class="tile-pick" aria-hidden="true">
@@ -594,7 +613,7 @@ function fmt(ts: number) {
         </span>
         <!-- 悬停/聚焦才浮出:图墙默认只应该是图 -->
         <div class="tile-veil">
-          <div class="tile-text">{{ t.entry.prompt }}</div>
+          <div class="tile-text">{{ workText(t.entry) }}</div>
           <div class="tile-foot">
             <span class="tile-meta">
               {{ fmt(t.entry.createdAt) }} · {{ t.entry.size === 'auto' ? 'Auto' : t.entry.size.replace('x', '×') }}<template
@@ -967,6 +986,27 @@ function fmt(ts: number) {
 .scard-when {
   font-variant-numeric: tabular-nums;
 }
+/* 出处那句(只有对话里生成的图有,见 lib/chatWork)。
+   **压在图上,不进下面那一行** —— 这一条只有 132px 宽,日期、角色名与
+   "1 of 2" 已经把那一行占满了。放左下角(右上留给标记/保存那两枚按钮),
+   垫一层半透明底,与图墙那枚角标同一套做法 */
+.scard-src {
+  position: absolute;
+  bottom: 6px;
+  left: 6px;
+  max-width: calc(100% - 12px);
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: rgba(24, 24, 22, 0.45);
+  color: #fff;
+  font-size: var(--fs-micro);
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  backdrop-filter: blur(6px);
+  pointer-events: none;
+}
 .scard-who {
   overflow: hidden;
   color: var(--text-2);
@@ -1177,6 +1217,27 @@ function fmt(ts: number) {
   display: block;
   width: 16px;
   height: 16px;
+}
+/* 来源角标:对话里生成的那两种图(见 lib/chatWork)。**常驻**,不像图砖正文那样
+   悬停才出 —— 它回答"这张是哪来的",而图墙正是靠扫的。
+   放左上角,与右上的收藏角标各占一隅;选择态让位给勾选圈(见模板上那个 v-if)。
+   垫一层半透明底:图墙什么底色的图都有,只靠白字加投影在浅色照片上读不出来 */
+.tile-src {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  max-width: calc(100% - 44px);
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(24, 24, 22, 0.45);
+  color: #fff;
+  font-size: var(--fs-micro);
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  backdrop-filter: blur(6px);
+  pointer-events: none;
 }
 /* 勾选角标:放左上角,与右上的收藏角标各占一隅,互不遮挡。
    两态同为圆形轮廓,只差中间那枚勾;不垫底、不换形状 ——

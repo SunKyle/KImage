@@ -215,10 +215,22 @@ interface ShotTemplate {
   env: string
   /** 这个人此刻在做什么。只在场景没交代动作时补 —— 补错了比不补更糟 */
   action?: string
-  /** "画面里没有人"这条硬约束。**只有空镜有** ——
-   *  它不并进 camera 是因为摄影指导会整句换掉 camera(见 lib/photoDirector),
-   *  而这一条是空镜唯一挡得住"风景里长出一个人"的东西 */
-  noPeople?: string
+  /** 这一档的**硬约束**:这一张照片最要紧的那件事,谁都不许改。
+   *
+   *  **它不并进 camera** —— 摄影指导补机位的办法就是整句换掉 `camera`
+   *  (见 lib/photoDirector 的 DIRECTOR_SLOTS),而下面这三件事都不能跟着那句话
+   *  一起被换掉:
+   *
+   *  - 空镜:"画面里没有人"(换掉就会在风景里长出一个人);
+   *  - 自拍:"相机在它自己手上"(换掉就画成别人拿相机 —— 用户 2026-10-05 报的那个);
+   *  - 他拍:"**手机在别人手上**"(换掉就退回一张不知道谁拍的通用照片 ——
+   *    用户 2026-10-05 的第二条要求:"要能理解自己用手机拍摄的视角,
+   *    和别人用手机拍摄的视角")。
+   *
+   *  三者是同一件事(这一档不可让渡的那一句),所以共用**一层**、一个槽名。
+   *  它不重复 camera:那句说的是"怎么拍"(臂展、前摄、手入画),
+   *  这一条说的是"谁拿的相机、拿的是什么" —— 前者会被换掉,后者不会 */
+  pin?: string
 }
 
 const TEMPLATES: Record<ChatShot, ShotTemplate> = {
@@ -226,8 +238,10 @@ const TEMPLATES: Record<ChatShot, ShotTemplate> = {
      轻微广角畸变 —— 这四个词缺一个,模型就会退回第三人称的构图 */
   selfie: {
     medium: 'photographic, shot on a phone front camera',
+    pin:
+      'the camera is in the subject\u2019s own hand \u2014 a selfie taken on their own phone at arm\u2019s length or in a mirror, not a picture somebody else took of them',
     camera:
-      'selfie taken at arm\u2019s length, front camera, face and shoulders filling the upper half of the frame, slight wide-angle distortion, the arm holding the phone partly visible in frame',
+      'selfie taken at arm\u2019s length, front camera, face and shoulders filling the upper half of the frame, shot from slightly above, slight wide-angle distortion, the arm holding the phone partly visible in frame',
     lens: 'shallow depth of field, background softly out of focus',
     /* 自拍的光必须落在脸上 —— 手臂挡不住的那种环境光 */
     light: 'natural light falling on the face and lighting it from one side, unposed',
@@ -235,13 +249,21 @@ const TEMPLATES: Record<ChatShot, ShotTemplate> = {
     env: 'the place clearly readable right behind the shoulders, close enough to touch',
     action: 'mid-moment, looking into the camera'
   },
-  /* 他拍:关键是"相机不在它手上",而且环境要有纵深。
-     前景遮挡 / 中景主体 / 光源在画面里可见 —— 这三样是"人和环境融在一起"的配方 */
+  /* 他拍:相机在**别人手上** —— 而且那也是一部手机(用户 2026-10-05 的要求:
+     "要能理解自己用手机拍摄的视角,和别人用手机拍摄的视角")。
+     所以这一档的介质不是"一张照片",是**别人拿手机随手拍的一张**:机位不在它手上、
+     取景随意、构图不讲究;环境要有纵深 —— 前景遮挡 / 中景主体 / 光源在画面里可见,
+     这三样是"人和环境融在一起"的配方。
+
+     刻意**不写"肖像照/写实摄影"**那类词:那会把画风推向影棚,而用户要的是
+     "朋友拿手机拍了我一张"的那种照片。 */
   third: {
-    medium: 'photographic',
+    medium: 'photographic, a casual snapshot taken on a phone by somebody else',
+    pin:
+      'the phone is in somebody else\u2019s hand \u2014 a snapshot another person took of the subject, not a picture the subject took of themselves',
     camera:
-      'third-person view, camera not held by the subject, eye-level, subject off-center, generous headroom, full figure and hands inside the frame',
-    lens: 'shallow depth of field separating the subject from the background',
+      'third-person view, hand-held phone snapshot taken by somebody else, the subject off-center with generous headroom, full figure and hands inside the frame, slight wide-angle distortion, framing casual rather than composed',
+    lens: 'mild background blur, reading as a phone photo rather than a studio portrait',
     light: 'directional light with a clear source, one side of the face brighter than the other',
     lightWet: 'soft overcast light with wet reflections on the ground and walls, the subject rimmed by it',
     env: 'the scene layered with depth: something in the foreground, the subject in the middle, the rest falling away behind',
@@ -254,7 +276,7 @@ const TEMPLATES: Record<ChatShot, ShotTemplate> = {
     /* **"没有人"单独成一层,不并进 camera** —— 摄影指导会整句换掉 camera,
        而这一条是空镜唯一的挡人防线:换掉它就有可能在空镜里长出一个人。
        见 planChatPhoto 里那一层的槽名 */
-    noPeople: 'a single unposed shot of the place itself, no people in frame',
+    pin: 'a single unposed shot of the place itself, no people in frame',
     camera: 'the camera set down or held steady, an ordinary vantage point on the place',
     lens: 'shallow depth of field with a soft, readable foreground',
     light: 'light from a visible source, falling across the scene',
@@ -279,24 +301,43 @@ function hasAction(scene: string): boolean {
  * 这一张该怎么拼。
  *
  * @param scene  模型给的场景描述(已由 server/chatTags.js 收敛成一行)
- * @param self   它是不是在画面里。**这是聊天模型唯一要回答的那件事** ——
- *               它可靠地知道"我在不在画面里";而"这张照片该谁拿相机"是摄影判断,
- *               不该由它顺手写进标签(见下)
+ * @param self   它是不是在画面里。由标签的前缀回答(`self:` / `selfie:` 都在画面里)
  * @param anchor 角色的身份锚点句(characterAnchor)。空串表示这个角色没填过设定 ——
  *               这时**不要**退回全量描述,参考图仍然锁得住脸
- * @param shot   **这一张怎么拍。不传就现认一个**
+ * @param shot   **这一张谁拿的相机**,由标签直接给(`selfie:` / `self:` 前缀,
+ *               见 server/chatTags.js)。不传就按场景文本判、再不行按默认
  *
- * —— 视角是谁定的 ——
+ * —— 视角是谁定的(2026-10-05 改过一次) ——
  *
- * `self` 只回答"画面里有没有人",回答不了"谁拿的相机":人在画面里既可能是自拍,
- * 也可能是别人拍的。从前这里是拿 isSelfie() 的词表去场景串里找"自拍"这两个字,
- * 找不到就当第三人称 —— 那等于**用比模型更少的信息替模型做判断**,
- * 而这个判断随后还被当成事实告诉摄影指导("这是第三人称,别改"),它连纠正的机会都没有。
+ * `self` 只回答"画面里有没有人",回答不了"谁拿的相机"。这个判断先后换过两次主人:
  *
- * 现在视角归摄影指导(见 lib/photoDirector 的 parseDirector / applyDirector),
- * 这个参数就是那个分工的接口:传了就用它(摄影指导判出来的),
- * 不传就退回词表 —— 那是**没有摄影指导时的降级路径**,不是主路径。
- * 词表仍然有用:它认得准明确写了"自拍"的场景,而那种场景恰好是猜错代价最大的。
+ * 1. **最初**:拿 isSelfie() 的词表在场景串里找"自拍",找不到就当第三人称。
+ *    问题是聊天模型写场景时通常不写"自拍"这两个字 —— 它写"我在阳台"
+ *    (设计文档里的例子就是 `[photo:self:me on the balcony, hair down]`)。
+ *    于是**绝大多数本该是自拍的图都落到了第三人称**;
+ * 2. **后来**:改由摄影指导(一次文本调用)判。可它只拿得到那一句场景、
+ *    看不到对话,信息比聊天模型**更少** —— 它同样只能猜,而且猜出来的
+ *    "third" 还会盖掉场景里明写的"自拍"。用户的原话:
+ *    "对于自拍的理解总是不好,老是会生成他拍视角的图片";
+ * 3. **现在**:由**聊天模型自己**在标签里说(它才知道自己在描述什么),
+ *    见 server/chatTags.js 的三个前缀;它没说时才退回词表,再不行**默认自拍**。
+ *
+ * —— 为什么默认是自拍,而不是沿用原来的"默认第三人称" ——
+ *
+ * 原来那条默认值的理由是"猜错成自拍(一张举着手机的怪图)比猜错成他拍代价大"。
+ * 那是**没有数据时的直觉**,而实测的结论正好相反:角色给用户发一张自己的图,
+ * 本来就是"你看我"这个动作 —— 用户 2026-10-05 明确说老是出他拍是错的。
+ *
+ * 四级判据,先命中的赢:
+ *
+ *     1. 标签说 selfie: / third: → 就是它(模型对"谁拿的相机"的直接回答)
+ *     2. 场景里明写自拍(mirror / arm's length / 自拍…) → 自拍
+ *     3. 场景里明写"别人拍的"(taken by / 偷拍…) → 他拍
+ *     4. 一条证据都没有 → **自拍**
+ *
+ * 第 2 条压过第 3 条:一句里同时出现两种字眼时,多半是模型在描述画面里的
+ * **另一个人**("他给我拍的"想要的其实是"我在画面里"),而按自拍画错的方向
+ * 恰好是用户能接受的那一侧。
  */
 export function planChatPhoto(
   scene: string,
@@ -312,14 +353,19 @@ export function planChatPhoto(
   if (!text) return { prompt: '', useRefs: false, shot: 'scene', self, scene: '', layers: [] }
 
   /* 画面里没有人时视角只能是空镜:**由 self 定死,不由任何人推断** ——
-     一张"我看到的东西"里长出一个人,比视角选错严重得多 */
+     一张"我看到的东西"里长出一个人,比视角选错严重得多。
+
+     有人在画面里时按四级定:标签 > 场景写着自拍 > 场景写着"别人拍的" > 默认自拍 */
   const resolved: ChatShot = !self
     ? 'scene'
     : shot === 'selfie' || shot === 'third'
       ? shot
       : isSelfie(text)
         ? 'selfie'
-        : 'third'
+        : isThirdShot(text)
+          ? 'third'
+          : /* 一条证据都没有:**默认自拍**(2026-10-05 改,理由见上) */
+            'selfie'
   const tpl = TEMPLATES[resolved]
   const miss = missingSlots(text)
   const spec = inline(anchor)
@@ -336,9 +382,11 @@ export function planChatPhoto(
   /* 锚点句排在场景之后:它是"这个人是谁"的约束,不是这一张的内容。
      只有它在画面里时才拼 —— 这正是把风景画成人的原因(见文件头) */
   if (self && spec) layers.push(['anchor', spec])
-  /* 空镜那句"没有人"垫在机位之前,而且是独立一层(见 ShotTemplate.noPeople):
-     摄影指导换得掉 camera,换不掉这一层 */
-  if (tpl.noPeople) layers.push(['noPeople', tpl.noPeople])
+  /* 这一档的硬约束垫在机位之前,而且是独立一层(见 ShotTemplate.pin):
+     摄影指导换得掉 camera,换不掉这一层 ——
+     空镜靠它挡住"风景里长出一个人",自拍靠它挡住"画成别人拿相机",
+     他拍靠它挡住"退回一张不知道谁拿手机的照片" */
+  if (tpl.pin) layers.push(['pin', tpl.pin])
   layers.push(['camera', tpl.camera])
   if (miss.lens) layers.push(['lens', tpl.lens])
   if (miss.light) {
@@ -445,20 +493,51 @@ export function composeChatPrompt(layers: ChatLayer[]): string {
 }
 
 /* —— 这一张是不是自拍 ——
- *  判据只在场景文本里。`photoSelf` 那个布尔回答不了这件事:它只说"它在画面里",
- *  而"在画面里"既可能是自拍,也可能是别人拍的。
+ *  判据只在场景文本里。标签的前缀(见 server/chatTags.js)是**第一判据**,
+ *  这里管的是"它没说,但场景自己写清楚了"的那一档 —— 两处都要认,
+ *  而且**自拍那条比"他拍"那条优先**(见 planChatPhoto)。
  *
- *  词表同样取窄:只认**明确是自拍**的说法,认不出就当第三人称。
- *  这个方向的默认值是有意的 —— 猜错成自拍的代价(一张举着手机的怪图)比
- *  猜错成他拍(一张正常的照片,只是不像自拍)更大。
+ *  词表取窄:只认**明确**的说法。认不出的由调用方落回默认,而默认现在是自拍 ——
+ *  所以这里的漏判不再等于"画成他拍",只是"少一条证据"。
  *
- *  例:"taking a selfie" → 自拍;"me on the balcony" → 他拍;
- *      "自拍一张给你看" → 自拍;"我在阳台" → 他拍。 */
-const SELFIE_RE = /\b(selfie|self-portrait|front camera|holding (?:my|the) phone|mirror shot|wefie)\b/i
-const SELFIE_ZH = ['自拍', '自拍照', '对着镜头拍', '举着手机拍', '前置摄像头']
+ *  例:"taking a selfie" → 自拍;"自拍一张给你看" → 自拍;
+ *      "me on the balcony" → 两条都不命中 → 默认自拍;
+ *      "he took this photo of me" → 命中他拍那条。 */
+const SELFIE_RE =
+  /\b(selfie|self-portrait|selfie shot|front camera|front-facing camera|holding (?:my|the) phone|phone in (?:my|the) hand|mirror shot|in the mirror|arm[\u2019']?s[- ]length|wefie)\b/i
+const SELFIE_ZH = [
+  '自拍',
+  '自拍照',
+  '对镜自拍',
+  '对镜拍',
+  '对着镜头拍',
+  '举着手机拍',
+  '举着手机',
+  '前置摄像头',
+  '前置镜头',
+  '自拍杆',
+  '手臂伸出去拍'
+]
 
 export function isSelfie(scene: string): boolean {
   return mentions(String(scene || ''), SELFIE_RE, SELFIE_ZH)
+}
+
+/* —— 这一张明说了是别人拍的 ——
+ *  只有**明确了"谁拿的相机"**的句子才算:有人替你按了快门、或那张照片出自
+ *  别人的手。不认"看起来像被拍"这种语气 —— 那种判不出来,而判错的方向
+ *  恰恰是用户报的那个毛病(把自拍判成他拍)。
+ *
+ *  它排在自拍那条之后(见 planChatPhoto):两边都命中时算自拍 ——
+ *  一句里同时有"自拍"和"他拍"的字眼,多半是模型在描述画面里**另一个人**
+ *  (比如"他给我拍的"要的其实是"我在画面里,但相机在别人手上")。
+ *  真那样写的时候,标签里的 `self:` 前缀才是权威 —— 那条排在更前面。 */
+const THIRD_RE =
+  /\b(?:taken|shot|photographed|snapped|captured)\s+by\b|\b(?:he|she|they|someone|somebody|a friend|my friend)\s+(?:took|takes|snapped|shot|photographed|captured)\b|\bsomeone else'?s (?:camera|phone)\b|\bcandid\b/i
+const THIRD_ZH = ['别人拍', '他拍', '她拍', '旁人拍', '朋友拍', '被人拍', '偷拍', '抓拍', '路人帮拍', '不是自拍']
+
+export function isThirdShot(scene: string): boolean {
+  return mentions(String(scene || ''), THIRD_RE, THIRD_ZH)
 }
 
 /* ===== 尺寸与参考图 ===================================================

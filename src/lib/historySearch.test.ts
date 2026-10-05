@@ -51,6 +51,14 @@ describe('matchesHistoryQuery · 命中判据', () => {
     expect(matchesHistoryQuery(entry({ collectionId: 'k9' }), 'night', names)).toBe(false)
   })
 
+  it('对话里那段场景:提示词里没有那个词,照样按场景搜得到', () => {
+    /* 对话那两种图的 prompt 是整段摄影指令(见 lib/chatWork),
+       用户记得的却是它当时说在哪儿 —— 场景漏了匹配就等于"这张找不到" */
+    const e = entry({ prompt: 'photographic, selfie at arm’s length, front camera', scene: 'on the balcony' })
+    expect(matchesHistoryQuery(e, 'balcony', names)).toBe(true)
+    expect(matchesHistoryQuery(e, 'basement', names)).toBe(false)
+  })
+
   it('多个词是 AND,而且可以来自不同字段', () => {
     const e = entry({ prompt: 'a cat by the window', characterId: 'c1' })
     expect(matchesHistoryQuery(e, 'alice cat', names)).toBe(true)

@@ -27,22 +27,24 @@
  *  这一层与 chatPhoto 的"失败只降级、绝不 reject"是同一条纪律:
  *  摄影指导挂了,这张图照样得出得来。
  *
+ *  —— 它不判视角(2026-10-05 改)——
+ *
+ *  视角(自拍 / 他拍 / 空镜)曾经也归它判,现在不归了:它只看得到一句场景,
+ *  而"谁拿的相机"是聊天模型在标签里说的话(见 server/chatTags.js)。
+ *  让它判的结果是大多数图落成他拍 —— 用户报的正是这个。现在它是**被告知**
+ *  这件事,然后只负责在这个视角下把机位写准。
+ *
  *  抽成纯函数是为了能直接断言 —— 上面每一条护栏都是"出错时画面会变形、
  *  但不会报错"的那类问题,而真正的出图要花钱、要联网,靠手测试不全。
  */
 
 import type { ChatLayer, ChatPhotoPlan, ChatShot } from './chatPhoto'
-import { composeChatPrompt, missingSlots, planChatPhoto } from './chatPhoto'
+import { composeChatPrompt, missingSlots } from './chatPhoto'
 
 /** 摄影指导能补的四位。**它不许碰 medium / 场景 / 锚点 / 负面约束** ——
  *  那几样分别是"媒介""内容""这个人是谁"与"挡什么",都不是"怎么拍" */
 export const DIRECTOR_SLOTS = ['camera', 'lens', 'light', 'env'] as const
 export type DirectorSlot = (typeof DIRECTOR_SLOTS)[number]
-
-/** 它唯一有权"选一个词"的地方:视角。**不是 DIRECTOR_SLOTS 的一员** ——
- *  那四位是"往提示词里填的句子",而这一位是"用哪套模板",去向不同
- *  (它要变成 shot,进而决定参考图顺序与画幅比例) */
-export const SHOT_LABEL = 'shot'
 
 /** 每一行的长度上限。提示词里写的是"under 20 words",这里按字符收口 ——
  *  字数它不总数得清,而一行写到 400 字符就开始喧宾夺主 */
@@ -61,13 +63,13 @@ const FOCAL_RE = /\b\d{1,3}\s*mm\b|\bf\/\d/i
 const STRUCTURE_RE = /[:：;；。！？!?"'`*#\r\n\t]/g
 
 /**
- * 把摄影指导的原始输出解析成"视角 + 四位"。
+ * 把摄影指导的原始输出解析成四位(机位 / 镜头 / 光 / 环境)。
  *
- * 认的是固定几行标签(`Shot: selfie` / `Camera: …`),不是散文 —— 散文没法逐位合并
+ * 认的是固定几行标签(`Camera: …` / `Light: …`),不是散文 —— 散文没法逐位合并
  * (已经说过的那一位要拒绝覆盖,而那需要知道每一句属于哪一位)。
  *
- * `Shot:` 那一行只认两个词(见 shotOf)。认不出就当作"它没判" ——
- * 调用方据此保留原来那个视角,而不是猜一个。
+ * **它不再判视角**(见下面 applyDirector 的说明):`Shot:` 那一行如果写了,
+ * 在这里会被当成认不出的位丢掉 —— 视角已经由标签定死了,不由它改。
  *
  * @returns 只含**解析成功且通过验收**的位。没提到的位、以及被丢掉的位,
  *          都不出现在结果里 —— 调用方据此逐位退回模板
@@ -88,34 +90,6 @@ export function parseDirector(raw: string): Partial<Record<DirectorSlot, string>
   return out
 }
 
-/**
- * 从原始输出里取视角。**与四位分开解析**是因为它的去向不同:
- * 它不往提示词里填句子,而是换一整套模板(进而换参考图顺序与画幅)。
- *
- * 只认 `selfie` 与 `third` 两个词。其余一律当作"没判" ——
- * 让模型自由发挥一个视角词(比如 "portrait"、"close-up")没法映射到模板上,
- * 而归一化它的近义词是在替它猜,不如老实退回原值。
- */
-export function parseDirectorShot(raw: string): 'selfie' | 'third' | '' {
-  for (const line of String(raw || '').split(/\r?\n/)) {
-    const m = /^\s*(?:shot|view|camera\s*angle)\s*[:：]\s*(.*)$/i.exec(line)
-    if (!m) continue
-    return shotOf(m[1])
-  }
-  return ''
-}
-
-/** 把一个词归一成视角。认不出返回空串(= 没判) */
-function shotOf(raw: string): 'selfie' | 'third' | '' {
-  const v = String(raw || '')
-    .toLowerCase()
-    .replace(/[^a-z]/g, '')
-  if (!v) return ''
-  if (v === 'selfie' || v === 'self' || v === 'selfportrait' || v === 'mirror') return 'selfie'
-  if (v === 'third' || v === 'thirdperson' || v === 'other' || v === 'external') return 'third'
-  return ''
-}
-
 /** 单行的验收与清洗。空串 = 这一位不要 */
 function lineValue(raw: string): string {
   let v = String(raw || '').replace(/\s+/g, ' ').trim()
@@ -132,50 +106,37 @@ function lineValue(raw: string): string {
 }
 
 /**
- * 摄影指导的结果并进方案。
+ * 摄影指导的结果并进方案。**它只补那四位,视角不归它管**(2026-10-05 改)。
  *
  * 四条不变量(每一条都有单测):
- * 1. **视角由它定,但"画面里有没有人"不由它定** —— 空镜场景里即便它写了 selfie
- *    也会被压回空镜(见 planChatPhoto 的 resolved)。一张"我看到的东西"里长出
- *    一个人,比视角选错严重得多;
+ * 1. **视角它一个字都改不了** —— 它只收到"这一张是自拍 / 他拍 / 空镜"这个事实,
+ *    并据此写机位。理由见下面那段;
  * 2. **场景已经说过的那一位不接受覆盖** —— 场景里写了光,模型再写一句光就是
  *    自相矛盾,而模型会挑一处当噪声丢掉、或者把两者硬凑成一张谁都不像的图;
  * 3. **没被补上或验收不过的位退回模板** —— 降级是逐位的,不是整层;
- * 4. **只换那四位 + 视角**。medium / 场景 / 锚点 / 动作 / 负面约束一律不动。
+ * 4. **只换那四位**。medium / 场景 / 锚点 / 动作 / 负面约束 / 那两条硬约束一律不动。
  *
- * @param patch.written parseDirector 的结果(只含通过验收的位)
- * @param patch.shot    parseDirectorShot 的结果,空串 = 它没判(保留原视角)
+ * —— 为什么把视角从它手里收回来 ——
+ *
+ * 它拿到的是**一句场景**,看不到对话、也看不到聊天模型写标签时的意图,
+ * 所以"谁拿的相机"这件事它的信息**比聊天模型少**。让它判的后果实测有两条:
+ * 场景写着"自拍"时它可能判成 third(把唯一的硬证据覆盖掉),
+ * 场景只写"我在阳台"时它又只能猜 —— 而它猜出来的是他拍。
+ * 用户的原话是"对于自拍的理解总是不好,老是会生成他拍视角的图片"。
+ *
+ * 现在分工是:聊天模型在标签里说(`selfie:` / `self:`),`planChatPhoto` 定死模板,
+ * 摄影指导**被告知**这个事实,只负责"在这个视角下这句机位怎么写"。
+ * 这也是这个模块一开始的原则("一位归谁管"就写在层名上)推到底的样子。
+ *
+ * @param patch parseDirector 的结果(只含通过验收的位)
  */
 export function applyDirector(
   plan: ChatPhotoPlan,
-  patch: { written: Partial<Record<DirectorSlot, string>>; shot?: 'selfie' | 'third' | '' }
+  patch: Partial<Record<DirectorSlot, string>>
 ): ChatPhotoPlan {
-  /* —— 视角变了就换一整套模板 ——
-     这是 applyDirector 里唯一一处"重拼"而不是"打补丁"的地方,而且是必须的:
-     视角决定的不是一句话,是 medium/camera/lens/light/env/noPeople/action 一整组。
-     只换 camera 而留着自拍的 medium("shot on a phone front camera")会拼出一张
-     自称自拍、却按第三人称取景的图。
-
-     两个细节都不能省:
-     - **第三位参数传的是"底稿自己认为的视角"**,不是 `plan.shot`。
-       `plan.shot` 是已经解析过的结果,拿它当输入会把"场景写着 selfie"与
-       "模板用了 selfie"这两种状态搅在一起 —— 一旦它等于 'scene',
-       自拍模板就再也回不来了;
-     - **锚点要原样带过去**。它由调用方保证不变(视角不该动"这个人是谁"),
-       而重拼会把它丢在原来的 layers 里,所以这里得取回来重新拼一遍。 */
-  const shot = !plan.self
-    ? 'scene'
-    : patch.shot === 'selfie' || patch.shot === 'third'
-      ? patch.shot
-      : plan.shot
-  const base =
-    shot === plan.shot
-      ? plan
-      : rebuildForShot(plan, shot)
-
   /* 场景已经覆盖的位:即便模型写了也不采用(见不变量 2)。
      判据与模板同一处 —— missingSlots 是"这一位空着吗"的唯一权威 */
-  const miss = missingSlots(base.scene)
+  const miss = missingSlots(plan.scene)
   const allowed: Record<DirectorSlot, boolean> = {
     /* 机位与纵深是无条件补的(见 missingSlots 的说明),所以永远接受 */
     camera: true,
@@ -184,40 +145,29 @@ export function applyDirector(
     light: miss.light
   }
 
-  const layers: ChatLayer[] = base.layers.map(([slot, value]) => {
+  const layers: ChatLayer[] = plan.layers.map(([slot, value]) => {
     if (!DIRECTOR_SLOTS.includes(slot as DirectorSlot)) return [slot, value] as ChatLayer
     const s = slot as DirectorSlot
-    const written = patch.written[s]
+    const written = patch[s]
     if (!allowed[s] || !written) return [slot, value] as ChatLayer
     return [slot, written] as ChatLayer
   })
 
-  return { ...base, prompt: composeChatPrompt(layers), layers }
-}
-
-/** 换一套模板重拼,同时把锚点这一层原样带过去(见 applyDirector 的说明)。
- *
- *  取锚点的办法是**从原 layers 里读回来**,不是让调用方再传一次 ——
- *  chatPhoto 的 layers 本来就是"哪一层归谁管"的权威记录,让调用方
- *  另存一份 anchor 只会多一处会漂的状态。 */
-function rebuildForShot(plan: ChatPhotoPlan, shot: ChatShot): ChatPhotoPlan {
-  const anchor = plan.layers.find(([slot]) => slot === 'anchor')?.[1] || ''
-  return planChatPhoto(plan.scene, plan.self, anchor, shot)
+  return { ...plan, prompt: composeChatPrompt(layers), layers }
 }
 
 /** 给摄影指导模型的那段活。**纯字符串**,所以能直接断言口径。
  *
- *  —— 为什么这里说的是"画面里有没有人"而不是"这是自拍" ——
+ *  —— 交代给它的一件事实:这一张是谁拿的相机 ——
  *
- *  视角现在是**它要判的那件事**,不是我们告诉它的前提。告诉它"这是自拍,
- *  别改"就等于把它唯一有权做的那个判断也收回来了 —— 而它手上的信息
- *  比那个词表多(它看得到整个场景和用户那句话说的事)。
+ *  这不是它的判断,是它写机位的前提(2026-10-05 改)。它拿到的只有一句场景,
+ *  看不到对话,所以"谁拿的相机"它判不出来 —— 让它判就是让它猜,
+ *  而猜出来的默认是他拍(用户报的那个毛病)。
  *
- *  我们只交代**一件它推不出来的事实**:画面里有没有人。那来自聊天模型的
- *  `photoSelf`,是这个协议里唯一可信的判据 —— 一张"我看到的东西"里
- *  长出一个人,比视角选错严重得多。
+ *  另外两件它推不出来的事实:画面里有没有人(`photoSelf`)、
+ *  以及哪几位场景已经有着落了(由 missingSlots 算)。
  *
- *  "do not change it" 那一句是要紧的,但管的是**场景**,不是视角。 */
+ *  "do not change it" 那一句管的是**场景**。 */
 export function directorTask(plan: ChatPhotoPlan): string {
   const subject = plan.self
     ? 'The character is in this image.'
@@ -227,10 +177,27 @@ export function directorTask(plan: ChatPhotoPlan): string {
     plan.scene,
     '',
     subject,
+    shotBrief(plan.shot),
     directorBrief(plan),
     '',
-    'Now write the five lines. Decide Shot yourself from the scene and from what is said above.'
+    'Now write the four lines.'
   ].join('\n')
+}
+
+/** 这一张的视角,以**事实**的口吻告诉它 —— 附一句"机位那句要与之相符"。
+ *
+ *  之所以还要说清"是谁拿的相机",是因为它要写 `Camera:` 那一行:
+ *  同样是"拍一个人",自拍与他拍的机位句完全不是一回事。
+ *  但**它不能改这件事** —— 那句 "do not switch" 就是这条不变量在提示词里的写法,
+ *  而结构上的保证是 `applyDirector` 里它根本没有入口。 */
+export function shotBrief(shot: ChatShot): string {
+  if (shot === 'selfie') {
+    return 'The camera is in the character\u2019s own hand \u2014 their own phone, at arm\u2019s length or in a mirror. Write the camera line so it matches that, and do not switch to a third-person view.'
+  }
+  if (shot === 'third') {
+    return 'Somebody else is holding the phone \u2014 this is a snapshot another person took of the character, not a selfie. Write the camera line so it matches that casual hand-held look, and do not turn it into a selfie or a posed studio portrait.'
+  }
+  return 'The camera is set down or held steady on the place itself.'
 }
 
 /** 哪些位场景已经有着落了。**判据必须与 applyDirector 同一处**(missingSlots)——
