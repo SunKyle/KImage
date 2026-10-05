@@ -33,7 +33,7 @@ import { growTextarea, vGrow } from '../lib/grow'
 import { agoLabel } from '../../server/chatTime.js'
 /* 显示层也要摘一次中段标签:**库里已有的老消息还带着它**
    (那一版服务端还没这道工序)。同一个纯函数,两端同一个判据 */
-import { stripStandaloneTags } from '../../server/chatTags.js'
+import { parsePhotoIntent, stripStandaloneTags } from '../../server/chatTags.js'
 import { speak, speechSupported, speakingId, speakingLoading, stopSpeaking, warmUpSpeech } from '../lib/speech'
 
 /* 角色对话页。它是一个平级页面(见 lib/nav.ts),不是浮层 ——
@@ -138,9 +138,14 @@ function avatarOf(c: Character): string {
  *  它是在渲染那一刻算的，页面开着不动一小时这句话会旧一小时 ——
  *  与"Last spoke"那行同一条取舍：它服务的是"刚回到这一页的那一眼"。 */
 const sceneLine = computed(() => {
-  const p = (stillMsg.value?.photo || '').replace(/\s+/g, ' ').trim()
+  /* 取**第一小句**:`reply.photo` 是那段出图提示词(可能很长),
+     而这一行要的是"这一幕在哪" —— 参考图里写的是 `sitting by the window`,
+     不是一整段。`parsePhotoIntent` 先把 `self:` 那类标记剪掉 */
+  const raw = parsePhotoIntent(stillMsg.value?.photo || '', current.value?.name || '').scene
+  const first = raw.split(/[,，。;；]/)[0].trim()
+  const label = first.length > 22 ? `${first.slice(0, 20)}…` : first
   const t = clockNow()
-  return p ? `${p} · ${t}` : t
+  return label ? `${label} · ${t}` : t
 })
 
 /** 本机钟的 HH:MM。与 T6.1 发给服务端的那份同一个口径:用户眼前的钟。
@@ -2995,21 +3000,28 @@ onBeforeUnmount(() => {
 .chat.is-immersive {
   /* 沉浸页的阅读列宽。**普通页刻意不收窄**(见 .chat-inner 那段注释),
      这里收窄是因为前提变了:那两侧不再是面板里的留白,而是角色的画面 */
-  --immersive-col: 760px;
+  --immersive-col: 660px;
 }
 /* 面板的框去掉:对话该浮在场景上,而不是装在一个框里 */
 .chat.is-immersive .chat-main {
   border: 0;
   background: none;
 }
-/* 头、消息、输入各自收在同一个宽度里 —— 一条竖直的中轴 */
+/* 输入区收在中间(参考图里那条胶囊就是居中的) */
 .chat.is-immersive .chat-head,
-.chat.is-immersive .chat-inner,
-.chat.is-immersive .chat-empty.is-inside,
 .chat.is-immersive .chat-compose > * {
   width: 100%;
   max-width: var(--immersive-col);
   margin-inline: auto;
+}
+/* **正文靠左**,不居中:参考图里字在左、人在右 —— 那个不对称就是它的构图。
+   居中一列会把画面切成两半,右边那一半的人就没了位置 */
+.chat.is-immersive .chat-inner,
+.chat.is-immersive .chat-empty.is-inside {
+  width: 100%;
+  max-width: var(--immersive-col);
+  margin-inline: 0 auto;
+  padding-left: clamp(16px, 7vw, 96px);
 }
 /* 工具层收走:模型/记忆药丸、⋮ 菜单、可点的换人入口。
    **进出沉浸那枚按钮留着** —— 它是出口,而藏起出口的全屏模式是把用户关在里面 */
@@ -3115,11 +3127,11 @@ onBeforeUnmount(() => {
    上限给得克制:看一眼认得出来即可,想细看点开还是大图 */
 .chat.is-immersive .msg-img-btn,
 .chat.is-immersive .msg.assistant .msg-img-btn {
-  max-width: min(190px, 34%);
+  max-width: min(150px, 24%);
 }
 .chat.is-immersive .msg-img,
 .chat.is-immersive .msg-photo {
-  max-height: 170px;
+  max-height: 120px;
 }
 /* 输入区收成一条宽胶囊(参考图里就是一整条半透明胶囊)。
    圆角用 999 而不是 --r:这一条比别处的卡片更长更扁,
@@ -3147,15 +3159,14 @@ onBeforeUnmount(() => {
   width: 100%;
   height: 100%;
   object-fit: cover;
-  /* 放大一点点,免得 blur 在四边露出羽化过的透明边 */
-  transform: scale(1.12);
-  /* 明确的虚化 + 压暗:它要的是"那儿的光与色",不是一张能看清的照片。
-     看清楚了反而会和气泡抢注意力 —— 而这一页要读的是字 */
-  filter: blur(34px) saturate(1.08);
-  /* 2026-10-05:0.55 → 0.72。0.55 那一档在真机上"看不出来有背景"
-     (判据是 `document.querySelector('.chat-bg img').src` 有值 ——
-     图在,只是被蒙版盖没了)。气泡是不透明的,所以提高它不影响读字 */
-  opacity: 0.72;
+  transform: scale(1.02);
+  /* **不再大虚化**。第一版是 blur(34px),那是为了"字压在上面能读" ——
+     可它同时把"这一场戏"整个糊没了,而这一页的全部意思就在那张图上
+     (用户的话:"和我给的第二张参考图完全不一样")。
+     参考图的做法不是虚化,是**构图与蒙版**:画面锐利,靠左半边压暗让出字。
+     下面那层蒙版就是干这个的 */
+  filter: blur(2px) saturate(1.04);
+  opacity: 1;
 }
 /* 压暗蒙版。**对比度是硬约束,不是审美**(设计稿 §4):
    正文压在这上面也要满足小字可读,所以这一层给得很重 ——
@@ -3167,13 +3178,23 @@ onBeforeUnmount(() => {
   /* 上重、中轻、下重 —— 因为**压在背景上的那几行字在哪**:
      顶部是角色名(这一页最先要认出来的东西),底部是输入区那一块提示,
      中间那一带基本被气泡盖着,可以让出更多画面 */
-  background: linear-gradient(
-    to bottom,
-    color-mix(in srgb, var(--bg) 70%, transparent) 0%,
-    color-mix(in srgb, var(--bg) 42%, transparent) 22%,
-    color-mix(in srgb, var(--bg) 46%, transparent) 70%,
-    color-mix(in srgb, var(--bg) 74%, transparent) 100%
-  );
+  /* 横向:左边重(字在那儿)、右边几乎透明(人那儿) —— 这是参考图的可读性来源;
+     纵向:顶部与底部各压一档,给角色名与输入区那两行字兜底 */
+  background:
+    linear-gradient(
+      90deg,
+      color-mix(in srgb, var(--bg) 92%, transparent) 0%,
+      color-mix(in srgb, var(--bg) 68%, transparent) 34%,
+      color-mix(in srgb, var(--bg) 12%, transparent) 76%,
+      transparent 100%
+    ),
+    linear-gradient(
+      to bottom,
+      color-mix(in srgb, var(--bg) 58%, transparent) 0%,
+      transparent 20%,
+      transparent 76%,
+      color-mix(in srgb, var(--bg) 66%, transparent) 100%
+    );
 }
 /* 窄屏把虚化收小:手机上 GPU 那一档开销更敏感,而屏幕小、半径本来也不必那么大 */
 @media (max-width: 720px) {
