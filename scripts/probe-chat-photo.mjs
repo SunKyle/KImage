@@ -363,6 +363,15 @@ async function main() {
       systemOf().indexOf('Right now: 2026') < systemOf().indexOf('What has happened so far')
     )
     ok('规则里带着"别每句都报时"', systemOf().includes('it is a clock'))
+    /* 这两条是 T6.5 加的软规则。这里断言的只是"它们确实进了 system" ——
+       模型照不照做是另一回事(那是提示词类改动,只能手测),别把这条
+       当成"接话题行为已验证" */
+    ok(
+      '规则里带着"接话题"与"照片要连贯"',
+      systemOf().includes('it is on you to carry it') &&
+        systemOf().includes('Keep the pictures consistent'),
+      JSON.stringify(systemOf().split('\n').filter((l) => l.includes('carry it') || l.includes('consistent')))
+    )
 
     /* 没给时间（老前端、手搓请求、时钟坏掉）→ 整块不出现，且**不影响这一轮**。
        判据用行首锚定的正则、**不是 includes('Right now')** ——
