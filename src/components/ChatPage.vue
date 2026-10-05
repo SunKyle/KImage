@@ -125,6 +125,15 @@ function avatarOf(c: Character): string {
   return coverSrc(c.ref)
 }
 
+/** 沉浸页背景用的那张。与头像是**同一个** object URL(coverSrc 按 Blob 缓存),
+ *  所以它不额外占内存、也不额外发请求。
+ *
+ *  刻意**不做降采样**:设计稿里写的是"正脸可能上千像素,先降到 1080 再 blur",
+ *  而实际存下来的那张是 CHAR_IMAGE_MAX(1280)的 JPEG(见 useCharacters 的
+ *  charImageBlob)—— 降到 1080 几乎是个空操作,不值得为它加一段 canvas 代码。
+ *  真正要防的 GPU 开销用两件事对付:压暗蒙版把它盖住一半、窄屏把 blur 收小 */
+const bgSrc = computed(() => (current.value ? avatarOf(current.value) : ''))
+
 /* 最近活跃在前:**置顶的永远在最前**,其余按最后一条消息的时间排,
    没聊过的排在后面(按创建时间)。顺序是派生的,不落盘 ——
    与 charStats / charWorks 同一条规矩;而"置顶"恰恰是派生不出来的那份意愿,
@@ -869,6 +878,15 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="chat" :class="{ 'is-immersive': immersive }">
+    <!-- 背景层:它所在的地方。**固定定位、铺满视口** —— 它不该被 .shell 的
+         栏宽与内边距裁住,沉浸要的正是"整屏都是它那儿"。
+         正脸的字节本来就为头像取过一次(coverSrc 按 Blob 缓存),这里不新增请求、
+         不新增调用;没有正脸(手填的角色、或图丢了)就只剩那层压暗色,
+         不报错、不留空壳 -->
+    <div v-if="immersive && current" class="chat-bg" aria-hidden="true">
+      <img v-if="bgSrc" :src="bgSrc" alt="" />
+    </div>
+
     <!-- —— 左栏:角色。与对话是同一个对象的两个面 —— -->
     <aside v-show="!immersive" class="chat-rail" aria-label="Characters">
       <p class="rail-eyebrow">Conversations</p>
@@ -1225,14 +1243,16 @@ onBeforeUnmount(() => {
                       <PhTrash aria-hidden="true" />
                     </button>
                     <!-- 重新生成 / 重试:排在"删"后面。两者是同一件事的两种叫法,
-                         只有末尾那一条有(见 canRegenMsg) -->
+                         只有末尾那一条有(见 canRegenMsg)。
+                         **只有图标**,名字在这儿给读屏与悬停提示一份 -->
                     <button
                       v-if="canRegenMsg(r.msg)"
-                      class="quiet-btn regen-inline"
+                      class="regen-btn"
+                      :title="regenLabel"
+                      :aria-label="regenLabel"
                       @click="emit('regenerate', current.id)"
                     >
                       <PhArrowsClockwise aria-hidden="true" />
-                      {{ regenLabel }}
                     </button>
                   </span>
                 </div>
@@ -1292,11 +1312,16 @@ onBeforeUnmount(() => {
 
             <!-- 重新生成 / 重试的**退路**:末尾那条没有气泡可挂时(只发了一张图、
                  没有文字 —— 那种消息不渲染气泡,下角那排也就没有落脚点)才出现在
-                 这儿。正常情况下它在末尾那条的悬停动作里,排在"删"后面 -->
+                 这儿。正常情况下它在末尾那条的悬停动作里,排在"删"后面。
+                 一样只有图标(名字在 title / aria-label 上) -->
             <div v-if="(canRegenerate || canRetry) && !tailBubble" class="regen">
-              <button class="quiet-btn" @click="emit('regenerate', current.id)">
+              <button
+                class="regen-btn"
+                :title="regenLabel"
+                :aria-label="regenLabel"
+                @click="emit('regenerate', current.id)"
+              >
                 <PhArrowsClockwise aria-hidden="true" />
-                {{ regenLabel }}
               </button>
             </div>
           </div>
@@ -1485,6 +1510,101 @@ onBeforeUnmount(() => {
 }
 
 /* ===== 左栏 ===== */
+/* ===== 沉浸态 =====
+   这一段的每一条都在做同一件事:**把工具那一层收走,把画面还给角色**
+   (见 doc/沉浸式对话页面设计.md)。判据只有一条 —— 屏幕上每一样东西,
+   是在服务这段话,还是在服务"这个软件的功能" */
+.chat.is-immersive {
+  /* 沉浸页的阅读列宽。**普通页刻意不收窄**(见 .chat-inner 那段注释),
+     这里收窄是因为前提变了:那两侧不再是面板里的留白,而是角色的画面 */
+  --immersive-col: 760px;
+}
+/* 面板的框去掉:对话该浮在场景上,而不是装在一个框里 */
+.chat.is-immersive .chat-main {
+  border: 0;
+  background: none;
+}
+/* 头、消息、输入各自收在同一个宽度里 —— 一条竖直的中轴 */
+.chat.is-immersive .chat-head,
+.chat.is-immersive .chat-inner,
+.chat.is-immersive .chat-empty.is-inside,
+.chat.is-immersive .chat-compose > * {
+  width: 100%;
+  max-width: var(--immersive-col);
+  margin-inline: auto;
+}
+/* 工具层收走:模型/记忆药丸、⋮ 菜单、可点的换人入口。
+   **进出沉浸那枚按钮留着** —— 它是出口,而藏起出口的全屏模式是把用户关在里面 */
+.chat.is-immersive .head-chip,
+.chat.is-immersive .chat-menu-wrap,
+.chat.is-immersive .head-pick {
+  display: none;
+}
+/* 身份照旧显示,变成不可点的那一份(head-solo 的 DOM 本来就在,宽屏用的就是它) */
+.chat.is-immersive .head-solo {
+  display: flex;
+}
+/* 头部那条分隔线也去掉:它属于"面板"那套边界 */
+.chat.is-immersive .chat-head {
+  border-bottom-color: transparent;
+}
+/* 字号上一档:这一页只有对话,没有别的东西要抢层级 */
+.chat.is-immersive .bubble {
+  font-size: var(--fs-md);
+}
+
+/* 背景层。z-index 0 + 上面那两层网格子项各自 z-index 1(见下),
+   不用负 z-index:负值会跑到 body 背景之下,效果随浏览器的绘制顺序而变 */
+.chat-bg {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  /* 它只是背景:绝不能接走指针事件(消息流在它上面要能滚、能点) */
+  pointer-events: none;
+}
+.chat-bg img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  /* 放大一点点,免得 blur 在四边露出羽化过的透明边 */
+  transform: scale(1.12);
+  /* 明确的虚化 + 压暗:它要的是"那儿的光与色",不是一张能看清的照片。
+     看清楚了反而会和气泡抢注意力 —— 而这一页要读的是字 */
+  filter: blur(34px) saturate(1.08);
+  opacity: 0.55;
+}
+/* 压暗蒙版。**对比度是硬约束,不是审美**(设计稿 §4):
+   正文压在这上面也要满足小字可读,所以这一层给得很重 ——
+   正脸只在顶部中间透出来一点 */
+.chat-bg::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  /* 上重、中轻、下重 —— 因为**压在背景上的那几行字在哪**:
+     顶部是角色名(这一页最先要认出来的东西),底部是输入区那一块提示,
+     中间那一带基本被气泡盖着,可以让出更多画面 */
+  background: linear-gradient(
+    to bottom,
+    color-mix(in srgb, var(--bg) 78%, transparent) 0%,
+    color-mix(in srgb, var(--bg) 58%, transparent) 22%,
+    color-mix(in srgb, var(--bg) 62%, transparent) 70%,
+    color-mix(in srgb, var(--bg) 82%, transparent) 100%
+  );
+}
+/* 窄屏把虚化收小:手机上 GPU 那一档开销更敏感,而屏幕小、半径本来也不必那么大 */
+@media (max-width: 720px) {
+  .chat-bg img {
+    filter: blur(22px) saturate(1.05);
+  }
+}
+/* 沉浸态里那两层网格子项要压在背景之上 */
+.chat.is-immersive .chat-rail,
+.chat.is-immersive .chat-main {
+  position: relative;
+  z-index: 1;
+}
+
 /* 沉浸态:**单列**。
    注意隐藏左栏本身**不会**让上面那条 `240px` 的轨道塌掉 —— 显式的轨道宽度
    还在,右边会平白少 240px 再加一道 gap,症状是"右边窄了一截",
@@ -1971,6 +2091,12 @@ onBeforeUnmount(() => {
 .msg:hover .msg-ops {
   opacity: 1;
 }
+/* 键盘走到这一排上时也要看得见。它们平时是 opacity: 0 的,
+   而 Tab 是**不产生 hover** 的 —— 少了这一条,焦点落上去时
+   屏幕上什么都不会变,等于在盲按(重新生成也在这一排里,见 .regen-btn) */
+.msg:focus-within .msg-ops {
+  opacity: 1;
+}
 /* 正在念的那条常驻显示:它是"怎么让它停下来"的唯一入口,
    不该等手指找上来才出现 */
 .msg-ops.on {
@@ -1979,8 +2105,15 @@ onBeforeUnmount(() => {
 .msg-ops.on .speak-btn {
   color: var(--text-2);
 }
+/* 念 / 删 / 重来同形:40×40 的圆点,无底无边,悬停才浮出淡底。
+   重新生成**只有图标**(2026-10-05 用户要求"只保留 icon"):同一个动作有
+   两种叫法("Regenerate" / "Try again",见 regenLabel),而那行字放在这一排里
+   既比旁边两枚长出一大截,又会在窄屏被面板裁掉 —— 气泡上限占着消息区 76%,
+   留给外侧那排的只有剩下的 24%(见 .msg-ops)。
+   名字留在 title 与 aria-label 上:看得见的是图标,读得到的是词 */
 .speak-btn,
-.del-btn {
+.del-btn,
+.regen-btn {
   display: grid;
   place-items: center;
   width: 40px;
@@ -1993,10 +2126,12 @@ onBeforeUnmount(() => {
   transition: color var(--dur) var(--ease), background var(--dur) var(--ease);
 }
 .speak-btn svg,
-.del-btn svg {
+.del-btn svg,
+.regen-btn svg {
   font-size: 15px;
 }
-.speak-btn:hover {
+.speak-btn:hover,
+.regen-btn:hover {
   background: var(--accent-soft);
   color: var(--text-2);
 }
@@ -2005,18 +2140,6 @@ onBeforeUnmount(() => {
 .del-btn:hover {
   background: var(--accent-soft);
   color: var(--danger);
-}
-/* 那一排里的"重新生成":同排其余两枚是 40×40 的圆点,它是唯一带字的。
-   所以字号压到最小档、左右各收一点 —— 它得读得出自己是什么
-   ("Regenerate"与"Try again"是两件事,不能只剩一个图标),
-   又不能比那两枚圆点更抢眼。可点高度仍与它们齐平(quiet-btn 的 40px) */
-.regen-inline {
-  padding: 0 7px;
-  font-size: var(--fs-micro);
-  white-space: nowrap;
-}
-.regen-inline svg {
-  font-size: 14px;
 }
 /* 还在等音频。这一档必须看得出来 —— 第三方合成要等几百毫秒到好几秒,
    而在它出声之前,"在等"和"已经念完了"长得一模一样:都是不出声。
@@ -2281,17 +2404,17 @@ onBeforeUnmount(() => {
   }
 }
 /* 重新生成是这一页最次要的动作 —— 它不该和对话争视线。
-   平时它挂在末尾那条消息的悬停动作里(见 .regen-inline);只有末尾那条
-   **没有气泡可挂**时才退回这里(自由站一行)。做成一枚无底无边的细文字:
-   眼睛扫过去几乎不占用注意力,但可点高度仍给到 40px,手按得着 */
+   平时它挂在末尾那条消息的悬停动作里(见 .regen-btn);只有末尾那条
+   **没有气泡可挂**时才退回这里(自己站一行)。它是同一枚图标键:
+   无底无边,悬停才浮出淡底,可点区域仍是 40×40 */
 .regen {
   display: flex;
   margin-top: var(--sp-1);
 }
 /* "最次要的动作"的统一长相:无底无边的一行细字,悬停才浮出淡底。
-   重新生成与"改记忆"都用它 —— 它们都是"这一页顺带能做的事",
-   做成按钮会和对话本身抢视线。
-   可点高度仍留 40px:眼睛不被打断,手指按得着 */
+   "改记忆"用它 —— 它也是"这一页顺带能做的事",做成按钮会和对话本身抢视线。
+   可点高度仍留 40px:眼睛不被打断,手指按得着。
+   (重新生成原本也用它,2026-10-05 起改成与"念 / 删"同形的图标键,见 .regen-btn) */
 .quiet-btn {
   display: inline-flex;
   align-items: center;

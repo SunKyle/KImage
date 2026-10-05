@@ -169,6 +169,16 @@ onBeforeUnmount(() => {
   -webkit-user-select: none;
   -webkit-tap-highlight-color: transparent;
 }
+/* 对话页:抬到输入区**之上**。
+   两件事挤在同一个位置 —— 撤销条是 bottom: 28px 的居中浮条,而聊天页的
+   输入卡片也是底部居中(卡片底边离视口底约 40px)。实测重叠 32px,
+   而且它不只是难看:那一块**会吃掉点击**,想点进输入框打字的那一下
+   会落在撤销键上,把刚删掉的东西撤销回来。
+   值 = 输入卡片顶边到视口底的距离(约 92px)+ 一道缝。
+   类名由主界面按"当前是不是对话页"给(见 App.vue) */
+.undo.over-compose {
+  bottom: 100px;
+}
 .undo-btn {
   grid-area: 1 / 1;
   display: inline-flex;

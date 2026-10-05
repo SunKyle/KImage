@@ -2048,7 +2048,13 @@ async function main() {
           ...(m.imageId ? { imageId: m.imageId } : {})
         }))
         await new Promise((res, rej) => {
-          const tx = db.transaction(['chat_messages', 'chat_summaries', 'chat_images'], 'readwrite')
+          const tx = db.transaction(
+            ['chat_messages', 'chat_summaries', 'chat_images', 'chars'],
+            'readwrite'
+          )
+          /* 角色的正脸(卡面/头像/沉浸页背景都用它)。
+             没有它的时候背景层会退化成"只剩压暗色",那条也一并量 */
+          tx.objectStore('chars').put({ id: charId, data: png })
           const store = tx.objectStore('chat_messages')
           for (const m of msgs) store.put(m)
           tx.objectStore('chat_images').put({
@@ -2233,6 +2239,9 @@ async function main() {
       chatProbe.normal = await evaluate(() => {
         const chat = document.querySelector('.chat')
         return {
+          /* 普通骨架下不该有背景层(v-if="immersive"),消息也不收窄 */
+          bgImg: !!document.querySelector('.chat-bg'),
+          colW: Math.round(document.querySelector('.chat-inner')?.getBoundingClientRect().width || 0),
           cols: getComputedStyle(chat).gridTemplateColumns,
           railW: Math.round(document.querySelector('.chat-rail')?.getBoundingClientRect().width || 0),
           mastH: document.querySelector('.masthead')?.offsetHeight || 0,
@@ -2253,8 +2262,22 @@ async function main() {
       chatProbe.immersive = await evaluate(() => {
         const chat = document.querySelector('.chat')
         const main = document.querySelector('.chat-main')
+        const menu = document.querySelector('.chat-menu-wrap')
+        const solo = document.querySelector('.head-solo')
         return {
           immersiveClass: chat.classList.contains('is-immersive'),
+          /* 背景层:用的是同一张正脸的 object URL,不额外发请求 */
+          bgImg: !!document.querySelector('.chat-bg img'),
+          bgBlob: (document.querySelector('.chat-bg img')?.getAttribute('src') || '').startsWith(
+            'blob:'
+          ),
+          /* 收窄成一列(普通骨架下是整块面板的宽) */
+          colW: Math.round(document.querySelector('.chat-inner')?.getBoundingClientRect().width || 0),
+          /* 工具层收走、身份留下、出口留着 */
+          menuHidden: !menu || getComputedStyle(menu).display === 'none',
+          soloShown: !!solo && getComputedStyle(solo).display !== 'none',
+          pickHidden: getComputedStyle(document.querySelector('.head-pick')).display === 'none',
+          exitBtn: !!document.querySelector('[aria-label="Leave immersive mode"]'),
           pref: localStorage.getItem('kimage.immersive'),
           mastH: document.querySelector('.masthead')?.offsetHeight || 0,
           varMast: getComputedStyle(document.documentElement).getPropertyValue('--mast-h').trim(),
@@ -2267,11 +2290,64 @@ async function main() {
         }
       })
 
+      /* 拍一张:背景压得够不够暗、一列收得对不对、头部还剩什么 ——
+         这些**只能用眼睛判断**(间距、对齐、留白没有可断言的判据),
+         而它们恰恰是 UI 改动里最容易翻车的一类 */
+      await shot('chat-immersive')
+      if (SHOT_DIR) {
+        /* 顺手再拍一张浅色的。设计稿把"对比度"列成硬约束,却又如实记着
+           "还没想好怎么自动量" —— 那么两种主题各看一眼就是它现在的替代:
+           背景是图片,取不到"计算样式里的背景色",而压暗够不够只有眼睛知道。
+           只改 data-theme 这一个属性(applyTheme 干的就是这件事),不动存盘的偏好 */
+        const was = await evaluate(() => document.documentElement.getAttribute('data-theme'))
+        await evaluate(() => document.documentElement.setAttribute('data-theme', 'light'))
+        await shot('chat-immersive-light')
+        await evaluate((v) => document.documentElement.setAttribute('data-theme', v), was)
+      }
+      /* 截图那一步收尾会 clearDeviceMetricsOverride,把视口还回默认那个窄窗 ——
+         而下面"回到普通骨架是两列"的断言依赖桌面宽度,所以这里补回来。
+         (这条坑只在带 --shot-dir 时才会踩到,CI 不带,所以它只会骗到顺手拍图的人) */
+      await send('Emulation.setDeviceMetricsOverride', {
+        width: 1280,
+        height: 900,
+        deviceScaleFactor: 1,
+        mobile: false
+      })
+      await settle()
+
+      /* 破功清点(设计 §6 / §8)。这三条都是"安静地坏掉"的那一类 */
+      chatProbe.layers = await evaluate(() => {
+        const stream = document.querySelector('.chat-stream')
+        /* 给消息流节点盖个戳:下面的模式切换如果把它整棵重造,
+           这个属性就会跟着消失 —— 而重建 live region 会让读屏把整段重播一遍 */
+        if (stream) stream.__probeStamp = 'kept'
+        /* 往上滚一点,"回到最新"那枚就该浮出来 */
+        if (stream) stream.scrollTop = 0
+        return {
+          stamped: stream?.__probeStamp === 'kept',
+          /* 整页钉死靠的是 clip:hidden 会让 .shell 变成滚动容器,
+             聚焦底部输入框时浏览器可能把它滚一下(§10.7 踩过) */
+          shellOverflow: getComputedStyle(document.querySelector('.shell')).overflow
+        }
+      })
+      await sleep(200)
+      chatProbe.layers.jump = await evaluate(() => {
+        const j = document.querySelector('.jump')
+        return { shown: !!j, inViewport: !!j && j.getBoundingClientRect().top >= 0 }
+      })
+      chatProbe.layers.stampKept = await evaluate(
+        () => document.querySelector('.chat-stream')?.__probeStamp === 'kept'
+      )
+
       /* ⑤ 一次 Esc 只退一层 ⇒ 回到普通骨架,而**偏好不变**(它记的是意愿) */
       await evaluate(() => {
         window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))
       })
       await settle()
+      /* Esc 之后那个节点还该是同一个(它只是换了外层 class,没被重造) */
+      chatProbe.layers.stampAfterEsc = await evaluate(
+        () => document.querySelector('.chat-stream')?.__probeStamp === 'kept'
+      )
       chatProbe.backToNormal = await evaluate(() => {
         const chat = document.querySelector('.chat')
         return {
@@ -2365,6 +2441,36 @@ async function main() {
         messages: document.querySelectorAll('.chat-inner .msg').length,
         undoToast: !!document.querySelector('.undo .undo-btn')
       }))
+      /* 撤销条与输入区都在底部居中 —— 这两条会不会打架,量一次。
+         设计稿把这条列成"要现场看一眼再定",这里给出数:*测量*而已,
+         重叠与否**不断言**(它在普通骨架下大概也是这样,是既有行为,
+         要改就是一次全局改动,得单独决定) */
+      /* 先在桌面视口下量:默认那个无头窗口只有 ~356 高,而 .chat 有
+         min-height:420px —— 面板会被 clip 掉一截,量出来的重叠恒为 0,
+         等于没测(这一条我第一次就踩了) */
+      await send('Emulation.setDeviceMetricsOverride', {
+        width: 1280,
+        height: 900,
+        deviceScaleFactor: 1,
+        mobile: false
+      })
+      await settle()
+      chatProbe.toastVsCompose = await evaluate(() => {
+        const t = document.querySelector('.undo')
+        const box = document.querySelector('.compose-box') || document.querySelector('.compose-off')
+        if (!t || !box) return null
+        const a = t.getBoundingClientRect()
+        const b = box.getBoundingClientRect()
+        const overlap = Math.max(0, Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top))
+        return {
+          toast: { top: Math.round(a.top), bottom: Math.round(a.bottom) },
+          compose: { top: Math.round(b.top), bottom: Math.round(b.bottom) },
+          overlap: Math.round(overlap)
+        }
+      })
+      await send('Emulation.clearDeviceMetricsOverride')
+      await settle()
+
       chatProbe.clickedUndoMsg = await evaluate(() => {
         const b = document.querySelector('.undo .undo-btn')
         if (!b) return 'missing'
@@ -2539,6 +2645,20 @@ async function main() {
         /* 单列:左栏隐藏了,但它那条 240px 的轨道若不显式改掉,内容会平白窄一截 */
         chatProbe.immersive?.cols.split(' ').length === 1 &&
         chatProbe.immersive?.mainW > chatProbe.immersive?.chatW - 40 &&
+        /* 背景层:沉浸态才有,画的是那张正脸(blob URL,不额外发请求);
+           普通骨架下它整个不该在 */
+        chatProbe.normal?.bgImg === false &&
+        chatProbe.immersive?.bgImg === true &&
+        chatProbe.immersive?.bgBlob === true &&
+        /* 收窄成一列:沉浸 760,普通是整块面板 */
+        chatProbe.immersive?.colW > 0 &&
+        chatProbe.immersive?.colW <= 760 &&
+        chatProbe.immersive?.colW < chatProbe.normal?.colW &&
+        /* 工具层收走、身份留下、出口留着 */
+        chatProbe.immersive?.menuHidden === true &&
+        chatProbe.immersive?.soloShown === true &&
+        chatProbe.immersive?.pickHidden === true &&
+        chatProbe.immersive?.exitBtn === true &&
         /* 且**真的把顶栏那份高度还给了面板** —— 比在视口高度上做文章稳:
            后者会被 .chat 的 min-height 盖过去 */
         chatProbe.immersive?.chatH >=
@@ -2551,6 +2671,18 @@ async function main() {
         chatProbe.backToNormal?.cols.split(' ').length === 2 &&
         chatProbe.backToNormal?.varMast === chatProbe.normal?.varMast &&
         chatProbe.backToNormal?.pref === '0' &&
+        /* 消息流是**同一棵 DOM**:切模式时它没被重造(否则 live region 会重播整段) */
+        chatProbe.layers?.stamped === true &&
+        chatProbe.layers?.stampKept === true &&
+        chatProbe.layers?.stampAfterEsc === true &&
+        chatProbe.layers?.shellOverflow === 'clip' &&
+        /* "回到最新"在沉浸态里照样浮得出来,而且落在视口内 */
+        chatProbe.layers?.jump?.shown === true &&
+        chatProbe.layers?.jump?.inViewport === true &&
+        /* 撤销条不许压住输入区。它是一条**会吃掉点击**的浮条:
+           压住输入框中间时,点进去打字的那一下会触发"撤销"。
+           这条是量出来才发现的(见 Wave C 的 T6.12) */
+        chatProbe.toastVsCompose?.overlap === 0 &&
         chatProbe.rendered?.bubbles >= 3 &&
         chatProbe.rendered?.hasMemory === true &&
         chatProbe.rendered?.oldMemoryBlock === false &&

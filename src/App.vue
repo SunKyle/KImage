@@ -2823,6 +2823,7 @@ function createAssignCollection(title: string) {
         :key="pendingUndo.token"
         :label="pendingUndo.label"
         :duration="UNDO_MS"
+        :class="{ 'over-compose': page === 'chat' }"
         @undo="runUndo"
         @expire="commitUndo"
       />
