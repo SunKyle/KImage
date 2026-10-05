@@ -183,6 +183,14 @@ const stillMsg = computed(() => {
 })
 const stillId = computed(() => stillMsg.value?.photoId || '')
 
+/** 这一屏的背景是哪一档。它决定**取景方式**:专用背景图与剧照按"人在右"构的图,
+ *  而退回到人像时那张是居中的证件照式画面,得靠 CSS 把它推到右边去 */
+const bgKind = computed(() => {
+  if (props.backdrop) return 'backdrop'
+  if (stillId.value && imgUrl(stillId.value)) return 'still'
+  return 'face'
+})
+
 const bgSrc = computed(() => {
   const c = current.value
   if (!c) return ''
@@ -957,7 +965,12 @@ onBeforeUnmount(() => {
          正脸的字节本来就为头像取过一次(coverSrc 按 Blob 缓存),这里不新增请求、
          不新增调用;没有正脸(手填的角色、或图丢了)就只剩那层压暗色,
          不报错、不留空壳 -->
-    <div v-if="immersive && current" class="chat-bg" aria-hidden="true">
+    <div
+      v-if="immersive && current"
+      class="chat-bg"
+      :class="`is-${bgKind}`"
+      aria-hidden="true"
+    >
       <img v-if="bgSrc" :src="bgSrc" alt="" />
     </div>
 
@@ -3045,10 +3058,12 @@ onBeforeUnmount(() => {
   margin-inline: 0 auto;
   padding-left: clamp(16px, 7vw, 96px);
 }
-/* 工具层收走:模型/记忆药丸、⋮ 菜单、可点的换人入口。
-   **进出沉浸那枚按钮留着** —— 它是出口,而藏起出口的全屏模式是把用户关在里面 */
+/* 工具层收走:模型/记忆药丸、可点的换人入口。
+   **留着的两样**:
+   - 进出沉浸那枚按钮 —— 它是出口,而藏起出口的全屏模式是把用户关在里面;
+   - **⋮ 菜单** —— 参考图右上角那枚就是它,而且"重画这一场的背景"没有别处可去。
+     (第一版把它一起藏了,于是那条入口永远点不到 —— 用户报"没有换背景的按钮啊") */
 .chat.is-immersive .head-chip,
-.chat.is-immersive .chat-menu-wrap,
 .chat.is-immersive .head-pick {
   display: none;
 }
@@ -3181,6 +3196,9 @@ onBeforeUnmount(() => {
   width: 100%;
   height: 100%;
   object-fit: cover;
+  /* 裁切时偏向右边取景:这一页的构图是"字在左、人在右",
+     而图比容器宽时(横图常见)取哪一块由它决定 */
+  object-position: 68% center;
   transform: scale(1.02);
   /* **不再大虚化**。第一版是 blur(34px),那是为了"字压在上面能读" ——
      可它同时把"这一场戏"整个糊没了,而这一页的全部意思就在那张图上
@@ -3193,6 +3211,14 @@ onBeforeUnmount(() => {
 /* 压暗蒙版。**对比度是硬约束,不是审美**(设计稿 §4):
    正文压在这上面也要满足小字可读,所以这一层给得很重 ——
    正脸只在顶部中间透出来一点 */
+/* 退回到**人像**(首图/底图)时,那张是竖构图、人脸在正中的证件照式画面 ——
+   铺满屏幕会是一张大脸怼在中间,而左边那道蒙版正好压在人身上。
+   把它整张往右推、并放大一档(放大是为了不露出左边缘的空当)。
+   专用背景图与剧照不走这一条:它们本来就按"人在右"构的图 */
+.chat-bg.is-face img {
+  transform: translateX(13%) scale(1.24);
+  object-position: 50% center;
+}
 .chat-bg::after {
   content: '';
   position: absolute;

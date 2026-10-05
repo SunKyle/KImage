@@ -2359,7 +2359,10 @@ async function main() {
           /* 收窄成一列(普通骨架下是整块面板的宽) */
           colW: Math.round(document.querySelector('.chat-inner')?.getBoundingClientRect().width || 0),
           /* 工具层收走、身份留下、出口留着 */
-          menuHidden: !menu || getComputedStyle(menu).display === 'none',
+          /* ⋮ **在沉浸态必须还在**:参考图右上角那枚就是它,而且
+             "重画这一场的背景"只住在这里面(第一版把它一起藏了,
+             用户报"没有换背景的按钮啊") */
+          menuShown: !!menu && getComputedStyle(menu).display !== 'none',
           /* 最新那张剧照被提到背景上之后,流里不该再出现它 ——
              判据是"有几张 msg-photo",普通骨架下是 1 */
           stillInFlow: document.querySelectorAll('.chat-inner img.msg-photo').length > 0,
@@ -2403,6 +2406,27 @@ async function main() {
         height: 900,
         deviceScaleFactor: 1,
         mobile: false
+      })
+      await settle()
+
+      /* 右上角那枚 ⋮ 里有没有"重画背景"。**它在沉浸态是唯一入口** ——
+         藏了它就等于这个功能没有入口 */
+      chatProbe.backdropMenu = await evaluate(() => {
+        const b = document.querySelector('.chat-menu-wrap .icob')
+        if (!b) return { opened: false }
+        b.click()
+        return { opened: true }
+      })
+      /* **等一拍再读**:菜单是 v-if 挂上去的,点完这一拍它还没进 DOM */
+      await settle()
+      chatProbe.backdropMenu.items = await evaluate(() =>
+        [...document.querySelectorAll('.chat-menu button')].map((x) => (x.textContent || '').trim())
+      )
+      chatProbe.backdropMenu.hasNewBackground = chatProbe.backdropMenu.items.some((e) =>
+        /New background/i.test(e)
+      )
+      await evaluate(() => {
+        document.body.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }))
       })
       await settle()
 
@@ -2767,7 +2791,9 @@ async function main() {
         chatProbe.immersive?.colW <= 760 &&
         chatProbe.immersive?.colW < chatProbe.normal?.colW &&
         /* 工具层收走、身份留下、出口留着 */
-        chatProbe.immersive?.menuHidden === true &&
+        chatProbe.immersive?.menuShown === true &&
+        /* 点开它,里面得有"重画这一场的背景"那一条 */
+        chatProbe.backdropMenu?.hasNewBackground === true &&
         chatProbe.immersive?.soloShown === true &&
         chatProbe.immersive?.pickHidden === true &&
         chatProbe.immersive?.exitBtn === true &&

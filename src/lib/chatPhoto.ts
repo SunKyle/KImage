@@ -392,7 +392,8 @@ export function planChatBackdrop(scene: string, anchor = ''): ChatPhotoPlan {
   layers.push([
     'camera',
     'the subject stands in the right third of the frame at a medium distance, ' +
-      'the left two thirds fall into shadow and stay uncluttered \u2014 words are read there'
+      'facing left into the empty half, the left two thirds of the frame fall into ' +
+      'shadow and stay uncluttered \u2014 words are read there, the camera is off to their left'
   ])
   layers.push(['lens', 'shallow depth of field, the room falling away behind them'])
   layers.push([
@@ -406,7 +407,8 @@ export function planChatBackdrop(scene: string, anchor = ''): ChatPhotoPlan {
   /* 负面约束垫在最末:它挡的正是"证件照"那套默认构图,再补上背景图独有的两条 */
   layers.push([
     'negative',
-    `${NEGATIVE}, no text, no watermark, no caption, no bright cluttered left side`
+    `${NEGATIVE}, no text, no watermark, no caption, no bright cluttered left side, ` +
+      'the subject is not centred and not on the left half of the frame'
   ])
   return {
     prompt: composeChatPrompt(layers),
