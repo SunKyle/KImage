@@ -1580,7 +1580,10 @@ onBeforeUnmount(() => {
   /* 明确的虚化 + 压暗:它要的是"那儿的光与色",不是一张能看清的照片。
      看清楚了反而会和气泡抢注意力 —— 而这一页要读的是字 */
   filter: blur(34px) saturate(1.08);
-  opacity: 0.55;
+  /* 2026-10-05:0.55 → 0.72。0.55 那一档在真机上"看不出来有背景"
+     (判据是 `document.querySelector('.chat-bg img').src` 有值 ——
+     图在,只是被蒙版盖没了)。气泡是不透明的,所以提高它不影响读字 */
+  opacity: 0.72;
 }
 /* 压暗蒙版。**对比度是硬约束,不是审美**(设计稿 §4):
    正文压在这上面也要满足小字可读,所以这一层给得很重 ——
@@ -1594,10 +1597,10 @@ onBeforeUnmount(() => {
      中间那一带基本被气泡盖着,可以让出更多画面 */
   background: linear-gradient(
     to bottom,
-    color-mix(in srgb, var(--bg) 78%, transparent) 0%,
-    color-mix(in srgb, var(--bg) 58%, transparent) 22%,
-    color-mix(in srgb, var(--bg) 62%, transparent) 70%,
-    color-mix(in srgb, var(--bg) 82%, transparent) 100%
+    color-mix(in srgb, var(--bg) 70%, transparent) 0%,
+    color-mix(in srgb, var(--bg) 42%, transparent) 22%,
+    color-mix(in srgb, var(--bg) 46%, transparent) 70%,
+    color-mix(in srgb, var(--bg) 74%, transparent) 100%
   );
 }
 /* 窄屏把虚化收小:手机上 GPU 那一档开销更敏感,而屏幕小、半径本来也不必那么大 */
