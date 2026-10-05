@@ -2186,6 +2186,24 @@ async function main() {
         window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))
       })
       await settle()
+      /* —— 进页面时落在哪一段 ——
+         这是左栏那条排序规则的**同一个规则**(见 lib/chatOrder):落点必须是
+         左栏第一行。夹具里置顶那个没有一句对话,所以这里落到的就是它 ——
+         这不是缺陷,是"置顶排在前面"的必然结果,而这一条断言把它钉住。
+         下面紧接着**显式选中"要测的那一段"**:这一份探针后面所有关于消息、
+         附图、记忆的断言讲的都是 Probe talker 那一段对话,不该被排序规则牵连。 */
+      chatProbe.landing = await evaluate(() => {
+        const first = document.querySelector('.chat-rail .rail-item')?.textContent || ''
+        const head = document.querySelector('.chat-head .head-name')?.textContent || ''
+        return { railFirst: /Probe pinned/.test(first), landedOn: head.trim(), pick: head.trim() }
+      })
+      await evaluate(() => {
+        const row = [...document.querySelectorAll('.chat-rail .rail-item')].find((r) =>
+          /Probe talker/.test(r.textContent || '')
+        )
+        row?.querySelector('button')?.click()
+      })
+      await settle()
       chatProbe.rendered = await evaluate(() => {
         const bubbles = document.querySelectorAll('.bubble, .msg, .chat-msg').length
         /* 配图必须**在文字之后**(垫在下面):比的是两者在气泡里的位置。
@@ -2363,8 +2381,10 @@ async function main() {
              "重画这一场的背景"只住在这里面(第一版把它一起藏了,
              用户报"没有换背景的按钮啊") */
           menuShown: !!menu && getComputedStyle(menu).display !== 'none',
-          /* 最新那张剧照被提到背景上之后,流里不该再出现它 ——
-             判据是"有几张 msg-photo",普通骨架下是 1 */
+          /* **它发过的图必须在流里**,沉浸态也一样 —— 那是这段对话的一部分。
+             曾经有过一条"最新那张已经铺在背景上,所以流里不再重复"的例外,
+             那是"背景图借的就是这张剧照"那会儿留下的;现在背景图是单独生成的
+             另一张,那条例外就没了理由(用户报"最后一张图在聊天记录里不显示") */
           stillInFlow: document.querySelectorAll('.chat-inner img.msg-photo').length > 0,
           /* 背景画的**必须是那张剧照**(它 720 宽),不是退回去的头像(640)。
              两条路画出来的都是图,只有宽度分得开 */
@@ -2436,8 +2456,14 @@ async function main() {
         /* 给消息流节点盖个戳:下面的模式切换如果把它整棵重造,
            这个属性就会跟着消失 —— 而重建 live region 会让读屏把整段重播一遍 */
         if (stream) stream.__probeStamp = 'kept'
-        /* 往上滚一点,"回到最新"那枚就该浮出来 */
-        if (stream) stream.scrollTop = 0
+        /* 往上滚一点,"回到最新"那枚就该浮出来。
+           **顺手补一次 scroll 事件**:布局刚变过(进沉浸态那一下)时,
+           `scrollTop = 0` 有可能本来就是 0 —— 那样不会触发 scroll,
+           而"贴不贴底"是那一次事件里算出来的,补一次才判得准 */
+        if (stream) {
+          stream.scrollTop = 0
+          stream.dispatchEvent(new Event('scroll'))
+        }
         return {
           stamped: stream?.__probeStamp === 'kept',
           /* 整页钉死靠的是 clip:hidden 会让 .shell 变成滚动容器,
@@ -2454,8 +2480,11 @@ async function main() {
           inViewport: !!j && j.getBoundingClientRect().top >= 0,
           /* 这一页现在**可能根本没有可滚的东西**(剧本排版比气泡短得多,
              八条消息在 900 高的视口里放得下)。那样的话"回到最新"不该出现才对 ——
-             所以判据是"有东西在下面 ⟺ 它出现",而不是"它必须出现" */
-          scrollable: !!stream && stream.scrollHeight > stream.clientHeight + 4
+             所以判据是"离底够远 ⟺ 它出现",而不是"它必须出现"。
+             **"够远"用的是那枚按钮自己的阈值**(FOLLOW_GAP = 80px):
+             只溢出十几像素时,界面算的是"还贴着底",那枚按钮本来就不该冒出来 ——
+             第一版拿"能不能滚"当判据,于是它红得莫名其妙 */
+          farFromBottom: !!stream && stream.scrollHeight - stream.clientHeight > 80
         }
       })
       chatProbe.layers.stampKept = await evaluate(
@@ -2763,6 +2792,9 @@ async function main() {
       chatProbe.passed =
         chatProbe.seeded === 8 &&
         /* 偏好开着,但首页的 chrome 照常(顶栏在) */
+        /* 落点 = 左栏第一行(与左栏共用同一条排序规则) */
+        chatProbe.landing?.railFirst === true &&
+        chatProbe.landing?.landedOn === 'Probe pinned' &&
         chatProbe.homeChrome?.mastVisible === true &&
         chatProbe.homeChrome?.pref === '1' &&
         /* 基线与沉浸态必须**真的不一样** —— 否则下面那几条断言全在恒真的地方打转 */
@@ -2797,8 +2829,8 @@ async function main() {
         chatProbe.immersive?.soloShown === true &&
         chatProbe.immersive?.pickHidden === true &&
         chatProbe.immersive?.exitBtn === true &&
-        /* 最新那张剧照被提到背景上之后,**不该在流里再出现一次** */
-        chatProbe.immersive?.stillInFlow === false &&
+        /* 它发过的图在沉浸态**照样在流里**(背景是另一张,不是这张) */
+        chatProbe.immersive?.stillInFlow === true &&
         /* 剧照优先那条路:背景得是那张 720 宽的戏,不是 640 宽的头像 */
         chatProbe.immersive?.bgW === 720 &&
         /* 且**真的把顶栏那份高度还给了面板** —— 比在视口高度上做文章稳:
@@ -2819,7 +2851,7 @@ async function main() {
         chatProbe.layers?.stampAfterEsc === true &&
         chatProbe.layers?.shellOverflow === 'clip' &&
         /* "回到最新":有东西在下面时它浮得出来、落在视口内;没有时它就不该在 */
-        chatProbe.layers?.jump?.shown === chatProbe.layers?.jump?.scrollable &&
+        chatProbe.layers?.jump?.shown === chatProbe.layers?.jump?.farFromBottom &&
         (chatProbe.layers?.jump?.shown === false || chatProbe.layers?.jump?.inViewport === true) &&
         /* 撤销条不许压住输入区。它是一条**会吃掉点击**的浮条:
            压住输入框中间时,点进去打字的那一下会触发"撤销"。

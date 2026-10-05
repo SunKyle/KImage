@@ -56,6 +56,10 @@ const chatSummary = ref<Record<string, ChatSummary>>({})
    左栏就会把它当成"从没聊过" —— 明明聊过,却显示 No messages yet 并排到最后。
    取法见 idb.ts 的 getLastChatLine,代价与消息条数无关 */
 const chatLast = ref<Record<string, ChatMessage>>({})
+/* 上面那份读到了没有。它比角色晚一步到,而左栏的排序与"进对话页挑哪一个"
+   都要用它 —— 没到就挑,只能按创建时间排,挑中的不是左栏第一行。
+   **失败也算问过了**(见下面的 finally):停在等待里的话,对话页会一直空着 */
+const chatLastReady = ref(false)
 /* 正在压记忆的角色。压缩是后台动作,但同一个角色不该叠两个 */
 const chatSummarizing = new Set<string>()
 /* "这段对话还作数吗"的代次。压缩是异步的,回来时得知道这期间它有没有被清掉 ——
@@ -146,15 +150,19 @@ async function writeImportedChat(charId: string, chat: ImportedChat) {
 
 async function loadChatLast() {
   const ids = deps.characters.value.map((c) => c.id)
-  if (!ids.length) return
-  const got = await getLastChatLine(ids)
-  if (!got.size) return
-  const next = { ...chatLast.value }
-  for (const [id, msg] of got) {
-    const known = next[id]
-    if (!known || known.createdAt < msg.createdAt) next[id] = msg
+  try {
+    if (!ids.length) return
+    const got = await getLastChatLine(ids)
+    if (!got.size) return
+    const next = { ...chatLast.value }
+    for (const [id, msg] of got) {
+      const known = next[id]
+      if (!known || known.createdAt < msg.createdAt) next[id] = msg
+    }
+    chatLast.value = next
+  } finally {
+    chatLastReady.value = true
   }
-  chatLast.value = next
 }
 
 /* 说完一句就地把左栏那行更新掉,不必整批重读 */
@@ -435,6 +443,7 @@ function clearChat(id: string) {
     chatHasMore,
     chatSummary,
     chatLast,
+    chatLastReady,
     chatBusy,
     chatControllers,
     bumpChatSeq,

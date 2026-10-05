@@ -31,6 +31,9 @@ import { isInside, layerOnEscape, trapTab } from '../lib/ui'
 import { growTextarea, vGrow } from '../lib/grow'
 /* "多久以前"那句话与服务端拼给角色的那句**同源**(见那份文件的 agoLabel) */
 import { agoLabel } from '../../server/chatTime.js'
+/* 左栏的顺序与"某个角色最后一句"的取法:与主界面进页面时的那一挑**共用同一份**
+   (见 lib/chatOrder 的说明) */
+import { lastMessageLookup, orderConversations } from '../lib/chatOrder'
 /* 显示层也要摘一次中段标签:**库里已有的老消息还带着它**
    (那一版服务端还没这道工序)。同一个纯函数,两端同一个判据 */
 import { parsePhotoIntent, stripStandaloneTags } from '../../server/chatTags.js'
@@ -207,27 +210,16 @@ const bgSrc = computed(() => {
 })
 
 /* 最近活跃在前:**置顶的永远在最前**,其余按最后一条消息的时间排,
-   没聊过的排在后面(按创建时间)。顺序是派生的,不落盘 ——
-   与 charStats / charWorks 同一条规矩;而"置顶"恰恰是派生不出来的那份意愿,
-   所以它存在角色身上(Character.pinned),这里只把它当第一个排序关键字。
-   注意列的是**全部**角色,不是"聊过的那些":只列聊过的,新角色就永远开不了头 */
-/* 某个角色最后一句。**内存里那份优先,库里那份兜底** ——
-   内存里的更新(刚说完的话就在里面),而 lastMsg 是给没打开过的角色用的:
-   消息按角色懒加载,不补这一路的话它们在左栏一律显示 No messages yet */
-function lastOf(id: string): ChatMessage | undefined {
-  const list = props.messages[id]
-  if (list && list.length) return list[list.length - 1]
-  return props.lastMsg[id]
-}
-
-const ordered = computed(() =>
-  [...props.characters].sort(
-    (a, b) =>
-      Number(!!b.pinned) - Number(!!a.pinned) ||
-      (lastOf(b.id)?.createdAt || 0) - (lastOf(a.id)?.createdAt || 0) ||
-      b.createdAt - a.createdAt
-  )
+   没聊过的排在后面(按创建时间)。注意列的是**全部**角色,不是"聊过的那些":
+   只列聊过的,新角色就永远开不了头。
+   规则本身在 lib/chatOrder —— 主界面进对话页替用户挑一个时问的是同一件事,
+   两处各排一遍的话,刷新之后选中的那行就不是第一行(见那份文件的说明) */
+const lastOf = lastMessageLookup(
+  () => props.messages,
+  () => props.lastMsg
 )
+
+const ordered = computed(() => orderConversations(props.characters, lastOf))
 
 /** 左栏那一行摘要:最后一句说了什么 */
 function lastLine(c: Character): string {
@@ -1355,14 +1347,17 @@ onBeforeUnmount(() => {
                 </div>
                 <!-- 角色发来的图。**也在气泡外面**,垫在它说的话下面:
                      先读它说什么,再看它给你看什么。还没有 photoId = 正在画,
-                     占一个同尺寸的方骨架位,免得图到了把整段对话顶下去 -->
+                     占一个同尺寸的方骨架位,免得图到了把整段对话顶下去。
+
+                     **沉浸态也照常显示**。曾经有一条"最新那张已经在背景上了,
+                     所以流里不再重复"的例外 —— 那是"背景图就借这张剧照"那会儿
+                     留下的。现在背景图是**单独生成、单独存**的另一张(见
+                     doc/沉浸式对话页面设计.md §4),那条例外就没有理由了:
+                     它发过的图是**这段对话的一部分**,不该因为换了个骨架就消失。
+                     (只有"还没有专用背景图、暂借这张剧照铺底"的那一档会看到
+                     同一张图出现两次 —— 那是过渡状态,不是丢掉消息的理由) -->
                 <button
-                  v-if="
-                    r.msg.role === 'assistant' &&
-                    r.msg.photoId &&
-                    imgUrl(r.msg.photoId) &&
-                    !(immersive && r.msg.photoId === stillId)
-                  "
+                  v-if="r.msg.role === 'assistant' && r.msg.photoId && imgUrl(r.msg.photoId)"
                   type="button"
                   class="msg-img-btn"
                   :aria-label="`Open the photo from ${current.name}`"
@@ -1400,15 +1395,9 @@ onBeforeUnmount(() => {
                     Try again
                   </button>
                 </div>
-                <!-- 正在画的那张占一个骨架位。**已经在背景上的那张不占** ——
-                     它走的是上面那条被沉浸态收掉的分支,而这一支如果没有同一个
-                     判断,就会在原地留下一个空白的方块(截图里就是这么发现的) -->
+                <!-- 正在画的那张占一个骨架位(它还没有 photoId,只能落在这里) -->
                 <span
-                  v-else-if="
-                    r.msg.role === 'assistant' &&
-                    r.msg.photo &&
-                    !(immersive && r.msg.photoId === stillId)
-                  "
+                  v-else-if="r.msg.role === 'assistant' && r.msg.photo"
                   class="msg-photo msg-photo-skel"
                   aria-hidden="true"
                 ></span>
@@ -3191,6 +3180,20 @@ onBeforeUnmount(() => {
   overflow: hidden;
   /* 它只是背景:绝不能接走指针事件(消息流在它上面要能滚、能点) */
   pointer-events: none;
+  /* —— 让位的力道收在**一个旋钮**上 ——
+     这一层到今天已经调过四轮(见设计稿 §4),每一轮都在两条渐变里改六个数;
+     而"白不白"与"字读不读得出来"本来就是同一个数的两端,拆成六个数只会
+     每次都得重新配平。现在形状定死在下面,轻重只动这一个。
+     用户 2026-10-05 的原话:"只是感觉蒙了一层白白的" */
+  --veil: .78;
+  /* 白压到哪为止:**跟着文本那一栏走,不跟着视口走**。
+     视口百分比在宽屏上会把白糊到人身上,在 900px 那种窗口上又盖不住行尾 ——
+     而"字占多宽"是算得出来的:shell 的内边距 + 栏宽(见 App.vue 的 .shell-wide
+     与这里的 --immersive-col)。
+     后半截那个 50vw 是给**超宽屏**留的:那里 shell 会居中,文本整体右移,
+     而居中量恰好不超过半屏 —— 于是两者取大,一次覆盖两种情形。
+     再往右留 150px 过渡,让人物那一侧干干净净地透出来 */
+  --veil-w: max(calc(var(--sp-4, 16px) + var(--immersive-col, 660px)), 50vw);
 }
 .chat-bg img {
   width: 100%;
@@ -3200,17 +3203,18 @@ onBeforeUnmount(() => {
      而图比容器宽时(横图常见)取哪一块由它决定 */
   object-position: 68% center;
   transform: scale(1.02);
-  /* **不再大虚化**。第一版是 blur(34px),那是为了"字压在上面能读" ——
-     可它同时把"这一场戏"整个糊没了,而这一页的全部意思就在那张图上
-     (用户的话:"和我给的第二张参考图完全不一样")。
-     参考图的做法不是虚化,是**构图与蒙版**:画面锐利,靠左半边压暗让出字。
-     下面那层蒙版就是干这个的 */
-  filter: blur(2px) saturate(1.04);
+  /* **一点模糊都不加**(2026-10-05,用户报"很模糊")。
+     那 2px 是第一版"大虚化"退下来的残余:当时基础是 blur(34px),留 2px
+     是为了把"借来的剧照"垫软一点。而背景图现在是**为这一页专门生成的**,
+     构图与景深都写在提示词里 —— 再垫一层只是把细节抹掉,可读性一点没多
+     (让位归下面那层蒙版)。
+     顺带说清"糊"的真正来源,免得下一次又怪到这一层:**是放大**。
+     生成出来的是 1.5～2M 像素,而要铺满的是一块 2 倍屏(约 4M 设备像素),
+     浏览器把它拉了 1.5～1.8 倍 —— 这个只有"向上游要更大的一档"能补,
+     CSS 补不了(见 useGeneration 的 generateChatBackdrop) */
+  filter: saturate(1.04);
   opacity: 1;
 }
-/* 压暗蒙版。**对比度是硬约束,不是审美**(设计稿 §4):
-   正文压在这上面也要满足小字可读,所以这一层给得很重 ——
-   正脸只在顶部中间透出来一点 */
 /* 退回到**人像**(首图/底图)时,那张是竖构图、人脸在正中的证件照式画面 ——
    铺满屏幕会是一张大脸怼在中间,而左边那道蒙版正好压在人身上。
    把它整张往右推、并放大一档(放大是为了不露出左边缘的空当)。
@@ -3219,37 +3223,43 @@ onBeforeUnmount(() => {
   transform: translateX(13%) scale(1.24);
   object-position: 50% center;
 }
+/* 让位的那一层。**对比度是硬约束,不是审美**(设计稿 §4):
+   正文压在这上面也要满足小字可读 —— 所以它不能没有。
+   但"不能没有"与"给得很重"是两件事:重了就是给整张图蒙一层白
+   (用户 2026-10-05:"只是感觉蒙了一层白白的")。
+   现在的做法是**把白约束在字所占的那一条上**,而不是整体减淡 */
 .chat-bg::after {
   content: '';
   position: absolute;
   inset: 0;
-  /* 上重、中轻、下重 —— 因为**压在背景上的那几行字在哪**:
-     顶部是角色名(这一页最先要认出来的东西),底部是输入区那一块提示,
-     中间那一带基本被气泡盖着,可以让出更多画面 */
-  /* 横向:左边重(字在那儿)、右边几乎透明(人那儿) —— 这是参考图的可读性来源;
-     纵向:顶部与底部各压一档,给角色名与输入区那两行字兜底 */
+  /* 整层的轻重由 --veil 一个数管(见 .chat-bg 那段) */
+  opacity: var(--veil);
+  /* 横向:**白只压在字那一条上**,到文本栏右边线就开始散,再 150px 之后
+     一点都不剩 —— 人物在右三分之一,那里现在是干净的。
+     从前那版是视口百分比(92/68/12/0),于是宽屏上人物的位置正好落在
+     12～30% 那一档白里(用户:"蒙了一层白白的")。
+     纵向:上、下各一道,只给顶部那行名字与底部输入区兜底,幅度比原来收了一半 ——
+     它们横跨整幅,压得重就等于给整张图蒙一层白 */
   background:
     linear-gradient(
       90deg,
-      color-mix(in srgb, var(--bg) 92%, transparent) 0%,
-      color-mix(in srgb, var(--bg) 68%, transparent) 34%,
-      color-mix(in srgb, var(--bg) 12%, transparent) 76%,
-      transparent 100%
+      var(--bg) 0,
+      color-mix(in srgb, var(--bg) 84%, transparent) calc(var(--veil-w) * 0.5),
+      color-mix(in srgb, var(--bg) 36%, transparent) var(--veil-w),
+      transparent calc(var(--veil-w) + 150px)
     ),
     linear-gradient(
       to bottom,
-      color-mix(in srgb, var(--bg) 58%, transparent) 0%,
-      transparent 20%,
-      transparent 76%,
-      color-mix(in srgb, var(--bg) 66%, transparent) 100%
+      color-mix(in srgb, var(--bg) 44%, transparent) 0,
+      transparent 13%,
+      transparent 87%,
+      color-mix(in srgb, var(--bg) 48%, transparent) 100%
     );
 }
-/* 窄屏把虚化收小:手机上 GPU 那一档开销更敏感,而屏幕小、半径本来也不必那么大 */
-@media (max-width: 720px) {
-  .chat-bg img {
-    filter: blur(22px) saturate(1.05);
-  }
-}
+/* 窄屏那条 `blur(22px)` 已经删掉。它写于"基础就是 blur(34px)"那一版,
+   本意是"窄屏收小一档";而基础降到 2px 之后,它变成了**放大 11 倍** ——
+   于是任何 ≤720px 的窗口里背景都是糊的,而那条路正是手机上唯一的路。
+   留着它还会让人以为"手机上的糊是故意的" */
 /* 沉浸态里那两层网格子项要压在背景之上 */
 .chat.is-immersive .chat-rail,
 .chat.is-immersive .chat-main {

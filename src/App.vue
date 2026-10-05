@@ -75,6 +75,8 @@ import {
 import { titleFromPrompt } from './lib/text'
 import { stopSpeaking } from './lib/speech'
 import { contextText } from './lib/chatContext'
+/* 对话左栏的顺序:进对话页替用户挑一个时,与 ChatPage 铺左栏时用的是同一份规则 */
+import { lastMessageLookup, orderConversations } from './lib/chatOrder'
 /* 打字节奏:上游吐字是匀速的,而匀速正是机器感最直接的来源(见那份文件的四条纪律) */
 import { Pacer } from './lib/typing'
 import { NAV_ITEMS } from './lib/nav'
@@ -314,6 +316,7 @@ const {
   chatHasMore,
   chatSummary,
   chatLast,
+  chatLastReady,
   chatBusy,
   chatControllers,
   bumpChatSeq,
@@ -1502,6 +1505,15 @@ watch(activeCharId, (id) => loadCharViews(id))
  * 所以可以放心在角色列表变化时整批重读。**只往后合并,不整体替换** ——
  * 刚说完的那一句比库里读出来的新,不能被盖回去。
  */
+/* 左栏第一行是谁,与 ChatPage 用的是同一份规则(见 lib/chatOrder)。
+   从前这里取 characters[0] —— 那是**数组顺序**,也就是角色页那条"最近建的在前"。
+   于是刷新之后进对话页,选中的是最近造的那个,而不是左栏顶上那个最近聊过的:
+   明明第一行写着 A,打开的却是没人说过的 B */
+const lastChatOf = lastMessageLookup(
+  () => chatMessages.value,
+  () => chatLast.value
+)
+
 // 进对话页时确保手上有一个角色
 watch(page, (p) => {
   if (p === 'chat') ensureChatChar()
@@ -1509,8 +1521,17 @@ watch(page, (p) => {
 
 function ensureChatChar() {
   if (chatCharId.value && characters.value.some((c) => c.id === chatCharId.value)) return
-  chatCharId.value = characters.value[0]?.id || ''
+  /* "最后一句"还没读到之前不挑:那时能用的只剩创建时间,排出来的第一行是假的。
+     晚一步的 loadChatLast 到了会回头再挑一次(见下面的 watch) */
+  if (!chatLastReady.value) return
+  chatCharId.value = orderConversations(characters.value, lastChatOf)[0]?.id || ''
 }
+
+/* 上面那份数据到位时补挑一次。它在启动时总会被问一次(见 onMounted 的
+   loadChatLast),所以这一挑不会落空 —— 只是比角色晚一拍 */
+watch(chatLastReady, (ready) => {
+  if (ready && page.value === 'chat') ensureChatChar()
+})
 
 /** 从别处进对话页:带上要看的那个人(角色详情页的入口走这里) */
 function openChat(charId: string) {

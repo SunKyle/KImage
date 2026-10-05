@@ -17,6 +17,7 @@ import {
 } from '../api'
 import { REF_ARCHIVE_EDGE, REF_IMAGE_EDGE } from '../lib/payload'
 import {
+  backdropViewOrder,
   characterAnchor,
   chatPhotoSize,
   planChatBackdrop,
@@ -508,7 +509,7 @@ function undoEnhance() {
     try {
       let refList: string[] = []
       try {
-        refList = await deps.charRefSrcsOf(charId, shotViewOrder('third'))
+        refList = await deps.charRefSrcsOf(charId, backdropViewOrder())
       } catch {
         /* 参考图读不出来仍然照画（纯文生图），背景不像它总好过一片空 */
         refList = []

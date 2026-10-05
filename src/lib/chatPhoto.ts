@@ -384,18 +384,30 @@ export function planChatBackdrop(scene: string, anchor = ''): ChatPhotoPlan {
   if (!text) return { prompt: '', useRefs: false, shot: 'scene', self: true, scene: '', layers: [] }
   const spec = inline(anchor)
   const layers: ChatLayer[] = [
-    ['medium', 'cinematic film still, wide landscape framing, made to sit behind text'],
+    /* 机位与**尺度**排在最前(顺序就是权重,见文件头)。
+       从前这一层只说了"横构图",人多大、多远全交给后面那层"medium distance" ——
+       而 medium distance 在摄影里就是半身景:一张大脸。加上场景串本身是从
+       "发给你的那张照片"里抄来的("me in the back seat"),它自带"镜头就在脸前"
+       的语境,两句一凑,交上来的就是那张大脸(**实测反馈**:人占比太大、而且在正中)。
+       所以这一层必须把"广"写死:整个地方在画面里,人在画面里是小的 */
+    [
+      'medium',
+      'cinematic film still, wide landscape framing of the whole place, ' +
+        'the person small in the frame, camera set back across the room, made to sit behind text'
+    ],
     ['scene', text]
   ]
   /* 锚点句垫在场景之后:它是"这个人是谁"的约束,不是这一张的内容 */
   if (spec) layers.push(['anchor', spec])
   layers.push([
     'camera',
-    'the subject stands in the right third of the frame at a medium distance, ' +
-      'facing left into the empty half, the left two thirds of the frame fall into ' +
-      'shadow and stay uncluttered \u2014 words are read there, the camera is off to their left'
+    'the person is small \u2014 full figure, at most a third of the frame height \u2014 ' +
+      'standing or sitting in the right third, seen from several metres away, facing left ' +
+      'into the empty half; the left two thirds of the frame fall into shadow and stay ' +
+      'uncluttered \u2014 words are read there'
   ])
-  layers.push(['lens', 'shallow depth of field, the room falling away behind them'])
+  /* 深焦,不是浅景深:这一页要的是"这一场戏",而把房间虚掉就等于把戏虚掉了 */
+  layers.push(['lens', 'deep focus, the place reading all the way to the back wall'])
   layers.push([
     'light',
     'low natural light, the brightest part of the frame is on the right near the subject'
@@ -404,11 +416,15 @@ export function planChatBackdrop(scene: string, anchor = ''): ChatPhotoPlan {
     'env',
     'the place readable around them and deep enough to feel like a room, not a studio backdrop'
   ])
-  /* 负面约束垫在最末:它挡的正是"证件照"那套默认构图,再补上背景图独有的两条 */
+  /* 负面约束垫在最末:它挡的正是"证件照"那套默认构图。
+     背景图独有的几条里,**不许特写**是最要紧的一条 —— 少了它,场景里那句
+     "我在车后座"会把镜头一路拉到脸上(与第一层那句"人在画面里是小的"是一对) */
   layers.push([
     'negative',
     `${NEGATIVE}, no text, no watermark, no caption, no bright cluttered left side, ` +
-      'the subject is not centred and not on the left half of the frame'
+      'not a close-up, not a headshot, not a selfie, the face is not the subject of the ' +
+      'picture and does not fill the frame, the subject is not centred and not on the ' +
+      'left half of the frame'
   ])
   return {
     prompt: composeChatPrompt(layers),
@@ -464,6 +480,19 @@ export function shotRatio(shot: ChatShot): number {
 export function shotViewOrder(shot: ChatShot): string[] {
   if (shot === 'third') return ['full', 'front', 'detail', 'closeups', 'expression']
   return ['front', 'closeups', 'detail', 'full', 'expression']
+}
+
+/** 背景图拿哪几张设定图当参考。
+ *
+ *  **只留两张**:全身像打头(背景图里那个人是小的,交代身形与服装靠的就是它),
+ *  正脸跟一张管"还是同一个人"。刻意**不发 detail / closeups 那两张 2×2** ——
+ *  它们是头肩与面部的网格,四格里全是大脸:模型拿到这种参考,交上来的常常
+ *  就是一张大脸居中(与它同一条路上那两句提示词正面冲突)。
+ *
+ *  这不是"参考图越少越像"的问题:背景里那张脸只占几十像素,likeness 由锚点句
+ *  与这两张兜着已经够;而构图一旦跑偏,整张图就没法用了 */
+export function backdropViewOrder(): string[] {
+  return ['full', 'front']
 }
 
 /** 挑不出任何一档比例时的兜底:交给上游自己定 */

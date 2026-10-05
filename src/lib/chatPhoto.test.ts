@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   CHAT_PHOTO_PROMPT_CHARS,
+  backdropViewOrder,
   characterAnchor,
   chatPhotoSize,
   isSelfie,
@@ -10,6 +11,7 @@ import {
   shotViewOrder,
   planChatBackdrop
 } from './chatPhoto'
+import { CHARACTER_VIEWS } from '../api'
 
 /* 这一层现在管四件事:这张里有没有它本人、是自拍还是他拍、拼锚点句还是全量设定表、
    以及"只补不覆盖"的补全。四件事都是纯字符串处理,而真正的出图要花钱、要联网、
@@ -365,5 +367,57 @@ describe('planChatBackdrop · 对话背景图', () => {
   it('没有场景就不出提示词 —— 一张没有场景的人像当背景不如用它的剧照', () => {
     expect(planChatBackdrop('').prompt).toBe('')
     expect(planChatBackdrop('   ').prompt).toBe('')
+  })
+
+  /* 实测反馈:"人物占比太大了,并且在正中间,和效果图差距太大"。
+     根子在两处 —— 尺度没写死(那句 medium distance 在摄影里就是半身景),
+     而负面约束里**一条"不许特写"都没有**,偏偏场景串常常写着"我在车后座"。
+     下面几条盯的就是这两处,别让它们再退回去 */
+  it('人在画面里是**小的**:尺度写在最前一层,而不是埋在机位那句里', () => {
+    const p = planChatBackdrop('me in the back seat of the car')
+    const [first] = p.layers
+    expect(first[0]).toBe('medium')
+    expect(first[1]).toMatch(/wide landscape/i)
+    expect(first[1]).toMatch(/small in the frame/i)
+    /* 顺序就是权重:这一层必须排在场景之前 —— 场景自带"镜头就在脸前"的语境 */
+    expect(p.layers.findIndex(([k]) => k === 'medium')).toBe(0)
+    expect(p.layers.findIndex(([k]) => k === 'scene')).toBeGreaterThan(0)
+  })
+
+  it('不许特写、不许大脸:negative 里那几条必须都在', () => {
+    const p = planChatBackdrop('me in the back seat of the car')
+    expect(p.prompt).toMatch(/not a close-up/i)
+    expect(p.prompt).toMatch(/not a headshot/i)
+    expect(p.prompt).toMatch(/not a selfie/i)
+    expect(p.prompt).toMatch(/does not fill the frame/i)
+  })
+
+  it('不再写 "medium distance" —— 那句话正是半身景的来源', () => {
+    expect(planChatBackdrop('at a rooftop bar').prompt).not.toMatch(/medium distance/i)
+  })
+
+  it('深焦:把房间虚掉就是把"这一场戏"虚掉了', () => {
+    const p = planChatBackdrop('at a rooftop bar')
+    expect(p.prompt).toMatch(/deep focus/i)
+    expect(p.prompt).not.toMatch(/shallow depth of field/i)
+  })
+})
+
+/* 背景图发哪几张设定图当参考。detail / closeups 是头肩与面部的 2×2 网格 ——
+   四格里全是大脸,模型会跟着把镜头拉到脸上。这几条盯的是"别再把它们发出去" */
+describe('backdropViewOrder · 背景图的参考图', () => {
+  it('全身像打头、正脸跟上 —— 这两张管"还是同一个人"与身形', () => {
+    expect(backdropViewOrder()).toEqual(['full', 'front'])
+  })
+
+  it('不发那两张 2×2 的面部网格', () => {
+    const order = backdropViewOrder()
+    expect(order).not.toContain('detail')
+    expect(order).not.toContain('closeups')
+  })
+
+  it('每张都在已知视图清单里 —— 写错一个键不会报错,只会静静少一张参考图', () => {
+    const known = CHARACTER_VIEWS.map((v) => v.kind as string)
+    for (const kind of backdropViewOrder()) expect(known).toContain(kind)
   })
 })
