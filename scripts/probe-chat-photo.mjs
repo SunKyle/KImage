@@ -252,6 +252,26 @@ async function main() {
     out = await readChat(r)
     ok('正文中间的分行留着', out.text === 'First line.\nSecond line.', JSON.stringify(out.text))
 
+    /* —— 用例 1c：标签被正文顶到中间 ——
+       模型先说一句、再决定给你看张图、然后又补一句收尾的话。splitTags 只认末尾
+       (那是为了不误吃正文里的方括号),所以这一枚原来会**原样流给用户看** ——
+       用户在聊天框里看见一行 `[photo:self:…]`。现在由 stripStandaloneTags 摘掉,
+       意图照样报上来(图还是要发的) */
+    console.log('\n用例 1c · 中段那枚标签不许露给用户')
+    chatReply =
+      '等下等下,这个状态你也想看呀?\n\n[photo:self:me in the car, tired but grinning]\n\n怎么样,值不值得等这么久诶?\n[mood:tired]'
+    r = await post(APP_PORT, '/api/chat', { ...cfg, messages: [{ role: 'user', content: 'hi' }] })
+    out = await readChat(r)
+    ok('正文里没有标签残留', !/\[\s*(photo|mood)/i.test(out.text), JSON.stringify(out.text))
+    ok(
+      '中段那个换行/空行也没留下一堆空行',
+      out.text === '等下等下,这个状态你也想看呀?\n\n怎么样,值不值得等这么久诶?',
+      JSON.stringify(out.text)
+    )
+    ok('意图照样报上来(图还是要发的)', out.done?.photo === 'me in the car, tired but grinning', String(out.done?.photo))
+    ok('self: 也认出来了', out.done?.photoSelf === true)
+    ok('末尾那枚 mood 照旧', out.done?.mood === 'tired', String(out.done?.mood))
+
     /* —— 用例 2：接近上限的长场景 —— */
     console.log('\n用例 2 · 长场景（' + SCENE_FULL.length + ' 字）')
     chatReply = `Look at this.\n[photo:${SCENE_FULL}]\n[mood:warm]`
@@ -390,6 +410,10 @@ async function main() {
        现在改成"大多数消息里没有图,这是正常的",连贯性收成描述规则末尾
        的一个从句(断言跟着改成新措辞) */
     ok(
+      '规则里点明"标签必须在最后、后面不许再有话"',
+      systemOf().includes('Nothing may come after it')
+    )
+    ok(
       '规则里带着"接话题"与"照片别滥用"',
       systemOf().includes('it is on you to carry it') &&
         systemOf().includes('Most of your messages have no picture in them') &&
@@ -416,7 +440,12 @@ async function main() {
   } finally {
     app.kill()
     upstream.close()
-    await once(app, 'exit').catch(() => {})
+    /* **先看它是不是已经退了**:`once` 等的是"将来"那次 exit ——
+       子进程要是早就崩了,这一个 await 永远不 resolve,而那时事件循环里
+       已经一个句柄都不剩,Node 于是**静静地退出**,退出码还是 0:
+       探针只打了一行标题就没了,连 stderr 都来不及打。
+       (这个坑是排查"服务端起不来"时踩的,花了比修 bug 更久的时间) */
+    if (app.exitCode === null) await once(app, 'exit').catch(() => {})
     if (appErr.length) console.log('\n[服务端 stderr]\n' + appErr.join('').slice(0, 2000))
   }
 

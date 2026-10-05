@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { PHOTO_SCENE_CHARS, cleanScene, splitTags, tailHold } from '../../server/chatTags.js'
+import {
+  PHOTO_SCENE_CHARS,
+  cleanScene,
+  splitTags,
+  stripStandaloneTags,
+  tailHold
+} from '../../server/chatTags.js'
 
 /* 这些用例都是"会漏给用户看"的那几类:
    标签没剪干净、半截标签闪出来、自由文本没收敛。 */
@@ -296,5 +302,60 @@ describe('tailHold · 放到哪才不漏半截标签', () => {
       }
     }
     for (const f of frames) expect(f).not.toMatch(/\[(p|ph|pho|m|mo|moo)/)
+  })
+})
+
+/* 中段那枚标签:模型先说一句、再决定给你看张图、然后又补一句收尾的话 ——
+   于是 `[photo:…]` 落在正文中间,而 splitTags 只认末尾(那是为了不误吃
+   正文里的方括号)。用户看到的就是聊天框里明晃晃一行 `[photo:self:…]`。 */
+describe('stripStandaloneTags · 摘掉"独占一行的"标签(不限于末尾)', () => {
+  it('正文中间那枚被摘掉,意图照样取出来', () => {
+    const r = stripStandaloneTags(
+      '等下等下,我这个状态你也想看呀?\n\n[photo:self:me in the car, tired but grinning]\n\n怎么样,值不值得你等这么久诶?',
+      'Tian'
+    )
+    expect(r.text).toBe('等下等下,我这个状态你也想看呀?\n\n怎么样,值不值得你等这么久诶?')
+    expect(r.photo).toBe('me in the car, tired but grinning')
+    expect(r.photoSelf).toBe(true)
+  })
+
+  it('连着两枚也认(photo + mood)', () => {
+    const r = stripStandaloneTags('先说一句。\n[photo:rain on the window]\n[mood:tired]\n再说一句。')
+    expect(r.text).toBe('先说一句。\n再说一句。')
+    expect(r.photo).toBe('rain on the window')
+    expect(r.photoSelf).toBe(false)
+    expect(r.mood).toBe('tired')
+  })
+
+  it('同一类出现两次时取第一枚 —— 它就是这一轮想说的事', () => {
+    const r = stripStandaloneTags('[photo:first scene]\n中间\n[photo:second scene]')
+    expect(r.photo).toBe('first scene')
+  })
+
+  it('**夹在句子里的方括号一律不碰** —— 那是正文', () => {
+    for (const t of [
+      '我说[photo:x]这个词,你别多想。',
+      '他说的[注]在这里。',
+      'notes [1] and [2] here'
+    ]) {
+      expect(stripStandaloneTags(t).text).toBe(t)
+    }
+  })
+
+  it('半截标签不动(它这一块还没写完,由流式那一层扣着)', () => {
+    const t = '先说一句。\n[photo:tired'
+    expect(stripStandaloneTags(t).text).toBe(t)
+  })
+
+  it('摘掉之后剩下的空行收一收,但不碰没有标签的正文', () => {
+    expect(stripStandaloneTags('一段。\n\n[photo:x]\n\n另一段。').text).toBe('一段。\n\n另一段。')
+    const plain = '一段。\n\n\n\n另一段。'
+    expect(stripStandaloneTags(plain).text).toBe(plain)
+  })
+
+  it('标签后面只跟标点也认(模型偶尔写得随意)', () => {
+    const r = stripStandaloneTags('你好。\n[photo:me on the balcony].\n再见。')
+    expect(r.text).toBe('你好。\n再见。')
+    expect(r.photo).toBe('me on the balcony')
   })
 })

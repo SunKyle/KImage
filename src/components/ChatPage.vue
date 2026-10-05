@@ -31,6 +31,9 @@ import { isInside, layerOnEscape, trapTab } from '../lib/ui'
 import { growTextarea, vGrow } from '../lib/grow'
 /* "多久以前"那句话与服务端拼给角色的那句**同源**(见那份文件的 agoLabel) */
 import { agoLabel } from '../../server/chatTime.js'
+/* 显示层也要摘一次中段标签:**库里已有的老消息还带着它**
+   (那一版服务端还没这道工序)。同一个纯函数,两端同一个判据 */
+import { stripStandaloneTags } from '../../server/chatTags.js'
 import { speak, speechSupported, speakingId, speakingLoading, stopSpeaking, warmUpSpeech } from '../lib/speech'
 
 /* 角色对话页。它是一个平级页面(见 lib/nav.ts),不是浮层 ——
@@ -340,7 +343,10 @@ const rows = computed<Row[]>(() => {
  *  这只是"显示出来的样子":末尾的空白不是它说的话。
  *  两个角色一视同仁 —— 自己打的字末尾多一行空行同样不该显示。 */
 function shownText(m: ChatMessage): string {
-  return m.content.trimEnd()
+  /* 先摘中段那几枚独占一行的标签(修在服务端之前生成的消息还带着它),
+     再收掉末尾的空白。两件事都是"显示出来的样子":库里的正文一个字不改 ——
+     摘掉标签不该把历史消息的字节也改了,那是另一次决定 */
+  return stripStandaloneTags(m.content).text.trimEnd()
 }
 
 /** 光标挂在正在说的那一条上。它同时说明"这会儿还在往下写" */

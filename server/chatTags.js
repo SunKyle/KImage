@@ -108,6 +108,58 @@ export function parsePhotoIntent(raw, charName = '') {
   return { scene, self: self || named }
 }
 
+/**
+ * 把**独占一行的**标签摘出来（不限于末尾）。
+ *
+ * —— 为什么还需要它 ——
+ *
+ * `splitTags` 只认**末尾**那一枚，那是为了不误吃正文里的方括号（`[注]`、`[1]`）。
+ * 但模型并不总把标签写在最后：它会先写一句、再决定给你看张图、然后又补一句
+ * 收尾的话 —— 于是那枚 `[photo:…]` 落在**中间**，`splitTags` 够不着，
+ * 它会原样流给用户看（用户的原话是"为什么会有这种生成对话记录"）。
+ *
+ * 判据很窄，所以不会误伤：**这一行除了这枚标签什么都没有**。
+ * 夹在句子中间、或者行里还有别的话的方括号，一律不碰（那是正文）。
+ *
+ * 与末尾那条路的分工：末尾的标签尾巴会被 `tailHold` 扣住、由 `splitTags` 收走，
+ * 走不到这里；能走到这里的就是"被正文顶到中间去"的那几枚。
+ *
+ * @returns text 摘干净之后的正文；photo / mood 是顺手取出来的意图（没有就是空串）。
+ *          同一类标签出现多次时**取第一枚** —— 它就是这一轮想说的事。
+ */
+export function stripStandaloneTags(s, charName = '') {
+  const lines = String(s || '').split('\n')
+  const kept = []
+  let photo = ''
+  let photoSelf = false
+  let mood = ''
+  let removed = false
+  for (const line of lines) {
+    const m = /^\[\s*(photo|mood)\s*[:=]\s*([^[\]]*?)\s*\]\s*[.!?]?$/i.exec(line.trim())
+    if (!m) {
+      kept.push(line)
+      continue
+    }
+    const kind = m[1].toLowerCase()
+    if (kind === 'photo') {
+      if (!photo) {
+        const shot = parsePhotoIntent(m[2], charName)
+        photo = shot.scene
+        photoSelf = shot.self
+      }
+    } else if (!mood) {
+      mood = m[2].trim().toLowerCase()
+    }
+    /* 这一行整个吃掉 —— 连它那个换行一起（不然正文里会多出一行空白） */
+    removed = true
+  }
+  /* 标签常常是**空行包着**写的。抽掉那一行之后剩下连着的空行要收一收,
+     否则用户看到的是一段话、两个空行、再一段话(收成一段一处空行)。
+     没抽掉任何东西时一个字都不动 —— 不借着这个机会去改别人的正文 */
+  const text = removed ? kept.join('\n').replace(/\n{3,}/g, '\n\n') : kept.join('\n')
+  return { text, photo, photoSelf, mood }
+}
+
 /* 一枚标签的**名字**。**必须与那两条正则认的前缀一致** ——
    放宽一处、这里不放宽,边界就会算错;收窄一处、这里不收窄,正文会被多扣一段。
    只写名字而不是整条正则:下面那个回溯是从末尾逐段剥,剥到哪一段不是标签就停 */

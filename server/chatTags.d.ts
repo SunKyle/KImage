@@ -11,6 +11,12 @@ export declare function parsePhotoIntent(
   raw: unknown,
   charName?: string
 ): { scene: string; self: boolean }
+/** 把**独占一行的**标签摘出来(不限于末尾)。末尾那些由 splitTags 收走,
+ *  这里管的是"被正文顶到中间去"的那几枚 */
+export declare function stripStandaloneTags(
+  s: unknown,
+  charName?: string
+): { text: string; photo: string; photoSelf: boolean; mood: string }
 export declare function splitTags(
   s: unknown,
   charName?: string

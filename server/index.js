@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto'
 import { lookup as dnsLookup } from 'node:dns/promises'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { ProxyAgent } from 'undici'
-import { splitTags, tailHold } from './chatTags.js'
+import { splitTags, stripStandaloneTags, tailHold } from './chatTags.js'
 import { timeContext } from './chatTime.js'
 import { ENHANCE_PROMPTS, ENHANCE_TEMPERATURE } from './enhancePrompts.js'
 
@@ -174,7 +174,7 @@ const CHAT_RULES = `Rules:
 - When they only send a word or two back ("ok", "haha", "yeah"), it is on you to carry it: say something of your own - what you are doing right now, or where the thing you were talking about left off. Do not answer a shrug with a shrug. If they are clearly trying to end the conversation, let them.
 - If you happen to know what time it is, or how long it has been since you two last spoke, mention it only when it is actually relevant. Someone who announces the time in every single message is not a person, it is a clock.
 - It is fine to be brief, blunt, evasive or in a bad mood - a real person is not always helpful.
-- Most of your messages have no picture in them, and that is normal. Send one only when the picture is the point of the message: they asked to see you, or something is happening right now that you would actually take a photo of. Being somewhere is not a reason by itself - do not attach one just because you can. When you do send one, put a photo tag on its own line at the very end: [photo:a description of the scene from your point of view]. Up to 400 characters, one line. If you are in the picture yourself, start that description with "self:" - for example [photo:self:me on the balcony, hair down]. Leave the prefix off when it is only what you are looking at, because a picture without it is generated without your reference sheet: a view stays a view. Never use the tag as a substitute for actually saying something. Do not comment on the tag or explain it.
+- Most of your messages have no picture in them, and that is normal. Send one only when the picture is the point of the message: they asked to see you, or something is happening right now that you would actually take a photo of. Being somewhere is not a reason by itself - do not attach one just because you can. When you do send one, put a photo tag on its own line at the very end, after everything else you have to say (the mood tag goes after it): [photo:a description of the scene from your point of view]. Nothing may come after it - if you have more to say, say it before the tag. Up to 400 characters, one line. If you are in the picture yourself, start that description with "self:" - for example [photo:self:me on the balcony, hair down]. Leave the prefix off when it is only what you are looking at, because a picture without it is generated without your reference sheet: a view stays a view. Never use the tag as a substitute for actually saying something. Do not comment on the tag or explain it.
 - That description is the only thing the picture is drawn from, and whoever draws it cannot see this conversation. So put in what only you know: what time it is and what the light is doing, the weather, what is around you, and what you are doing right now. "me on the balcony" is not enough; "self:me leaning on the balcony rail at dusk, the rain just stopped, streetlights coming on below, hair still wet" is. Write it as plain description, never as an instruction to a machine. Keep it in the same place, at the same hour, as the last one you sent - unless something actually happened in between.
 - After everything you say, put a mood tag on the very last line, in exactly this form: [mood:word]. One lowercase English word for how you feel as you send this message. Pick the word that actually fits, for example: arrogant, amused, wary, bored, angry, tired, warm, cold, proud, uneasy, delighted. Do not comment on the tag or explain it - just end with it.`
 
@@ -1279,16 +1279,27 @@ app.post('/api/chat', rateLimit, async (req, res) => {
      声明在 try 外面是有意的:中途 Stop 或上游断流时,那截尾巴也得放出去 ——
      否则用户按了停止,最后那二三十个字符会凭空消失 */
   let tail = ''
+  /* 中段那几枚标签取出来的意图(见下面循环里那一段)。末尾那几枚走 splitTags,
+     两处最后合在一起 —— 合的时候**末尾优先**:它更靠后,更接近"最后想给你看的那张" */
+  let midShot = { scene: '', self: false }
+  let midMood = ''
   /* 收尾那一下:把尾巴里该发的字发出去,该剪的标签剪下来返回给调用方。
      角色名要传进去:标签里没写 self: 时,"描述里点了自己的名字"也算它在画面里
      (见 chatTags.js 的 parsePhotoIntent) */
   const flushTail = () => {
-    const who = character && typeof character === 'object' ? character.name : ''
     const { text, mood, photo, photoSelf } = splitTags(tail, who)
     if (text) sendEvent({ delta: text })
     tail = ''
-    return { mood, photo, photoSelf }
+    return {
+      mood: mood || midMood,
+      photo: photo || midShot.scene,
+      photoSelf: photo ? photoSelf : midShot.self
+    }
   }
+
+  /* 角色名要传给两处标签处理:标签里没写 self: 时,"描述里点了自己的名字"
+     也算它在画面里(见 chatTags.js 的 parsePhotoIntent) */
+  const who = character && typeof character === 'object' ? character.name : ''
 
   let upstream = null
   let connectErr = null
@@ -1423,7 +1434,15 @@ app.post('/api/chat', rateLimit, async (req, res) => {
         tail += delta
         const release = tailHold(tail)
         if (release > 0) {
-          sendEvent({ delta: tail.slice(0, release) })
+          /* 放出去之前先摘掉**独占一行的标签**。
+             尾巴那几枚由 tailHold 扣着、收尾时由 splitTags 收走,走不到这里;
+             能走到这里的是"被正文顶到中间去"的那几枚 —— 模型先说一句、
+             再决定给你看张图、然后又补一句收尾的话。不摘的话那枚 `[photo:…]`
+             会原样流给用户看(用户报过这个)。意图照样记下来,收尾时一起报 */
+          const cut = stripStandaloneTags(tail.slice(0, release), who)
+          if (cut.text) sendEvent({ delta: cut.text })
+          if (cut.photo) midShot = { scene: cut.photo, self: cut.photoSelf }
+          if (cut.mood) midMood = cut.mood
           tail = tail.slice(release)
         }
       }
