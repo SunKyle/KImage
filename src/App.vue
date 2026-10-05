@@ -105,6 +105,13 @@ import {
 } from './lib/theme'
 /* 界面偏好(不是数据)。与主题同一类:不跨标签页同步,丢了不影响任何东西 */
 import { saveImmersive, savedImmersive } from './lib/prefs'
+/* 对话背景图:沉浸页铺满屏幕的那一张。**单独一张表**(见 idb.ts 的 BACKDROP_STORE) */
+import {
+  deleteChatBackdrop,
+  getChatBackdrop,
+  putChatBackdrop,
+  type ChatBackdrop
+} from './lib/idb'
 import type { ApiConfig, FavoritePayload, HistoryEntry, PromptItem, ResultItem, ReuseParams, Character, CharacterFields, CharacterPersona, CharacterViewKind, CharacterVoice, ChatMessage, ImportedCharacter } from './types'
 
 // —— 状态 ——
@@ -340,6 +347,93 @@ function toggleImmersive() {
   immersive.value = !immersive.value
   saveImmersive(immersive.value)
 }
+
+/* —— 对话背景图 ——
+   沉浸页铺满屏幕的那一张,**与设定图、参考图、消息里的图各存各的**
+   (用户特意交代过)。它按"当前这一场戏"画:戏换了就该换一张。
+
+   三条刻意的取舍:
+   - **进沉浸页时才画**(不是每次进对话页):那一页要它,别的时候不花这个钱;
+   - **一场戏只画一次**:记录里带着画它时用的那段场景,与当前这一场一致就直接用,
+     反复进出不会重复付费;
+   - **失败静默**:退回剧照/首图,下一次进沉浸页再试 —— 与记忆压缩同一条规矩
+     (它不该为一个背景弹一句技术错误)。用户手动点"重画"时才如实说原因 */
+const backdrops = ref<Record<string, ChatBackdrop>>({})
+const backdropBusy = ref<Record<string, boolean>>({})
+
+/** 当前这一场戏的描述:最后一条**已经画出来**的剧照写的那段场景。
+ *  与沉浸页头部那行、以及背景本身取自同一条消息(三处必须一致) */
+function currentScene(id: string): string {
+  const list = chatMessages.value[id] || []
+  for (let i = list.length - 1; i >= 0; i--) {
+    const m = list[i]
+    if (m.photoId && m.photo) return m.photo
+  }
+  return ''
+}
+
+/** 需要就画一张背景。`force` 是用户手动点的"重画这一场" */
+async function ensureBackdrop(id: string, force = false) {
+  if (!id) return
+  const scene = currentScene(id)
+  /* 没有戏可画就别画 —— 一张没有场景的人像当背景,不如用它的剧照/首图 */
+  if (!scene) return
+  const had = backdrops.value[id]
+  if (!force && had && had.scene === scene) return
+  if (backdropBusy.value[id]) return
+  if (!config.value?.baseUrl) return
+
+  backdropBusy.value = { ...backdropBusy.value, [id]: true }
+  try {
+    const out = await generateChatBackdrop(id, scene)
+    if (!out.blob) {
+      /* 静默(见上面那条),但用户手动要的那一次必须说清为什么没有 */
+      if (force) notice.value = out.error || 'Could not draw a background for this scene.'
+      return
+    }
+    /* 换掉旧的那张:它不再被界面引用,连同 objectURL 一起放掉 */
+    const stale = had?.blob
+    const rec: ChatBackdrop = { charId: id, scene, blob: out.blob, createdAt: Date.now() }
+    backdrops.value = { ...backdrops.value, [id]: rec }
+    await putChatBackdrop(rec)
+    if (stale && stale !== rec.blob) releaseSrc(stale)
+  } finally {
+    const rest = { ...backdropBusy.value }
+    delete rest[id]
+    backdropBusy.value = rest
+  }
+}
+
+/** 进沉浸页时按需画一张;戏换了也补一张 */
+watch(immersiveOn, (on) => {
+  if (!on || !chatCharId.value) return
+  void loadBackdrop(chatCharId.value).then(() => ensureBackdrop(chatCharId.value))
+})
+/* 换角色:把这个角色库里那张读回来(沉浸态时还要看要不要补一张) */
+watch(chatCharId, (id) => {
+  if (!id) return
+  void loadBackdrop(id).then(() => {
+    if (immersiveOn.value) void ensureBackdrop(id)
+  })
+})
+/* 对话里又出了一张新剧照 —— 那就是"换了一场戏" */
+watch(
+  () => currentScene(chatCharId.value),
+  () => {
+    if (immersiveOn.value && chatCharId.value) void ensureBackdrop(chatCharId.value)
+  }
+)
+/* 进页面时把库里那张读回来(每个角色一张,一次读完不心疼) */
+async function loadBackdrop(id: string) {
+  if (!id || backdrops.value[id]) return
+  const rec = await getChatBackdrop(id)
+  if (rec) backdrops.value = { ...backdrops.value, [id]: rec }
+}
+/* 背景图给界面的那一份地址(按 Blob 缓存,与头像那张共用一套) */
+const backdropSrc = computed(() => {
+  const rec = backdrops.value[chatCharId.value]
+  return rec ? coverSrc(rec.blob) : ''
+})
 const previewEntry = ref<HistoryEntry | null>(null)
 /* 预览打开时落在第几张。与 previewEntry 一起设:历史页是按张摊平的,
    "点的是哪一张"是打开动作的一部分,不该由预览卡自己从头数 */
@@ -500,6 +594,7 @@ const {
   multiModel,
   runLabel,
   generateChatPhoto,
+  generateChatBackdrop,
   recordFor,
   doGenerate,
   stopSlot,
@@ -1090,6 +1185,11 @@ function deleteChar(id: string) {
       chatSummary.value = sumRest
       dropChatLast(id)
       void deleteChatOf(id)
+      /* 背景图也一起走:它属于这个角色这一场戏,角色没了就没有"这一场"了 */
+      void deleteChatBackdrop(id)
+      const bgRest = { ...backdrops.value }
+      delete bgRest[id]
+      backdrops.value = bgRest
       saveCharacters(characters.value)
     }
   })
@@ -2718,7 +2818,10 @@ function createAssignCollection(title: string) {
         :vision-config="visionConfig || undefined"
         :tts-config="ttsConfig || undefined"
         :immersive="immersiveOn"
+        :backdrop="backdropSrc"
+        :backdrop-busy="!!backdropBusy[chatCharId]"
         @toggle-immersive="toggleImmersive"
+        @new-backdrop="ensureBackdrop(chatCharId, true)"
         @select="chatCharId = $event"
         @send="sendChat"
         @stop="stopChat"

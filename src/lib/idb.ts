@@ -36,6 +36,11 @@ const VOICE_SAMPLE_STORE = 'voice_samples'
    而图一条就是几百 KB:混在一张表里,"读这一屏消息"就变成"顺便把
    这些图全拖进内存"。消息上只留一个 id(见 types.ts 的 ChatMessage.imageId) */
 const CHAT_IMAGE_STORE = 'chat_images'
+/* 对话背景图(沉浸页铺满屏幕的那一张)。
+   **单独一张表**,理由与"角色的参考图不跟提示词封面挤在一起"完全一样:
+   它有自己的生命周期(一场戏一张、换戏就换),而 chat_images 是按"消息引用到没有"
+   来回收的(见 pruneChatImages)—— 混进去它要么被当成孤儿删掉,要么永远留着 */
+const BACKDROP_STORE = 'chat_backdrops'
 /* ===== 历史容量 =====================================================
    不按固定条数淘汰,而是看浏览器给的配额:只有占用接近上限时才清理最旧的一批。
    固定条数会在空间还很宽裕时就静默删记录,而每条记录的体积差很多,
@@ -68,7 +73,7 @@ export interface PruneResult {
    在用户眼里就是"我的图、我的历史全没了",而数据其实一条都没少。
    所以哪怕这一次没有任何结构要改,号该加也得加。
    ------------------------------------------------------------------ */
-const DB_VERSION = 11
+const DB_VERSION = 12
 
 /* 连接只开一次。
    indexedDB.open 是一次异步握手,而原实现每次读写都重开一遍 ——
@@ -196,6 +201,10 @@ function openDB(): Promise<IDBDatabase> {
       /* v11 新增:聊天里的附图(见 CHAT_IMAGE_STORE 的说明) */
       if (!db.objectStoreNames.contains(CHAT_IMAGE_STORE)) {
         db.createObjectStore(CHAT_IMAGE_STORE, { keyPath: 'id' })
+      }
+      /* v12 新增:对话背景图,keyPath 直接是 charId —— 一个角色一张(见 BACKDROP_STORE) */
+      if (!db.objectStoreNames.contains(BACKDROP_STORE)) {
+        db.createObjectStore(BACKDROP_STORE, { keyPath: 'charId' })
       }
     }
     req.onsuccess = () => {
@@ -862,6 +871,59 @@ export async function putChatImage(rec: ChatImage): Promise<void> {
     tx.oncomplete = () => resolve()
     tx.onerror = () => reject(tx.error)
   })
+}
+
+/** 一个角色的对话背景图。**带它当时画的那段场景** ——
+ *  调用方据此判断"换戏了没有",从而决定要不要重画一张(见 App 的 ensureBackdrop) */
+export interface ChatBackdrop {
+  charId: string
+  /** 画它时用的场景描述。与当前这一场不一致 = 该重画了 */
+  scene: string
+  blob: Blob
+  createdAt: number
+}
+
+export async function getChatBackdrop(charId: string): Promise<ChatBackdrop | undefined> {
+  try {
+    const db = await openDB()
+    const row = await new Promise<ChatBackdrop | undefined>((resolve, reject) => {
+      const req = db.transaction(BACKDROP_STORE, 'readonly').objectStore(BACKDROP_STORE).get(charId)
+      req.onsuccess = () => resolve(req.result as ChatBackdrop | undefined)
+      req.onerror = () => reject(req.error)
+    })
+    return row && row.blob instanceof Blob ? row : undefined
+  } catch {
+    /* 读不出来当作没有:退回首图/主题色,不该因为一张背景让整页打不开 */
+    return undefined
+  }
+}
+
+export async function putChatBackdrop(rec: ChatBackdrop): Promise<void> {
+  try {
+    const db = await openDB()
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(BACKDROP_STORE, 'readwrite')
+      tx.objectStore(BACKDROP_STORE).put(rec)
+      tx.oncomplete = () => resolve()
+      tx.onerror = () => reject(tx.error)
+    })
+  } catch {
+    /* 写不进去就只活在内存里这一场:下一场再画一张,不是数据丢失 */
+  }
+}
+
+export async function deleteChatBackdrop(charId: string): Promise<void> {
+  try {
+    const db = await openDB()
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(BACKDROP_STORE, 'readwrite')
+      tx.objectStore(BACKDROP_STORE).delete(charId)
+      tx.oncomplete = () => resolve()
+      tx.onerror = () => reject(tx.error)
+    })
+  } catch {
+    /* 同上 */
+  }
 }
 
 export async function getChatImage(id: string): Promise<ChatImage | undefined> {

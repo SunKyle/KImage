@@ -16,7 +16,13 @@ import {
   sizeForVendor
 } from '../api'
 import { REF_ARCHIVE_EDGE, REF_IMAGE_EDGE } from '../lib/payload'
-import { characterAnchor, chatPhotoSize, planChatPhoto, shotViewOrder } from '../lib/chatPhoto'
+import {
+  characterAnchor,
+  chatPhotoSize,
+  planChatBackdrop,
+  planChatPhoto,
+  shotViewOrder
+} from '../lib/chatPhoto'
 import type { ChatPhotoPlan } from '../lib/chatPhoto'
 import { DIRECTOR_SLOTS, applyDirector, directorTask, parseDirector, parseDirectorShot } from '../lib/photoDirector'
 import { urlToBlob } from '../lib/idb'
@@ -472,6 +478,63 @@ function undoEnhance() {
     } catch (e) {
       /* 上游/代理的真实错误。`generate()` 抛的就是 /api/generate 回给我们的
          那句话(例如"密钥不对""模型不存在"),它比任何我们编的文案都有用 */
+      return { error: photoFailureText(e) }
+    }
+  }
+
+  /**
+   * 画**这一场戏的背景图**（沉浸页铺满屏幕的那一张）。
+   *
+   * 与 `generateChatPhoto` 的三处不同，都是刻意的：
+   * - 提示词走 `planChatBackdrop`（横构图、主体靠右、左边留给字）；
+   * - **不进消息流**：它不属于哪一条消息，画完由调用方写进 `chat_backdrops`；
+   * - **不过摄影指导那一层**：那是"这一张照片怎么拍"的层，而背景图自己已经把
+   *   机位与光写死了（见那段提示词的注释）。多一次文本调用换不到什么，
+   *   而它正好压在"进沉浸页"这条路上 —— 那条路该尽量短。
+   *
+   * 与 `generateChatPhoto` 同一条约定：**失败只返回 error，绝不往外抛**。
+   */
+  async function generateChatBackdrop(
+    charId: string,
+    scene: string
+  ): Promise<{ blob?: Blob; error?: string }> {
+    const who = deps.characters.value.find((c) => c.id === charId)
+    const plan = planChatBackdrop(scene, who ? characterAnchor(who) : '')
+    if (!plan.prompt) return { error: 'There is no scene to draw a background for yet.' }
+    const cfg = deps.config.value
+    const gap = imageConfigGap(cfg)
+    if (gap) return { error: gap }
+    const ctrl = new AbortController()
+    try {
+      let refList: string[] = []
+      try {
+        refList = await deps.charRefSrcsOf(charId, shotViewOrder('third'))
+      } catch {
+        /* 参考图读不出来仍然照画（纯文生图），背景不像它总好过一片空 */
+        refList = []
+      }
+      const res = await generate(
+        {
+          prompt: plan.prompt,
+          /* 横构图。复用"空镜"那一档比例（3:2）—— 它比人像档宽，
+             又比 16:9 更容易在各家的档位表里找到 */
+          size: chatPhotoSize(sizeChoicesOf(cfg), 'scene', true),
+          n: 1,
+          ...(refList.length ? { images: refList } : {}),
+          ...extraParams(cfg),
+          quality: 'high'
+        },
+        cfg,
+        ctrl.signal
+      )
+      const first = res?.[0]
+      if (!first) return { error: 'The image API returned no image for this prompt.' }
+      try {
+        return { blob: await urlToBlob(imageSrc(first)) }
+      } catch {
+        return { error: 'The image API returned something that is not a usable image.' }
+      }
+    } catch (e) {
       return { error: photoFailureText(e) }
     }
   }
@@ -932,6 +995,7 @@ function retry() {
     composedPrompt,
     doGenerate,
     generateChatPhoto,
+    generateChatBackdrop,
     recordFor,
     runBatch,
     persistBatch,

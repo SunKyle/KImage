@@ -368,6 +368,56 @@ export function planChatPhoto(
 }
 
 /** 分层 → 发出去的提示词。顺序就是权重(见文件头),空值丢掉不留空逗号 */
+/* ===== 对话背景图 =====================================================
+ *  沉浸页铺满屏幕的那一张。**它与"角色发的那张图"是两件事**:
+ *  - 它不进消息流,所以不该按"随手拍给人的"那种形状拼 —— 它是一张**给字让位的底**;
+ *  - 它要横构图、主体靠右、左边留出暗而干净的余地。参考图那一屏能读,
+ *    靠的就是这个构图(而不是把照片糊掉 —— 那条路走过,把"这一场戏"整个糊没了);
+ *  - 它按"当前这一场戏"生成,换一场就该换一张(编排见 App 的 ensureBackdrop)。
+ *
+ *  与设定图、参考图、消息里的图**各存各的**(见 idb.ts 的 chat_backdrops)-
+ *  用户特意交代过:它是一份单独的图,不该和那几样混在一起。
+ */
+export function planChatBackdrop(scene: string, anchor = ''): ChatPhotoPlan {
+  const text = inline(scene)
+  /* 没有场景就没有"这一场"可画。调用方据此放弃这一张,而不是画一张没有场景的人像 */
+  if (!text) return { prompt: '', useRefs: false, shot: 'scene', self: true, scene: '', layers: [] }
+  const spec = inline(anchor)
+  const layers: ChatLayer[] = [
+    ['medium', 'cinematic film still, wide landscape framing, made to sit behind text'],
+    ['scene', text]
+  ]
+  /* 锚点句垫在场景之后:它是"这个人是谁"的约束,不是这一张的内容 */
+  if (spec) layers.push(['anchor', spec])
+  layers.push([
+    'camera',
+    'the subject stands in the right third of the frame at a medium distance, ' +
+      'the left two thirds fall into shadow and stay uncluttered \u2014 words are read there'
+  ])
+  layers.push(['lens', 'shallow depth of field, the room falling away behind them'])
+  layers.push([
+    'light',
+    'low natural light, the brightest part of the frame is on the right near the subject'
+  ])
+  layers.push([
+    'env',
+    'the place readable around them and deep enough to feel like a room, not a studio backdrop'
+  ])
+  /* 负面约束垫在最末:它挡的正是"证件照"那套默认构图,再补上背景图独有的两条 */
+  layers.push([
+    'negative',
+    `${NEGATIVE}, no text, no watermark, no caption, no bright cluttered left side`
+  ])
+  return {
+    prompt: composeChatPrompt(layers),
+    useRefs: true,
+    shot: 'scene',
+    self: true,
+    scene: text,
+    layers
+  }
+}
+
 export function composeChatPrompt(layers: ChatLayer[]): string {
   return layers
     .map(([, value]) => value)

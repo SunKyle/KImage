@@ -78,6 +78,11 @@ const props = defineProps<{
   /* 沉浸态:同一页的第二种骨架(见 doc/沉浸式对话页面设计.md)。
      **它是显示层的事,页面自己不改任何数据** —— 偏好存盘与外壳那一层归主界面 */
   immersive?: boolean
+  /* 这一场戏的**背景图**(单独生成、单独存的那一张)的地址。
+     空 = 还没画出来,退到剧照/首图。读库与编排归主界面(见 App 的 ensureBackdrop) */
+  backdrop?: string
+  /** 正在画这一场的背景。界面据它说一句"正在画"(它是一次真调用,用户该知道) */
+  backdropBusy?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -115,6 +120,8 @@ const emit = defineEmits<{
   /* 切骨架(进/出沉浸)。**只交意图** —— 它是偏好,存盘归主界面
      (与主题切换同一条分工) */
   (e: 'toggleImmersive'): void
+  /** 用户手动要一张新的背景图(这一场戏重画)。**只交意图** —— 生成与落盘归主界面 */
+  (e: 'newBackdrop'): void
 }>()
 
 /* ===== 取用的那一份 =================================================
@@ -184,6 +191,9 @@ const bgSrc = computed(() => {
      `imgUrl()` 与流里那张图共用同一份缓存(一条消息一个 objectURL),
      所以这里不额外读库、不额外占内存;还没读完的那一拍先落回首图。
      退路依次是:剧照 → 正脸 → 底图(`sourceRef`) → 主题色 */
+  /* 顺序:这一场专门的背景图 → 最新那张剧照 → 正脸 → 底图 → 主题色。
+     背景图排第一是因为它**就是为这件事画的**(横构图、主体靠右、左边留给字) */
+  if (props.backdrop) return props.backdrop
   const still = stillId.value ? imgUrl(stillId.value) : ''
   return still || coverSrc(c.ref) || coverSrc(c.sourceRef)
 })
@@ -886,6 +896,13 @@ function onKey(e: KeyboardEvent) {
   ])
 }
 
+/** 手动要一张新的背景图(见 App 的 ensureBackdrop)。它同时把菜单收起来 —— 
+ *  菜单开着的时候点它,下一步想看的是画面,不是菜单 */
+function askBackdrop() {
+  closeMenu()
+  emit('newBackdrop')
+}
+
 function clearChat() {
   closeMenu()
   /* 卡片一起收:这段对话(连同记忆)马上就没了,留着一张写着旧记忆的卡片
@@ -1104,6 +1121,11 @@ onBeforeUnmount(() => {
                 <button v-if="memory" @click="forgetMemory">
                   <PhEraser aria-hidden="true" />
                   Forget memory
+                </button>
+                <!-- 这一场戏的背景图。**只在沉浸态给** —— 它服务的就是那一页 -->
+                <button v-if="immersive" :disabled="backdropBusy" @click="askBackdrop">
+                  <PhImage aria-hidden="true" />
+                  {{ backdropBusy ? 'Drawing the background…' : 'New background' }}
                 </button>
                 <button :disabled="!msgs.length" @click="clearChat">
                   <PhTrash aria-hidden="true" />

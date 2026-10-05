@@ -7,7 +7,8 @@ import {
   missingSlots,
   planChatPhoto,
   shotRatio,
-  shotViewOrder
+  shotViewOrder,
+  planChatBackdrop
 } from './chatPhoto'
 
 /* 这一层现在管四件事:这张里有没有它本人、是自拍还是他拍、拼锚点句还是全量设定表、
@@ -329,5 +330,40 @@ describe('chatPhotoSize · 按场景挑尺寸,别一律方框', () => {
   it('空候选不返回空串 —— 空值会被发到上游', () => {
     expect(chatPhotoSize([], 'selfie', false)).toBe('auto')
     expect(chatPhotoSize(undefined as unknown as string[], 'selfie', false)).toBe('auto')
+  })
+})
+
+/* 对话背景图:沉浸页铺满屏幕的那一张。它与"角色发的那张图"是两件事 ——
+   那张是随手拍给人的,这张是**给字让位的底**。所以这里盯的不是"画得像不像",
+   而是那几条**只有背景图才需要**的性质:横构图、主体靠右、左边留给字。 */
+describe('planChatBackdrop · 对话背景图', () => {
+  it('横构图 + 主体靠右 + 左边留给字(这三条缺一条就不成其为背景)', () => {
+    const p = planChatBackdrop('sitting by the window at night', 'warm smile, dark hair')
+    expect(p.prompt).toMatch(/wide landscape/i)
+    expect(p.prompt).toMatch(/right third/i)
+    expect(p.prompt).toMatch(/left two thirds/i)
+  })
+
+  it('场景原文一字不改地进去(与照片那条同一条纪律)', () => {
+    const scene = 'leaning on the balcony rail, the rain just stopped'
+    expect(planChatBackdrop(scene).prompt).toContain(scene)
+  })
+
+  it('锚点句带上 —— 背景里那个人也得是同一个人', () => {
+    const p = planChatBackdrop('at a rooftop bar', 'oval face, high cheekbones')
+    expect(p.prompt).toContain('oval face, high cheekbones')
+    // 没有锚点时不该留一句空的
+    expect(planChatBackdrop('at a rooftop bar').prompt).not.toContain('undefined')
+  })
+
+  it('负面约束要挡掉"居中证件照"与"左边很亮很乱"', () => {
+    const p = planChatBackdrop('at a rooftop bar')
+    expect(p.prompt).toMatch(/not a passport or ID photo/i)
+    expect(p.prompt).toMatch(/no bright cluttered left side/i)
+  })
+
+  it('没有场景就不出提示词 —— 一张没有场景的人像当背景不如用它的剧照', () => {
+    expect(planChatBackdrop('').prompt).toBe('')
+    expect(planChatBackdrop('   ').prompt).toBe('')
   })
 })
