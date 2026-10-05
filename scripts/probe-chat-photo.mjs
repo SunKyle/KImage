@@ -334,6 +334,52 @@ async function main() {
       JSON.stringify(failBody.detail)
     )
     FAIL_GENERATE = false
+
+    /* —— 用例 7：时间那一块 ——
+       "现在几点 / 上次说话"由前端算好、服务端拼进 system（见 server/chatTime.js）。
+       这一条链上会静默出错的正是**接缝**：前端没把字段发出来、服务端没接住、
+       或者接住了却插错位置 —— 三种都不会报错，角色只是变得不知道时间，
+       而"它不知道时间"这件事在产品上完全看不出来（它照聊不误）。 */
+    console.log('\n用例 7 · 时间那一块')
+    chatReply = 'Sure.'
+    const STAMP = '2026-10-05T23:41:07+08:00'
+    const STAMP_MS = Date.parse(STAMP)
+    const systemOf = () => String(seen.chat?.messages?.[0]?.content || '')
+
+    r = await post(APP_PORT, '/api/chat', {
+      ...cfg,
+      nowLocal: STAMP,
+      lastAt: STAMP_MS - 3 * 24 * 60 * 60 * 1000,
+      memory: 'They met in Lisbon.',
+      messages: [{ role: 'user', content: 'hi' }]
+    })
+    await readChat(r)
+    ok('当前时间进去了（含星期几）', systemOf().includes('Right now: 2026-10-05 23:41, Monday'), JSON.stringify(systemOf().slice(0, 120)))
+    ok('没有秒（秒是机器的时间）', !systemOf().includes('23:41:07'))
+    ok('上次说话的间隔进去了', /^You two last spoke 3 days ago\.$/m.test(systemOf()))
+    ok('角色资料还在（没把别的块挤掉）', systemOf().includes('Name: Alice'))
+    ok(
+      '时间排在记忆之前 —— 记忆是一段成篇的叙述，夹在两块短事实中间会被切碎',
+      systemOf().indexOf('Right now: 2026') < systemOf().indexOf('What has happened so far')
+    )
+    ok('规则里带着"别每句都报时"', systemOf().includes('it is a clock'))
+
+    /* 没给时间（老前端、手搓请求、时钟坏掉）→ 整块不出现，且**不影响这一轮**。
+       判据用行首锚定的正则、**不是 includes('Right now')** ——
+       规则里本来就有"the time"这类字眼，拿子串判会误判成通过（第一版就踩了） */
+    r = await post(APP_PORT, '/api/chat', { ...cfg, messages: [{ role: 'user', content: 'hi' }] })
+    await readChat(r)
+    ok('不给时间时整块消失', !/^Right now: /m.test(systemOf()))
+    ok('也不留 "last spoke" 的空壳', !/^You two last spoke /m.test(systemOf()))
+
+    r = await post(APP_PORT, '/api/chat', {
+      ...cfg,
+      nowLocal: 'today',
+      lastAt: STAMP_MS,
+      messages: [{ role: 'user', content: 'hi' }]
+    })
+    await readChat(r)
+    ok('时间给坏了也只是没有这一块（不报错、不挡话）', !/^Right now: /m.test(systemOf()))
   } finally {
     app.kill()
     upstream.close()

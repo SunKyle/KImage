@@ -1460,6 +1460,13 @@ async function runChat(id: string) {
   // 最后一句必须是用户说的,否则这一轮本来就不该发
   if (!context.length || context[context.length - 1].role !== 'user') return
 
+  /* "上次说话"取的是**这一轮之前**那一条的时间。
+     用户刚打的那条就在末尾 —— 拿它当"上次",算出来永远是"刚刚",
+     那句话也就永远不会出现(整个功能等于没做)。
+     用完整列表而不是 context:窗口截掉的老消息照样是"上次" */
+  const before = (chatMessages.value[id] || []).slice(0, -1)
+  const lastAt = before.length ? before[before.length - 1].createdAt : undefined
+
   /* 用户这一轮带没带图。带了要另说两件事:
      1. 请求改用识图那条配置 —— **看图得有看图的模型**,对话模型多半不支持,
         而它回的那句参数错用户看不出"该换个模型了";没配识图就照旧用对话配置
@@ -1514,6 +1521,12 @@ async function runChat(id: string) {
      它决定出图时带不带设定图:场景照带上会被带跑,自拍不带会画成陌生人 */
   let photoSelf = false
   try {
+    /* 首字节口径。**只进性能面板,不落盘、不上报** ——
+       这个项目本地优先、无账号,不该为了一个内部数字把用户的行为发出去。
+       流式只是"不会等 5 秒憋出一整段",真正决定观感的是首字节有多快;
+       没有这个数就无从判断后面那些表现层的手脚值不值得做 */
+    performance.mark('kimage-chat-send')
+    let firstDelta = 0
     const out = await chatStream({
       character: chatPayloadOf(c),
       messages: context,
@@ -1521,9 +1534,26 @@ async function runChat(id: string) {
          与角色资料分开传 —— 同一个角色换一段对话,记忆不该跟着走 */
       memory: chatSummary.value[id]?.text || '',
       images,
+      lastAt,
       cfg: useCfg,
       signal: ctrl.signal,
       onDelta: (delta) => {
+        if (!firstDelta) {
+          firstDelta = performance.now()
+          performance.mark('kimage-chat-first-delta')
+          if (import.meta.env.DEV) {
+            try {
+              const m = performance.measure(
+                'kimage-chat-ttfb',
+                'kimage-chat-send',
+                'kimage-chat-first-delta'
+              )
+              console.debug(`[chat] first byte in ${Math.round(m.duration)}ms`)
+            } catch {
+              /* 标记被清掉或不可用:这只是个数字,不该影响这一轮 */
+            }
+          }
+        }
         if (reply) reply.content += delta
       }
     })
@@ -1537,6 +1567,11 @@ async function runChat(id: string) {
   } finally {
     chatControllers.delete(id)
     chatBusy.value = { ...chatBusy.value, [id]: false }
+    /* 不清会一轮一轮攒在性能面板里(同名标记是叠加的,不是覆盖的)。
+       放在 finally 里:断流、按 Stop、没收到任何 delta 的轮次也要收干净 */
+    performance.clearMarks('kimage-chat-send')
+    performance.clearMarks('kimage-chat-first-delta')
+    performance.clearMeasures('kimage-chat-ttfb')
   }
 
   if (!reply) return

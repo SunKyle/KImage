@@ -8,6 +8,9 @@ import {
   CHAR_SPEC_LINES,
   charSpecKeys
 } from '../server/charSpec.js'
+/* "现在几点"也是服务端那套提示词的一部分,而它要的**本地时刻**只有前端给得出
+   (见 server/chatTime.js)。这里只负责生成那个字符串,措辞全在那边 */
+import { localStamp } from '../server/chatTime.js'
 import {
   getAll,
   pruneHistory,
@@ -2552,6 +2555,10 @@ export interface ChatStreamOpts {
      历史里那些图不重发:一张图要吃掉上千 token,而窗口有 20 条,
      全发一遍就是几万 token,换来的只是"它还记得你看过那张图" */
   images?: string[]
+  /* 上一条消息的时间戳(epoch ms)。服务端据此说"你们上次说话是三天前";
+     不给 = 第一次开口,那一句就不出现(见 server/chatTime.js)。
+     "现在几点"不用调用方操心 —— 它是**这一刻的事实**,由下面现场取 */
+  lastAt?: number
   cfg: ApiConfig
   /** 每一块增量。调用方拿到就往气泡上追加 */
   onDelta: (delta: string) => void
@@ -2574,6 +2581,10 @@ export async function chatStream(opts: ChatStreamOpts): Promise<ChatStreamResult
       messages: opts.messages,
       memory: opts.memory || undefined,
       images: opts.images?.length ? opts.images : undefined,
+      /* 本地时刻随请求走。**不放在 ChatStreamOpts 里让调用方传**:
+         它是"此刻"的事实,晚一拍都不对,而调用方没有任何理由关心它 */
+      nowLocal: localStamp(),
+      lastAt: opts.lastAt,
       textModel: opts.cfg.model,
       baseUrl: opts.cfg.baseUrl,
       apiKey: opts.cfg.apiKey

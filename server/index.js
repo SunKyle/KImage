@@ -8,6 +8,7 @@ import { lookup as dnsLookup } from 'node:dns/promises'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { ProxyAgent } from 'undici'
 import { splitTags, tailHold } from './chatTags.js'
+import { timeContext } from './chatTime.js'
 import { ENHANCE_PROMPTS, ENHANCE_TEMPERATURE } from './enhancePrompts.js'
 
 dotenv.config()
@@ -170,6 +171,7 @@ const CHAT_RULES = `Rules:
 - Do not use markdown. No lists, no bold, no headings - this is a chat, not a document.
 - Keep it short: one to three sentences. Real people type short messages.
 - Never end every reply with a question. Let the conversation breathe.
+- If you happen to know what time it is, or how long it has been since you two last spoke, mention it only when it is actually relevant. Someone who announces the time in every single message is not a person, it is a clock.
 - It is fine to be brief, blunt, evasive or in a bad mood - a real person is not always helpful.
 - When a picture would genuinely help (they ask to see you, or you are somewhere worth showing), put a photo tag on its own line at the very end: [photo:a description of the scene from your point of view]. Up to 400 characters, one line. If you are in the picture yourself, start that description with "self:" - for example [photo:self:me on the balcony, hair down]. Leave the prefix off when it is only what you are looking at, because a picture without it is generated without your reference sheet: a view stays a view. Never use the tag as a substitute for actually saying something. Do not comment on the tag or explain it.
 - That description is the only thing the picture is drawn from, and whoever draws it cannot see this conversation. So put in what only you know: what time it is and what the light is doing, the weather, what is around you, and what you are doing right now. "me on the balcony" is not enough; "self:me leaning on the balcony rail at dusk, the rain just stopped, streetlights coming on below, hair still wet" is. Write it as plain description, never as an instruction to a machine.
@@ -183,6 +185,10 @@ const CHAT_RULES = `Rules:
  *  都是一个免费的大请求放大器 —— 而 character 的每一项都是外部输入。
  *  400 对这里面最长的一项(identity / voice)也已经很宽了,正常内容远够不到。 */
 const CHAT_FIELD_CHARS = 400
+/* "现在几点 / 上次说话"那一块的上限。它由 chatTime 那几条正则生成,
+   正常只有一到两行(几十个字符);这里再收一道是因为入口是公开的 ——
+   任何一个字符数不设上限的入参都是免费的大请求放大器 */
+const CHAT_TIME_CHARS = 200
 function chatOneLine(v, max = CHAT_FIELD_CHARS) {
   return String(v || '')
     .replace(/\s+/g, ' ')
@@ -201,8 +207,10 @@ function chatOneLine(v, max = CHAT_FIELD_CHARS) {
  * 是角色会主动提到的东西。
  *
  * memory 是长期记忆的简报(滑出窗口的消息压成的那一段),空串表示还没压过。
+ * time 是"现在几点、上次说话是什么时候"(见 chatTime.js),空串表示这一轮没有 ——
+ * 前端没给、给坏了、或这是一条手搓的请求,三种情况都走这一条退路。
  */
-function chatSystemPrompt(character, memory) {
+function chatSystemPrompt(character, memory, time) {
   const char = character && typeof character === 'object' ? character : {}
   const p = char.persona && typeof char.persona === 'object' ? char.persona : {}
 
@@ -231,6 +239,14 @@ function chatSystemPrompt(character, memory) {
   const parts = [CHAT_OPENING]
   if (who.length) parts.push(`Who you are:\n${who.join('\n')}`)
   if (how.length) parts.push(`How you behave:\n${how.join('\n')}`)
+  /* 时间压在"你是谁 / 你怎么说话"之后、记忆之前。
+     它与记忆属同一层("发生过什么、现在是什么时候"),而**必须排在记忆前面**:
+     记忆是一段成篇的叙述,夹在两块短事实中间会把它切碎。
+     **不能过 chatOneLine** —— 它会把换行压成空格,而那两行正是靠换行分开的
+     ("Right now: …" 与 "You two last spoke …" 合成一句读起来像机器在念表)。
+     这里是纯粹的截断,结构由 chatTime 那几条正则负责 */
+  const now = typeof time === 'string' ? time.slice(0, CHAT_TIME_CHARS) : ''
+  if (now) parts.push(now)
   /* 长期记忆压在"你是谁"之后、规则之前:它讲的是"发生过什么",
      与"你是什么人"属同一层,而规则要留在最后当收束。
      这里同样过一遍 chatOneLine 把换行收掉 —— 它是模型生成的文本,
@@ -1127,7 +1143,8 @@ app.post('/api/enhance', rateLimit, async (req, res) => {
  * 前端就不用为每家中转各写一段解析。
  */
 app.post('/api/chat', rateLimit, async (req, res) => {
-  const { character, messages, memory, images, textModel, baseUrl, apiKey } = req.body || {}
+  const { character, messages, memory, images, nowLocal, lastAt, textModel, baseUrl, apiKey } =
+    req.body || {}
 
   if (!baseUrl) {
     return res.status(400).json({ error: 'Configure your Base URL first' })
@@ -1138,6 +1155,12 @@ app.post('/api/chat', rateLimit, async (req, res) => {
   /* 记忆也是外部输入(它由上游生成、经前端存了一圈再发回来),
      照消息那样收一道长度 */
   const memoryText = typeof memory === 'string' ? memory.slice(0, CHAT_MAX_CHARS) : ''
+
+  /* 时间那一块。**认不出来就整块丢掉**,不报错 ——
+     它是锦上添花的一层(角色不知道时间也能聊),而手搓的请求、
+     老版本前端、时钟坏掉的机器都会走到这里。为一个装饰性的字段
+     把整轮对话挡回去,是把主次弄反了(见 chatTime.js 里那几条纪律) */
+  const time = timeContext({ nowLocal, lastAt })
 
   /* 历史逐条收窄。入口是公开的,不设上限就等于给了个免费的大请求放大器。
      正文在这里就换掉空串:下面"太长的报错"与最后那条多模态的拼装都靠它 */
@@ -1208,7 +1231,7 @@ app.post('/api/chat', rateLimit, async (req, res) => {
      这里没这个问题,所以可以算好一份直接用 */
   const body = JSON.stringify({
     model: textModel,
-    messages: [{ role: 'system', content: chatSystemPrompt(character, memoryText) }, ...history],
+    messages: [{ role: 'system', content: chatSystemPrompt(character, memoryText, time) }, ...history],
     temperature: CHAT_TEMPERATURE,
     max_tokens: CHAT_MAX_TOKENS,
     stream: true
