@@ -75,6 +75,8 @@ import {
 import { titleFromPrompt } from './lib/text'
 import { stopSpeaking } from './lib/speech'
 import { contextText } from './lib/chatContext'
+/* 打字节奏:上游吐字是匀速的,而匀速正是机器感最直接的来源(见那份文件的四条纪律) */
+import { Pacer } from './lib/typing'
 import { NAV_ITEMS } from './lib/nav'
 import { useFeedback } from './composables/useFeedback'
 import { useConfigs } from './composables/useConfigs'
@@ -1520,6 +1522,30 @@ async function runChat(id: string) {
   /* 这张里有没有它本人(模型写在 [photo:self:…] 里)。
      它决定出图时带不带设定图:场景照带上会被带跑,自拍不带会画成陌生人 */
   let photoSelf = false
+  /* 打字节奏。它只决定"什么时候放",不决定"放什么" ——
+     所以这里最要紧的不是节奏好不好看,而是**一个字都不能丢**:
+     收尾(马上要落盘)、按 Stop、页面被切走三处都必须把手里剩下的冲出来,
+     漏一处就会存进一条少半句的回复(见 lib/typing.ts) */
+  const pacer = new Pacer(reply?.id || id)
+  let paceTimer: ReturnType<typeof setTimeout> | null = null
+  /* 页面被切走之后就不再压了:没人在看的时候攒着毫无意义,
+     而且回来时一次性冒出半屏字比慢一点更难看 */
+  let unpaced = false
+  const pump = () => {
+    paceTimer = null
+    if (!reply) return
+    if (document.hidden) {
+      reply.content += pacer.flush()
+      unpaced = true
+      return
+    }
+    const { text, wait } = pacer.take()
+    if (text) reply.content += text
+    /* wait > 0:到了标点,压一小段再问;wait === 0:这一批放完了 ——
+       还有剩就下一拍接着放(上游一次给了好几段),否则等下一次 push */
+    if (wait > 0) paceTimer = setTimeout(pump, wait)
+    else if (pacer.pending > 0) paceTimer = setTimeout(pump, 0)
+  }
   try {
     /* 首字节口径。**只进性能面板,不落盘、不上报** ——
        这个项目本地优先、无账号,不该为了一个内部数字把用户的行为发出去。
@@ -1554,7 +1580,16 @@ async function runChat(id: string) {
             }
           }
         }
-        if (reply) reply.content += delta
+        /* 切成不压之后**直接贴**,不能再走 pacer ——
+           它手里已经没有东西了(切走那一刻冲干净了),但顺序必须保持 */
+        if (!reply) return
+        if (unpaced) reply.content += delta
+        else {
+          pacer.push(delta)
+          /* 第一块立刻贴上去,不等到下一拍:首字节已经够贵了,
+             不该再被节奏器加上一帧 */
+          if (!paceTimer) pump()
+        }
       }
     })
     finish = out.finish
@@ -1567,6 +1602,13 @@ async function runChat(id: string) {
   } finally {
     chatControllers.delete(id)
     chatBusy.value = { ...chatBusy.value, [id]: false }
+    /* **先冲节奏再收摊**:下面紧接着就要落盘,手里还扣着字就会存进半句。
+       断流、按 Stop、没收到任何 delta 的轮次全都走这一条 */
+    if (paceTimer) {
+      clearTimeout(paceTimer)
+      paceTimer = null
+    }
+    if (reply) reply.content += pacer.flush()
     /* 不清会一轮一轮攒在性能面板里(同名标记是叠加的,不是覆盖的)。
        放在 finally 里:断流、按 Stop、没收到任何 delta 的轮次也要收干净 */
     performance.clearMarks('kimage-chat-send')
