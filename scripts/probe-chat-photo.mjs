@@ -234,6 +234,24 @@ async function main() {
     const proseFrames = out.deltas.filter((d) => !d.includes('[photo') && d.trim())
     ok('正文是分多帧流出来的(扣尾没有把正文停住)', proseFrames.length > 3, String(proseFrames.length))
 
+    /* —— 用例 1b：正文末尾的那个换行不许流到界面上 ——
+       模型把标签写在单独一行,而那个 `\n` **总是比标签先到**。按"标签起点"
+       算出来的放行边界正好落在它后面,于是它被当成正文发出去;收尾那次
+       splitTags 的 trimEnd 追不回来(字早发出去了)。气泡是 pre-wrap,
+       结尾的 `\n` 会被如实渲染成一行空行 —— 用户看到的就是"短回复底下
+       多了一行"。这条断言的是**流出来的正文精确等于那句话**,不带尾巴 */
+    console.log('\n用例 1b · 正文末尾不带那个换行')
+    chatReply = 'Sure.\n[mood:calm]'
+    r = await post(APP_PORT, '/api/chat', { ...cfg, messages: [{ role: 'user', content: 'hi' }] })
+    out = await readChat(r)
+    ok('流出来的正文精确等于那句话(末尾没有换行)', out.text === 'Sure.', JSON.stringify(out.text))
+    ok('mood 照旧剪出来', out.done?.mood === 'calm', String(out.done?.mood))
+    /* 空行只可能从末尾来;中间那个换行(如果模型真写了分行)必须留着 */
+    chatReply = 'First line.\nSecond line.\n[photo:a window at dawn]'
+    r = await post(APP_PORT, '/api/chat', { ...cfg, messages: [{ role: 'user', content: 'hi' }] })
+    out = await readChat(r)
+    ok('正文中间的分行留着', out.text === 'First line.\nSecond line.', JSON.stringify(out.text))
+
     /* —— 用例 2：接近上限的长场景 —— */
     console.log('\n用例 2 · 长场景（' + SCENE_FULL.length + ' 字）')
     chatReply = `Look at this.\n[photo:${SCENE_FULL}]\n[mood:warm]`

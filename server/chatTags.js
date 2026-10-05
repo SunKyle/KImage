@@ -174,9 +174,20 @@ export function tailHold(buffer) {
      而那个 `[` 因为落在正文中间(inner 里带换行)没被剥干净 ——
      取 min 会选中它,等于把左边那枚完整标签整枚放了出去。 */
   const closed = completeTagStart(s)
-  if (closed >= 0) return closed
-  const open = OPEN_TAIL_RE.exec(s)
-  return open ? open.index : s.length
+  const cut = closed >= 0 ? closed : (OPEN_TAIL_RE.exec(s)?.index ?? s.length)
+  /* 再把末尾那段空白一起扣住 —— **它不是正文,而是"标签前面那个换行"**。
+   *
+   * 模型把标签写在单独一行,所以正文尾巴上总挂着一个 `\n`,而它**总是比标签先到**
+   * (那时标签还没开这个头)。上面两条算出来的边界正好落在它后面,于是这个换行
+   * 会被当成正文发出去 —— 界面上就是气泡底下多出一行空行
+   * (`white-space: pre-wrap` 会把结尾的 `\n` 如实渲染出来),
+   * 而收尾那次 `splitTags` 的 `trimEnd` 已经追不回来了:字早发出去了。
+   *
+   * 扣住它没有代价:后面一来非空白字符(或标签自己开了头),它就跟着放出去。
+   * 代价只有一个:整条回复全是空白时什么都放不出去 —— 那本来也没有正文。 */
+  let end = cut
+  while (end > 0 && /\s/.test(s[end - 1])) end--
+  return end
 }
 
 /** 末尾那几枚已经长成形的标签从哪开始。没有就返回 -1。
@@ -328,7 +339,10 @@ export function splitTags(s, charName = '') {
   if (pp) return { text: str.slice(0, pp.index).trimEnd(), mood: '', photo: '', photoSelf: false }
   const mp = MOOD_PARTIAL_RE.exec(str)
   if (mp) return { text: str.slice(0, mp.index).trimEnd(), mood: '', photo: '', photoSelf: false }
-  return { text: str, mood: '', photo: '', photoSelf: false }
+  /* 一枚标签都没有。**末尾空白照样收掉** —— 这里以前是原样返回,于是
+     "模型忘了写标签、但结尾带了个换行"的回复会把那行空行留在气泡里。
+     它与上面几条分支做的事其实是同一件:末尾的空白不是它要说的话 */
+  return { text: str.trimEnd(), mood: '', photo: '', photoSelf: false }
 }
 
 

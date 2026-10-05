@@ -2027,6 +2027,10 @@ async function main() {
           },
           // 没画完的那张:只有场景描述、没有 photoId。出图只活在内存里,
           // 所以这条从库里读回来就只可能是"没画出来" → 提示 + 重试键,不是骨架
+          /* 末尾带一个换行的回复。复刻的是**已经存在库里的老数据** ——
+             "标签前面那个换行先一步流出去"留下的尾巴。气泡是 pre-wrap,
+             结尾的 \n 会被如实渲染成一行空行(ChatPage 的 shownText 负责收掉它) */
+          { role: 'assistant', content: 'One line only.\n', dt: 0.35 },
           { role: 'assistant', content: 'One second.', dt: 0.2, photo: 'still drawing' }
         ].map((m, i) => ({
           id: `probe-msg-${i}`,
@@ -2110,6 +2114,17 @@ async function main() {
           /* 末尾那行"离开多久了"。整段对话是 3 天前的,所以它该说 3 天 ——
              文本要精确匹配:写死一句 "Last spoke recently" 之类也算没接上 */
           awayLine: document.querySelector('.chat-stream .sep.away')?.textContent || '',
+          /* 末尾带空白的气泡有几个(应当为 0)。库里那条 'One line only.\n'
+             就是为这条断言播的:显示层不收尾,它就会渲染成一行空行 */
+          trailingWsBubbles: [...document.querySelectorAll('.bubble')].filter((b) =>
+            /\s$/.test(b.textContent || '')
+          ).length,
+          trailPadBubble: (() => {
+            const b = [...document.querySelectorAll('.bubble')].find((x) =>
+              (x.textContent || '').includes('One line only.')
+            )
+            return b ? JSON.stringify(b.textContent) : '(没找到)'
+          })(),
           photoRendered: !!document.querySelector('img.msg-photo'),
           photoBelowText: !!order && order.imgAt > order.textAt && order.textAt >= 0,
           /* 库里那条只带场景、没有 photoId 的消息,读回来时**不再顶着骨架**:
@@ -2414,7 +2429,7 @@ async function main() {
       })
 
       chatProbe.passed =
-        chatProbe.seeded === 7 &&
+        chatProbe.seeded === 8 &&
         chatProbe.rendered?.bubbles >= 3 &&
         chatProbe.rendered?.hasMemory === true &&
         chatProbe.rendered?.oldMemoryBlock === false &&
@@ -2422,6 +2437,10 @@ async function main() {
         /* 回来时知道自己离开了多久 —— 而且说的是**真实的那段间隔**(3 天)。
            判别性:核对的是精确文本,常量或错数都过不去 */
         chatProbe.rendered?.awayLine === 'Last spoke 3 days ago' &&
+        /* 气泡底下不留空行:库里那条 'One line only.\n' 是给这条播的 ——
+           pre-wrap 会把结尾的 \n 如实渲染成一行空行(判别性:去掉显示层那一下
+           trimEnd,这条立刻变红) */
+        chatProbe.rendered?.trailingWsBubbles === 0 &&
         chatProbe.rendered?.photoRendered === true &&
         chatProbe.rendered?.photoBelowText === true &&
         /* 没画出来的那一张:必须说出来、并且给一枚重试键(骨架不该再出现)。

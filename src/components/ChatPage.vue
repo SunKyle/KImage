@@ -265,6 +265,21 @@ const rows = computed<Row[]>(() => {
   return out
 })
 
+/** 气泡里显示的正文。
+ *
+ *  **只收掉末尾的空白**。它不是它说的话,而是"标签前面那个换行"的遗留:
+ *  模型把 `[mood:…]` / `[photo:…]` 写在单独一行,那个换行有时会先一步
+ *  流到界面上(修在 `chatTags.js` 的 `tailHold` 里了),而**已经存在库里的
+ *  老消息也带着它**。气泡是 `white-space: pre-wrap`,结尾的 `\n` 会被
+ *  如实渲染成一行空行 —— 短回复底下因此总像空了一格。
+ *
+ *  不改库里的内容、也不改发给模型的上下文(那个换行对模型无害),
+ *  这只是"显示出来的样子":末尾的空白不是它说的话。
+ *  两个角色一视同仁 —— 自己打的字末尾多一行空行同样不该显示。 */
+function shownText(m: ChatMessage): string {
+  return m.content.trimEnd()
+}
+
 /** 光标挂在正在说的那一条上。它同时说明"这会儿还在往下写" */
 const cursorId = computed(() => {
   if (!streaming.value) return ''
@@ -1111,7 +1126,7 @@ onBeforeUnmount(() => {
                   <span class="sr-only">
                     {{ r.msg.role === 'user' ? 'You said: ' : `${current.name} said: ` }}
                   </span>
-                  {{ r.msg.content }}<span v-if="r.msg.id === cursorId" class="cursor" aria-hidden="true"></span>
+                  {{ shownText(r.msg) }}<span v-if="r.msg.id === cursorId" class="cursor" aria-hidden="true"></span>
                   <!-- 这一条的两个悬停动作(念 / 删)。整排贴着气泡外侧下角,
                        绝对定位 —— 它不该挤占气泡的宽度。放进流里(哪怕用
                        opacity 藏起来)会实打实地把每个气泡压窄 80px。

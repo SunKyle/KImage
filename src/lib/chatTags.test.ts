@@ -199,15 +199,35 @@ describe('tailHold · 放到哪才不漏半截标签', () => {
   it('末尾是完整标签时,边界停在标签起点', () => {
     const prose = 'Rain again. I am so tired of it. '
     const s = prose + '[photo:me on the balcony]'
-    expect(tailHold(s)).toBe(prose.length)
+    /* **连正文与标签之间那个空白一起扣住** —— 它是"标签前面那一截",
+       收尾时会被 splitTags 的 trimEnd 收掉;提前放出去就成了气泡底下的空行
+       (2026-10-05 修的那条,见下面那条用例) */
+    expect(tailHold(s)).toBe('Rain again. I am so tired of it.'.length)
   })
 
   it('标签还没闭合时,边界停在那个 `[` 上', () => {
     const prose = 'It is coming down hard. '
     const s = prose + '[photo:rain on the window'
-    expect(tailHold(s)).toBe(prose.length)
-    /* 只打出一个 `[` 也一样 —— 那是下一块增量还没到 */
-    expect(tailHold('some words [')).toBe('some words '.length)
+    expect(tailHold(s)).toBe('It is coming down hard.'.length)
+    /* 只打出一个 `[` 也一样 —— 那是下一块增量还没到(它前面那个空格同样扣住) */
+    expect(tailHold('some words [')).toBe('some words'.length)
+  })
+
+  it('末尾那段空白一律扣住 —— 它是"标签前面那个换行",不是正文', () => {
+    /* 这条修的是用户报的"短回复底下多一行空行"。
+       模型把标签写在单独一行,而那个 `\n` **总是比标签先到** ——
+       按"标签起点"算出来的边界正好落在它后面,于是它被当成正文发了出去,
+       收尾的 trimEnd 追不回来(字早发出去了);pre-wrap 会把结尾的 `\n`
+       如实渲染成一行空行。
+       扣住它没有代价:后面一来非空白字符,它就跟着放出去 */
+    expect(tailHold('嗯。\n')).toBe(2)
+    expect(tailHold('嗯。\n\n')).toBe(2)
+    expect(tailHold('嗯。\n[mo')).toBe(2)
+    expect(tailHold('嗯。\n[mood:x]')).toBe(2)
+    // 空白后面只要来了正文,它就不再是"末尾",照常放出去
+    expect(tailHold('嗯。\nNext')).toBe('嗯。\nNext'.length)
+    // 整截都是空白:一个字符都不放(那本来也没有正文)
+    expect(tailHold('   \n\n')).toBe(0)
   })
 
   it('**两枚标签相邻时,上一枚完整标签也不许放出去**', () => {
@@ -224,7 +244,7 @@ describe('tailHold · 放到哪才不漏半截标签', () => {
   it('正文 + 两枚标签:只放正文,两枚都留住', () => {
     const prose = 'Rain again. I am tired.\n'
     const s = prose + '[photo:me on the balcony]\n[mood:tired]'
-    expect(tailHold(s)).toBe(prose.length)
+    expect(tailHold(s)).toBe('Rain again. I am tired.'.length)
   })
 
   it('正文里长得像标签的方括号不算标签 —— 数字与汉字都排除了', () => {
@@ -240,14 +260,16 @@ describe('tailHold · 放到哪才不漏半截标签', () => {
        这里用一个带换行的超长场景复现。 */
     const scene = 'me leaning on the rail at dusk, the rain just stopped,\n' + 'x'.repeat(300)
     const s = `Look at this.\n[photo:${scene}]\n[`
-    expect(tailHold(s)).toBe('Look at this.\n'.length)
+    expect(tailHold(s)).toBe('Look at this.'.length)
   })
 
   it('分块喂完整一轮:放出去的只有正文,两枚标签一个字符都没漏', () => {
     const reply = 'Rain again. I am so tired of it.\n[photo:self:me on the balcony]\n[mood:tired]'
     const { released, held } = stream(reply)
-    expect(released).toBe('Rain again. I am so tired of it.\n')
-    expect(held).toBe('[photo:self:me on the balcony]\n[mood:tired]')
+    /* 放出去的正文**末尾不带那个换行**(它归标签那一截),所以界面上
+       不会多出一行空行 */
+    expect(released).toBe('Rain again. I am so tired of it.')
+    expect(held).toBe('\n[photo:self:me on the balcony]\n[mood:tired]')
   })
 
   it('分块喂长场景:正文先流出去,标签留在手里', () => {
@@ -255,7 +277,7 @@ describe('tailHold · 放到哪才不漏半截标签', () => {
     const reply = `Look at this.\n[photo:${scene}]\n[mood:warm]`
     const { released, held } = stream(reply, 7)
     /* 正文完整放出去,而且**不是等到流末才放** —— 这是这一整套改动的目的 */
-    expect(released).toBe('Look at this.\n')
+    expect(released).toBe('Look at this.')
     expect(held).toContain('[photo:')
     /* 放出去的那一段里绝不能带半个标签 */
     expect(released).not.toContain('[ph')
