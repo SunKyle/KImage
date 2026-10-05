@@ -64,25 +64,51 @@ export function localStamp(d = new Date()) {
   )
 }
 
+/**
+ * "多久以前"那句话 —— **两端共用同一种说法**。
+ *
+ * 服务端拿它拼 "You two last spoke 3 days ago."(见下),
+ * 界面拿它显示消息流末尾那行 "Last spoke 3 days ago"。
+ * 共用的理由不是省几行字:同一个事实在两处被说成两样,
+ * 用户会以为它们在讲两件事 —— 而它们讲的是同一件。
+ *
+ * @param ms   过去了多久
+ * @param opts.long  true = 不设上限(界面用:隔了半年也该说出个大概)。
+ *                   false = 超过 30 天不报(系统提示词用:让它开口就提"两个月前"
+ *                   只会换来一句尴尬的寒暄,不如让它自己决定要不要提)
+ * @returns 那句话;空串表示**不该报**(太近、太久、或时间戳是坏的)
+ */
+export function agoLabel(ms, { long = false } = {}) {
+  const t = Number(ms)
+  /* 未来(负数)、NaN、以及"同一口气"里连着说的,都不报 ——
+     宁可少一句,也不能让它说出自相矛盾的话 */
+  if (!Number.isFinite(t) || t < SAME_BREATH_MS) return ''
+
+  const min = Math.floor(t / 60000)
+  if (min < 60) return `${min} ${min === 1 ? 'minute' : 'minutes'} ago`
+  const hours = Math.floor(min / 60)
+  if (hours < 24) return `${hours} ${hours === 1 ? 'hour' : 'hours'} ago`
+  const days = Math.floor(hours / 24)
+  if (!long) return days > TOO_LONG_DAYS ? '' : `${days} ${days === 1 ? 'day' : 'days'} ago`
+  /* 再往上只给"界面"用,粒度也粗一档:隔了半年还说 "183 days ago"
+     是机器在报数,而这时候人会说"半年了" */
+  if (days <= 31) return `${days} ${days === 1 ? 'day' : 'days'} ago`
+  const months = Math.round(days / 30)
+  if (months < 12) return `${months} months ago`
+  const years = Math.round(days / 365)
+  return `${years} ${years === 1 ? 'year' : 'years'} ago`
+}
+
 /** "上次说话"那一句。返回空串表示这一句不该出现(太近、太久、或压根没有) */
 function intervalLine(base, lastAt) {
   const t = Number(lastAt)
   if (!Number.isFinite(t) || t <= 0) return ''
-  const ms = base - t
-  /* 未来时间:用户改过系统钟,或上一条消息的时间戳坏了。
-     报"负三天前"比不报糟得多 —— 它会让角色说出自相矛盾的话 */
-  if (ms < 0) return ''
-  if (ms < SAME_BREATH_MS) return ''
-
-  const min = Math.floor(ms / 60000)
-  if (min < 60) return `You two last spoke ${min} minutes ago.`
-  const hours = Math.floor(min / 60)
-  if (hours < 24) return `You two last spoke ${hours} ${hours === 1 ? 'hour' : 'hours'} ago.`
-  const days = Math.floor(hours / 24)
-  /* 天不写"昨天":26 小时前可能是前天的 23 点,按日历算并不是昨天。
+  /* 未来时间(用户改过系统钟,或上一条的时间戳坏了)由 agoLabel 挡掉 ——
+     报"负三天前"比不报糟得多,它会让角色说出自相矛盾的话。
+     天不写"昨天":26 小时前可能是前天的 23 点,按日历算并不是昨天。
      这一块里每一句话都必须是**真的**,宁可用不那么亲切的说法 */
-  if (days > TOO_LONG_DAYS) return ''
-  return `You two last spoke ${days} ${days === 1 ? 'day' : 'days'} ago.`
+  const ago = agoLabel(base - t)
+  return ago ? `You two last spoke ${ago}.` : ''
 }
 
 /**

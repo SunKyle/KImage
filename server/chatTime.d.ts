@@ -11,3 +11,7 @@ export declare function timeContext(input?: {
   nowLocal?: string
   lastAt?: number
 }): string
+
+/** "3 days ago" 这类相对说法 —— 系统提示词与界面**共用同一句**。
+ *  空串 = 不该报(太近、太久、时间戳是坏的);`long: true` 时不限 30 天(界面用) */
+export declare function agoLabel(ms: number, opts?: { long?: boolean }): string

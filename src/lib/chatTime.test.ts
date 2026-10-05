@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { localStamp, timeContext } from '../../server/chatTime.js'
+import { agoLabel, localStamp, timeContext } from '../../server/chatTime.js'
 
 /* 这一块的每一条判据都冲着同一件事:**说出去的时间必须是真的。**
    角色一旦报错时间(星期几不对、说"负三天前"、报一个不存在的日期),
@@ -120,5 +120,54 @@ describe('认不出来就整块丢掉', () => {
 
   it('Z 不收:没有偏移就说不清是哪个时区的 23:41,而这一块宁可没有', () => {
     expect(timeContext({ nowLocal: '2026-10-05T23:41:07Z' })).toBe('')
+  })
+})
+
+/* 这一句**两端共用**:服务端拼 "You two last spoke 3 days ago.",
+   界面在消息流末尾显示 "Last spoke 3 days ago"。
+   同一个事实在两处被说成两样,用户会以为它们在讲两件事 —— 所以边界只有一份 */
+describe('agoLabel(两端共用的那一句)', () => {
+  const MIN = 60 * 1000
+  const HOUR = 60 * MIN
+  const DAY = 24 * HOUR
+
+  it('两分钟以内不报 —— 同一口气里连着说的不算"上次"', () => {
+    expect(agoLabel(0)).toBe('')
+    expect(agoLabel(30 * 1000)).toBe('')
+    expect(agoLabel(2 * MIN - 1)).toBe('')
+    expect(agoLabel(2 * MIN)).toBe('2 minutes ago')
+  })
+
+  it('未来与坏值不报', () => {
+    for (const bad of [-1, -DAY, NaN, Infinity, -Infinity, 'abc', null, undefined]) {
+      expect(agoLabel(bad as never)).toBe('')
+    }
+  })
+
+  it('分钟 / 小时 / 天,单复数都对', () => {
+    expect(agoLabel(25 * MIN)).toBe('25 minutes ago')
+    expect(agoLabel(60 * MIN)).toBe('1 hour ago')
+    expect(agoLabel(90 * MIN)).toBe('1 hour ago')
+    expect(agoLabel(5 * HOUR)).toBe('5 hours ago')
+    expect(agoLabel(DAY)).toBe('1 day ago')
+    expect(agoLabel(3 * DAY)).toBe('3 days ago')
+  })
+
+  it('默认不报超过 30 天的(提示词用:开口就提"两个月前"只会换来尴尬)', () => {
+    expect(agoLabel(30 * DAY)).toBe('30 days ago')
+    expect(agoLabel(31 * DAY)).toBe('')
+  })
+
+  it('long = true 时不设上限,而且粒度变粗(界面用)', () => {
+    expect(agoLabel(31 * DAY, { long: true })).toBe('31 days ago')
+    expect(agoLabel(60 * DAY, { long: true })).toBe('2 months ago')
+    expect(agoLabel(365 * DAY, { long: true })).toBe('1 year ago')
+    expect(agoLabel(800 * DAY, { long: true })).toBe('2 years ago')
+  })
+
+  it('提示词那一句就是它拼出来的(两处不可能各说各的)', () => {
+    const now = localStamp(new Date(2026, 9, 5, 23, 41))
+    const base = Date.parse(now)
+    expect(timeContext({ nowLocal: now, lastAt: base - 3 * DAY })).toContain(agoLabel(3 * DAY))
   })
 })

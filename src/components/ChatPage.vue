@@ -27,6 +27,8 @@ import { REF_IMAGE_EDGE } from '../lib/payload'
 // 浮层的公共行为(Tab 圈定 / 点外收起 / Esc 逐层退)
 import { isInside, layerOnEscape, trapTab } from '../lib/ui'
 import { growTextarea, vGrow } from '../lib/grow'
+/* "多久以前"那句话与服务端拼给角色的那句**同源**(见那份文件的 agoLabel) */
+import { agoLabel } from '../../server/chatTime.js'
 import { speak, speechSupported, speakingId, speakingLoading, stopSpeaking, warmUpSpeech } from '../lib/speech'
 
 /* 角色对话页。它是一个平级页面(见 lib/nav.ts),不是浮层 ——
@@ -206,7 +208,9 @@ function dayLabel(t: number): string {
 }
 
 type Row =
-  | { kind: 'sep'; key: string; label: string }
+  /* away: 末尾那一行"离开多久了"。它与别的时间分隔不是一回事 ——
+     别的说"这条消息是什么时候发的",它说"这段对话放多久了" */
+  | { kind: 'sep'; key: string; label: string; away?: boolean }
   /* first: 这是"新的一段"的第一条(换了人,或者上面刚插了一条时间分隔)。
      间距据此分两档 —— 见下面 rows 的说明与 .msg.group-first */
   | { kind: 'msg'; key: string; msg: ChatMessage; first: boolean }
@@ -239,6 +243,24 @@ const rows = computed<Row[]>(() => {
     })
     prev = m.createdAt
     prevRole = m.role
+  }
+  /* 末尾那一行"离开多久了"。
+     回到一段放了很久的对话时,你的眼睛落在**最新那一条**上 ——
+     而它的时间标记在**上面很远的地方**:分隔只插在"间隔之前",
+     连着说的那几句后面没有标记。于是"这一整段是三天前的"这件事,
+     在视口里一个字都没有,只有一串没有时间的句子。
+     补在末尾而不是顶上,正是因为你会落在这里(顶上那些要往上翻才看得到)。
+
+     阈值与分隔同一条(30 分钟):刚聊完就去别处转一圈回来,
+     不该看见它。措辞与角色被告知的那句**同源**(见 server/chatTime.js) ——
+     同一个事实在界面与提示词里说成两样,用户会以为它们在讲两件事 */
+  const newest = msgs.value[msgs.value.length - 1]
+  if (newest) {
+    const gap = Date.now() - newest.createdAt
+    if (gap > SEP_GAP) {
+      const ago = agoLabel(gap, { long: true })
+      if (ago) out.push({ kind: 'sep', key: 'sep-away', label: `Last spoke ${ago}`, away: true })
+    }
   }
   return out
 })
@@ -1058,7 +1080,7 @@ onBeforeUnmount(() => {
             </div>
 
             <template v-for="r in rows" :key="r.key">
-              <p v-if="r.kind === 'sep'" class="sep">{{ r.label }}</p>
+              <p v-if="r.kind === 'sep'" class="sep" :class="{ away: r.away }">{{ r.label }}</p>
               <div v-else class="msg" :class="[r.msg.role, { 'group-first': r.first }]">
                 <!-- 用户附的图。**独立一块,不放进气泡**(文字有文字的框,图有图的位置)。
                      压在文字上面是因为它是那句话的前提:先看图,再读字 -->
@@ -1795,6 +1817,12 @@ onBeforeUnmount(() => {
   font-size: var(--fs-micro);
   letter-spacing: 0.04em;
   color: var(--text-4);
+}
+/* 末尾那行"离开多久了"。它不在两条消息之间,而是**收在一段对话的后面** ——
+   所以上面留足(与最后一条拉开),下面由输入区那边负责,别挤在一起。
+   刻意不加边框、不加底色:它是这段对话的一个注脚,不是一条消息 */
+.sep.away {
+  margin: var(--sp-6) 0 var(--sp-2);
 }
 .msg {
   display: flex;

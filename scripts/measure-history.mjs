@@ -1940,6 +1940,9 @@ async function main() {
       chatProbe.seeded = await evaluate(async () => {
         const charId = 'probe-chat-char'
         const now = Date.now()
+        /* 这段对话是 3 天前的。取这个数不是为了仿真,是为了让
+           "Last spoke 3 days ago" 那一行有确定的、可断言的文本 */
+        const CHAT_AGO = 3 * 24 * 60 * 60 * 1000
         localStorage.setItem(
           'kimage.characters',
           JSON.stringify([
@@ -2030,7 +2033,9 @@ async function main() {
           charId,
           role: m.role,
           content: m.content,
-          createdAt: now - m.dt * 60000,
+          /* 整段对话挪到 3 天前:探针要能看见"离开多久了"那一行,
+             而它是按"最新一条距今多久"算的。相对次序(dt)一个没动 */
+          createdAt: now - CHAT_AGO - m.dt * 60000,
           ...(m.photo ? { photo: m.photo } : {}),
           ...(m.photoId ? { photoId: m.photoId } : {}),
           ...(m.imageId ? { imageId: m.imageId } : {})
@@ -2056,9 +2061,9 @@ async function main() {
             charId,
             text: 'They met on a cold morning and agreed to keep it short.',
             upToId: 'probe-msg-1',
-            upToAt: now - 2 * 60000,
+            upToAt: now - CHAT_AGO - 2 * 60000,
             covered: 2,
-            updatedAt: now
+            updatedAt: now - CHAT_AGO
           })
           tx.oncomplete = res
           tx.onerror = () => rej(tx.error)
@@ -2102,6 +2107,9 @@ async function main() {
           hasMemory: !!document.querySelector('.mem-chip'),
           oldMemoryBlock: !!document.querySelector('.chat-stream .memory'),
           charInRail: /Probe talker/.test(document.body.textContent || ''),
+          /* 末尾那行"离开多久了"。整段对话是 3 天前的,所以它该说 3 天 ——
+             文本要精确匹配:写死一句 "Last spoke recently" 之类也算没接上 */
+          awayLine: document.querySelector('.chat-stream .sep.away')?.textContent || '',
           photoRendered: !!document.querySelector('img.msg-photo'),
           photoBelowText: !!order && order.imgAt > order.textAt && order.textAt >= 0,
           /* 库里那条只带场景、没有 photoId 的消息,读回来时**不再顶着骨架**:
@@ -2411,6 +2419,9 @@ async function main() {
         chatProbe.rendered?.hasMemory === true &&
         chatProbe.rendered?.oldMemoryBlock === false &&
         chatProbe.rendered?.charInRail === true &&
+        /* 回来时知道自己离开了多久 —— 而且说的是**真实的那段间隔**(3 天)。
+           判别性:核对的是精确文本,常量或错数都过不去 */
+        chatProbe.rendered?.awayLine === 'Last spoke 3 days ago' &&
         chatProbe.rendered?.photoRendered === true &&
         chatProbe.rendered?.photoBelowText === true &&
         /* 没画出来的那一张:必须说出来、并且给一枚重试键(骨架不该再出现)。
