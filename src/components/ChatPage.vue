@@ -135,18 +135,19 @@ function avatarOf(c: Character): string {
  *  它是在渲染那一刻算的，页面开着不动一小时这句话会旧一小时 ——
  *  与"Last spoke"那行同一条取舍：它服务的是"刚回到这一页的那一眼"。 */
 const sceneLine = computed(() => {
-  const clock = () => {
-    const d = new Date()
-    const p = (n: number) => String(n).padStart(2, '0')
-    return `${p(d.getHours())}:${p(d.getMinutes())}`
-  }
-  const list = msgs.value
-  for (let i = list.length - 1; i >= 0; i--) {
-    const p = (list[i].photo || '').replace(/\s+/g, ' ').trim()
-    if (p) return `${p} · ${clock()}`
-  }
-  return clock()
+  const p = (stillMsg.value?.photo || '').replace(/\s+/g, ' ').trim()
+  const t = clockNow()
+  return p ? `${p} · ${t}` : t
 })
+
+/** 本机钟的 HH:MM。与 T6.1 发给服务端的那份同一个口径:用户眼前的钟。
+ *  它在渲染那一刻算 —— 页面开着不动一小时这句话会旧一小时,
+ *  与"Last spoke"那行同一条取舍:它服务的是"刚回到这一页的那一眼" */
+function clockNow(): string {
+  const d = new Date()
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${p(d.getHours())}:${p(d.getMinutes())}`
+}
 
 /** 沉浸页背景用的那张。与头像是**同一个** object URL(coverSrc 按 Blob 缓存),
  *  所以它不额外占内存、也不额外发请求。
@@ -155,14 +156,28 @@ const sceneLine = computed(() => {
  *  而实际存下来的那张是 CHAR_IMAGE_MAX(1280)的 JPEG(见 useCharacters 的
  *  charImageBlob)—— 降到 1080 几乎是个空操作,不值得为它加一段 canvas 代码。
  *  真正要防的 GPU 开销用两件事对付:压暗蒙版把它盖住一半、窄屏把 blur 收小 */
+/** 最新那张**已经画出来**的剧照属于哪一条。
+ *
+ *  它同时决定三件事:背景画哪张、流里**不**再重复画它、以及头部那行场景写什么。
+ *  三件事必须是同一条消息 —— 否则会出现"背景是窗边、标题写的是别的"这种错位
+ *  (头一行原来取的是"最后一条照片**意图**",而那条完全可能还没画出来) */
+const stillMsg = computed(() => {
+  const list = msgs.value
+  for (let i = list.length - 1; i >= 0; i--) if (list[i].photoId) return list[i]
+  return null
+})
+const stillId = computed(() => stillMsg.value?.photoId || '')
+
 const bgSrc = computed(() => {
   const c = current.value
   if (!c) return ''
-  /* 正脸优先;没有正脸就退到**底图**(`sourceRef`,用户上传的那张)。
-     "没有正脸"是一种很常见的角色:只上传了一张图、还没生成过正脸 ——
-     而那一张同样是"它长什么样",有它也比只剩一层压暗色强。
-     两个都没有才落到主题色(不报错、不留空壳) */
-  return coverSrc(c.ref) || coverSrc(c.sourceRef)
+  /* **剧照优先**:这一页要的是"这一场戏",而生成的剧照正是它 ——
+     它带着镜头、光与环境,是唯一撑得住"锐利铺满"的那种图。
+     `imgUrl()` 与流里那张图共用同一份缓存(一条消息一个 objectURL),
+     所以这里不额外读库、不额外占内存;还没读完的那一拍先落回首图。
+     退路依次是:剧照 → 正脸 → 底图(`sourceRef`) → 主题色 */
+  const still = stillId.value ? imgUrl(stillId.value) : ''
+  return still || coverSrc(c.ref) || coverSrc(c.sourceRef)
 })
 
 /* 最近活跃在前:**置顶的永远在最前**,其余按最后一条消息的时间排,
@@ -1296,7 +1311,12 @@ onBeforeUnmount(() => {
                      先读它说什么,再看它给你看什么。还没有 photoId = 正在画,
                      占一个同尺寸的方骨架位,免得图到了把整段对话顶下去 -->
                 <button
-                  v-if="r.msg.role === 'assistant' && r.msg.photoId && imgUrl(r.msg.photoId)"
+                  v-if="
+                    r.msg.role === 'assistant' &&
+                    r.msg.photoId &&
+                    imgUrl(r.msg.photoId) &&
+                    !(immersive && r.msg.photoId === stillId)
+                  "
                   type="button"
                   class="msg-img-btn"
                   :aria-label="`Open the photo from ${current.name}`"
@@ -1334,8 +1354,15 @@ onBeforeUnmount(() => {
                     Try again
                   </button>
                 </div>
+                <!-- 正在画的那张占一个骨架位。**已经在背景上的那张不占** ——
+                     它走的是上面那条被沉浸态收掉的分支,而这一支如果没有同一个
+                     判断,就会在原地留下一个空白的方块(截图里就是这么发现的) -->
                 <span
-                  v-else-if="r.msg.role === 'assistant' && r.msg.photo"
+                  v-else-if="
+                    r.msg.role === 'assistant' &&
+                    r.msg.photo &&
+                    !(immersive && r.msg.photoId === stillId)
+                  "
                   class="msg-photo msg-photo-skel"
                   aria-hidden="true"
                 ></span>
@@ -1613,7 +1640,7 @@ onBeforeUnmount(() => {
   border: 0;
   border-radius: 999px;
   background: none;
-  color: var(--text-4);
+  color: var(--text-3);
   cursor: pointer;
   opacity: 0;
   transition: opacity var(--dur) var(--ease), color var(--dur) var(--ease),
@@ -1753,7 +1780,7 @@ onBeforeUnmount(() => {
    它们是同一枚药丸里的次要信息,不该和主词争同样的分量 */
 .chip-when,
 .chip-note {
-  color: var(--text-4);
+  color: var(--text-3);
   font-weight: 400;
 }
 /* 模型名可能很长(中转上自己写的别名),给它一档上限再省略 ——
@@ -1970,7 +1997,12 @@ onBeforeUnmount(() => {
   margin: var(--sp-4) 0 var(--sp-1);
   font-size: var(--fs-micro);
   letter-spacing: 0.04em;
-  color: var(--text-4);
+  /* **内容用 --text-3,不用 --text-4**。--text-4 是"禁用态"那一档:
+     浅色主题里它在白底上只有 1.65:1、深色 2.01:1 —— 那意味着读不出来。
+     从前背景几乎是一片纯色时它还勉强看得见,沉浸页把剧照铺上来之后
+     就彻底不行了(这条规矩同一份文件里早写过一次,见 .mem-note)。
+     真正的禁用态(菜单项、发送键)仍留在 --text-4 */
+  color: var(--text-3);
 }
 /* 末尾那行"离开多久了"。它不在两条消息之间,而是**收在一段对话的后面** ——
    所以上面留足(与最后一条拉开),下面由输入区那边负责,别挤在一起。
@@ -2055,7 +2087,7 @@ onBeforeUnmount(() => {
   border: 0;
   border-radius: 999px;
   background: none;
-  color: var(--text-4);
+  color: var(--text-3);
   cursor: pointer;
   transition: color var(--dur) var(--ease), background var(--dur) var(--ease);
 }
@@ -2136,7 +2168,7 @@ onBeforeUnmount(() => {
 .cut {
   margin: 3px 0 0;
   font-size: var(--fs-micro);
-  color: var(--text-4);
+  color: var(--text-3);
 }
 /* ===== 记忆卡片 =====
    它是"关于这段对话"的一段派生文本,不是一条消息 —— 所以它不排在消息流里,
@@ -2191,7 +2223,7 @@ onBeforeUnmount(() => {
   text-transform: uppercase;
 }
 .mem-card-when {
-  color: var(--text-4);
+  color: var(--text-3);
   text-transform: none;
   letter-spacing: 0;
 }
@@ -2205,7 +2237,7 @@ onBeforeUnmount(() => {
   border: 0;
   border-radius: 999px;
   background: none;
-  color: var(--text-4);
+  color: var(--text-3);
   cursor: pointer;
   transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
 }
@@ -2358,7 +2390,7 @@ onBeforeUnmount(() => {
   border: 0;
   border-radius: var(--r-sm);
   background: none;
-  color: var(--text-4);
+  color: var(--text-3);
   font-size: var(--fs-xs);
   cursor: pointer;
   transition: color var(--dur) var(--ease), background var(--dur) var(--ease);
@@ -2627,7 +2659,7 @@ onBeforeUnmount(() => {
   /* 触控目标 ≥40px:这一行本身只是提示,撑高的是里面那枚键 */
   min-height: 40px;
   font-size: var(--fs-xs);
-  color: var(--text-4);
+  color: var(--text-3);
 }
 .photo-fail > svg {
   font-size: 14px;
@@ -2727,7 +2759,7 @@ onBeforeUnmount(() => {
   outline: none;
 }
 .compose-box textarea::placeholder {
-  color: var(--text-4);
+  color: var(--text-3);
   transition: color var(--dur) var(--ease);
 }
 /* 一进来就把提示语提亮一档:它是"这里可以说话"的唯一提示 */
@@ -3071,6 +3103,17 @@ onBeforeUnmount(() => {
   position: absolute;
   top: var(--sp-3);
   right: var(--sp-2);
+}
+/* 沉浸态里的图**都收小**:正文是一页剧本,图是"它给你看过的东西",
+   不该有一块比台词还大的色块横在那儿(参考图那一屏正文里根本没有图块)。
+   上限给得克制:看一眼认得出来即可,想细看点开还是大图 */
+.chat.is-immersive .msg-img-btn,
+.chat.is-immersive .msg.assistant .msg-img-btn {
+  max-width: min(190px, 34%);
+}
+.chat.is-immersive .msg-img,
+.chat.is-immersive .msg-photo {
+  max-height: 170px;
 }
 /* 输入区收成一条宽胶囊(参考图里就是一整条半透明胶囊)。
    圆角用 999 而不是 --r:这一条比别处的卡片更长更扁,

@@ -1976,6 +1976,36 @@ async function main() {
           r.onsuccess = () => res(r.result)
           r.onerror = () => rej(r.error)
         })
+        /* 一张"剧照":夜色里的窗。**它现在会被铺成沉浸页的背景** ——
+           所以不能再用纯色:纯色铺满屏幕还是纯色,截图里分不出
+           "背景是这张图"还是"背景没画出来"(这个坑刚踩过一次) */
+        const still = await (async () => {
+          const c = document.createElement('canvas')
+          /* 720 而不是 640:**与正脸那张刻意不同宽** —— 这样"背景画的是剧照
+             还是退回去的正脸"才有一条决定性判据(比 naturalWidth) */
+          c.width = 720
+          c.height = 960
+          const g = c.getContext('2d')
+          const night = g.createLinearGradient(0, 0, 0, 960)
+          night.addColorStop(0, '#0d1522')
+          night.addColorStop(1, '#1b2430')
+          g.fillStyle = night
+          g.fillRect(0, 0, 640, 960)
+          // 远处几盏灯
+          for (let i = 0; i < 90; i++) {
+            const x = (i * 97) % 720
+            const y = 120 + ((i * 53) % 700)
+            g.fillStyle = i % 4 ? 'rgba(255,214,150,.75)' : 'rgba(190,220,255,.6)'
+            g.fillRect(x, y, 4, 4)
+          }
+          // 窗框与窗台
+          g.fillStyle = '#2a2f38'
+          g.fillRect(0, 0, 720, 120)
+          g.fillRect(540, 0, 180, 960)
+          g.fillRect(0, 840, 720, 120)
+          return await new Promise((res) => c.toBlob((b) => res(b), 'image/png'))
+        })()
+
         // 一张真图(用 canvas 现造,不靠网络)
         const png = await new Promise((res) => {
           const c = document.createElement('canvas')
@@ -2106,7 +2136,7 @@ async function main() {
           for (const m of msgs) store.put(m)
           tx.objectStore('chat_images').put({
             id: 'probe-photo-1',
-            blob: png,
+            blob: still,
             createdAt: now
           })
           // 用户附的那张是另一张图(横的),这样"谁发的"一眼分得出来
@@ -2148,6 +2178,14 @@ async function main() {
 
       // ④ 进对话页
       chatProbe.navToChat = await gotoPage('Chat')
+      /* 播种时偏好是开着的 ⇒ 一进来就是沉浸态。**先退出来**再量:
+         下面那一段量的是**气泡骨架**那一套(左右对齐、附图、失败提示…),
+         它们是普通页的判据;沉浸页那套(剧本排版、场景行、剧照当底图)
+         由 ⑤ 之后那一段单独量。两套判据各在自己的骨架下量,才不会互相污染 */
+      await evaluate(() => {
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))
+      })
+      await settle()
       chatProbe.rendered = await evaluate(() => {
         const bubbles = document.querySelectorAll('.bubble, .msg, .chat-msg').length
         /* 配图必须**在文字之后**(垫在下面):比的是两者在气泡里的位置。
@@ -2322,6 +2360,12 @@ async function main() {
           colW: Math.round(document.querySelector('.chat-inner')?.getBoundingClientRect().width || 0),
           /* 工具层收走、身份留下、出口留着 */
           menuHidden: !menu || getComputedStyle(menu).display === 'none',
+          /* 最新那张剧照被提到背景上之后,流里不该再出现它 ——
+             判据是"有几张 msg-photo",普通骨架下是 1 */
+          stillInFlow: document.querySelectorAll('.chat-inner img.msg-photo').length > 0,
+          /* 背景画的**必须是那张剧照**(它 720 宽),不是退回去的头像(640)。
+             两条路画出来的都是图,只有宽度分得开 */
+          bgW: document.querySelector('.chat-bg img')?.naturalWidth || 0,
           soloShown: !!solo && getComputedStyle(solo).display !== 'none',
           pickHidden: getComputedStyle(document.querySelector('.head-pick')).display === 'none',
           exitBtn: !!document.querySelector('[aria-label="Leave immersive mode"]'),
@@ -2380,7 +2424,15 @@ async function main() {
       await sleep(200)
       chatProbe.layers.jump = await evaluate(() => {
         const j = document.querySelector('.jump')
-        return { shown: !!j, inViewport: !!j && j.getBoundingClientRect().top >= 0 }
+        const stream = document.querySelector('.chat-stream')
+        return {
+          shown: !!j,
+          inViewport: !!j && j.getBoundingClientRect().top >= 0,
+          /* 这一页现在**可能根本没有可滚的东西**(剧本排版比气泡短得多,
+             八条消息在 900 高的视口里放得下)。那样的话"回到最新"不该出现才对 ——
+             所以判据是"有东西在下面 ⟺ 它出现",而不是"它必须出现" */
+          scrollable: !!stream && stream.scrollHeight > stream.clientHeight + 4
+        }
       })
       chatProbe.layers.stampKept = await evaluate(
         () => document.querySelector('.chat-stream')?.__probeStamp === 'kept'
@@ -2719,6 +2771,10 @@ async function main() {
         chatProbe.immersive?.soloShown === true &&
         chatProbe.immersive?.pickHidden === true &&
         chatProbe.immersive?.exitBtn === true &&
+        /* 最新那张剧照被提到背景上之后,**不该在流里再出现一次** */
+        chatProbe.immersive?.stillInFlow === false &&
+        /* 剧照优先那条路:背景得是那张 720 宽的戏,不是 640 宽的头像 */
+        chatProbe.immersive?.bgW === 720 &&
         /* 且**真的把顶栏那份高度还给了面板** —— 比在视口高度上做文章稳:
            后者会被 .chat 的 min-height 盖过去 */
         chatProbe.immersive?.chatH >=
@@ -2736,9 +2792,9 @@ async function main() {
         chatProbe.layers?.stampKept === true &&
         chatProbe.layers?.stampAfterEsc === true &&
         chatProbe.layers?.shellOverflow === 'clip' &&
-        /* "回到最新"在沉浸态里照样浮得出来,而且落在视口内 */
-        chatProbe.layers?.jump?.shown === true &&
-        chatProbe.layers?.jump?.inViewport === true &&
+        /* "回到最新":有东西在下面时它浮得出来、落在视口内;没有时它就不该在 */
+        chatProbe.layers?.jump?.shown === chatProbe.layers?.jump?.scrollable &&
+        (chatProbe.layers?.jump?.shown === false || chatProbe.layers?.jump?.inViewport === true) &&
         /* 撤销条不许压住输入区。它是一条**会吃掉点击**的浮条:
            压住输入框中间时,点进去打字的那一下会触发"撤销"。
            这条是量出来才发现的(见 Wave C 的 T6.12) */
@@ -2763,7 +2819,10 @@ async function main() {
         chatProbe.rendered?.pendingSkeleton === false &&
         chatProbe.rendered?.photoOutsideBubble === true &&
         chatProbe.rendered?.photoWidth > 0 &&
-        chatProbe.rendered?.photoWidth <= 240 &&
+        /* 上限跟着 CSS 那一档走(min(320px, 76%))。它仍然在断言
+           "这是一张缩略图,不是一面墙" —— 只是原来是拿 32px 的夹具
+           对着 240 这个松数在量 */
+        chatProbe.rendered?.photoWidth <= 320 &&
         chatProbe.rendered?.regenWithoutModel === false &&
         /* 置顶:左栏第一行是那个置顶的(它没有对话、建得也更晚) */
         /Probe pinned/.test(chatProbe.rendered?.railFirst || '') &&
