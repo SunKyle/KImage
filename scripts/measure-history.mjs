@@ -205,13 +205,15 @@ async function evaluate(fn, ...fnArgs) {
    (改动前 / 改动后)排布可比 —— 窗口大小不同的话截出来的图没法对着看 */
 const SHOT_DIR = arg('shot-dir', '')
 if (SHOT_DIR) mkdirSync(SHOT_DIR, { recursive: true })
-async function shot(name) {
+async function shot(name, width = 1280, height = 900) {
   if (!SHOT_DIR) return
   await send('Emulation.setDeviceMetricsOverride', {
-    width: 1280,
-    height: 900,
-    deviceScaleFactor: 1,
-    mobile: false
+    width,
+    height,
+    /* 窄屏那几张按手机算(dsf 2 + mobile):媒体查询、触控目标、
+       safe-area 那一套只有在这种尺寸下才真的走到 */
+    deviceScaleFactor: width <= 480 ? 2 : 1,
+    mobile: width <= 480
   })
   // 视口一变会重排,等一拍再拍,免得拍到旧的布局
   await sleep(300)
@@ -1996,6 +1998,46 @@ async function main() {
             g.fillRect(0, 0, w, h)
             c.toBlob((b) => res(b), 'image/png')
           })
+        /* 一张**像人脸**的图当角色正脸,而不是纯色方块 ——
+           沉浸页那层压暗到底盖掉了多少,拿纯色是看不出来的
+           (纯色被盖掉一半还是纯色,看不出"照片还在不在") */
+        const face = await (async () => {
+          const c = document.createElement('canvas')
+          c.width = 640
+          c.height = 960
+          const g = c.getContext('2d')
+          const sky = g.createLinearGradient(0, 0, 0, 960)
+          sky.addColorStop(0, '#cfe3f5')
+          sky.addColorStop(1, '#f6e3d0')
+          g.fillStyle = sky
+          g.fillRect(0, 0, 640, 960)
+          g.fillStyle = '#3a2a24'
+          g.beginPath()
+          g.ellipse(320, 400, 190, 250, 0, 0, Math.PI * 2)
+          g.fill()
+          g.fillStyle = '#e8b48c'
+          g.beginPath()
+          g.ellipse(320, 430, 150, 195, 0, 0, Math.PI * 2)
+          g.fill()
+          g.fillStyle = '#2b2118'
+          g.beginPath()
+          g.ellipse(265, 415, 18, 11, 0, 0, Math.PI * 2)
+          g.fill()
+          g.beginPath()
+          g.ellipse(375, 415, 18, 11, 0, 0, Math.PI * 2)
+          g.fill()
+          g.strokeStyle = '#9c5f4a'
+          g.lineWidth = 7
+          g.beginPath()
+          g.arc(320, 480, 55, 0.35, Math.PI - 0.35)
+          g.stroke()
+          g.fillStyle = '#586b7a'
+          g.beginPath()
+          g.ellipse(320, 950, 300, 200, 0, 0, Math.PI * 2)
+          g.fill()
+          return await new Promise((res) => c.toBlob((b) => res(b), 'image/png'))
+        })()
+
         const tall = await mk(180, 320, '#3f7d5a')
         const banner = await mk(800, 200, '#8a5a3f')
         const wide = await new Promise((res) => {
@@ -2053,8 +2095,13 @@ async function main() {
             'readwrite'
           )
           /* 角色的正脸(卡面/头像/沉浸页背景都用它)。
+             **画一张像人脸的图,而不是一个纯色方块** —— 沉浸页背景那层压暗
+             到底盖掉了多少,拿纯色是看不出来的(纯色被盖掉一半还是纯色)。
              没有它的时候背景层会退化成"只剩压暗色",那条也一并量 */
-          tx.objectStore('chars').put({ id: charId, data: png })
+          /* **只播底图,不播正脸** —— 这一条正好测新增的那条退路:
+             角色只有上传的那张图、还没生成过正脸时,背景层仍然有东西可画。
+             正脸那条路(coverSrc(c.ref))本来就是头像与角色卡一直在走的那条 */
+          tx.objectStore('chars').put({ id: charId + ':source', data: face })
           const store = tx.objectStore('chat_messages')
           for (const m of msgs) store.put(m)
           tx.objectStore('chat_images').put({
@@ -2366,6 +2413,19 @@ async function main() {
       await settle()
 
       await shot('chat-messages')
+
+      /* 窄屏两张:这一页的断点(860/720/640)只有在这种宽度下才真的走到 ——
+         左栏收起、角色头变成可点按钮、气泡 76% 太窄要放开、输入区贴 safe-area */
+      await shot('chat-narrow', 390, 844)
+      await evaluate(() => {
+        document.querySelector('[aria-label="Immersive mode"]')?.click()
+      })
+      await settle()
+      await shot('chat-narrow-immersive', 390, 844)
+      await evaluate(() => {
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))
+      })
+      await settle()
 
       // ⑦ 点图开大图 → Esc 收起
       chatProbe.clickedPhoto = await evaluate(() => {

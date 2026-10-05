@@ -132,7 +132,15 @@ function avatarOf(c: Character): string {
  *  而实际存下来的那张是 CHAR_IMAGE_MAX(1280)的 JPEG(见 useCharacters 的
  *  charImageBlob)—— 降到 1080 几乎是个空操作,不值得为它加一段 canvas 代码。
  *  真正要防的 GPU 开销用两件事对付:压暗蒙版把它盖住一半、窄屏把 blur 收小 */
-const bgSrc = computed(() => (current.value ? avatarOf(current.value) : ''))
+const bgSrc = computed(() => {
+  const c = current.value
+  if (!c) return ''
+  /* 正脸优先;没有正脸就退到**底图**(`sourceRef`,用户上传的那张)。
+     "没有正脸"是一种很常见的角色:只上传了一张图、还没生成过正脸 ——
+     而那一张同样是"它长什么样",有它也比只剩一层压暗色强。
+     两个都没有才落到主题色(不报错、不留空壳) */
+  return coverSrc(c.ref) || coverSrc(c.sourceRef)
+})
 
 /* 最近活跃在前:**置顶的永远在最前**,其余按最后一条消息的时间排,
    没聊过的排在后面(按创建时间)。顺序是派生的,不落盘 ——
