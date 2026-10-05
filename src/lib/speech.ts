@@ -190,6 +190,66 @@ function nudge(charId: string, salt: string): number {
   return 0.9 + (hash(charId + salt) % 18) / 100
 }
 
+/* ===== 情绪落到语调上 ================================================
+   情绪已经有自己的出口了(见 server/chatTags.js 的 `[mood:…]`),但**那是给眼睛的**。
+   同一句话换个语调念出来,像不像那个人差别很大 —— 而这是全站唯一一处
+   "情绪可以不花钱地影响表达"的地方(浏览器自带语音:零成本、离线)。
+
+   三条纪律:
+   1. **振幅要小**。rate 一档 ±0.06、pitch ±0.08 —— 再放大就开始像卡通配音,
+      与上面那条 0.90~1.07 的边界同一条理由:它是"同一把嗓子换了个心情",
+      不是换了一个人;
+   2. **认不出就不动**。情绪词是模型自由写的(刻意没有枚举表,见 chatTags 的设计),
+      所以这张表注定覆盖不全 —— 覆盖不到就保持原样,**绝不猜**。
+      而且**用整词匹配、不做子串**:`unamused` 里含 `amused`,两者正好相反;
+   3. **只作用于浏览器那条路**。第三方合成的音色是角色**身份**的一部分,
+      跟着情绪改音高等于换了个人(见 speak())。 */
+const MOOD_TONE: Record<string, { rate: number; pitch: number }> = {
+  /* 低落、疲惫:慢一点、低一点 */
+  tired: { rate: -0.06, pitch: -0.05 },
+  sad: { rate: -0.06, pitch: -0.06 },
+  bored: { rate: -0.05, pitch: -0.03 },
+  cold: { rate: -0.03, pitch: -0.05 },
+  flat: { rate: -0.04, pitch: -0.03 },
+  /* 温和、亲近:略慢、略高 */
+  warm: { rate: -0.02, pitch: 0.04 },
+  soft: { rate: -0.03, pitch: 0.03 },
+  fond: { rate: -0.02, pitch: 0.05 },
+  gentle: { rate: -0.03, pitch: 0.04 },
+  /* 高兴、兴奋:快一点、高一点 */
+  amused: { rate: 0.05, pitch: 0.07 },
+  delighted: { rate: 0.05, pitch: 0.08 },
+  excited: { rate: 0.06, pitch: 0.08 },
+  happy: { rate: 0.04, pitch: 0.06 },
+  playful: { rate: 0.05, pitch: 0.06 },
+  /* 绷着、提防:略快、略低 */
+  angry: { rate: 0.05, pitch: -0.06 },
+  annoyed: { rate: 0.04, pitch: -0.05 },
+  wary: { rate: 0.03, pitch: -0.02 },
+  uneasy: { rate: 0.03, pitch: -0.03 },
+  tense: { rate: 0.04, pitch: -0.04 },
+  /* 端着:慢一点、低一点 */
+  proud: { rate: -0.02, pitch: -0.02 },
+  arrogant: { rate: -0.03, pitch: -0.03 },
+  smug: { rate: -0.02, pitch: -0.04 }
+}
+
+/** 语调的安全区。用户自己配过 rate/pitch 时叠加可能越界,夹回来 */
+const TONE_MIN = 0.5
+const TONE_MAX = 1.5
+const clampTone = (n: number) => Math.min(TONE_MAX, Math.max(TONE_MIN, n))
+
+/** 把情绪叠到既有的语速/音高上。认不出、或压根没给情绪,原样返回 */
+export function toneWithMood(
+  rate: number,
+  pitch: number,
+  mood?: string
+): { rate: number; pitch: number } {
+  const t = MOOD_TONE[String(mood || '').trim().toLowerCase()]
+  if (!t) return { rate, pitch }
+  return { rate: clampTone(rate + t.rate), pitch: clampTone(pitch + t.pitch) }
+}
+
 function pickVoice(
   charId: string,
   text: string,
@@ -217,7 +277,8 @@ function speakInBrowser(
   charId: string,
   msgId: string,
   voice?: CharacterVoice,
-  language?: string
+  language?: string,
+  mood?: string
 ) {
   return new Promise<void>((resolve) => {
     try {
@@ -232,8 +293,16 @@ function speakInBrowser(
         const tag = langOf(text, language)
         u.lang = SPEECH_LOCALES[tag] || tag
       }
-      u.rate = typeof voice?.rate === 'number' ? voice.rate : nudge(charId, 'rate')
-      u.pitch = typeof voice?.pitch === 'number' ? voice.pitch : nudge(charId, 'pitch')
+      /* 语速与音高先取"这个角色的基线"(用户配过的优先,否则按 id 哈希),
+         再叠一层这一条的情绪。叠完夹回安全区 —— 用户自己把 rate 调到 1.4
+         的时候,一个 +0.08 的情绪不该把它推到浏览器不认的地方 */
+      const tone = toneWithMood(
+        typeof voice?.rate === 'number' ? voice.rate : nudge(charId, 'rate'),
+        typeof voice?.pitch === 'number' ? voice.pitch : nudge(charId, 'pitch'),
+        mood
+      )
+      u.rate = tone.rate
+      u.pitch = tone.pitch
       /* 收尾要把状态收回来。onerror 也得收 ——
          浏览器在念不出来时(没有可用音色、被策略拦下)会直接报错,
          不收的话那枚按钮就永远停在"停止"上了 */
@@ -432,6 +501,9 @@ export interface SpeakTarget {
   language?: string
   /** 走 tts 时用的那条配置。engine 是 tts 而它缺了,就直接走浏览器 */
   cfg?: ApiConfig
+  /* 这一条消息的情绪(见 chatTags 的 `[mood:…]`)。**只影响浏览器那条路**:
+     第三方合成的音色是角色身份的一部分,跟着情绪改音高等于换了个人 */
+  mood?: string
 }
 
 /**
@@ -454,7 +526,7 @@ export async function speak(text: string, target: SpeakTarget, msgId: string): P
   if (!wantsTts || !target.cfg) {
     /* 没配 tts,或配了却没给它配置:走浏览器。
        这里**不提醒** —— 用户本来就没打算用第三方 */
-    await speakInBrowser(body, target.charId, msgId, v, target.language)
+    await speakInBrowser(body, target.charId, msgId, v, target.language, target.mood)
     return ''
   }
 

@@ -441,7 +441,16 @@ async function toggleSpeak(msg: ChatMessage) {
      不必再从回复文本里猜它说的是哪国话 */
   const said = await speak(
     msg.content,
-    { charId: c.id, voice: c.voice, language: c.persona?.language, cfg: props.ttsConfig },
+    {
+      charId: c.id,
+      voice: c.voice,
+      language: c.persona?.language,
+      cfg: props.ttsConfig,
+      /* 这一条的情绪一起给它:浏览器那条路据此调一点语速与音高
+         (见 lib/speech 的 toneWithMood)。第三方那条路不认这个参数 ——
+         那把嗓子是角色的身份,不该跟着情绪变 */
+      mood: msg.mood
+    },
     msg.id
   )
   if (said) emit('notice', said)
