@@ -57,6 +57,13 @@ import {
   shrinkScaleFor
 } from '../lib/payload'
 import { blobToDataURL } from '../lib/idb'
+import {
+  canvasDataUrl,
+  encodeAt,
+  fitToCanvas,
+  nextPaint,
+  scaleDataUrl
+} from '../lib/canvasAi'
 import type { ApiConfig, EditMode, ResultItem } from '../types'
 
 /* 自由画布 · P0:本地变换 + 保存成一条新记录。
@@ -1245,74 +1252,7 @@ let editAbort: AbortController | null = null
    视图操作(缩放、平移)不受影响 —— 那些不改内容 */
 const locked = computed(() => !props.item || !!job.value)
 
-/* 画布 → data URL,但把编码那一段让出去。
- *
- *  toDataURL 是全同步的:一张 3840px 的 PNG 编码能把主线程按住几百毫秒,
- *  这段时间里占位、进度条都动不了(正是 nextPaint 想避开的那件事)。
- *  toBlob 把编码交给浏览器,再由 FileReader 读成 data URL —— 那一步也是异步的。
- *  接口那边要的仍然是 data URL(见 types.ts 的 EditParams),最后一程不变 */
-function canvasDataUrl(c: HTMLCanvasElement): Promise<string> {
-  return new Promise((resolve, reject) => {
-    c.toBlob((b) => {
-      if (!b) {
-        reject(new Error('Could not encode the image'))
-        return
-      }
-      blobToDataURL(b).then(resolve, reject)
-    }, 'image/png')
-  })
-}
-
-/* —— 编辑载荷收窄 ——
-   原图与 mask 是整幅位图,而这条请求是 JSON + data URL(base64 再放大三分之一)。
-   实测一张 3840×2160 的照片编成 PNG 之后是 27.8MB,直接超过服务端 15MB 的
-   请求体上限 —— 也就是说"在 4K 图上做局部编辑"过去必然失败。
-   而厂商的编辑结果本身有上限(gpt-image-1 最大 1536,本站给的档位最大 2560),
-   送更大的进去换不到更大的结果。所以这里按上限收窄,再按内容挑格式。 */
-async function encodeAt(c: HTMLCanvasElement, scale: number): Promise<string> {
-  const t = scale >= 1 ? c : newCanvas(c.width * scale, c.height * scale)
-  if (t !== c) {
-    const ctx = t.getContext('2d')
-    if (ctx) {
-      ctx.imageSmoothingQuality = 'high'
-      ctx.drawImage(c, 0, 0, t.width, t.height)
-    }
-  }
-  /* 带透明的只能走 PNG —— JPEG 会把透明压成黑块(与存图、参考图那两处同一个坑)。
-     不透明的走 JPEG:实测同一张 2560 的照片,PNG 要 12.4MB,JPEG 只要 2.7MB。
-     反过来的情形也存在(截图类 PNG 只要 0.02MB 而 JPEG 要 1.1MB),但 1.1MB
-     离预算还远,不值得为它多编一次再比大小 */
-  const alpha = hasAlpha(t)
-  /* **不要用 toDataURL**:它是全同步的。实测 2560×1440 的 JPEG 要 34ms、
-     PNG 要 102ms,全压在"点了按钮之后"那一下上 —— 60fps 下一帧只有 16.7ms,
-     也就是用户会看到明显的卡住。toBlob 把编码交给浏览器(实测主线程只占 2.2ms),
-     再由 FileReader 读成 data URL,产出的字节与 toDataURL 完全一致(已核对) */
-  const blob = await toBlob(t, alpha ? 'image/png' : 'image/jpeg')
-  if (!blob) throw new Error('Could not encode the image')
-  return blobToDataURL(blob)
-}
-
-/** 把一张已经是 data URL 的图按同一比例缩一次(mask 由各自的生成器按整幅画布
- *  产出,这里统一收窄 —— 改那三个生成器不如在这一处收口)。
- *  mask 永远编回 PNG:它是硬边形状,有损编码会把边缘糊掉,而它本来就不大 */
-async function scaleDataUrl(url: string, scale: number): Promise<string> {
-  if (scale >= 1) return url
-  const bmp = await createImageBitmap(await (await fetch(url)).blob())
-  const t = newCanvas(
-    Math.max(1, Math.round(bmp.width * scale)),
-    Math.max(1, Math.round(bmp.height * scale))
-  )
-  const ctx = t.getContext('2d')
-  if (ctx) {
-    ctx.imageSmoothingQuality = 'high'
-    ctx.drawImage(bmp, 0, 0, t.width, t.height)
-  }
-  bmp.close()
-  // 同样走异步那条:mask 多是平色(实测 2560 的 PNG 只有几十 KB),但没理由再留一处同步编码
-  const blob = await toBlob(t, 'image/png')
-  return blob ? blobToDataURL(blob) : url
-}
-
+/* 载荷编码与缩放工具已抽离至 lib/canvasAi.ts */
 /** 这一次编辑要送出去的两张图。**必须同一个缩放系数** ——
  *  尺寸对不上上游会直接判参数错误,所以系数只能算一次、两张图共用。
  *  超预算时再退一档重编(带透明的大图才可能走到,普通照片第一轮就进预算)。
@@ -1353,50 +1293,7 @@ function fullMask(): Promise<string> {
   })
 }
 
-/** 把上游回来的那张对回画布原来的画幅。
- *
- *  请求那边已经按原尺寸去要了(见 api.ts 的 allowedSizeFor),但上游听不听话不由我们 ——
- *  只认固定几档画幅的厂商,一张 16:9 的图也只能给到 3:2。这里再兜一道,
- *  让"编辑不改变画幅"这件事在本地成立,而不是托付给别人。
- *
- *  贴法是"填满再居中裁":宁可裁掉一点边,也不要整幅被拉伸变形 ——
- *  变形是每一帧都看得见的错,裁边只在极端比例下才明显 */
-async function fitToCanvas(bmp: ImageBitmap, w: number, h: number): Promise<ImageBitmap> {
-  if (bmp.width === w && bmp.height === h) return bmp
-  const c = newCanvas(w, h)
-  const ctx = c.getContext('2d')
-  if (ctx) {
-    ctx.imageSmoothingQuality = 'high'
-    const k = Math.max(w / bmp.width, h / bmp.height)
-    const dw = bmp.width * k
-    const dh = bmp.height * k
-    ctx.drawImage(bmp, (w - dw) / 2, (h - dh) / 2, dw, dh)
-  }
-  bmp.close()
-  return createImageBitmap(c)
-}
-
-/** 让浏览器真的画一帧再往下走。
- *
- *  单等一个微任务(或 nextTick)是不够的:那只是把回调排到队尾,浏览器要等
- *  主线程整条空下来才会绘制。而紧接着那几件取原图、编码 mask 的事是几百毫秒的
- *  同步活儿,排在它们后面等于没让 —— 占位会跟着一起卡在那儿不动。
- *  两帧是因为第一帧的 rAF 回调仍在绘制之前,要到第二次才算画过。
- *
- *  另外压一条超时:标签页切到后台时 rAF 会被冻住,不兜底的话这次编辑就
- *  发不出去了。给 200ms 封顶 —— 让帧是为了观感,不该真的耽误正事 */
-function nextPaint(): Promise<void> {
-  return new Promise((resolve) => {
-    const timer = setTimeout(resolve, 200)
-    requestAnimationFrame(() =>
-      requestAnimationFrame(() => {
-        clearTimeout(timer)
-        resolve()
-      })
-    )
-  })
-}
-
+/* 画幅适配与帧让步已抽离至 lib/canvasAi.ts */
 /**
  * 一次 AI 请求的公共骨架:先把占位交出去、接住取消、把回来的那张对回画幅、入栈。
  *

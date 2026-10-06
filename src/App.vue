@@ -83,7 +83,8 @@ import { contextText } from './lib/chatContext'
 import { lastMessageLookup, orderConversations } from './lib/chatOrder'
 /* 打字节奏:上游吐字是匀速的,而匀速正是机器感最直接的来源(见那份文件的四条纪律) */
 import { Pacer } from './lib/typing'
-import { NAV_ITEMS } from './lib/nav'
+import { NAV_ITEMS, type Page } from './lib/nav'
+import { formatHash, parseHash } from './lib/router'
 import { useFeedback } from './composables/useFeedback'
 import { useConfigs } from './composables/useConfigs'
 import { useHistory } from './composables/useHistory'
@@ -337,8 +338,36 @@ const {
   clearChat
 } = useChat({ characters, chatConfig, notice, announce, scheduleUndo })
 
-type Page = 'home' | 'chars' | 'chat' | 'canvas' | 'lib' | 'history' | 'settings'
-const page = ref<Page>('home')
+/* —— 页面落在哪一页:由 hash 说了算(见 lib/router.ts) ——
+   页面与对话对象都进地址栏,于是刷新不再回到首页,某段对话也能直接把链接发给别人。
+   两个方向各管一头:这里读进来,下面的 watch 写回去;用户手改地址或按前进后退
+   则由 onHashChange 接住 */
+const initialRoute = parseHash(typeof window !== 'undefined' ? window.location.hash : '')
+const page = ref<Page>(initialRoute.page)
+if (initialRoute.id && initialRoute.page === 'chat') {
+  chatCharId.value = initialRoute.id
+}
+
+/* 状态变了就写回地址栏。用 replaceState 而不是 pushState:这些变化
+   (切页、换对话对象)每一步都进历史栈的话,用户按一次后退只退回上一个 tab,
+   而返回上一页这个动作本身就被埋掉了 */
+watch([page, chatCharId], ([p, cid]) => {
+  if (typeof window === 'undefined') return
+  const id = p === 'chat' && cid ? cid : undefined
+  const targetHash = formatHash(p, id)
+  if (window.location.hash !== targetHash) {
+    window.history.replaceState(null, '', targetHash)
+  }
+})
+
+/* 反方向:用户手改地址、或按了前进后退。**只认 hash**,不碰别处状态 */
+function onHashChange() {
+  const { page: p, id } = parseHash(window.location.hash)
+  if (page.value !== p) page.value = p
+  if (id && p === 'chat' && chatCharId.value !== id) {
+    chatCharId.value = id
+  }
+}
 
 /* —— 沉浸式对话页 ——
    它是**同一个对话页的第二种骨架**,不是第二个页面:状态、消息、输入、流式全复用,
@@ -740,6 +769,7 @@ onMounted(() => {
 })
 onBeforeUnmount(() => window.removeEventListener('scroll', onScroll))
 onBeforeUnmount(() => window.removeEventListener('storage', onStorageSync))
+onBeforeUnmount(() => window.removeEventListener('hashchange', onHashChange))
 onBeforeUnmount(() => syncChannel?.close())
 
 /* —— 顶部导航(分段控件) ——
@@ -824,6 +854,7 @@ onMounted(() => {
     void loadChatLast()
   })
   window.addEventListener('storage', onStorageSync)
+  window.addEventListener('hashchange', onHashChange)
   /* 记录与字节那一侧走广播(BroadcastChannel)。它与上面的 storage 事件
      互不重复:那个管被整份覆盖写的目录,这个管 IndexedDB 里的记录 */
   syncChannel = openSyncChannel((batch) => void handleRemoteSync(batch))

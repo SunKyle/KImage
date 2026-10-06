@@ -3,9 +3,13 @@
    顶部字标取"当前在哪一页"的那个名字。各写一份迟早对不上 ——
    加了页面只改一处,所以摆在这儿。
 
-   顺序就是导航上的顺序;value 必须与 App 的 Page 联合类型一致。
+   顺序就是导航上的顺序;value 取自下面那份 Page 联合类型 ——
+   它同样摆在这儿:"有哪几页"与这份清单本来是同一件事,
+   hash 路由的解析也读它一份(见 lib/router.ts)。
    label 是给人看的完整名字:导航里它是悬停提示与读屏名(条目本身只显示图标),
    字标里则直接显示出来 */
+export type Page = 'home' | 'chars' | 'chat' | 'canvas' | 'lib' | 'history' | 'settings'
+
 export interface NavItem {
   value: string
   label: string
