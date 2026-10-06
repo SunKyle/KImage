@@ -26,6 +26,14 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      # 与上一步不同的一道:tsconfig 的 include 只有 src/**,server/** 平时
+      # **不过任何类型检查**,而 node --check 只查语法。于是"拆模块时漏了一个
+      # import"两条路都看不见 —— 它只在真的打到那个端点时让整个 Node 进程退出
+      # (2026-10-06:tts.js 少了 normalizeResourceId 的定义,一次语音请求就把
+      # 后端打死,前端只看到 500)。这一步专盯"用到的名字有没有出处"。
+      - name: Server module wiring (undefined names)
+        run: npm run check:server
+
       - name: Unit tests
         run: npm test
 
@@ -39,6 +47,25 @@ jobs:
       # size/quality 对不对。不花钱、不联网(上游是本地假服务)。
       - name: Chat photo pipeline probe (end-to-end, fake upstream)
         run: npm run probe:chat-photo
+
+      # 上面那条验的是"某一条路的业务对不对",这两步验的是另一件事:
+      # **每个端点打一遍之后,进程还活着吗**。模块化之后,一个漏掉的 import
+      # 不是"坏一条路",是整台服务没了 —— 而那时所有端点都只回 ECONNREFUSED,
+      # 从单个请求的返回码上根本看不出是这个原因。
+      # 与 perf job 同一个手法:后台起服务,下一步用它。
+      - name: Serve the API
+        run: |
+          npm run dev:server &
+          for _ in $(seq 1 40); do
+            curl -sf -o /dev/null http://127.0.0.1:3000/api/health && break
+            sleep 0.5
+          done
+          curl -sf http://127.0.0.1:3000/api/health || { echo "后端没起来"; exit 1; }
+
+      # 请求一律不碰真上游(目标写成丢弃端口 127.0.0.1:9),断言的是
+      # "拿到了响应" + "进程仍然健康",所以不花钱、不联网。
+      - name: API smoke (every endpoint + the process survives)
+        run: npm run smoke:api
 
   # 性能与跨标签页同步的回归门。
   # 与上面那个 job 分开:上面判"对不对"(秒级),这里判"有没有变慢/变胖"(分钟级),
