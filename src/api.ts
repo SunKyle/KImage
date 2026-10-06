@@ -1802,8 +1802,13 @@ export function characterFaceDesc(c: Character): string {
    才谈得上"同一张脸"。取景分方形与竖幅 —— 头像装得下方形,全身只有竖幅才放得开。
 
    顺序也按"它补上了什么"来排:脸定人 → 把这张脸转到别的方向看 →
-   全身交代体型与服装轮廓 → 细部特写交代材质与零件 → 表情收情绪跨度。
-   这个顺序只影响列表与"一次补齐"的先后,不影响任何一张的提示词。
+   全身交代体型与服装轮廓 → 细部特写交代材质与零件 → 肢体交代手、臂、腿、躯干。
+
+   **这个顺序不只是列表顺序**(2026-10-06 更正):对话出图那条路有自己的排法
+   (见 lib/chatPhoto 的 shotViewOrder),但**创作区那条路不传 order,取的就是
+   这里的顺序,而且只取前 4 张**(见 useCharacters 的 MAX_CHAR_REFS)——
+   所以排在最后一位的那张等于在那条路上自动出局。`body` 排最后正是这个原因:
+   它只在"角色发一张自己身体的特写"时需要,其它几条路都用不上它。
 
    注意:修饰词里绝对不能出现 "character reference sheet" 这类词。
    它在图像模型那里是一个很强的排版概念(设定表 = 正面 + 侧面 + 背面并排 + 细节放大),
@@ -1902,9 +1907,25 @@ export const CHARACTER_VIEWS: Array<{
     framing: 'square'
   },
   {
-    kind: 'expression',
-    label: 'Expressions',
-    suffix: 'a 2x2 grid of different facial expressions, plain background',
+    /* 四格肢体:手、臂、腿、躯干。**它替掉的是原来那张表情 2×2**(2026-10-06)。
+
+       为什么是肢体而不是表情:表情由场景文本决定,从来不是从参考图抄的 ——
+       那张图生成出来之后**不进任何一张图**(它在每一条参考图顺序里都排第 5,
+       而参考图上限是 4)。而肢体是这条链上唯一**既没有结构化字段、又最常被
+       特写**的那一处:提示词只能靠锚点句(七项全是头部特征)和特写那层的一句
+       性别兜着,画出来常常不是这个人的手 —— 用户先后报过两次,第二次是
+       "明明是女生,生成的手却很粗糙"(见 lib/chatPhoto 的 partLine)。
+
+       它与 closeups 的分工:那张管脸(眼睛、皮肤与脸上的标记、手、面料),
+       这张管肢体(手、臂、腿、躯干)。两张都躲不开 2×2 网格那点拼贴先验,
+       兜底在提示词的负面层(not a collage, not a contact sheet, no panels)。
+
+       四格必须点明"同一人、同一打光、同一背景",否则模型会画成四个不同的人 ——
+       与 closeups 同一条理由;末尾同样压一句 no text, no labels */
+    kind: 'body',
+    label: 'Body',
+    suffix:
+      'a 2x2 grid of close-up body shots of the same person under identical lighting on the same plain background, one part per panel: the hands with their fingers, the forearms, the legs, the torso, identical skin and build in every panel, no text, no labels',
     framing: 'square'
   }
 ]

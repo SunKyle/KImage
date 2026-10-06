@@ -3,12 +3,14 @@ import {
   CHAT_PHOTO_PROMPT_CHARS,
   backdropViewOrder,
   characterAnchor,
+  characterGender,
   chatPhotoSize,
   frameFromScene,
   frameLine,
   isSelfie,
   isThirdShot,
   missingSlots,
+  partLine,
   planChatPhoto,
   resolveFrame,
   shotRatio,
@@ -421,6 +423,90 @@ describe('frameLine · 不可让渡的那一句', () => {
   })
 })
 
+/* ===== 特写的那一格属于这个人(2026-10-06)===============================
+ *  用户报的:"特写她的手,但那只手跟角色不符 —— 明明是女生,手却很粗糙。"
+ *  根因不在手上:锚点句那七项**全是头部与体型**,而这一档的画面里往往没有脸,
+ *  于是"这个人是谁"整段失效、参考图里那张脸也一起失效。 */
+describe('characterGender · 单独给,不并进锚点句', () => {
+  it('取得到那一栏', () => {
+    expect(characterGender({ fields: { gender: 'female', face: 'oval face' } })).toBe('female')
+  })
+
+  it('没填过(老角色)时是空串,不报错', () => {
+    expect(characterGender({ fields: { face: 'oval face' } })).toBe('')
+    expect(characterGender(undefined)).toBe('')
+  })
+})
+
+describe('partLine · 这一格是那个人身上的局部', () => {
+  it('带上性别 —— "一只手"与"这个女生的手"是两回事', () => {
+    const line = partLine('female')
+    expect(line).toContain('female')
+    expect(line).toContain('same skin')
+  })
+
+  it('性别空着也留着后半句 —— 它治的是"退回一只通用的手"', () => {
+    const line = partLine('')
+    expect(line).toContain('not a generic stand-in')
+    expect(line).not.toContain('female')
+  })
+})
+
+describe('planChatPhoto · part 只在特写那一档出现', () => {
+  const HANDS = 'my hands wrapped around the mug, steam rising'
+
+  it('特写:锚点句之后补一句"这一格是那个人的局部",并带上性别', () => {
+    const p = planChatPhoto(HANDS, true, ANCHOR, 'selfie', 'close', 'female')
+    expect(p.prompt).toContain('female')
+    /* 排在锚点句之后 —— 两者是同一件事("这个人是谁") */
+    expect(p.prompt.indexOf('female')).toBeGreaterThan(p.prompt.indexOf(ANCHOR))
+  })
+
+  it('**其余各档一个字都不多** —— 性别送进来也不该改它们', () => {
+    /* 他拍 + 全身、自拍 + 半身是这条路上绝大多数图:那两档画面里有脸,
+       锚点句与参考图兜得住,补进去只会变成标签(见 ANCHOR_KEYS 那段注释) */
+    for (const [shot, frame] of [['third', 'full'], ['selfie', 'medium']] as const) {
+      const withSex = planChatPhoto(BARE_SCENE, true, ANCHOR, shot, frame, 'female')
+      expect(withSex.prompt).toBe(planChatPhoto(BARE_SCENE, true, ANCHOR, shot, frame).prompt)
+    }
+  })
+
+  it('空镜不补 —— 画面里没有"这个人",补了就是给"风景里长出一个人"递刀', () => {
+    const p = planChatPhoto('rain running down the window pane', false, '', 'scene', 'close', 'female')
+    expect(p.prompt).not.toContain('female')
+    expect(p.layers.map(([slot]) => slot)).not.toContain('part')
+  })
+
+  it('它在 layers 里单独成层 —— 所以摄影指导拿不到它(见 photoDirector)', () => {
+    const p = planChatPhoto(HANDS, true, ANCHOR, 'selfie', 'close', 'female')
+    expect(p.layers.map(([slot]) => slot)).toContain('part')
+  })
+})
+
+/* ===== 特写不补"动作"(2026-10-06 查这条链时发现)======================
+ *  模板那两句是以"画面里有脸"写的:自拍那句是 `mid-moment, looking into the
+ *  camera`。而这一档的画面里常常只有一只手、一片布料 —— 请模型"看向镜头",
+ *  就是请它把一双眼睛画进来,与"一个局部填满画面"正面打架。 */
+describe('planChatPhoto · 动作那一层在特写下不出现', () => {
+  it('拍手时不补"看向镜头" —— 那不是这一档的画面里有的东西', () => {
+    const p = planChatPhoto('my hands wrapped around the mug', true, ANCHOR, 'selfie', 'close')
+    expect(p.prompt).not.toContain('looking into the camera')
+    expect(p.layers.map(([slot]) => slot)).not.toContain('action')
+  })
+
+  it('半身与全身照旧补 —— 那两档人整只在画面里,那两句成立', () => {
+    for (const [shot, frame] of [['selfie', 'medium'], ['third', 'full']] as const) {
+      const p = planChatPhoto('the pier at dusk', true, ANCHOR, shot, frame)
+      expect(p.layers.map(([slot]) => slot), `${shot}/${frame}`).toContain('action')
+    }
+  })
+
+  it('场景自己交代了动作时,本来就不补 —— 这条纪律没变', () => {
+    const p = planChatPhoto('leaning on the balcony rail', true, ANCHOR, 'selfie', 'medium')
+    expect(p.layers.map(([slot]) => slot)).not.toContain('action')
+  })
+})
+
 describe('planChatPhoto · 分层与顺序', () => {
 
   it('场景照:不拼锚点、不发参考图、镜头是空镜', () => {
@@ -585,11 +671,71 @@ describe('shotRatio / shotViewOrder', () => {
   })
 
   it('视图名必须是真实存在的枚举 —— 写错只会静静地少一张参考图', () => {
-    const real = new Set(['front', 'detail', 'full', 'closeups', 'expression'])
+    /* 判据取自 CHARACTER_VIEWS 本身,不另抄一份:抄的那份在换视图时会静静地过期
+       (2026-10-06 就发生过 —— expression 换成 body,而手抄的那张表还写着 expression) */
+    const real = new Set(CHARACTER_VIEWS.map((v) => v.kind as string))
     for (const shot of ['selfie', 'third', 'scene'] as const) {
-      for (const k of shotViewOrder(shot)) expect(real.has(k)).toBe(true)
-      expect(new Set(shotViewOrder(shot)).size).toBe(shotViewOrder(shot).length)
+      for (const frame of [undefined, 'close', 'medium', 'full'] as const) {
+        const order = shotViewOrder(shot, frame)
+        for (const k of order) expect(real.has(k)).toBe(true)
+        expect(new Set(order).size).toBe(order.length)
+      }
     }
+  })
+})
+
+/* ===== 景别 → 参考图(2026-10-06)=========================================
+ *  与提示词那一侧同一条理由:参考图在图像编辑那条路上是**最强的机位来源** ——
+ *  把机位句改近了、手上却给一张"整个人在画面里"的参考,取景照样会被拽回去。
+ *  这一组钉住的是**边界**:两端必须动,中间必须一个字不动。 */
+describe('shotViewOrder · 景别也决定参考图', () => {
+  it('特写:全身像出局 —— 它正是把取景往回拽的那一张', () => {
+    expect(shotViewOrder('selfie', 'close')).not.toContain('full')
+    expect(shotViewOrder('third', 'close')).not.toContain('full')
+  })
+
+  it('特写:正面像打头、closeups 紧跟 —— 头一张不留给带版式先验的 2×2 网格', () => {
+    for (const shot of ['selfie', 'third'] as const) {
+      const order = shotViewOrder(shot, 'close')
+      expect(order[0]).toBe('front')
+      expect(order[1]).toBe('closeups')
+    }
+  })
+
+  it('全身:全身像打头,两条视角都一样 —— 与谁拿的相机无关', () => {
+    expect(shotViewOrder('selfie', 'full')[0]).toBe('full')
+    expect(shotViewOrder('third', 'full')[0]).toBe('full')
+  })
+
+  it('特写:肢体那张(2×2 手/臂/腿/躯干)在,而且排在头角度之前', () => {
+    /* 这一档的画面里常常没有脸 —— 那时参考图里只有 closeups 那四分之一格
+       是"手上的证据",不够。它必须落在上限 4 以内,排在最后一位等于白加 */
+    for (const shot of ['selfie', 'third'] as const) {
+      const order = shotViewOrder(shot, 'close')
+      expect(order).toContain('body')
+      expect(order.indexOf('body')).toBeLessThan(4)
+      expect(order.indexOf('body')).toBeLessThan(order.indexOf('detail'))
+    }
+  })
+
+  it('肢体那张只进特写这一档 —— 其余两档里它落在会被截掉的位置', () => {
+    /* 全身/半身里手和腿只占几十个像素,给一张 2×2 的肢体只是多一份网格。
+       它在那两条顺序里排最后一位,而发出去时**只取前 4 张**
+       (useCharacters 的 MAX_CHAR_REFS),所以实际不参与 —— 但在数组里留着它,
+       是为了让"他拍 + 全身"与"不传景别"能逐字相同(见下面那条) */
+    for (const [shot, frame] of [['selfie', 'medium'], ['third', 'full']] as const) {
+      expect(shotViewOrder(shot, frame).indexOf('body')).toBeGreaterThanOrEqual(4)
+    }
+    /* 特写那一档反过来,它必须在 4 以内 */
+    expect(shotViewOrder('selfie', 'close').indexOf('body')).toBeLessThan(4)
+  })
+
+  it('**缺省那一档逐字不变** —— 他拍缺省是全身,自拍缺省是半身', () => {
+    /* 这一档吃掉了这条路上绝大多数图:他拍 + 全身必须与"景别没参与时"逐字相同 */
+    expect(shotViewOrder('third', 'full')).toEqual(shotViewOrder('third'))
+    /* 半身不登记 —— 自拍那一档的缺省就是它,所以他拍传半身也照旧 */
+    expect(shotViewOrder('selfie', 'medium')).toEqual(shotViewOrder('selfie'))
+    expect(shotViewOrder('third', 'medium')).toEqual(shotViewOrder('third'))
   })
 })
 

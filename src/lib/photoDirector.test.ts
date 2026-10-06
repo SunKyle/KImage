@@ -355,3 +355,28 @@ describe('applyDirector · 景别它一个字都改不了', () => {
     expect(after.prompt).not.toContain('full figure')
   })
 })
+
+/* ===== 特写那一句"这一格属于这个人":与景别同一层级的护栏(2026-10-06) ====
+ *  摄影指导写的就是 `Camera:` 那一行,而"这是谁的局部"不是它可以优化的工艺 ——
+ *  它只看得到一句场景,看不到对话、也看不到那个角色是谁。
+ *  (用户报的:"特写她的手,那只手却跟角色不符 —— 明明是女生,手很粗糙。") */
+describe('applyDirector · "这一格属于这个人"它也改不了', () => {
+  const REWRITE = 'Camera: low angle, weathered hands, rough knuckles'
+
+  it('它写一句"粗糙的手",机位那是它的事,part 那一层一个字没动', () => {
+    const plan = planChatPhoto(
+      'my hands wrapped around the mug',
+      true,
+      ANCHOR,
+      'selfie',
+      'close',
+      'female'
+    )
+    const after = applyDirector(plan, parseDirector(REWRITE))
+    const layer = (p: typeof plan, name: string) => p.layers.find(([slot]) => slot === name)?.[1]
+
+    expect(layer(after, 'camera')).toContain('weathered hands')
+    expect(layer(after, 'part')).toBe(layer(plan, 'part'))
+    expect(after.prompt).toContain('female')
+  })
+})

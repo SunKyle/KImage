@@ -23,6 +23,7 @@ import { PHOTO_SCENE_CHARS } from '../../server/chatTags.js'
 import {
   backdropViewOrder,
   characterAnchor,
+  characterGender,
   chatPhotoSize,
   planChatBackdrop,
   planChatPhoto,
@@ -344,9 +345,24 @@ function undoEnhance() {
 
 
   /* 摄影指导这一跳最多等多久。它不是用户主动发起的(用户只看到"图在画"),
-     所以超时不能太长 —— 卡住时宁可交一张模板拼的图,也不能让骨架一直转。
-     15 秒是给"思考型"文本模型留的余量:它们会把思考也算进这段时间 */
-  const DIRECTOR_TIMEOUT_MS = 15_000
+     所以不能无限等 —— 卡住时宁可交一张模板拼的图,也不能让骨架一直转。
+     但**它耽误的只是"图晚多久出来",不是正文**(正文早就流完在屏幕上了),
+     所以这个数该按"文本模型能有多慢"来定,而不是按"别让骨架转多久":
+
+     - 服务端那一侧给的是 UPSTREAM_TIMEOUT_MS = 120 秒 —— 也就是说 2 分钟以内,
+       它**不会**替我们放弃;
+     - 而这一层打的是"当前生效的文本配置",它很可能是**思考型**模型:
+       思考也走这段路,一个短任务花 20 秒以上是常事。
+
+     15 秒是原值,实测经常不够(用户 2026-10-06:"角色生图前的 enhance 经常
+     超时失败"),而它一超时就**整层丢掉**、退回模板 —— 那正是"图看着没用上
+     摄影指导"的样子。30 秒是个折中:覆盖绝大多数思考时间,又不至于真卡住时
+     让骨架转太久。
+
+     **真正该换的是模型**:如果 30 秒仍然经常不够,下一步不是继续加这个数,
+     而是给"提示词改写"配一条非思考型的文本配置 —— 它这一跳要的只是一段
+     四行的短回答。 */
+  const DIRECTOR_TIMEOUT_MS = 30_000
 
   /** 让摄影指导写这一张的机位、镜头、光与环境。
    *
@@ -359,11 +375,24 @@ function undoEnhance() {
    *    代理直连重试、错误回显这些事,而多一条端点就是多一处要跟着改的地方;
    *  - **用当前生效的文本配置**,与提示词改写同一个来源。没配就跳过一次 ——
    *    这不该是这个功能的硬依赖(用户可能只配了出图那条);
-   *  - **等它,但不与出图并行**:它改的就是出图要用的那段提示词。 */
+   *  - **等它,但不与出图并行**:它改的就是出图要用的那段提示词。
+   *
+   *  —— 每一处跳过都留一行 console.debug(2026-10-06 补)——
+   *
+   *  这一层从前**完全静默**:没配文本模型、超时、上游报错,在界面上长得一模一样
+   *  (都是"图看起来没用上摄影指导"),而这三件事要做的事完全不同 ——
+   *  没配要去配,超时要换模型或调时限,报错要去看那一句 detail。
+   *  与 [chat] photo intent 那行同一套:详细级别、不落盘、不上报。
+   *  **看之前要把控制台的 Verbose 打开**(debug 默认是折叠的)。 */
   async function withDirector(base: ChatPhotoPlan, cfg: ApiConfig): Promise<ChatPhotoPlan | null> {
     const textCfg = deps.textConfig.value
-    if (!textCfg?.baseUrl || !textCfg.model) return null
+    if (!textCfg?.baseUrl || !textCfg.model) {
+      console.debug('[chat] photo director skipped: no text model configured')
+      return null
+    }
     const ac = new AbortController()
+    /* 计时只为那一行日志:它同时回答"这次等了多久"与"30 秒够不够" */
+    const startedAt = Date.now()
     const timer = setTimeout(() => ac.abort(), DIRECTOR_TIMEOUT_MS)
     try {
       const raw = await enhancePrompt(
@@ -385,9 +414,24 @@ function undoEnhance() {
          再从碎片里挑可信的只会引入噪声。
          **视角与景别都不在它那几位里**(2026-10-05 / 10-06 起它不判这两样,
          只被告知),所以这里只看那四位 */
-      if (!DIRECTOR_SLOTS.some((s) => written[s])) return null
+      const ms = Date.now() - startedAt
+      if (!DIRECTOR_SLOTS.some((s) => written[s])) {
+        console.debug('[chat] photo director: nothing usable in its answer', ms, 'ms', raw.slice(0, 80))
+        return null
+      }
+      console.debug('[chat] photo director:', ms, 'ms', Object.keys(written).join('/'))
       return applyDirector(base, written)
-    } catch {
+    } catch (e) {
+      /* AbortError 只可能是上面那个定时器:这条链上没有第二处会 abort 它
+         (用户按 Stop 中断的是对话流,不是这一跳) */
+      console.debug(
+        '[chat] photo director skipped after',
+        Date.now() - startedAt,
+        'ms:',
+        (e as Error)?.name === 'AbortError'
+          ? `no answer within ${DIRECTOR_TIMEOUT_MS / 1000}s`
+          : (e as Error)?.message || e
+      )
       return null
     } finally {
       clearTimeout(timer)
@@ -446,7 +490,9 @@ function undoEnhance() {
    *    落回这一档视角的缺省景别。**它是"让角色拍特写却总变成臂展自拍"的解药**:
    *    在它之前,景别写死在模板的机位句里,谁都说不动;
    *  - 拼进提示词的是**锚点句**而不是那份全量设定表 —— 后者正是"死板"的来源;
-   *  - 尺寸与参考图顺序也跟着镜头走:自拍竖、空镜横,全身那张打头才交代得住体型
+   *  - 尺寸与参考图顺序也跟着镜头与景别走:自拍竖、空镜横;他拍与全身那两档拿
+   *    全身像打头才交代得住体型,而**特写那一档反过来把全身像摘掉** ——
+   *    参考图是这条链上最强的机位来源(见 lib/chatPhoto 的 FRAME_REF_ORDER);
    *
    *  **绝不 reject**:这条链是后台跑的,往外抛没有调用方接得住
    *  (见 App 的 drawChatPhoto)。所以一律返回上面那个结果对象。 */
@@ -469,7 +515,17 @@ function undoEnhance() {
        景别同理,只认那三档 */
     const wantShot = shot === 'selfie' || shot === 'third' ? shot : undefined
     const wantFrame = frame === 'close' || frame === 'medium' || frame === 'full' ? frame : undefined
-    const basePlan = planChatPhoto(text, self, who ? characterAnchor(who) : '', wantShot, wantFrame)
+    const basePlan = planChatPhoto(
+      text,
+      self,
+      who ? characterAnchor(who) : '',
+      wantShot,
+      wantFrame,
+      /* 性别只服务特写那一档(见 lib/chatPhoto 的 partLine):那一段画面里
+         往往没有脸,而锚点句那七项全是头部特征 —— 它是"这个人是谁"唯一的
+         接续。有脸的那些图用不上它,所以不加进锚点句、不改动它们 */
+      who ? characterGender(who) : ''
+    )
     const cfg = deps.config.value
     const gap = imageConfigGap(cfg)
     if (gap) return { error: gap }
@@ -490,7 +546,12 @@ function undoEnhance() {
       let refList: string[] = []
       if (plan.useRefs) {
         try {
-          refList = await deps.charRefSrcsOf(charId, shotViewOrder(plan.shot))
+          /* 顺序由 **shot + frame** 一起给:视角定"哪一类照片"(自拍以正面为主、
+             他拍以全身打头),景别定"离得多近"(特写把全身像摘掉、全身把全身像
+             提到最前,见 lib/chatPhoto 的 FRAME_REF_ORDER)。
+             **少传 frame 那一半就等于上一版** —— 参考图是这条链上最强的机位来源,
+             只改提示词那一侧是不够的(那正是"特写仍拿全身像当参考"的旧毛病) */
+          refList = await deps.charRefSrcsOf(charId, shotViewOrder(plan.shot, plan.frame))
         } catch {
           /* 参考图读不出来仍然照画(纯文生图),但要说明"这张可能不像它" */
           refList = []

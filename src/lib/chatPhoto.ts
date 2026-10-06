@@ -23,7 +23,8 @@
  *  —— 六层提示词,顺序不能反 ——
  *
  *      shot(谁拿的相机) → scene(画的是什么) → anchor(是谁)
- *      → pin/frame(这一档不可让渡的两条) → camera/lens/light/environment(补空的位)
+ *      → part(特写时:这一格是那个人的局部) → pin/frame(这一档不可让渡的两条)
+ *      → camera/lens/light/environment(补空的位)
  *      → negative(挡证件照、肢体画坏与拼贴)
  *
  *  顺序既是权重也是语义:
@@ -78,7 +79,7 @@ export type ChatFrame = 'close' | 'medium' | 'full'
 
 /** 一层提示词:槽名 + 这一层的正文。槽名决定**这一位归谁管** ——
  *  摄影指导那一层只能改 camera / lens / light / env(见 lib/photoDirector),
- *  其余几个槽(medium / scene / anchor / pin / frame / action / negative)
+ *  其余几个槽(medium / scene / anchor / part / pin / frame / action / negative)
  *  它连值都拿不到 */
 export type ChatLayer = [string, string]
 
@@ -90,8 +91,9 @@ export interface ChatPhotoPlan {
   /** 这一张怎么拍。调用方据它挑参考图与尺寸(自拍竖一点、空镜横一点)。
    *  **摄影指导有权改它** —— 见 lib/photoDirector 的 applyDirector */
   shot: ChatShot
-  /** 这一张离得多近。**调用方不据它挑参考图,也不据它挑尺寸** ——
-   *  它只决定机位/景深/环境那三句与那一条 frame 硬约束(见 FRAMING)。
+  /** 这一张离得多近。**调用方据它挑参考图,但不据它挑尺寸** ——
+   *  它决定机位/景深/环境那三句、那一条 frame 硬约束(见 FRAMING),
+   *  以及参考图的取舍顺序(见 FRAME_REF_ORDER,2026-10-06 补)。
    *  与 shot 一样,摄影指导改不到它(不在 DIRECTOR_SLOTS 里) */
   frame: ChatFrame
   /** 它是不是在画面里。**这是聊天模型唯一回答的那件事**,
@@ -156,6 +158,50 @@ export function characterAnchor(c: { fields?: unknown } | undefined): string {
     .filter(Boolean)
     .slice(0, ANCHOR_MAX)
     .join(', ')
+}
+
+/**
+ * 性别那一栏。**单独给,不并进锚点句** —— 那条取舍有它的道理,而且这里不需要推翻它:
+ * 见 partLine 的说明(只有"画面里没有脸"的那一档才用得上这一位)。
+ *
+ * 它是 charSpec 里的必填项(enumValues: female / male),所以正常角色都不会是空串;
+ * 加结构化字段之前的老角色才可能空着,那时 partLine 只留不带性别的那半句。
+ */
+export function characterGender(c: { fields?: unknown } | undefined): string {
+  const f = c?.fields as Record<string, unknown> | undefined
+  if (!f || typeof f !== 'object') return ''
+  return inline(typeof f.gender === 'string' ? (f.gender as string) : '')
+}
+
+/**
+ * 特写那一档:这一格是**那个人身上的一个局部**。
+ *
+ * —— 为什么非有它不可(用户 2026-10-06 报的那个)——
+ *
+ * "角色明明是女生，可是生成的那只手很粗糙。"根因不在手上,在**锚点句管不到手**:
+ * 那七项全是头部与体型(脸、头发、眼睛、眉毛、鼻嘴、胡须、体型)。这一档的画面里
+ * 往往没有脸 —— 于是提示词里唯一能说明"这个人是谁"的那一段整段失效,参考图里
+ * 那张脸也一起失效(模型要画的是手)。它退回自己的缺省:一只手,而且是它画过最多
+ * 的那种手。
+ *
+ * —— 为什么不干脆把性别加进锚点句 ——
+ *
+ * 那条取舍是**写过、也测过的**:「性别不进锚点句 —— 它由参考图和脸型特征决定,
+ * 写出来只会变成标签」。那个判断对**画面里有脸**的那些图是成立的,失效的只是
+ * "没有脸的那一档"。而加进锚点句会改掉这条路上**每一张**图,包括那绝大多数
+ * 本来不必改的 —— 所以只补这一档,一个字的代价也不外溢。
+ *
+ * 后半句("same age / skin / build, not a generic stand-in")不需要任何结构化字段:
+ * 它治的是"退回一只通用的手"这件事本身。所以**没有性别也留着它** ——
+ * 老角色一样受用(皮肤与年龄那一层由 face 那一项兜着,见 charSpec 对 face 的说明)。
+ */
+export function partLine(gender: string): string {
+  const sex = inline(gender)
+  return (
+    'a detail of that same person ' +
+    `\u2014 ${sex ? `${sex}, ` : ''}same age, same skin and same build as the reference, ` +
+    'not a generic stand-in'
+  )
 }
 
 /* ===== 场景里已经说了什么 =============================================
@@ -538,6 +584,9 @@ function hasAction(scene: string): boolean {
  *               缺省景别(见 resolveFrame 与 DEFAULT_FRAME)。
  *               它与 shot 一样**只由这一层定死** —— 摄影指导改不到,
  *               只被告知(见 photoDirector 的 frameBrief)
+ * @param gender **这个角色的性别**(见 characterGender)。只在特写那一档用得上 ——
+ *               它是"画面里没有脸"时唯一还成立的身份特征(见 partLine)。
+ *               空串 = 没填过(老角色),那时 partLine 只留不带性别的那半句
  *
  * —— 视角是谁定的(2026-10-05 改过一次) ——
  *
@@ -576,7 +625,8 @@ export function planChatPhoto(
   self: boolean,
   anchor = '',
   shot?: ChatShot,
-  frame?: ChatFrame
+  frame?: ChatFrame,
+  gender = ''
 ): ChatPhotoPlan {
   const text = String(scene || '')
     .replace(/\s+/g, ' ')
@@ -612,7 +662,8 @@ export function planChatPhoto(
 
   /* —— 分层是要紧的,不是排版 ——
      每一层前面那句都是**这一位归谁管**的标记:
-     `medium` / `scene` / `anchor` / `pin` / `frame` / `negative` 不在 DIRECTOR_SLOTS 里,
+     `medium` / `scene` / `anchor` / `part` / `pin` / `frame` / `negative` 不在
+     DIRECTOR_SLOTS 里,
      所以摄影指导那一层(见 photoDirector.applyDirector)结构上就改不到它们。
      场景原文进 layers 时带的是 `scene` 槽 —— 它永远原样保留,不改写 */
   const layers: ChatLayer[] = [
@@ -622,6 +673,11 @@ export function planChatPhoto(
   /* 锚点句排在场景之后:它是"这个人是谁"的约束,不是这一张的内容。
      只有它在画面里时才拼 —— 这正是把风景画成人的原因(见文件头) */
   if (self && spec) layers.push(['anchor', spec])
+  /* 特写那一档再补一句"这一格是那个人身上的局部"(见 partLine)。
+     紧跟在锚点句之后:两者说的是同一件事("这个人是谁"),而**锚点句那七项
+     全是头部特征** —— 这一档的画面里往往没有脸,它是那一段失效时唯一的接续。
+     没有它,拍手就是"一只手",而不是"这个人的手" */
+  if (self && framed === 'close') layers.push(['part', partLine(gender)])
   /* 这一档的硬约束垫在机位之前,而且是独立一层(见 ShotTemplate.pin):
      摄影指导换得掉 camera,换不掉这一层 ——
      空镜靠它挡住"风景里长出一个人",自拍靠它挡住"画成别人拿相机",
@@ -645,8 +701,15 @@ export function planChatPhoto(
      **但"纵深"在特写下是另一句话**:那一档要的是"背景化开",不是"前景中景远景" */
   layers.push(['env', over?.env ?? tpl.env])
   /* 动作只在场景真的没交代时才补。补出来的动作是模板的猜测,
-     而它比光和环境更容易和场景矛盾(场景说"靠栏杆",模板说"走在路上") */
-  if (tpl.action && !hasAction(text)) layers.push(['action', tpl.action])
+     而它比光和环境更容易和场景矛盾(场景说"靠栏杆",模板说"走在路上")。
+     **特写这一档干脆不补**(2026-10-06 查这条链时发现):模板那两句是以
+     "画面里有脸"写的 —— 自拍那句是 `mid-moment, looking into the camera`。
+     而这一档的画面里常常只有一只手、一片布料、一处疤:请模型"看向镜头",
+     就是请它把一双眼睛画进来,与"一个局部填满画面"正面打架(与当初
+     "特写 vs 半身自拍"是同一类错)。何况这一档的场景通常自己交代了动作
+     ("手压在笔记上")—— 只是不在 ACTION_* 那两张表里,而漏判的代价不该是
+     补一句错的。半身与全身照旧补:那两档人整只在画面里,那两句成立 */
+  if (tpl.action && framed !== 'close' && !hasAction(text)) layers.push(['action', tpl.action])
   /* 负面约束垫在最后:它挡的是"证件照"那套默认构图,不是内容本身 */
   layers.push(['negative', NEGATIVE])
 
@@ -793,8 +856,9 @@ export function isThirdShot(scene: string): boolean {
 }
 
 /* ===== 尺寸与参考图 ===================================================
- *  两个查表,由 shot 决定。它们放在这里而不是调用方,是因为"自拍该竖一点"
- *  与"全身该用全身那张参考图"是同一个决定的两种表现 —— 都属于"这一张怎么拍"。
+ *  两个查表:尺寸由 shot 决定,参考图由 shot + frame 决定。它们放在这里而不是
+ *  调用方,是因为"自拍该竖一点"与"特写不该拿全身像当参考"是同一个决定的
+ *  两种表现 —— 都属于"这一张怎么拍"。
  *  ==================================================================== */
 
 /** 这一张想要的画幅比例(宽/高)。挑尺寸时按它找最接近的一档 */
@@ -807,10 +871,53 @@ export function shotRatio(shot: ChatShot): number {
 /** 参考图按镜头挑:先取哪张视图、再按什么顺序补。
  *  自拍/半身以正面为主(它就是要看正脸),全身那张打头才交代得住体型与服装轮廓。
  *  值必须与 types.ts 的 CharacterViewKind 一致 —— 写错一个键不会报错,
- *  只会静静地少一张参考图(所以单测直接断言这张表) */
-export function shotViewOrder(shot: ChatShot): string[] {
-  if (shot === 'third') return ['full', 'front', 'detail', 'closeups', 'expression']
-  return ['front', 'closeups', 'detail', 'full', 'expression']
+ *  只会静静地少一张参考图(所以单测直接断言这张表)
+ *
+ *  —— 景别对这一侧的影响(2026-10-06 补)——
+ *
+ *  这一位从前只改机位/景深/环境那三句,**参考图一动不动** —— 于是"特写"推到了
+ *  眼睛上,手上给模型看的仍是正面全身与半身那几张。两条证据说明这一侧必须跟着走:
+ *  - 参考图在图像编辑那条路上是**最强的机位来源**(见 api.ts 的 REF_IDENTITY_ONLY
+ *    与 2×2 网格那两条注释):i2i 的默认行为就是保住输入的构图,一句"凑近"拗不过
+ *    一张"整个人在画面里"的参考;
+ *  - 背景图那条路已经量过一次(见 backdropViewOrder):发出去的四张里有三张头脸,
+ *    模型跟着把镜头拉到脸上 —— 反过来同样成立。
+ *
+ *  所以只修**两端**,中间那一档不登记:
+ *  - 全身:全身像必须打头(与他拍那一档的默认同一条理由);
+ *  - 特写:全身像摘掉,正面像打头、closeups 紧跟;
+ *  - 半身:不登记 —— 它夹在两端之间,而他拍那一档的默认本来就拿全身像打头。
+ *
+ *  **不登记的那一档逐字等于这一位不存在时的顺序** —— 与 FRAMING 是同一条纪律:
+ * 老消息、认不出的说法、以及这条路上的绝大多数图,代价为零。 */
+const FRAME_REF_ORDER: Partial<Record<ChatFrame, string[]>> = {
+  /* 全身:身高体型与服装轮廓只有那一张交代得住。两条视角这一档用同一份顺序 ——
+     取景是"离得多近",与谁拿的相机无关 */
+  full: ['full', 'front', 'detail', 'closeups', 'body'],
+  /* 特写:**四张,正好用满上限**,全身出局、肢体那张进来(2026-10-06):
+     - 全身像出局 —— 它把取景往回拽,与这一档正相反(见上面第二条证据);
+     - **body 进来** —— 这一档的画面里常常没有脸(手、脖子、肩),而锚点句那七项
+       全是头部特征:那时"这个部位长什么样"在提示词里没有依据,参考图里也只有
+       closeups 那四分之一格。它排在第三 —— 在两张脸之后、头角度之前;
+     - **正面像打头** —— 它是整条链的锚,又是这五张里唯一一张**单张**人像。
+       头一张不留给带版式先验的网格,与背景图那条路的取舍同源;
+     - closeups 紧跟第二 —— 眼、皮肤与脸上的标记、手、面料那几格正是特写的
+       **内容**,少了它只能凭空编(见 api.ts 里这张图的来由);
+     - **若日后特写开始漏出"四格版式",第一个该摘的是 detail**(头角度那张):
+       它与"这一档只拍一个局部"离得最远。摘它而不是摘 body —— body 正是为
+       这一档加的。 */
+  close: ['front', 'closeups', 'body', 'detail']
+}
+
+/**
+ * @param frame 这一张离得多近。**只影响两端**(见 FRAME_REF_ORDER)——
+ *              不传、或传中间那一档,顺序逐字等于从前
+ */
+export function shotViewOrder(shot: ChatShot, frame?: ChatFrame): string[] {
+  const byFrame = frame ? FRAME_REF_ORDER[frame] : undefined
+  if (byFrame) return byFrame
+  if (shot === 'third') return ['full', 'front', 'detail', 'closeups', 'body']
+  return ['front', 'closeups', 'detail', 'full', 'body']
 }
 
 /** 背景图拿哪几张设定图当参考。

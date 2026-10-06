@@ -204,10 +204,11 @@ export function useCharacters(deps: CharacterDeps) {
    *  对话页可能正跟另一个角色说话,拿创作区那个角色的脸去画,
    *  画出来当然不像(这是实测反馈里最要紧的一条)。
    *
-   *  @param order 视图的取舍顺序。**对话出图按镜头传**(见 lib/chatPhoto 的
+   *  @param order 视图的取舍顺序。**对话出图按镜头与景别传**(见 lib/chatPhoto 的
    *               shotViewOrder):自拍以正面为主,全身像那张打头才交代得住
-   *               体型与服装轮廓。从前这里写死"正面永远排最前",于是拍全身
-   *               也拿一张头像当主参考图 —— 身高体型全靠模型现编。
+   *               体型与服装轮廓,而特写那一档反过来把全身像摘掉。
+   *               从前这里写死"正面永远排最前",于是拍全身也拿一张头像当主
+   *               参考图 —— 身高体型全靠模型现编。
    *               不传 = 保持原顺序(创作区那条路照旧) */
   async function charRefSrcsOf(charId: string, order: string[] = []): Promise<string[]> {
     const c = characters.value.find((x) => x.id === charId)

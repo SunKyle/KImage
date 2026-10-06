@@ -311,6 +311,56 @@ describe('景别前缀', () => {
   })
 })
 
+/* ===== 没有前缀、但场景里点了身体的某个部位(2026-10-06) ==============
+ *  第一条就是用户报的那句**原话**:模型既没写相机前缀、也没写代词,而中文那句
+ *  "手压在笔记上"里连"我的手"三个字都没有 —— 只看前缀与代词,它就是"画面里
+ *  没有人"。而"没有人"的后果不只是视角被定成空镜:**参考图一张都不发**
+ *  (见 lib/chatPhoto 的 useRefs = self),画出来自然不是这个人的手。 */
+describe('身体部位的兜底', () => {
+  it('用户报的那句原话 —— 中文、没前缀、没代词,也认得出它在画面里', () => {
+    const r = splitTags('x\n[photo:close:手压在笔记上，指甲还留着点上次涂的颜色，快掉光了]')
+    expect(r.photoSelf).toBe(true)
+    expect(r.photoFrame).toBe('close')
+  })
+
+  it('英文同理 —— "hands wrapped around the mug" 这类不带 my 的说法', () => {
+    const r = splitTags('x\n[photo:close:hands wrapped around the mug, steam rising]')
+    expect(r.photoSelf).toBe(true)
+  })
+
+  it('**"手机"不能撞成"手"** —— 词表只收没有别的意思的部位词', () => {
+    expect(splitTags('x\n[photo:close:手机放在桌上，屏幕还亮着]').photoSelf).toBe(false)
+  })
+
+  it('英文那一侧同理 —— "hand-held" 说的是那台相机,不是手', () => {
+    expect(splitTags('x\n[photo:close:a hand-held lamp lighting the corner]').photoSelf).toBe(false)
+  })
+
+  it('"the neck of the guitar" 不是脖子 —— neck 那道护栏', () => {
+    expect(splitTags('x\n[photo:close:the neck of the guitar in the foreground]').photoSelf).toBe(false)
+    /* 真说脖子的时候照认(这一句里**只有** neck 一个部位词,别让别的词把这条测空) */
+    expect(splitTags('x\n[photo:close:her neck, hair pushed aside]').photoSelf).toBe(true)
+  })
+
+  it('普通静物仍然判成"没有人" —— 这条兜底不该把一扇窗当成一个人', () => {
+    expect(splitTags('x\n[photo:close:rain running down the window pane]').photoSelf).toBe(false)
+    expect(splitTags('x\n[photo:a mug on the desk, steam rising]').photoSelf).toBe(false)
+  })
+
+  it('`no-self:` 是明说"没有人",这条兜底不能越过它', () => {
+    const r = splitTags('x\n[photo:close:no-self:指甲上的旧漆快掉光了]')
+    expect(r.photoSelf).toBe(false)
+    /* 壳抹掉,内容留着 —— 与 scene: / view: 同一处理 */
+    expect(r.photo).toBe('指甲上的旧漆快掉光了')
+  })
+
+  it('身体部位是内容,不是前缀 —— 它不能被剪掉', () => {
+    const r = splitTags('x\n[photo:close:手压在笔记上，指甲还留着点上次涂的颜色]')
+    expect(r.photo).toContain('指甲')
+    expect(r.photo).toContain('手压在笔记上')
+  })
+})
+
 describe('场景描述的收敛', () => {
   it('换行与连续空白压成一个空格', () => {
     expect(cleanScene('  a   rooftop\nat  dusk ')).toBe('a rooftop at dusk')

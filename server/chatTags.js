@@ -72,6 +72,16 @@ export function cleanScene(s) {
    2026-10-05 之前标签只有"在不在画面里"这一位，视角交给一次额外的文本调用去猜，
    大多数图被猜成他拍 —— 用户报的正是这个。现在一次说清两件事。
 
+   —— 第五种：**没有前缀，但场景里点了身体的某个部位**(2026-10-06)——
+
+   上面四种都要求模型**主动**写点什么(前缀、代词、或角色名)。而"拍我的手"
+   这一类它三样都可能不写:中文那句"手压在笔记上，指甲还留着点上次涂的颜色"
+   里没有 my、没有"我的手"、也没有角色名 —— 于是判成"画面里没有人"，
+   参考图一张都不发。所以再补一条兜底:场景里出现**没有别的意思的部位词**
+   (指甲 / 手腕 / 肩膀 / 皮肤 / 纹身…,nails / wrist / shoulder / tattoo…)，
+   就认为那一部分在画面里。词表刻意不收"手""脚"这种会撞"手机 / 手艺 / 脚本"的
+   词 —— 这条兜底宁可漏判，也不要把一扇窗当成一个人。
+
    —— 第二类前缀:景别(2026-10-06 新增)——
 
    `close:` / `medium:` / `full:` —— 这一张**离得多近**，写在"谁拿的相机"之后
@@ -124,8 +134,66 @@ const FRAME_TOKENS = {
 }
 const SELF_MARK_RE = /^\s*(?:me|i\s*'?m|i\s+am)\b\s*[:：,，\-–—]\s*/i
 const SELF_PLAIN_RE = /^\s*(?:me|i\s*'?m|i\s+am)\b/i
+
+/* —— 场景里点了身体的某个部位 ——
+   有的模型不写前缀、也不写代词,直接写"手压在笔记上，指甲还留着点上次涂的颜色"
+   (用户 2026-10-06 报的那句,原话)。中文尤其容易:它既没有 my、也没有"我的手"
+   那三个字,只看上面两个正则就是"画面里没有人"。
+
+   判错的代价不只是视角被定成空镜:**参考图一张都不发**(见 lib/chatPhoto 的
+   useRefs = self),画出来自然不是这个人的手 —— 用户看到的正是这个。
+
+   词表取窄:只收**没有别的意思**的部位词。像"脚"这种单独出现会撞
+   "脚本 / 脚下"的一律不收;英文那一侧有两处例外,各带一道护栏 ——
+   hand 会撞 "hand-held"(说的那台相机),那里是 `(?!-)`;
+   neck 会撞 "the neck of the guitar / a bottle",那里是 `(?!\s+of)`。
+   同一件事中文做不到:"手"会撞"手机 / 手艺"(它们比"一手拿着杯子"常见得多),
+   所以中文那条干脆不收单字"手",靠"指甲 / 手指 / 手腕"这些去认 ——
+   用户报的那句里正好有"指甲"。
+   与 SELFIE_RE / FRAME_*_RE 同一条纪律:宁可漏判(落回"没有人"),也不误判
+   (把一扇窗当成一个人)。 */
+const BODY_PART_RE =
+  /\b(hands?(?!-)|nails?|fingernails?|fingers?|fingertips?|knuckles?|palms?|wrists?|forearms?|elbows?|shoulders?|collarbones?|necks?(?!\s+of)|skin|complexion|tattoos?|scars?|freckles|lashes|thighs?|knees?|calves|ankles?)\b/i
+const BODY_PART_ZH = [
+  '指甲',
+  '手指',
+  '指尖',
+  '手腕',
+  '手掌',
+  '手心',
+  '手背',
+  '拳头',
+  '前臂',
+  '手臂',
+  '胳膊',
+  '肩膀',
+  '肩头',
+  '锁骨',
+  '脖子',
+  '喉咙',
+  '皮肤',
+  '肤色',
+  '纹身',
+  '疤痕',
+  '雀斑',
+  '睫毛',
+  '头发',
+  '发梢',
+  '眼睛',
+  '嘴唇',
+  '眉毛',
+  '膝盖',
+  '脚踝',
+  '大腿',
+  '小腿'
+]
+
 /** 模型偶尔会画蛇添足写个 scene: / view: —— 那不是内容，抹掉 */
 const SCENE_PREFIX_RE = /^\s*(?:scene|view|no-?self)\s*[:：,，\-–—]\s*/i
+/** 上面那条把 `no-self:` 和 scene:/view: 收在同一个壳里抹掉 —— 但前者是
+ *  **明说"画面里没有人"**,与后两个只是画蛇添足不同。所以它得单独认一次:
+ *  下面那条"点了身体部位就算你在画面里"的兜底不该越过它。 */
+const NO_SELF_RE = /^\s*no-?self\s*[:：,，\-–—]/i
 
 /** 前缀词 → 查表用的键:小写、去掉空格与连字符("Third-person" → "thirdperson") */
 function headToken(word) {
@@ -179,7 +247,15 @@ export function parsePhotoIntent(raw, charName = '') {
     // 代词留在描述里(它是内容)，只置位
     self = true
   }
+  /* `no-self:` 是明说"画面里没有人" —— 先记下来，再连壳一起抹掉。
+     下面那条身体部位的兜底不该越过它(建模时真写过 no-self 的只有这一条路) */
+  const noSelfSaid = NO_SELF_RE.test(base)
   base = base.replace(SCENE_PREFIX_RE, '')
+  /* 场景里点了身体的某个部位 → 那部分就是"你在画面里"(见 BODY_PART_RE 的说明)。
+     放在前缀抹掉之后再判:那些壳不该影响这一个判断 */
+  if (!self && !noSelfSaid && (BODY_PART_RE.test(base) || BODY_PART_ZH.some((w) => base.includes(w)))) {
+    self = true
+  }
 
   const scene = cleanScene(base)
   const name = String(charName || '').trim().toLowerCase()

@@ -406,8 +406,15 @@ export interface CharacterDraft {
 
    两个相邻的名字不是笔误:detail 是头部转面那张 2×2(标签 Angles),
    closeups 是细部特写那张 2×2(标签 Details)。前者是历史键名,留它是为了
-   库里已经生成好的 Angles 图还能对上;新加的就照内容老实叫 closeups */
-export type CharacterViewKind = 'front' | 'detail' | 'full' | 'closeups' | 'expression'
+   库里已经生成好的 Angles 图还能对上;新加的就照内容老实叫 closeups。
+
+   **`body` 是唯一一次"换了 key"**(2026-10-06,替掉原来的 `expression`)——
+   与 detail 那次换了内容还留着旧键不是一回事:那次换的是**同一类内容里的
+   另一种拍法**(3/4 头像 → 转面头像,都是头),老图留着仍然对得上;这次换的是
+   **另一类内容**(2×2 表情 → 2×2 肢体),老图留着会被当成"肢体参考"发出去 ——
+   那是个看不出来的错。所以那一格**宁可为空**:空格子在界面上写着"还没生成",
+   一眼就知道要做什么;一张贴错标签的旧图不写。 */
+export type CharacterViewKind = 'front' | 'detail' | 'full' | 'closeups' | 'body'
 
 export interface CharacterView {
   kind: CharacterViewKind
