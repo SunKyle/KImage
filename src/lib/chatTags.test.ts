@@ -17,7 +17,8 @@ describe('splitTags 的剪取', () => {
       mood: 'warm',
       photo: '',
       photoSelf: false,
-      photoShot: ''
+      photoShot: '',
+      photoFrame: ''
     })
   })
 
@@ -27,7 +28,8 @@ describe('splitTags 的剪取', () => {
       mood: '',
       photo: 'standing in the rain',
       photoSelf: false,
-      photoShot: ''
+      photoShot: '',
+      photoFrame: ''
     })
   })
 
@@ -39,7 +41,8 @@ describe('splitTags 的剪取', () => {
       mood: 'amused',
       photo: 'a rooftop at dusk',
       photoSelf: false,
-      photoShot: ''
+      photoShot: '',
+      photoFrame: ''
     })
   })
 
@@ -49,7 +52,8 @@ describe('splitTags 的剪取', () => {
       mood: 'amused',
       photo: 'a rooftop at dusk',
       photoSelf: false,
-      photoShot: ''
+      photoShot: '',
+      photoFrame: ''
     })
   })
 
@@ -68,14 +72,16 @@ describe('splitTags 的半截标签', () => {
       mood: '',
       photo: '',
       photoSelf: false,
-      photoShot: ''
+      photoShot: '',
+      photoFrame: ''
     })
     expect(splitTags('Hmm [moo')).toEqual({
       text: 'Hmm',
       mood: '',
       photo: '',
       photoSelf: false,
-      photoShot: ''
+      photoShot: '',
+      photoFrame: ''
     })
   })
 
@@ -214,8 +220,94 @@ describe('这一张里有没有它本人', () => {
       mood: 'warm',
       photo: 'a rooftop at dusk',
       photoSelf: true,
-      photoShot: ''
+      photoShot: '',
+      photoFrame: ''
     })
+  })
+})
+
+/* ===== 这一张离得多近(2026-10-06 新增) ==============================
+ *  景别与视角同源:都是"用户要什么",都由聊天模型在标签里说 ——
+ *  它没说时客户端按场景文本判(见 lib/chatPhoto 的 frameFromScene)。
+ *
+ *  加它的直接原因是用户那句话:"让角色拍特写图,总是变成自拍"。 */
+
+describe('景别前缀', () => {
+  it('写在"谁拿的相机"之后,两类都不进场景描述', () => {
+    const r = splitTags('x\n[photo:selfie:close:my eyes, looking straight at you]')
+    expect(r.photo).toBe('my eyes, looking straight at you')
+    expect(r.photoSelf).toBe(true)
+    expect(r.photoShot).toBe('selfie')
+    expect(r.photoFrame).toBe('close')
+  })
+
+  it('他拍 + 全身', () => {
+    const r = splitTags('x\n[photo:third:full:me on the pier, the harbour behind me]')
+    expect(r.photo).toBe('me on the pier, the harbour behind me')
+    expect(r.photoShot).toBe('third')
+    expect(r.photoFrame).toBe('full')
+  })
+
+  /* **这一条最要紧**:镜头对着一个东西、人不在画面里 —— 也正是
+     "拍个特写给我看"最常见的那个形状。它没有相机前缀,但景别照旧成立 */
+  it('空镜也能有景别 —— 画面里没有人不等于没有景别', () => {
+    const r = splitTags('x\n[photo:close:rain running down the window pane]')
+    expect(r.photo).toBe('rain running down the window pane')
+    expect(r.photoSelf).toBe(false)
+    expect(r.photoShot).toBe('')
+    expect(r.photoFrame).toBe('close')
+  })
+
+  it('两类前缀顺序不挑 —— 模型写反了也认', () => {
+    const r = splitTags('x\n[photo:close:selfie:my eyes]')
+    expect(r.photo).toBe('my eyes')
+    expect(r.photoShot).toBe('selfie')
+    expect(r.photoFrame).toBe('close')
+  })
+
+  it('那几种写法都认(大小写、连字符、shot/length)', () => {
+    for (const raw of ['CLOSE: my eyes', 'close-up:my eyes', 'macro: my eyes', 'detail:my eyes']) {
+      expect(splitTags(`x\n[photo:${raw}]`).photoFrame, raw).toBe('close')
+    }
+    for (const raw of ['full: me on the pier', 'full-length:me in the mirror', 'full-body: me', 'wide shot: the harbour']) {
+      expect(splitTags(`x\n[photo:${raw}]`).photoFrame, raw).toBe('full')
+    }
+    for (const raw of ['medium: me at the desk', 'half-body:me at the desk']) {
+      expect(splitTags(`x\n[photo:${raw}]`).photoFrame, raw).toBe('medium')
+    }
+  })
+
+  /* **必须要求一个分隔符**:close / medium / full 本身就是常用词。
+     不要求的话 "[photo:close to the window, the rain]" 会被剪成
+     "to the window, the rain" —— 场景从"离窗很近"变成"窗" */
+  it('"close to the window" 里的 close 不是景别', () => {
+    const r = splitTags('x\n[photo:close to the window, the rain]')
+    expect(r.photo).toBe('close to the window, the rain')
+    expect(r.photoFrame).toBe('')
+  })
+
+  it('长写法不被短写法咬掉一半', () => {
+    /* `full` 若先匹配，剩下的 "-length:" 会顶在场景最前面 */
+    expect(splitTags('x\n[photo:full-length:me in the mirror]').photo).toBe('me in the mirror')
+    expect(splitTags('x\n[photo:wide shot:the empty harbour]').photo).toBe('the empty harbour')
+  })
+
+  it('没说就是空串 —— 由客户端按场景文本判、再不行落回缺省', () => {
+    expect(splitTags('x\n[photo:selfie:me on the balcony]').photoFrame).toBe('')
+    expect(splitTags('x\n[photo:rain on the window]').photoFrame).toBe('')
+  })
+
+  it('认不出的词不是景别,而且留在场景里(它是内容)', () => {
+    const r = splitTags('x\n[photo:selfie:extreme zoom on my eyes]')
+    expect(r.photoFrame).toBe('')
+    expect(r.photo).toBe('extreme zoom on my eyes')
+  })
+
+  it('两条路都要带上它 —— 独占一行的中段标签一样算', () => {
+    const r = stripStandaloneTags('a\n[photo:selfie:close:my eyes]\nb')
+    expect(r.photoFrame).toBe('close')
+    expect(r.photoShot).toBe('selfie')
+    expect(r.text).toBe('a\nb')
   })
 })
 

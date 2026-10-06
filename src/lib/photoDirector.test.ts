@@ -5,6 +5,7 @@ import {
   applyDirector,
   directorBrief,
   directorTask,
+  frameBrief,
   parseDirector,
   shotBrief
 } from './photoDirector'
@@ -291,5 +292,66 @@ describe('directorTask / directorBrief · 告诉模型该干什么', () => {
     const brief = directorBrief(planChatPhoto(BARE, true, ANCHOR))
     expect(brief).toContain('covers none')
     expect(brief).not.toContain('Leave those lines empty')
+  })
+})
+
+/* ===== 景别:同样只被告知,而且换不掉(2026-10-06) ==================
+ *  它与视角是同一件事的两面 —— 都是"用户要什么",都不是它猜得出来的。
+ *  它写的 `Camera:` 那一行正是"推多近",所以不告诉它,它就会自己挑一个距离,
+ *  而 `applyDirector` 是整句替换:模板里那句对的会被整个顶掉。 */
+
+describe('frameBrief · 把景别当事实告诉它', () => {
+  it('任务里带着这一张的景别', () => {
+    const close = directorTask(planChatPhoto('my eyes', true, ANCHOR, 'selfie', 'close'))
+    expect(close).toContain('tight close-up')
+    expect(close).toContain('do not pull back')
+
+    const full = directorTask(planChatPhoto('me on the pier', true, ANCHOR, 'third', 'full'))
+    expect(full).toContain('full-figure shot')
+    expect(full).toContain('do not push in')
+  })
+
+  it('三档各说各的一句,而且人与空镜分开写', () => {
+    expect(frameBrief('close', true)).toContain('cropped out')
+    expect(frameBrief('medium', true)).toContain('half-body')
+    expect(frameBrief('full', true)).toContain('head to feet')
+    /* 空镜里没有"整个人"这回事 —— 写出来就是给"风景里长出一个人"递刀 */
+    expect(frameBrief('close', false)).toContain('nobody is in it')
+    expect(frameBrief('medium', false)).not.toContain('character')
+    expect(frameBrief('full', false)).not.toContain('character')
+    expect(frameBrief('full', false)).toContain('whole place')
+  })
+})
+
+describe('applyDirector · 景别它一个字都改不了', () => {
+  /* 它写回来的机位句是**整句替换**的 —— 所以"拉远"这件事它做得到,
+     除非景别另有一层挡着。这一组就是那条护栏的回归测试 */
+  const PULLED_BACK = 'Camera: wide shot, the whole room visible, the subject small'
+
+  it('它写了一句"拉远",机位那句照旧被换掉,但 frame 那一层一个字没动', () => {
+    const plan = planChatPhoto('my eyes, looking straight at you', true, ANCHOR, 'selfie', 'close')
+    const after = applyDirector(plan, parseDirector(PULLED_BACK))
+    const layer = (p: typeof plan, name: string) => p.layers.find(([slot]) => slot === name)?.[1]
+
+    expect(layer(after, 'camera')).toContain('wide shot')
+    expect(layer(after, 'frame')).toBe(layer(plan, 'frame'))
+    expect(layer(after, 'frame')).toContain('tight close-up')
+  })
+
+  it('**验收线:摄影指导拉不回来的那一张,特写还在**', () => {
+    /* 整串提示词里最后起作用的是 frame 那一层 ——
+       它与机位那句挨着,而且排在机位之前(顺序就是权重) */
+    const plan = planChatPhoto('my eyes', true, ANCHOR, 'selfie', 'close')
+    const after = applyDirector(plan, parseDirector(PULLED_BACK))
+    expect(after.frame).toBe('close')
+    expect(after.prompt).toContain('a tight close-up')
+    expect(after.prompt.indexOf('tight close-up')).toBeLessThan(after.prompt.indexOf('wide shot'))
+  })
+
+  it('景别不在它能补的四个位里 —— 它写一行 Shot:/Frame: 也进不来', () => {
+    const plan = planChatPhoto('my eyes', true, ANCHOR, 'selfie', 'close')
+    const after = applyDirector(plan, parseDirector('Shot: full figure\nFrame: wide\nCamera: held low'))
+    expect(after.frame).toBe('close')
+    expect(after.prompt).not.toContain('full figure')
   })
 })

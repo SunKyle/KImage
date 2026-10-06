@@ -342,11 +342,25 @@ export interface ChatMessage {
      "对于自拍的理解总是不好,老是会生成他拍视角的图片"。
      存下来,重画与导出才对得起当时那个意图 */
   photoShot?: ChatShotTag
+  /* 这一张**离得多近**,同样由模型写在标签前缀里(`close:` / `medium:` / `full:`,
+     见 server/chatTags.js)。空/缺省 = 它没说 —— 那时由 lib/chatPhoto 按场景文本判、
+     再不行落回这一档视角的缺省景别。
+     **为什么它非得单独存一位**(2026-10-06):在这之前,景别是写死在模板的机位句里的
+     (自拍那句是半身、他拍那句是全身),而场景里那句"特写"在整个链路里唯一的作用
+     是把景深那句删掉 —— 于是用户要的特写,交上来是一张臂展自拍。用户的原话是
+     "让角色拍特写图,总是变成自拍"。
+     存下来,重画与导出才对得起当时那个意图 */
+  photoFrame?: ChatFrameTag
 }
 
 /** 聊天里那一张图**谁拿的相机**。与 lib/chatPhoto 的 ChatShot 同名同值 ——
     'scene' 不进这里:画面里没有人时,它由 photoSelf 定死 */
 export type ChatShotTag = 'selfie' | 'third'
+
+/** 聊天里那一张图**离得多近**。与 lib/chatPhoto 的 ChatFrame 同名同值。
+    'medium' 也进得来 —— 它与"没说"不同:模型明确说了半身时,重画不该又去按
+    场景文本判一遍(那条判据可能会读到"全身镜"这种词) */
+export type ChatFrameTag = 'close' | 'medium' | 'full'
 
 /** 聊天里用户附的那张图。与 ChatMessage 分开存,理由见上面的 imageId */
 export interface ChatImage {
@@ -511,6 +525,9 @@ export interface ImportedChatMessage {
   /* 这一张谁拿的相机(见 ChatMessage.photoShot)。与 photoSelf 同一条理由:
      跟着包走,重画才画得出同一个视角 */
   photoShot?: ChatShotTag
+  /* 这一张离得多近(见 ChatMessage.photoFrame)。同上 ——
+     少了它,对方重画时会按场景文本重新判一次,而那一判可能读到不同的东西 */
+  photoFrame?: ChatFrameTag
 }
 
 /* 角色包里带回来的那段对话。**记忆是主,消息是辅** ——

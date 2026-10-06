@@ -1,8 +1,9 @@
-/* 对话里"角色发一张图"这一步的四个决定:
+/* 对话里"角色发一张图"这一步的五个决定:
    ① 这张里有没有它本人(要不要拼外貌、要不要发参考图);
-   ② 这一张是自拍、他拍还是空镜(镜头);
-   ③ 拼进提示词的是"锚点句"还是那份全量设定表;
-   ④ 这一张要不要补机位、光、环境 —— 以及**只补空着的位**。
+   ② 这一张是自拍、他拍还是空镜(**谁拿的相机**);
+   ③ 这一张离得多近:特写 / 半身 / 全身(**景别**,2026-10-06 新增);
+   ④ 拼进提示词的是"锚点句"还是那份全量设定表;
+   ⑤ 这一张要不要补机位、光、环境 —— 以及**只补空着的位**。
  *
  *  —— 为什么这里不再是"场景 + 设定表"两个字符串相加 ——
  *
@@ -19,10 +20,11 @@
  *  两者互相加强。所以这一层的改法是**做减法**:只留几个不可变的身份特征
  *  (见 characterAnchor),把表情、姿态、光的方向、景深全部让出来。
  *
- *  —— 四层提示词,顺序不能反 ——
+ *  —— 六层提示词,顺序不能反 ——
  *
- *      shot(这一张怎么拍) → scene(画的是什么) → anchor(是谁)
- *      → camera/light/environment(补空的位) → negative(挡证件照)
+ *      shot(谁拿的相机) → scene(画的是什么) → anchor(是谁)
+ *      → pin/frame(这一档不可让渡的两条) → camera/lens/light/environment(补空的位)
+ *      → negative(挡证件照、肢体画坏与拼贴)
  *
  *  顺序既是权重也是语义:
  *  - shot 排最前是因为没有它,"自拍"就只是场景里的一个词。图像模型没有"自拍"
@@ -55,12 +57,29 @@ import { sizeClosestTo } from '../api'
  *  放宽它不产生任何新调用,只是不再让最后那几层被无声吃掉。 */
 export const CHAT_PHOTO_PROMPT_CHARS = 6000
 
-/** 一张照片怎么拍。三档足够,再多就变成让聊天模型做摄影决定了(见下) */
+/** 谁拿的相机。三档足够,再多就变成让聊天模型做摄影决定了(见下) */
 export type ChatShot = 'selfie' | 'third' | 'scene'
+
+/** 景别 —— 这一张离得多近。与 shot 正交的第二位(2026-10-06 新增)。
+ *
+ *  —— 为什么非得有它 ——
+ *
+ *  在这之前,景别是**写死在 template 的机位句里**的:自拍那句是
+ *  "face and shoulders filling the upper half of the frame"(半身),
+ *  他拍那句是 "full figure and hands inside the frame"(全身)。
+ *  于是场景里写 "close-up of my eyes" 时,提示词里出现的是
+ *  "特写" + "脸和肩膀占满上半幅" + "身后的地方看得清" —— 三句正面打架,
+ *  模型只能挑一边信。用户报的"对于特写图还是不太能理解"就是这个。
+ *
+ *  三档而不是五档(特写/近景/中景/全景/远景):**这一位要的是"推到多近",
+ *  不是一份分镜表**。close 与 full 之外的一切都落回 medium,而 medium 的文案
+ *  逐字等于这一位不存在时的那三句 —— 老消息、认不出的说法,代价为零。 */
+export type ChatFrame = 'close' | 'medium' | 'full'
 
 /** 一层提示词:槽名 + 这一层的正文。槽名决定**这一位归谁管** ——
  *  摄影指导那一层只能改 camera / lens / light / env(见 lib/photoDirector),
- *  其余几个槽(medium / scene / anchor / action / negative)它连值都拿不到 */
+ *  其余几个槽(medium / scene / anchor / pin / frame / action / negative)
+ *  它连值都拿不到 */
 export type ChatLayer = [string, string]
 
 export interface ChatPhotoPlan {
@@ -71,6 +90,10 @@ export interface ChatPhotoPlan {
   /** 这一张怎么拍。调用方据它挑参考图与尺寸(自拍竖一点、空镜横一点)。
    *  **摄影指导有权改它** —— 见 lib/photoDirector 的 applyDirector */
   shot: ChatShot
+  /** 这一张离得多近。**调用方不据它挑参考图,也不据它挑尺寸** ——
+   *  它只决定机位/景深/环境那三句与那一条 frame 硬约束(见 FRAMING)。
+   *  与 shot 一样,摄影指导改不到它(不在 DIRECTOR_SLOTS 里) */
+  frame: ChatFrame
   /** 它是不是在画面里。**这是聊天模型唯一回答的那件事**,
    *  存下来是因为摄影指导改视角时要重拼模板,而"画面里有没有人"是那道护栏:
    *  没有人时视角只能是空镜,谁都不许改成自拍(见 planChatPhoto 的 resolved) */
@@ -153,9 +176,14 @@ function mentions(text: string, en: RegExp, zh: string[]): boolean {
 const LIGHT_RE = /\b(light|lighting|lit|glow|glowing|backlit|rim light|silhouette|shadow|shadows|sunlight|moonlight|lamp|lantern|candle|neon|beam)\b/i
 const LIGHT_ZH = ['光', '灯光', '阳光', '月光', '影子', '阴影', '逆光', '烛光', '霓虹', '照亮']
 
-/** 镜头/景深:已经写了就不补,免得两个焦段打架 */
-const LENS_RE = /\b(lens|focal|\d{2,3}\s*mm|bokeh|depth of field|shallow focus|blurred|blurry|out of focus|telephoto|wide[- ]angle|macro|close[- ]up)\b/i
-const LENS_ZH = ['镜头', '焦段', '景深', '虚化', '模糊', '广角', '长焦', '特写']
+/** 镜头/景深:已经写了就不补,免得两个焦段打架。
+ *
+ *  **"特写 / close-up / macro" 从这一条里拿掉了**(2026-10-06)。从前它们算
+ *  "已经写了镜头",于是场景一写特写,lens 那一句就整条不再补 —— 而那一句
+ *  正是"把主体从背景里剥出来"的那句,恰好是特写最需要的一句。它们其实是
+ *  **景别**的词,现在归 frameFromScene 管(见 FRAMING)。 */
+const LENS_RE = /\b(lens|focal|\d{2,3}\s*mm|bokeh|depth of field|shallow focus|blurred|blurry|out of focus|telephoto|wide[- ]angle)\b/i
+const LENS_ZH = ['镜头', '焦段', '景深', '虚化', '模糊', '广角', '长焦']
 
 export interface SceneSlots {
   light: boolean
@@ -192,6 +220,68 @@ export function isWet(scene: string): boolean {
   return mentions(String(scene || ''), WET_RE, WET_ZH)
 }
 
+/* ===== 这一张离得多近 =================================================
+ *  —— 谁说了算,与视角同一套四级判据 ——
+ *
+ *      1. 标签说 close: / medium: / full: → 就是它(见 server/chatTags.js)
+ *      2. 场景里明写"特写 / 全身 / macro…" → 按它
+ *      3. 一条证据都没有 → **这一档视角的缺省景别**(见 DEFAULT_FRAME)
+ *
+ *  为什么第 3 条不是一个统一的默认值:缺省值该是"这种照片通常长什么样"。
+ *  自拍是臂展举着的,半身是常态;朋友拿手机替你拍的那张,人整只都在画面里。
+ *  给两者同一个默认值,等于把其中一半的图改掉 —— 而这一位不存在时,
+ *  出来的提示词必须**逐字等于从前那三句**(见 FRAMING 的说明)。
+ *
+ *  —— 词表为什么取窄 ——
+ *
+ *  与 isSelfie / isThirdShot 同一条纪律:宁可漏判(落回缺省),也不误判
+ *  (把"全身心投入"读成全身景)。所以 "full" / "wide" / "detail" 这些
+ *  **单独出现时意思不明的词一律不认**,只认连在一起就基本能确定的说法。
+ *  ==================================================================== */
+/* 中文没有词边界,所以中英合并成一个正则、直接 test ——
+   `全身(?!心)`:唯一一个真的会撞上的常用词是"全身心投入",
+   而它一旦被读成"全身景",这一张的构图就整个跑了 */
+const FRAME_CLOSE_RE = /\b(close[- ]?up|extreme close[- ]?up|macro|tight on|fills the frame)\b|特写|大特写|微距|放大到/i
+const FRAME_FULL_RE = /\b(full[- ]?body|full[- ]?length|full figure|whole figure|head to toe|wide shot|establishing shot)\b|全身(?!心)|从头到脚|远景|全景/i
+/* 半身那一档。**它不能省** —— 三档里少了它,`FRAMING.third.medium` 就成了
+   一段谁也走不到的死代码(他拍那一档的缺省是全身,而"半身"没有任何别的入口)。
+   `半身` 会顺带把"上半身"也命中 —— 这是对的,那句话说的就是取景到腰以上;
+   真正会误伤的是"半身裙"这类词,而它猜错的方向(更近一点)正是可接受的那一侧 */
+const FRAME_MEDIUM_RE = /\b(half[- ]?body|half[- ]?length|waist[- ]?up|from the waist|mid[- ]?shot)\b|半身|腰部以上|齐腰/i
+
+/**
+ * 场景里明说的景别。认不出来返回空串 —— **调用方据此落回缺省**,
+ * 而不是在这里替它挑一个(与 isSelfie 同一条分工)。
+ *
+ * 两边都命中时**特写赢**:一句里同时出现"全身"和"特写"多半是模型在写
+ * "全身照里的一个特写"这类绕的话,而用户报的毛病是一律拍得太远 ——
+ * 猜近的那一侧是他能接受的那一侧。半身排在最后:三档里它是最弱的一条断言
+ * (说"全身"的画面里通常不会同时说"半身",反过来也一样)。
+ */
+export function frameFromScene(scene: string): ChatFrame | '' {
+  const t = String(scene || '')
+  if (FRAME_CLOSE_RE.test(t)) return 'close'
+  if (FRAME_FULL_RE.test(t)) return 'full'
+  if (FRAME_MEDIUM_RE.test(t)) return 'medium'
+  return ''
+}
+
+/** 这一档视角**通常**是多近。它只在标签与场景都没说时兜底,所以它同时是
+ *  "这一位不存在时"的行为(自拍/空镜那三句的机位句本来就是半身/中景,
+ *  他拍那句本来就是全身)—— 这一位加进来,一张图都不该被它改掉 */
+const DEFAULT_FRAME: Record<ChatShot, ChatFrame> = {
+  selfie: 'medium',
+  third: 'full',
+  scene: 'medium'
+}
+
+/** 标签 > 场景 > 这一档的缺省。**判据只有这三条,没有第四条** ——
+ *  摄影指导也改不到它(不在 DIRECTOR_SLOTS 里),它只被告知(见 photoDirector) */
+export function resolveFrame(shot: ChatShot, said: string, scene: string): ChatFrame {
+  if (said === 'close' || said === 'medium' || said === 'full') return said
+  return frameFromScene(scene) || DEFAULT_FRAME[shot]
+}
+
 /* ===== 三套镜头模板 ===================================================
  *  两条机位句是这一层存在的理由:**图像模型没有"自拍"这个概念**,
  *  它只有"画一个人"。能把"画一个人"掰成一张自拍的,是下面这几个具体的词。
@@ -200,8 +290,26 @@ export function isWet(scene: string): boolean {
  *  lens 那句在自拍/他拍两档都出现,是因为景深决定了**人和环境贴不贴**——
  *  这正是"人物与环境融不进去"的一半原因。
  *  ==================================================================== */
+/* 垫在最末的那一条。它原本只挡"证件照"那套默认构图,2026-10-06 补进两类:
+ *
+ * **① 肢体画坏**(用户报的"四肢畸形、缺手少腿")。词只挑**多出来的、长错的**:
+ * `no extra limbs` / 多指与连指 / 畸形或重复的手。**刻意不写 "no missing limbs"、
+ * 也不写"不许在画面边缘裁到肢体"** —— 那两句会与特写那一档的构图直接打架
+ * (那一档明写着"其余身体出画"),模型读到"不许缺"最省力的解法是**把镜头拉远**,
+ * 而那正是这一轮刚修好的毛病。**"缺"要治在机位句上(裁切点落在关节之外),
+ * 不是治在负面词上。** 负面词对 gpt-image-1 / Gemini 这类模型效力本就很弱,
+ * 对认负面词的几家(豆包、万相这一档)才有实际作用 —— 所以它值一条,但不是主力。
+ *
+ * **② 拼贴/接触印相**。这一条有明确的来路:对话出图的参考图里有**两张 2×2 网格**
+ * (见 shotViewOrder 与 api.ts 的 CHARACTER_VIEWS),而"参考图是拷贝先验"——
+ * 拼贴先验最容易漏成一张多手多肢的拼版。背景图那条路早就为此把参考图砍到两张了,
+ * 这里是同一件事在提示词这一侧的兜底。
+ *
+ * 不写 "no text":背景图那一层自己带着(见 planChatBackdrop),写两遍只是重复 */
 const NEGATIVE =
-  'not a character sheet, not a passport or ID photo, not centered neutral expression, not flat lighting'
+  'not a character sheet, not a passport or ID photo, not centered neutral expression, not flat lighting, ' +
+  'no extra limbs, no extra or fused fingers, no deformed or duplicated hands, ' +
+  'not a collage, not a contact sheet, no panels'
 
 interface ShotTemplate {
   medium: string
@@ -285,6 +393,125 @@ const TEMPLATES: Record<ChatShot, ShotTemplate> = {
   }
 }
 
+/* ===== 景别怎么改那三句 ===============================================
+ *  上面 TEMPLATES 里那三句就是**这一档视角的缺省景别**(见 DEFAULT_FRAME),
+ *  所以这里只登记"不是缺省的那两档" —— 缺省那一档压根没有条目,
+ *  于是今天所有图的提示词**逐字不变**(这也让这次改动不可能弄坏已经对的东西)。
+ *
+ *  景别只改三样:**机位、景深、环境**。光与"谁拿的相机"跟它无关 ——
+ *  一个特写不会换一个光源,也不会因此变成别人拿的相机。
+ *
+ *  —— 为什么 frame 还要单独成一层(见下面 frameLine) ——
+ *
+ *  因为摄影指导换机位的办法是**整句替换 `camera`**(见 photoDirector 的
+ *  DIRECTOR_SLOTS)。它若写一句"广角,整个地方都看得见",上面这三句就一起
+ * 被换掉了 —— 而它只拿得到一句场景,看不到用户是想要一张特写。
+ *  这与视角当初被它判错是同一个坑,所以走同一条解法:**不可让渡的那一条
+ *  单独成层**,它换不到(不在 DIRECTOR_SLOTS 里),只被告知(见 frameBrief)。
+ *  ==================================================================== */
+interface FrameOverride {
+  camera: string
+  lens?: string
+  /** 只在特写那两档用得上:半身/全身那两句光**本来就成立**,
+   *  而"一边脸比另一边亮"在拍手、拍疤的特写里是错的(那里没有脸) */
+  light?: string
+  env?: string
+}
+
+const FRAMING: Record<ChatShot, Partial<Record<ChatFrame, FrameOverride>>> = {
+  selfie: {
+    /* 特写:那四个"自拍"信号里,**臂展这一个在特写下物理上不成立** ——
+       贴到眼睛那么近不可能是手臂伸直拍的。而"相机在它自己手上"这条事实
+       由 `pin` 那一层不可让渡地写着(见 ShotTemplate.pin),所以这里可以放心
+       把距离换成"一只手举近",剩下的三个信号(前置摄像头 / 手入画 / 轻微广角)
+       一个不少 —— 单测直接钉住这三样还在。
+
+       **一处轻微矛盾,刻意不收**:`pin` 那句里还留着 "at arm's length or in a
+       mirror"(它是"谁拿的相机"那一句的举例说明)。要收掉它就得给 pin 也做一份
+       景别变体 —— 那是"谁拿的相机"这条不变量的**第二份副本**,两份会漂;
+       而代价还落在**每一张已经出过的自拍**上(缺省那一档就不再逐字不变)。
+       权衡下来留着:它在前面二十个词的位置,紧跟着的 frame 与 camera 两层
+       各自明说了"整个人出画" —— 两票对一票,且那一票说的是"手机在谁手上" */
+    close: {
+      camera:
+        'selfie on the front camera, the phone held up close in one hand \u2014 one part of them fills the frame and the rest of the body runs off the edge, the hand holding the phone just inside the frame, slight wide-angle distortion',
+      lens: 'very shallow depth of field, everything but that one part falling away',
+      light: 'natural light falling across that one part, lighting it from one side, unposed',
+      env: 'the place reduced to a soft wash of light and colour behind it'
+    },
+    /* 全身:臂展同样装不下整个人。**刻意不写"对镜"** —— 镜子是场景里的一件
+       东西,场景没说它就不该被凭空添上(与"不许编时间/天气"同一条纪律)。
+       `pin` 那层的说法是"at arm's length **or in a mirror**",两条路都留着,
+       挑哪条交给出图模型 */
+    full: {
+      camera:
+        'full-length selfie \u2014 the phone held up in one hand, the whole figure from head to feet inside the frame with a little room above and below, shot straight on, slight wide-angle distortion',
+      lens: 'shallow depth of field, the room soft behind the whole figure',
+      env: 'the place readable around the whole figure, floor and ceiling both in the frame'
+    }
+  },
+  third: {
+    /* 他拍那一档的缺省**就是全身**(见 DEFAULT_FRAME),所以这里补的是
+       比缺省更近的那两档 —— 半身与特写。
+       半身这一档靠"场景写着腰以上 / 半身"或标签里的 `medium:` 进得来
+       (见 frameFromScene 的 FRAME_MEDIUM_RE 与 CHAT_RULES 那一句) */
+    medium: {
+      camera:
+        'third-person view, hand-held phone snapshot taken by somebody else, the subject from the waist up, off-center with generous headroom, hands inside the frame, slight wide-angle distortion, framing casual rather than composed'
+    },
+    close: {
+      camera:
+        'hand-held phone snapshot taken from close in, one part of the subject filling the frame and the rest of them running off the edge, framing casual rather than composed, slight wide-angle distortion',
+      lens: 'very shallow depth of field, only that one part sharp',
+      light: 'directional light with a clear source, raking across that one part so its texture reads',
+      env: 'the place falling away into blur behind that one part'
+    }
+  },
+  scene: {
+    /* 空镜那一档的缺省是中景,这里补特写与"整个地方"两头。
+       人不在画面里,所以这两句一个字都不提人(见 scene 那条 pin)。
+       camera 那两句刻意**不再重复"填满画面"** —— 那是上面 frame 那一层的活,
+       两句说同一件事只会把提示词撑长 */
+    close: {
+      camera: 'the camera pushed right in and held steady on that one detail',
+      lens: 'very shallow depth of field, everything but that detail soft',
+      env: 'nothing beyond that detail reads \u2014 just a wash of the place behind it'
+    },
+    full: {
+      camera: 'the camera set well back, an ordinary vantage point far enough to hold all of it',
+      lens: 'deep focus, the place reading all the way to the back',
+      env: 'the whole place in one view: foreground, middle ground, and the far side of it'
+    }
+  }
+}
+
+/**
+ * 景别那一层不可让渡的话(进 `frame` 槽,摄影指导碰不到)。
+ *
+ * **它对人与空镜是两套说法**:空镜里没有"整个人"这回事,写"the whole person"
+ * 就是给"风景里长出一个人"递刀(与 scene 那条 pin 同一个理由)。
+ *
+ * 这一句与 camera 那句是**一对**:camera 说"怎么拍"(推多近、镜头在哪),
+ * frame 说"这一张是哪种景别"。前者摄影指导可以整句换掉,后者不能 ——
+ * 所以后者必须自己站得住,不能写成"同上"。
+ */
+export function frameLine(self: boolean, frame: ChatFrame): string {
+  if (!self) {
+    if (frame === 'close') return 'a tight close-up of one detail of the place, that detail filling the frame'
+    if (frame === 'full') return 'the whole place taken in at once, in one wide view'
+    return 'a mid-distance view of the place: neither pushed in on one detail nor pulled back to take in all of it'
+  }
+  if (frame === 'close') {
+    return 'a tight close-up: one detail of the subject fills the frame and the rest of them is cropped out'
+  }
+  if (frame === 'full') {
+    return 'a full-figure shot: the whole person, head to feet, inside the frame'
+  }
+  /* 半身,不是"头肩" —— 他拍那一档的机位句写的是"腰以上",
+     两句用同一个词才不会互相打架(见 FRAMING.third.medium) */
+  return 'a half-body shot: the face and upper body, not the whole figure'
+}
+
 /* ===== 拼装 =========================================================== */
 
 /* 场景里已经交代了动作时,别再补一句"它在做什么" —— 两句会互相打架。
@@ -306,6 +533,11 @@ function hasAction(scene: string): boolean {
  *               这时**不要**退回全量描述,参考图仍然锁得住脸
  * @param shot   **这一张谁拿的相机**,由标签直接给(`selfie:` / `self:` 前缀,
  *               见 server/chatTags.js)。不传就按场景文本判、再不行按默认
+ * @param frame  **这一张离得多近**,由标签直接给(`close:` / `medium:` / `full:`)。
+ *               不传(或给了认不出的词)就按场景文本判、再不行按这一档视角的
+ *               缺省景别(见 resolveFrame 与 DEFAULT_FRAME)。
+ *               它与 shot 一样**只由这一层定死** —— 摄影指导改不到,
+ *               只被告知(见 photoDirector 的 frameBrief)
  *
  * —— 视角是谁定的(2026-10-05 改过一次) ——
  *
@@ -343,14 +575,17 @@ export function planChatPhoto(
   scene: string,
   self: boolean,
   anchor = '',
-  shot?: ChatShot
+  shot?: ChatShot,
+  frame?: ChatFrame
 ): ChatPhotoPlan {
   const text = String(scene || '')
     .replace(/\s+/g, ' ')
     .trim()
   /* 没有场景就没有要画的东西。这里先收口,免得拼出 "photographic, oval face, …"
      这种只剩外貌的提示词 —— 那会画出一张没有场景的人像,而调用方本该放弃这一张 */
-  if (!text) return { prompt: '', useRefs: false, shot: 'scene', self, scene: '', layers: [] }
+  if (!text) {
+    return { prompt: '', useRefs: false, shot: 'scene', frame: 'medium', self, scene: '', layers: [] }
+  }
 
   /* 画面里没有人时视角只能是空镜:**由 self 定死,不由任何人推断** ——
      一张"我看到的东西"里长出一个人,比视角选错严重得多。
@@ -366,13 +601,18 @@ export function planChatPhoto(
           ? 'third'
           : /* 一条证据都没有:**默认自拍**(2026-10-05 改,理由见上) */
             'selfie'
+  /* 景别跟着视角走:同一套四级判据,只是它的缺省值取决于视角(见 DEFAULT_FRAME) */
+  const framed = resolveFrame(resolved, frame || '', text)
   const tpl = TEMPLATES[resolved]
+  /* 非缺省景别那几档对机位/景深/环境的覆盖。**缺省那一档没有条目** ——
+     于是这一位不存在时,下面每一句都还是原来那一句(见 FRAMING) */
+  const over = FRAMING[resolved][framed]
   const miss = missingSlots(text)
   const spec = inline(anchor)
 
   /* —— 分层是要紧的,不是排版 ——
      每一层前面那句都是**这一位归谁管**的标记:
-     `medium` / `scene` / `anchor` / `negative` 不在 DIRECTOR_SLOTS 里,
+     `medium` / `scene` / `anchor` / `pin` / `frame` / `negative` 不在 DIRECTOR_SLOTS 里,
      所以摄影指导那一层(见 photoDirector.applyDirector)结构上就改不到它们。
      场景原文进 layers 时带的是 `scene` 槽 —— 它永远原样保留,不改写 */
   const layers: ChatLayer[] = [
@@ -387,17 +627,23 @@ export function planChatPhoto(
      空镜靠它挡住"风景里长出一个人",自拍靠它挡住"画成别人拿相机",
      他拍靠它挡住"退回一张不知道谁拿手机的照片" */
   if (tpl.pin) layers.push(['pin', tpl.pin])
-  layers.push(['camera', tpl.camera])
-  if (miss.lens) layers.push(['lens', tpl.lens])
+  /* 景别也单独成层,理由与 pin 一样(见 FRAMING 的说明):摄影指导换机位是
+     整句替换,而"这一张是特写"是**意图**,不是它可以优化的工艺 */
+  layers.push(['frame', frameLine(self, framed)])
+  layers.push(['camera', over?.camera ?? tpl.camera])
+  if (miss.lens) layers.push(['lens', over?.lens ?? tpl.lens])
   if (miss.light) {
     /* 场景没说光时,先看它说没说不好的天气:下雨/下雪是**已经给出的事实**,
        而"湿的地方反光"是这个事实的必然推论 —— 补它不算替场景编新事实,
-       却正好把光带进画面(阴天平光下,这是最容易丢的一种光) */
-    layers.push(['light', isWet(text) ? tpl.lightWet : tpl.light])
+       却正好把光带进画面(阴天平光下,这是最容易丢的一种光)。
+       那两句与景别无关,所以**湿的那一路不走景别的覆盖** ——
+       一处光不会因为推近就换一个来源,而它照样能把特写照亮 */
+    layers.push(['light', isWet(text) ? tpl.lightWet : (over?.light ?? tpl.light)])
   }
   /* 纵深是无条件的(见 missingSlots 的说明):它不是事实,是相机原理,
-     场景说了地点照样需要这一句 —— 而它正是"人和环境融不进去"的药 */
-  layers.push(['env', tpl.env])
+     场景说了地点照样需要这一句 —— 而它正是"人和环境融不进去"的药。
+     **但"纵深"在特写下是另一句话**:那一档要的是"背景化开",不是"前景中景远景" */
+  layers.push(['env', over?.env ?? tpl.env])
   /* 动作只在场景真的没交代时才补。补出来的动作是模板的猜测,
      而它比光和环境更容易和场景矛盾(场景说"靠栏杆",模板说"走在路上") */
   if (tpl.action && !hasAction(text)) layers.push(['action', tpl.action])
@@ -409,6 +655,7 @@ export function planChatPhoto(
     /* 参考图与外貌设定同一个开关:场景照不带参考图 —— 它跟"同一张脸"无关 */
     useRefs: self,
     shot: resolved,
+    frame: framed,
     self,
     scene: text,
     layers
@@ -429,7 +676,9 @@ export function planChatPhoto(
 export function planChatBackdrop(scene: string, anchor = ''): ChatPhotoPlan {
   const text = inline(scene)
   /* 没有场景就没有"这一场"可画。调用方据此放弃这一张,而不是画一张没有场景的人像 */
-  if (!text) return { prompt: '', useRefs: false, shot: 'scene', self: true, scene: '', layers: [] }
+  if (!text) {
+    return { prompt: '', useRefs: false, shot: 'scene', frame: 'full', self: true, scene: '', layers: [] }
+  }
   const spec = inline(anchor)
   const layers: ChatLayer[] = [
     /* 机位与**尺度**排在最前(顺序就是权重,见文件头)。
@@ -478,6 +727,9 @@ export function planChatBackdrop(scene: string, anchor = ''): ChatPhotoPlan {
     prompt: composeChatPrompt(layers),
     useRefs: true,
     shot: 'scene',
+    /* 背景图是"整个地方都在画面里"的那一档。它不走 resolveFrame ——
+       它压根不是"角色发的那张照片",景别在这里没有可判的东西(见这个函数的说明) */
+    frame: 'full',
     self: true,
     scene: text,
     layers

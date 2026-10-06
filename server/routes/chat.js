@@ -37,6 +37,7 @@ const CHAT_RULES = `Rules:
 - If you happen to know what time it is, or how long it has been since you two last spoke, mention it only when it is actually relevant. Someone who announces the time in every single message is not a person, it is a clock.
 - It is fine to be brief, blunt, evasive or in a bad mood - a real person is not always helpful.
 - Most of your messages have no picture in them, and that is normal. Send one only when the picture is the point of the message: they asked to see you, or something is happening right now that you would actually take a photo of. Being somewhere is not a reason by itself - do not attach one just because you can. When you do send one, put a photo tag on its own line at the very end, after everything else you have to say (the mood tag goes after it): [photo:a description of the scene from your point of view]. Nothing may come after it - if you have more to say, say it before the tag. Up to 400 characters, one line. You send these the way anyone sends a picture on a phone, and the prefix says whose phone it was. Leave it off when it is only what you are looking at: nobody is in that picture, and it is drawn without your reference sheet. If you are in the picture, the prefix says who is holding the phone, and you must pick one: "selfie:" when it is your own phone in your own hand - arm's length, or a mirror, for example [photo:selfie:me leaning on the balcony rail at dusk, hair down]; "third:" when somebody else is holding their phone and took the picture of you, for example [photo:third:me on stage, taken from the crowd]. If you are in the picture and you are not sure which one it is, write "selfie:". Never use the tag as a substitute for actually saying something. Do not comment on the tag or explain it.
+- How close the picture is, is a separate thing, and you only have to say it when it is not the usual distance. The usual distance - your face and shoulders, or an ordinary view of the place - needs no word at all. When the picture is about one thing rather than the whole of you or the whole place, write "close:" right after the phone prefix: your own eyes [photo:selfie:close:my eyes, looking straight at you]; somebody else's shot of your hands [photo:third:close:my hands wrapped around the mug, steam rising]; a detail of the place, with nobody in it [photo:close:rain running down the window pane]. When the whole of you and the room around you is the point, write "full:": [photo:third:full:me on the pier, the whole harbour behind me]. Stopping around the waist rather than at the shoulders is "medium:" - [photo:third:medium:me at my desk, the lamp still on behind me] - but that is the usual distance too, so you can always leave it out. **A close-up of something you are holding or looking at is not a selfie** - if your own body is not the subject of that frame, leave the phone prefix off and write "close:" alone. If they ask for a close-up, that is what they mean: a tight shot of the one thing, not a picture of your face held out at arm's length.
 - That description is the only thing the picture is drawn from, and whoever draws it cannot see this conversation. So put in what only you know: what time it is and what the light is doing, the weather, what is around you, and what you are doing right now. "me on the balcony" is not enough; "self:me leaning on the balcony rail at dusk, the rain just stopped, streetlights coming on below, hair still wet" is. Write it as plain description, never as an instruction to a machine. Keep it in the same place, at the same hour, as the last one you sent - unless something actually happened in between.
 - After everything you say, put a mood tag on the very last line, in exactly this form: [mood:word]. One lowercase English word for how you feel as you send this message. Pick the word that actually fits, for example: arrogant, amused, wary, bored, angry, tired, warm, cold, proud, uneasy, delighted. Do not comment on the tag or explain it - just end with it.`
 
@@ -296,21 +297,22 @@ app.post('/api/chat', rateLimit, async (req, res) => {
   let tail = ''
   /* 中段那几枚标签取出来的意图(见下面循环里那一段)。末尾那几枚走 splitTags,
      两处最后合在一起 —— 合的时候**末尾优先**:它更靠后,更接近"最后想给你看的那张" */
-  let midShot = { scene: '', self: false, shot: '' }
+  let midShot = { scene: '', self: false, shot: '', frame: '' }
   let midMood = ''
   /* 收尾那一下:把尾巴里该发的字发出去,该剪的标签剪下来返回给调用方。
      角色名要传进去:标签里没写前缀时,"描述里点了自己的名字"也算它在画面里
      (见 chatTags.js 的 parsePhotoIntent) */
   const flushTail = () => {
-    const { text, mood, photo, photoSelf, photoShot } = splitTags(tail, who)
+    const { text, mood, photo, photoSelf, photoShot, photoFrame } = splitTags(tail, who)
     if (text) sendEvent({ delta: text })
     tail = ''
     return {
       mood: mood || midMood,
       photo: photo || midShot.scene,
       photoSelf: photo ? photoSelf : midShot.self,
-      /* 视角跟着"这一张是谁给的"走:末尾那枚赢了就用它的,否则用中段那枚的 */
-      photoShot: photo ? photoShot : midShot.shot
+      /* 视角与景别跟着"这一张是谁给的"走:末尾那枚赢了就用它的,否则用中段那枚的 */
+      photoShot: photo ? photoShot : midShot.shot,
+      photoFrame: photo ? photoFrame : midShot.frame
     }
   }
 
@@ -458,7 +460,14 @@ app.post('/api/chat', rateLimit, async (req, res) => {
              会原样流给用户看(用户报过这个)。意图照样记下来,收尾时一起报 */
           const cut = stripStandaloneTags(tail.slice(0, release), who)
           if (cut.text) sendEvent({ delta: cut.text })
-          if (cut.photo) midShot = { scene: cut.photo, self: cut.photoSelf, shot: cut.photoShot }
+          if (cut.photo) {
+            midShot = {
+              scene: cut.photo,
+              self: cut.photoSelf,
+              shot: cut.photoShot,
+              frame: cut.photoFrame
+            }
+          }
           if (cut.mood) midMood = cut.mood
           tail = tail.slice(release)
         }

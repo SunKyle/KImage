@@ -4,10 +4,13 @@ import {
   backdropViewOrder,
   characterAnchor,
   chatPhotoSize,
+  frameFromScene,
+  frameLine,
   isSelfie,
   isThirdShot,
   missingSlots,
   planChatPhoto,
+  resolveFrame,
   shotRatio,
   shotViewOrder,
   planChatBackdrop
@@ -233,6 +236,191 @@ describe('planChatPhoto · 视角', () => {
   })
 })
 
+/* ===== 景别归谁定 ====================================================
+ *  2026-10-06 加的第二位,与视角正交。判据同一套写法:
+ *  标签 > 场景文本 > 这一档视角的缺省。
+ *
+ *  它治的是用户报的那件事:"让角色拍特写图,总是变成自拍"。 */
+
+describe('frameFromScene · 只认明确的景别', () => {
+  it.each([
+    'close-up of my eyes, looking right at you',
+    'an extreme close-up of the stitching',
+    'a macro shot of the frost on the glass',
+    'the scar on my collarbone fills the frame',
+    '特写:睫毛上还挂着水珠',
+    '大特写，别眨眼'
+  ])('认成特写:%s', (s) => expect(frameFromScene(s)).toBe('close'))
+
+  it.each([
+    'full body, me standing on the pier',
+    'a full-length mirror selfie',
+    'me head to toe in the doorway',
+    'an establishing shot of the harbour',
+    '全身照，站在窗前',
+    '从头到脚都是雨'
+  ])('认成全身:%s', (s) => expect(frameFromScene(s)).toBe('full'))
+
+  /* 半身这一档**必须有入口** —— 它同时是 `FRAMING.third.medium` 的唯一来路:
+     他拍那一档的缺省是全身,没有这一条,那段覆盖就是谁也走不到的死代码 */
+  it.each([
+    'a half-body shot of me at the desk',
+    'me from the waist up, the lamp behind me',
+    '半身照，靠在门框上',
+    '镜头齐腰，手里还拿着杯子',
+    /* "上半身" 说的是取景到腰以上,落在这一档是对的 */
+    '上半身都是雨'
+  ])('认成半身:%s', (s) => expect(frameFromScene(s)).toBe('medium'))
+
+  it.each([
+    'me on the balcony, hair down',
+    'leaning on the railing at night',
+    '我在阳台抽烟',
+    '窗外的雨',
+    /* 词表取窄的理由:"wide" / "detail" 单独出现时不知道在说什么 */
+    'a wide grin and a raised eyebrow',
+    '细节我都记得'
+  ])('认不出:%s', (s) => expect(frameFromScene(s)).toBe(''))
+
+  it('"全身心投入"里的"全身"不是景别 —— 中文没有词边界,这一条得自己挡', () => {
+    expect(frameFromScene('全身心投入地写着报告')).toBe('')
+  })
+
+  it('两边都命中时特写赢 —— 用户报的毛病是拍得太远', () => {
+    expect(frameFromScene('全身照里的一张特写')).toBe('close')
+  })
+})
+
+describe('planChatPhoto · 景别', () => {
+  it('**验收线:让角色拍特写,不许退回一张臂展自拍**', () => {
+    /* 从前景别**写死在机位句里**:自拍那句是半身、他拍那句是全身。
+       于是场景里那句"特写"在整个链路里唯一的作用是把景深那句删掉,
+       而机位那句照旧是"脸和肩膀占满上半幅 / 手臂入画 / 身后的地方看得清" ——
+       三句正面打架,模型挑一边信,交上来的就是一张臂展自拍 */
+    const p = planChatPhoto('my eyes, looking straight at you', true, ANCHOR, 'selfie', 'close')
+    expect(p.frame).toBe('close')
+    expect(p.prompt).toContain('close-up')
+    /* 半身自拍那三件套一件都不许在 */
+    expect(p.prompt).not.toContain('face and shoulders filling the upper half')
+    expect(p.prompt).not.toContain('the arm holding the phone partly visible in frame')
+    expect(p.prompt).not.toContain('the place clearly readable right behind the shoulders')
+  })
+
+  it('标签说 close 就是特写', () => {
+    expect(planChatPhoto('me on the balcony', true, ANCHOR, 'selfie', 'close').frame).toBe('close')
+  })
+
+  it('标签没说、场景写着特写,也是特写(中文一样认)', () => {
+    expect(planChatPhoto('close-up of my eyes', true, ANCHOR, 'selfie').frame).toBe('close')
+    expect(planChatPhoto('特写:我的眼睛', true, ANCHOR, 'selfie').frame).toBe('close')
+  })
+
+  it('"特写"不再把景深那一句吞掉 —— 特写最需要的正好是那一句', () => {
+    /* 从前 close-up / 特写 在 LENS_RE 里,命中就把 lens 那层整个删掉 */
+    const p = planChatPhoto('close-up of my eyes', true, ANCHOR)
+    expect(p.prompt).toMatch(/shallow depth of field/)
+  })
+
+  it('缺省景别由视角决定:自拍半身、他拍全身、空镜中景', () => {
+    expect(planChatPhoto('me on the balcony', true, ANCHOR, 'selfie').frame).toBe('medium')
+    expect(planChatPhoto('me on stage, taken by a friend', true, ANCHOR, 'third').frame).toBe('full')
+    expect(planChatPhoto('an empty harbour', false, ANCHOR).frame).toBe('medium')
+  })
+
+  it('**缺省那一档逐字不变** —— 这一位加进来,一张本来对的图都不该被改掉', () => {
+    /* 这是这次改动唯一真正的风险。FRAMING 表里**没有缺省那一档的条目**,
+       所以两条路拼出来的必须是同一串,不是"差不多" */
+    const cases = [
+      ['me on the balcony, hair down', 'selfie', 'medium'],
+      ['me on stage, taken from the crowd', 'third', 'full']
+    ] as const
+    for (const [scene, shot, dflt] of cases) {
+      expect(planChatPhoto(scene, true, ANCHOR, shot, dflt).prompt).toBe(
+        planChatPhoto(scene, true, ANCHOR, shot).prompt
+      )
+    }
+    const empty = planChatPhoto('rain on the window', false, ANCHOR)
+    expect(planChatPhoto('rain on the window', false, ANCHOR, 'scene', 'medium').prompt).toBe(empty.prompt)
+  })
+
+  it('认不出的景别词当"没说",落回缺省', () => {
+    expect(resolveFrame('selfie', 'wide', 'me on the balcony')).toBe('medium')
+    expect(resolveFrame('third', 'unknown', 'me on the pier')).toBe('full')
+  })
+
+  it('景别进的是独立一层 —— 它与 pin 一样,是别人换不掉的那一条', () => {
+    const p = planChatPhoto('my eyes', true, ANCHOR, 'selfie', 'close')
+    expect(p.layers.find(([slot]) => slot === 'frame')?.[1]).toContain('close-up')
+  })
+
+  it('空镜的特写照样是特写,而且仍然一个人都不许有', () => {
+    const p = planChatPhoto('rain running down the window pane', false, ANCHOR, undefined, 'close')
+    expect(p.frame).toBe('close')
+    expect(p.prompt).toContain('no people in frame')
+    expect(p.prompt).toContain('one detail of the place')
+  })
+
+  it('全身那一档照样有人、照样发参考图', () => {
+    const p = planChatPhoto('me on the pier', true, ANCHOR, 'third', 'full')
+    expect(p.frame).toBe('full')
+    expect(p.prompt).toContain('whole person, head to feet')
+    expect(p.useRefs).toBe(true)
+  })
+
+  /* —— 自查抓出来的三处,各钉一条 —— */
+
+  it('他拍的半身:场景写着"腰以上"就真的从腰以上取景', () => {
+    /* 他拍那一档的缺省是全身,半身只能靠这一条进来 —— 少了它,
+       FRAMING.third.medium 就是一段谁也走不到的死代码 */
+    const p = planChatPhoto('me at my desk, the lamp behind me, shot from the waist up', true, ANCHOR, 'third')
+    expect(p.frame).toBe('medium')
+    expect(p.prompt).toContain('from the waist up')
+    expect(p.prompt).not.toContain('full figure and hands inside the frame')
+    expect(p.prompt).toContain('half-body')
+  })
+
+  it('**特写不该凭空长出一面镜子** —— 镜子是场景里的东西,不是可以补的修辞', () => {
+    /* 全身自拍一开始写成 "full-length mirror selfie",而镜子是场景里的一件
+       实物。场景没说它有镜子就不该添上 —— 与"不许编时间/天气"同一条纪律。
+       判据只看 camera 那一层:pin 那层写的是"at arm's length **or in a
+       mirror**",它**故意**把两条路都留着,由出图模型按场景挑一条 ——
+       那不是这一层该收窄的东西 */
+    for (const frame of ['full', 'close'] as const) {
+      const p = planChatPhoto('me by the window', true, ANCHOR, 'selfie', frame)
+      const camera = p.layers.find(([slot]) => slot === 'camera')?.[1] || ''
+      expect(camera, frame).not.toMatch(/mirror/i)
+      expect(camera, frame).toContain('one hand')
+      /* 而"相机在它自己手上"这条事实照旧由 pin 那一层保着 */
+      expect(p.prompt).toContain('own hand')
+    }
+  })
+
+  it('自拍的特写:臂展不成立,但那三个"自拍"信号一个都不能少', () => {
+    /* 贴到眼睛那么近不可能是手臂伸直拍的 —— 所以距离那一个词换成"一只手举近",
+       而"相机在它自己手上"这条事实由 pin 那层不可让渡地写着 */
+    const p = planChatPhoto('my eyes', true, ANCHOR, 'selfie', 'close')
+    expect(p.prompt).not.toContain('at arm\u2019s length, the front camera pushed right in')
+    expect(p.prompt).toMatch(/front camera/)
+    expect(p.prompt).toContain('the hand holding the phone just inside the frame')
+    expect(p.prompt, '轻微广角是四个自拍信号里的第三个').toContain('slight wide-angle distortion')
+    expect(p.prompt, '"相机在自己手上"由 pin 那层保着').toContain('own hand')
+  })
+})
+
+describe('frameLine · 不可让渡的那一句', () => {
+  it('人不在画面里时一个字都不提人 —— 与空镜那条 pin 同一条纪律', () => {
+    for (const f of ['close', 'medium', 'full'] as const) {
+      expect(frameLine(false, f)).not.toMatch(/\bperson\b|\bsubject\b|face/)
+    }
+  })
+
+  it('人在画面里时三档各有各的说法', () => {
+    expect(frameLine(true, 'close')).toContain('cropped out')
+    expect(frameLine(true, 'medium')).toContain('half-body')
+    expect(frameLine(true, 'full')).toContain('head to feet')
+  })
+})
+
 describe('planChatPhoto · 分层与顺序', () => {
 
   it('场景照:不拼锚点、不发参考图、镜头是空镜', () => {
@@ -268,6 +456,35 @@ describe('planChatPhoto · 分层与顺序', () => {
     const p = planChatPhoto('me on the balcony', true, ANCHOR)
     expect(p.prompt).toContain('not a character sheet')
     expect(p.prompt).toContain('not a passport or ID photo')
+    /* 垫在最后是一条顺序上的不变量:前面几层被截断时,它才是最后一个被丢的 */
+    expect(p.layers[p.layers.length - 1]?.[0]).toBe('negative')
+  })
+
+  /* —— 肢体与拼贴(2026-10-06)——
+     用户报的是"生成的图特别是特写图会出现四肢畸形,或者缺少"。 */
+  it('负面约束要挡"多出来的、长错的"肢体', () => {
+    const p = planChatPhoto('me on the balcony', true, ANCHOR)
+    expect(p.prompt).toMatch(/no extra limbs/i)
+    expect(p.prompt).toMatch(/no extra or fused fingers/i)
+    expect(p.prompt).toMatch(/no deformed or duplicated hands/i)
+  })
+
+  it('**刻意不写"不许缺肢体"** —— 那句会与特写的构图打架,把镜头拉回去', () => {
+    /* 特写那一档明写着"其余身体出画"(见 FRAMING)。模型读到"no missing limbs"
+       最省力的解法是把镜头拉远 —— 而那正是这一轮刚修好的毛病。
+       "缺"要治在机位句上,不是治在负面词上 */
+    const close = planChatPhoto('my eyes', true, ANCHOR, 'selfie', 'close')
+    expect(close.prompt).not.toMatch(/missing limbs?/i)
+    expect(close.prompt).not.toMatch(/cropped (?:through|at the edge)/i)
+    /* 而它该有的那两条照旧在 */
+    expect(close.prompt).toMatch(/no extra limbs/i)
+  })
+
+  it('负面约束也要挡拼贴 —— 我们发的参考图里有两张 2×2 网格', () => {
+    const p = planChatPhoto('me on the balcony', true, ANCHOR)
+    expect(p.prompt).toMatch(/not a collage/i)
+    expect(p.prompt).toMatch(/not a contact sheet/i)
+    expect(p.prompt).toMatch(/no panels/i)
   })
 
   it('没填过设定的角色照样发参考图 —— 参考图是图,不依赖那段文字', () => {

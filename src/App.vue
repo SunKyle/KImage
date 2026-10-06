@@ -400,6 +400,13 @@ function toggleImmersive() {
 const backdrops = ref<Record<string, ChatBackdrop>>({})
 const backdropBusy = ref<Record<string, boolean>>({})
 
+/* 正在重画的那几张图,按**消息 id** 记(不是按角色 —— 同一段对话里可以有好几张图,
+   而"这一张在画"是那一条消息自己的状态)。
+   为什么非要有它:重画一张**已经画好**的图时,photoId 还在、旧图照旧显示,
+   于是"正在重画"在界面上本来没有任何痕迹 —— 用户点完看不出发生了什么,
+   还能连点好几次。它只喂给那一枚重画键(见 ChatPage 的 .photo-redraw) */
+const chatPhotoBusy = ref<Record<string, boolean>>({})
+
 /** 当前这一场戏的描述:最后一条**已经画出来**的剧照写的那段场景。
  *  与沉浸页头部那行、以及背景本身取自同一条消息(三处必须一致) */
 function currentScene(id: string): string {
@@ -1713,6 +1720,10 @@ async function runChat(id: string) {
      由模型在标签前缀里说(selfie: / third:,见 server/chatTags.js)——
      它是**唯一**知道"我在描述自己举着手机拍,还是别人给我拍"的那一层 */
   let photoShot = ''
+  /* 这一张离得多近:'close' / 'medium' / 'full' / 空串(它没说)。
+     与视角一样只由模型说得出 —— 而它是"让角色拍特写,却总变成臂展自拍"
+     那件事的解药(见 lib/chatPhoto 的 FRAMING) */
+  let photoFrame = ''
   /* 打字节奏。它只决定"什么时候放",不决定"放什么" ——
      所以这里最要紧的不是节奏好不好看,而是**一个字都不能丢**:
      收尾(马上要落盘)、按 Stop、页面被切走三处都必须把手里剩下的冲出来,
@@ -1788,6 +1799,7 @@ async function runChat(id: string) {
     photo = out.photo
     photoSelf = out.photoSelf
     photoShot = out.photoShot
+    photoFrame = out.photoFrame
     /* 这一轮到底有没有"发图的意图",以及它想给你看什么。
      *
      * **不该靠猜**:标签在服务端就被剪掉了(那是对的,用户不该看见 `[photo:…]`),
@@ -1795,7 +1807,7 @@ async function runChat(id: string) {
      * 一旦出现"怎么每句都在发图"的疑问,这一层是唯一能一眼分辨的地方。
      * 走 console.debug(详细级别,控制台默认不显示),**不落盘、不上报**。
      * 只在**确实有意图**时打一行 —— 它就是为"太多了"这种问题准备的 */
-    if (photo) console.debug('[chat] photo intent:', photo)
+    if (photo) console.debug('[chat] photo intent:', photo, { self: photoSelf, shot: photoShot, frame: photoFrame })
   } catch (e) {
     if (isAbort(e)) stopped = true
     else failure = e instanceof Error ? e.message : 'Request failed'
@@ -1833,6 +1845,9 @@ async function runChat(id: string) {
        依据该是同一个(在不在画面里、谁拿的相机) */
     if (photoSelf) reply.photoSelf = true
     if (photoShot === 'selfie' || photoShot === 'third') reply.photoShot = photoShot
+    if (photoFrame === 'close' || photoFrame === 'medium' || photoFrame === 'full') {
+      reply.photoFrame = photoFrame
+    }
     drawChatPhoto(id, reply)
   }
   if (!reply.content.trim() && !stopped) {
@@ -1933,6 +1948,12 @@ async function saveChatWork(
  *
  *  正文不受影响:一句"我画不出来"比什么都不说更打断对话
  *  (见 doc/角色配图设计.md 的"失败不阻断文字")。
+ *
+ *  —— 这一条也是"重画一张已经画好的图"的入口(2026-10-06)——
+ *
+ *  同一条路两处用:第一次没画出来时的**重试**,与"画出来了但不好看,再摇一次"的
+ *  **重画**(用户原话:"角色生图支持重新生成")。两者唯一的差别在失败那一下 ——
+ *  见 markFailed 里的分叉。
  */
 function drawChatPhoto(id: string, reply: ChatMessage) {
   const scene = reply.photo || ''
@@ -1940,22 +1961,40 @@ function drawChatPhoto(id: string, reply: ChatMessage) {
   // 重试时从失败态翻回"正在画":界面据此把提示换回骨架,并清掉上一次的原因
   reply.photoFailed = false
   reply.photoError = ''
+  /* 这一张在画。旧图还留在界面上(photoId 不动),所以这一位是"正在重画"
+     唯一的说法 —— 成功与失败两条路都要把它收掉,见下面 */
+  chatPhotoBusy.value = { ...chatPhotoBusy.value, [reply.id]: true }
+  const settleBusy = () => {
+    const next = { ...chatPhotoBusy.value }
+    delete next[reply.id]
+    chatPhotoBusy.value = next
+  }
 
   /** 这一张没画出来。**先看这条还在不在** —— 它可能已经被删了(清空对话、
    *  或单独删掉它),那就别再往上写:写回去等于把一条已经删掉的消息复活。
    *
    *  `why` 是失败的具体原因(见 generateChatPhoto 的返回类型)。从前这里
    *  连一个参数都没有 —— 界面只能说"生成失败",而真正的原因(没配出图模型 /
-   *  密钥不对 / 上游回了个空数组)在下面那个 catch 里就被吃掉了 */
+   *  密钥不对 / 上游回了个空数组)在下面那个 catch 里就被吃掉了。
+   *
+   *  **分叉:这一次是重画,还是第一次画**(2026-10-06)。
+   *  `reply.photoId` 还在 = 这条消息本来就有一张画好的图(重画)。
+   *  那时**绝不能**记 photoFailed —— 那会让界面上那枚失败提示顶掉一张好图,
+   *  而用户要的只是"再摇一次,不行就算了"。失败照旧要说,只是换成那一句转瞬的
+   *  提示(见 notice):图留着,原因也说得出 */
   async function markFailed(why: string) {
     if (!chatMessages.value[id]?.some((m) => m.id === reply.id)) return
+    if (reply.photoId) {
+      notice.value = why
+      return
+    }
     reply.photoFailed = true
     reply.photoError = why
     // 落盘:**刷新之后那行提示与重试键还在**,否则又变回一个永远转的骨架
     await putChatMessage(toRaw(reply)).catch(() => {})
   }
 
-  void generateChatPhoto(id, scene, !!reply.photoSelf, reply.photoShot)
+  void generateChatPhoto(id, scene, !!reply.photoSelf, reply.photoShot, reply.photoFrame)
     .then(async (out) => {
       if (!chatMessages.value[id]?.some((m) => m.id === reply.id)) return
       if (!out.blob) return markFailed(out.error)
@@ -1981,11 +2020,19 @@ function drawChatPhoto(id: string, reply: ChatMessage) {
     /* 兜一层。generateChatPhoto 约定"绝不 reject",但真抛出来了也必须落到
        同一个出口 —— 漏出去这条消息就一直停在骨架上,连那行提示都不会有 */
     .catch((e) => markFailed(photoFailureText(e)))
+    /* **三条路都要收掉"正在重画"**(成功 / 失败 / 抛出来)。放 finally 而不是
+       各写一遍:漏一处那一枚键就会一直转,而它正好是"能不能再点一次"的依据 */
+    .finally(settleBusy)
 }
 
 /** 重画某一条消息里的图。与"重新生成"不同:文字一条都不动,
- *  只是把那张没画出来的图再画一次 —— 依据(场景描述 + 是不是自拍)
- *  本来就在消息上,不必重新问模型一遍 */
+ *  也不重新问对话模型 —— 依据(场景描述 + 在不在画面里 + 谁拿的相机 + 多近)
+ *  本来就在消息上。
+ *
+ *  两处用它:那张图**没画出来**时的"重试",以及**画出来了但不好看**时的"重画"
+ *  (2026-10-06 加的入口,用户原话:"角色生图支持重新生成")。
+ *  后者是同一段代码:依据一样、走的路一样,差别只在失败那一下 ——
+ *  已经有一张好图时不拿失败提示去顶掉它(见 drawChatPhoto 的 markFailed)。 */
 function retryChatPhoto(id: string, msgId: string) {
   const msg = (chatMessages.value[id] || []).find((m) => m.id === msgId)
   if (!msg || !msg.photo) return
@@ -2971,6 +3018,7 @@ function createAssignCollection(title: string) {
         :messages="chatMessages"
         :last-msg="chatLast"
         :busy="chatBusy"
+        :redrawing="chatPhotoBusy"
         :active="chatCharId"
         :has-more="!!chatHasMore[chatCharId]"
         :summary="chatSummary[chatCharId]"

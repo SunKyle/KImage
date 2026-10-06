@@ -7,7 +7,6 @@ import {
   PhArrowsOutSimple,
   PhArrowsClockwise,
   PhBrain,
-  PhCaretDown,
   PhChatCircleDots,
   PhDotsThree,
   PhEraser,
@@ -22,6 +21,7 @@ import {
   PhSpeakerHigh,
   PhStopCircle,
   PhTrash,
+  PhUser,
   PhX
 } from '@phosphor-icons/vue'
 import type { ApiConfig, Character, ChatMessage, ChatSummary } from '../types'
@@ -58,6 +58,11 @@ const props = defineProps<{
   /** 各角色正在生成中(没有该角色的键 = 空闲)。
    *  必须按角色分开 —— A 在说话时切到 B,B 的界面不该跟着显示"正在输入" */
   busy: Record<string, boolean>
+  /** 正在**重画**的那几张图,按消息 id。
+   *  只有"这一张本来就有图、现在在再摇一次"时才为真 —— 第一次就没画出来的那种
+   *  不靠它(那时还没有 photoId,界面画的是骨架)。
+   *  必须由主界面给:出图只活在主界面那一层,这里只负责把状态画出来 */
+  redrawing: Record<string, boolean>
   /** 当前选中的角色 id。空 = 还没挑 */
   active: string
   /* 前面还有更早的消息没读。库里装的是这个角色**最近一档** ——
@@ -99,8 +104,10 @@ const emit = defineEmits<{
   (e: 'send', charId: string, text: string, image?: Blob): void
   (e: 'stop', charId: string): void
   (e: 'regenerate', charId: string): void
-  /* 重画这一条里的图。文字一条都不动 —— 它只是"那张图没画出来,
-     再来一次",不该顺带把角色说的话也重写一遍(与 regenerate 分开) */
+  /* 重画这一条里的图。文字一条都不动 —— 它只是"这张图再来一次",
+     不该顺带把角色说的话也重写一遍(与 regenerate 分开)。
+     **第一次没画出来**时的"重试"与**画好了想再摇一张**时的"重画"走同一个出口:
+     依据、路径完全一样,差别只在失败那一下(见主界面的 drawChatPhoto) */
   (e: 'retryPhoto', charId: string, messageId: string): void
   /* 删掉单独一条消息。**只交意图** —— 内存与 IndexedDB 两边怎么删、
      撤销窗口怎么给、附图什么时候收,全归主界面(与清空对话同一条分工) */
@@ -309,6 +316,20 @@ const chatChipTip = computed(() =>
       : props.chatBorrowed
         ? `Using the Prompt enhancing model (${chatModelName.value}) — click to add a dedicated one`
         : `${chatModelName.value} — click to change it in API settings`
+)
+/* ⋮ 菜单里那一行模型的补充说明。**同一时刻只说一句**,按"最要紧的那一件"排:
+   缺东西(发不出请求)> 借来的(能用,但不是它自己的)。
+   空白 = 都不用说。这两句原先挂在头部那枚药丸上(chip-note),
+   药丸收进菜单时它们不能跟着丢 —— "缺模型名"那种状态在界面上本来就无声无息
+   (药丸写着名字、设置页顶着 Current),少一句就再没人说了 */
+const chatModelNote = computed(() =>
+  !props.chatConfig
+    ? ''
+    : !chatReady.value
+      ? `missing its ${chatMissing.value}`
+      : props.chatBorrowed
+        ? 'from enhancing'
+        : ''
 )
 
 /* ===== 消息流的时间分隔 =============================================
@@ -1010,6 +1031,22 @@ function askBackdrop() {
   emit('newBackdrop')
 }
 
+/* ⋮ 菜单里那条 "Open in Characters"。它原来在头部是一枚常驻药丸,
+   但那属于"离开这一段对话" —— 点击频次远低于模型/记忆那两枚,
+   收进菜单之后头部只留"调这一段对话"的东西(见模板里那段说明) */
+function openDetail() {
+  closeMenu()
+  if (props.active) emit('openCharacter', props.active)
+}
+
+/* ⋮ 菜单里那条"换模型"。它原来也是头部的一枚常驻药丸(见模板里那段说明)。
+   **先收菜单再走** —— 这一步要去设置页,而菜单只有点到别处才收;
+   不收的话它会在跳转后留在原地 */
+function openChatModel() {
+  closeMenu()
+  emit('configureChatModel')
+}
+
 function clearChat() {
   closeMenu()
   /* 卡片一起收:这段对话(连同记忆)马上就没了,留着一张写着旧记忆的卡片
@@ -1186,9 +1223,6 @@ onBeforeUnmount(() => {
                 <span class="head-name">{{ current.name }}</span>
                 <span v-if="mood" :key="mood" class="mood">{{ mood }}</span>
               </span>
-              <span v-if="current.fields?.identity" class="head-sub">
-                {{ current.fields.identity }}
-              </span>
             </span>
           </button>
           <span class="head-solo">
@@ -1204,62 +1238,42 @@ onBeforeUnmount(() => {
               <!-- 沉浸态的第二行是**场景 · 时间**,不是那串长相清单。
                    场景取自它自己最后一张照片意图里写的描述(reply.photo)——
                    等于它说"我在窗边",这一行就写"在窗边",不是我们编的。
-                   只加在 head-solo 这一份里:沉浸态恒用这一份(见那段 CSS) -->
+                   **非沉浸态的第二行不再有东西**(2026-10-06)——
+                   那里原本写着角色的 identity(那串"夜班护士"式的设定描述),
+                   用户明确说不要:名字下面那行留给"此刻"的事,不留给档案 -->
               <span v-if="immersive && sceneLine" class="head-scene">{{ sceneLine }}</span>
-              <span v-else-if="current.fields?.identity" class="head-sub">
-                {{ current.fields.identity }}
-              </span>
             </span>
           </span>
 
-          <!-- 头部右侧:模型入口 + 记忆入口 + ⋮ 菜单。
-               三者一起靠右收在 head-acts 里,窄屏把名字挤省略号时才不会错位 -->
+          <!-- 头部右侧:记忆入口 + ⋮ 菜单。
+               两者一起靠右收在 head-acts 里,窄屏把名字挤省略号时才不会错位。
+               **两枚常驻药丸都收进了 ⋮ 菜单**:
+               - `Open in Characters`(2026-10-06)——"离开这一段对话",
+                 点击频次远低于"调这一段对话"的那几件;
+               - **模型的入口**(同日更晚)——它曾经是这一排最宽的一枚
+                 (名字长的中转别名能吃掉 18ch),也正是窄屏上先被挤掉的那枚;
+                 更要紧的是**沉浸态**:那一排药丸在沉浸态一律不显示
+                 (见 .chat.is-immersive .head-chip),想换模型得先退出沉浸 ——
+                 收进菜单之后,那条路上它才够得着。
+               于是头部只剩两枚常驻入口,一宽一窄都不会先坏掉 -->
           <div class="head-acts">
-            <!-- 去它的详情:改设定、看那五张设定图、看拿它做过的图,都在那一页。
-                 排在模型/记忆那两枚**左边**,因为它是"离开这一段对话",
-                 与那两枚"调这一段对话"不是一类。
-                 **不能塞进左边那个大按钮里** —— 按钮不能套按钮(见左栏那条注释) -->
-            <button
-              class="head-chip detail-chip"
-              :title="`Open ${current.name} in Characters`"
-              @click="emit('openCharacter', current.id)"
-            >
-              <span class="chip-label">Details</span>
-              <PhCaretDown aria-hidden="true" />
-            </button>
-
-            <!-- 现在用的是哪个模型。**这一页自己的配置入口** ——
-                 以前它只在生图那页的参数面板里能改(而且是和改写混在一排里),
-                 于是"跟角色说话"用哪个模型,只能在画图那一侧动。
-                 点一下直达设置页:还没专配过就直接开一张对话配置的表单,
-                 已经有专属配置时回列表切一条 -->
-            <button
-              class="head-chip model-chip"
-              :title="chatChipTip"
-              @click="emit('configureChatModel')"
-            >
-              <PhSlidersHorizontal aria-hidden="true" />
-              <span class="chip-name">{{ chatModelName }}</span>
-              <!-- 借来的那一条要带上来处。不说的话,用户会以为它已经独立配过了 ——
-                   而"它到底走的哪个模型"正是这次要解决的问题本身 -->
-              <span v-if="chatBorrowed" class="chip-note">from enhancing</span>
-            </button>
-
             <!-- 记忆的常驻入口。它在头部而不再在消息流顶上 ——
                  那是"它为什么还记得那件事"的解释,却要往上翻几百条才够得着。
-                 只在真有记忆时出现:空着的一枚药丸点开是一片空 -->
+                 只在真有记忆时出现:空着的一枚药丸点开是一片空。
+                 药丸里**只留图标与 Memory**:"多久没动过"那句在卡片头里已经写过一遍,
+                 同一个数不再在头部重复第二次(悬停短语里仍带着) -->
             <button
               v-if="memory"
               ref="memoryChip"
               class="head-chip mem-chip"
               :class="{ on: memoryOpen }"
+              :title="`Long-term memory — updated ${memoryWhen}`"
               aria-haspopup="dialog"
               :aria-expanded="memoryOpen"
               @click="toggleMemoryCard"
             >
               <PhBrain aria-hidden="true" />
               <span class="chip-label">Memory</span>
-              <span class="chip-when">{{ memoryWhen }}</span>
             </button>
 
             <div ref="menuWrap" class="chat-menu-wrap">
@@ -1272,6 +1286,27 @@ onBeforeUnmount(() => {
                 <PhDotsThree aria-hidden="true" />
               </button>
               <div v-if="menuOpen" class="chat-menu">
+                <!-- 现在用的是哪个模型 + 换一条。**头部那枚药丸收进了这里**
+                     (2026-10-06)——它以前是头部最宽的一枚(名字长的中转别名能吃掉
+                     18ch),窄屏上先被挤掉的正是它;而沉浸态下头部那一排药丸整个
+                     不显示,想换模型得先退出沉浸(见 .chat.is-immersive .head-chip)。
+                     点一下直达设置页:还没专配过就直接开一张对话配置的表单,
+                     已经有专属配置时回列表切一条。
+                     **顶上那一行仍要说清"现在用的是哪个、缺没缺东西"** ——
+                     它原来靠药丸上的 name/note 说,收进菜单不能把那两句丢掉 -->
+                <button class="menu-model" :title="chatChipTip" @click="openChatModel">
+                  <PhSlidersHorizontal aria-hidden="true" />
+                  <span class="mm-name">{{ chatModelName }}</span>
+                  <span v-if="chatModelNote" class="mm-note">{{ chatModelNote }}</span>
+                </button>
+                <!-- 去它的详情:改设定、看那五张设定图、看拿它做过的图,都在那一页。
+                     它原来在头部是一枚常驻药丸(Details),但那是"离开这一段对话" ——
+                     收进这里之后,头部只剩"调这一段对话"的那两枚。
+                     **不能塞进左边那个大按钮里** —— 按钮不能套按钮(见左栏那条注释) -->
+                <button @click="openDetail">
+                  <PhUser aria-hidden="true" />
+                  Open in Characters
+                </button>
                 <!-- 没有记忆就没东西可改也没东西可忘 ——
                      点了打开的卡片是空的,不如不给。
                      忘记忆排在清空对话前面,三档是"忘一点 / 忘干净"的递进 -->
@@ -1516,19 +1551,49 @@ onBeforeUnmount(() => {
                      它发过的图是**这段对话的一部分**,不该因为换了个骨架就消失。
                      (只有"还没有专用背景图、暂借这张剧照铺底"的那一档会看到
                      同一张图出现两次 —— 那是过渡状态,不是丢掉消息的理由) -->
-                <button
+                <div
                   v-if="r.msg.role === 'assistant' && r.msg.photoId && imgUrl(r.msg.photoId)"
-                  type="button"
-                  class="msg-img-btn"
-                  :aria-label="`Open the photo from ${current.name}`"
-                  @click="openZoom(r.msg.photoId, 'Photo from the character')"
+                  class="msg-photo-wrap"
                 >
-                  <img
-                    class="msg-photo"
-                    :src="imgUrl(r.msg.photoId)"
-                    alt="Photo from the character"
-                  />
-                </button>
+                  <button
+                    type="button"
+                    class="msg-img-btn"
+                    :aria-label="`Open the photo from ${current.name}`"
+                    @click="openZoom(r.msg.photoId, 'Photo from the character')"
+                  >
+                    <img
+                      class="msg-photo"
+                      :src="imgUrl(r.msg.photoId)"
+                      alt="Photo from the character"
+                    />
+                  </button>
+                  <!-- 正在重画。**这一层压在图上,不是只让角落里那枚图标动** ——
+                       只让图标动的时候,图本身毫无变化,点完跟没点一样
+                       (用户原话:"不知道是不是在重绘")。
+                       手法与设定图那一格是同一套(见 CharacterPage 的 .cell-busy):
+                       一层暗幕压住旧图,中间一枚呼吸的圆环。
+                       **旧图不撤** —— 重画失败时它照旧留在原位(见主界面的 markFailed)。
+                       暗幕不吃点击:图还看得清,也就还点得开放大 -->
+                  <span v-if="redrawing[r.msg.id]" class="photo-busy" aria-hidden="true">
+                    <span class="photo-busy-ring"></span>
+                  </span>
+                  <!-- 再摇一张。**挂在图上,不挂在文字那枚药丸里** ——
+                       两件理由:它作用的是这张图,而"整轮重来"已经用着同一个图标
+                       (见 .regen-btn),两枚同形的键挨在一起谁也分不清谁;
+                       而且"只发了一张图、没有文字"的消息根本没有气泡可挂。
+                       平时不出现(悬停或键盘聚焦才浮出来,与消息那排动作同一规矩);
+                       正在重画时它让位给上面那层暗幕 —— 那会儿该读的是进度,不是按钮 -->
+                  <button
+                    v-if="!redrawing[r.msg.id]"
+                    type="button"
+                    class="photo-redraw"
+                    title="Draw this photo again"
+                    :aria-label="`Draw ${current.name}’s photo again`"
+                    @click="emit('retryPhoto', current.id, r.msg.id)"
+                  >
+                    <PhArrowsClockwise aria-hidden="true" />
+                  </button>
+                </div>
                 <!-- 这一张没画出来。**必须说出来** —— 从前它只是把骨架悄悄撤掉,
                      于是"没收到图"和"本来就没打算发图"在界面上长得一模一样:
                      用户既不知道为什么没有图,也没有地方让它再来一次。
@@ -2085,23 +2150,6 @@ onBeforeUnmount(() => {
   background: var(--accent-soft);
   color: var(--text-2);
 }
-/* 药丸里那句补充说明(记忆的"多久没动过"、模型的"借来的")一律压暗一档:
-   它们是同一枚药丸里的次要信息,不该和主词争同样的分量 */
-.chip-when,
-.chip-note {
-  color: var(--text-3);
-  font-weight: 400;
-}
-/* 模型名可能很长(中转上自己写的别名),给它一档上限再省略 ——
-   不封顶的话它会一路把角色名字挤没,而这一页首先要认得出在跟谁说话 */
-.model-chip .chip-name {
-  max-width: 18ch;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-/* 窄屏:记忆那枚只留图标与时间,模型那枚收窄名字、去掉来源说明 ——
-   名字与身份已经占满了那一行,而这两条补充信息都能在展开/进入设置后看到 */
 /* —— 左栏的搜索 ——
    与历史页那一枚同款(圆角胶囊 / 1px 线 / 聚焦用 box-shadow 补一圈而不切 border:
    切了里面整行会挪一下)。**同一语义在全站用同一套视觉**是这一站的纪律,
@@ -2228,12 +2276,8 @@ onBeforeUnmount(() => {
   background: var(--accent-soft);
 }
 @media (max-width: 560px) {
-  .mem-chip .chip-label,
-  .model-chip .chip-note {
+  .mem-chip .chip-label {
     display: none;
-  }
-  .model-chip .chip-name {
-    max-width: 10ch;
   }
 }
 /* 宽屏用不可点的 head-solo,窄屏才换成可点的 head-pick ——
@@ -2282,9 +2326,9 @@ onBeforeUnmount(() => {
   gap: 1px;
   min-width: 0;
 }
-/* 名字与情绪同一行:情绪是"此刻的状态",贴着名字读最自然 ——
-   挪到下面那行(身份)去会被 46ch 的截断吃掉,
-   而那行是角色的定义,不该被一个每轮都在变的东西挤 */
+/* 名字与情绪同一行:情绪是"此刻的状态",贴着名字读最自然。
+   下面那一行现在是**沉浸态的场景 · 时间**(见 head-scene),不再是角色的身份 ——
+   "此刻"的东西都留在名字这一行,第二行只留给这一场戏 */
 .head-top {
   display: flex;
   align-items: center;
@@ -2325,15 +2369,6 @@ onBeforeUnmount(() => {
     animation: none;
   }
 }
-.head-sub {
-  overflow: hidden;
-  max-width: 46ch;
-  font-size: var(--fs-xs);
-  color: var(--text-3);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .chat-menu-wrap {
   position: relative;
   flex: none;
@@ -2389,6 +2424,21 @@ onBeforeUnmount(() => {
 .chat-menu button:disabled {
   color: var(--text-4);
   cursor: default;
+}
+/* 模型那一行:名字后面还要接一句"借来的 / 缺了哪一样",所以名字自己收口 ——
+   名字可以是中转上自己写的别名,很长,而这一行是固定宽度的菜单 */
+.chat-menu .mm-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 补充说明压暗一档并靠右:它是同一行里的次要信息,不该和名字争同样的分量 */
+.chat-menu .mm-note {
+  flex: none;
+  margin-left: auto;
+  color: var(--text-3);
+  font-size: var(--fs-micro);
 }
 
 /* ===== 消息流 ===== */
@@ -3076,6 +3126,96 @@ onBeforeUnmount(() => {
 .msg.assistant .msg-img-btn {
   max-width: min(320px, 76%);
 }
+
+/* 角色那张图外面多了一层:重画那一枚要有定位的锚,暗幕也要正好盖在图上。
+   **这一层的宽度由内容决定**(fit-content)—— 不能只给一个上限:上限是 320,
+   而竖图封顶后只有 240 宽,只给上限这一层就会宽出 80px,暗幕盖到图外面的空白上。
+
+   而"内容"要真的是那张图:所以按钮上那条百分比上限**必须在这里被撤掉** ——
+   它是对着包含块算的,留着它按钮就会撑到上限,这一层跟着撑到上限,
+   图却还是它自己那么宽(实测:暗幕 240、图 182,差 58px)。
+   撤掉之后两种情形都对得上:图比上限小 → 这一层收到图那么宽;
+   图比上限大 → 两个都撞同一个上限。 */
+.msg-photo-wrap {
+  position: relative;
+  width: fit-content;
+  max-width: min(320px, 76%);
+  /* 与气泡之间那道 8px 挪到这一层上。留图自己身上的话,它会落在这一层的**里面**
+     (这一层是 flex 项,自成 BFC,外边距不折叠)—— 于是暗幕比图高 8px,
+     上沿多压出 8px 的空白。挪出来之后这一层的盒子就等于图,逐边相等 */
+  margin-top: 8px;
+}
+.msg.assistant .msg-photo-wrap .msg-img-btn {
+  max-width: none;
+}
+.msg-photo-wrap .msg-photo {
+  margin-top: 0;
+}
+/* 正在重画:一层暗幕压住旧图 + 中间一枚呼吸的圆环。
+   与设定图那一格同一套语言(那一格也踩过同一个坑:"重跑一张已有的图时
+   格子里毫无变化,看不出在跑")。圆环呼吸做在 box-shadow 上 ——
+   按钮本身保持清晰,动的只是外圈 */
+.photo-busy {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  border-radius: 12px;
+  background: rgba(24, 24, 22, 0.5);
+  /* 不吃点击:暗幕底下那张图仍然点得开放大 */
+  pointer-events: none;
+}
+.photo-busy-ring {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: rgba(252, 251, 249, 0.22);
+  animation: photoBusy 1.6s var(--ease) infinite;
+}
+@keyframes photoBusy {
+  50% {
+    box-shadow: 0 0 0 7px rgba(252, 251, 249, 0.1);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .photo-busy-ring {
+    animation: none;
+  }
+}
+/* 再摇一张。**平时不出现**(悬停或键盘聚焦才浮出来,与消息那排动作同一规矩),
+   形状与底沿用那枚药丸的语言 —— 同一页里两种控件长相,用户就得重新认一次 */
+.photo-redraw {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  display: grid;
+  place-items: center;
+  width: var(--ops-btn);
+  height: var(--ops-btn);
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text-3);
+  box-shadow: var(--sh-sm);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity var(--dur) var(--ease);
+}
+.msg:hover .photo-redraw,
+.msg:focus-within .photo-redraw {
+  opacity: 1;
+}
+.photo-redraw:hover {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+/* 触屏没有悬停:常驻一份淡的(与消息那排动作同一条),否则重画就没有入口 */
+@media (hover: none) {
+  .photo-redraw {
+    opacity: 0.5;
+  }
+}
 .msg-img,
 .msg-photo {
   display: block;
@@ -3639,10 +3779,6 @@ onBeforeUnmount(() => {
 .chat.is-immersive .head-name {
   font-size: var(--fs-lg);
   letter-spacing: 0.01em;
-}
-/* 那串写给图像模型的长相清单在这里收掉(见上面 head-scene 的说明) */
-.chat.is-immersive .head-sub {
-  display: none;
 }
 .chat.is-immersive .head-scene {
   max-width: min(52ch, 62vw);

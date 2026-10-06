@@ -1948,6 +1948,25 @@ async function main() {
         /* 沉浸偏好开着。重载后应用落在**首页** —— 那时顶栏必须照常显示,
            "偏好留着、但不在对话页就回普通"正是下面要断言的语义之一 */
         localStorage.setItem('kimage.immersive', '1')
+        /* 一条**出图**配置(地址指向一个死端口)。⑦c 要把"正在重画"那一档按住看,
+           而重画在没有出图配置时**根本走不到发请求那一步**(见 imageConfigGap):
+           忙态会立刻被收掉,量不到、也截不到图。给一条配置之后它才会真的去发,
+           而我们再把它桩住不落地 */
+        localStorage.setItem(
+          'kimage.apiConfigs',
+          JSON.stringify([
+            {
+              id: 'probe-image',
+              name: 'Probe image',
+              baseUrl: 'http://127.0.0.1:9/v1',
+              apiKey: 'probe-key',
+              model: 'probe-image-model',
+              kind: 'image',
+              vendor: 'openai'
+            }
+          ])
+        )
+        localStorage.setItem('kimage.apiActive', 'probe-image')
         localStorage.setItem(
           'kimage.characters',
           JSON.stringify([
@@ -1955,7 +1974,10 @@ async function main() {
               id: charId,
               name: 'Probe talker',
               createdAt: now,
-              fields: { gender: 'female', identity: 'probe', outfit: '', marks: '' },
+              /* identity 用一个**只属于它**的短语(与角色名不重叠) ——
+                 下面要断言"这行身份描述不再出现在头部",而名字里若含同样的词,
+                 那条断言就永远过得去(判别性会丢) */
+              fields: { gender: 'female', identity: 'probe spec line', outfit: '', marks: '' },
               persona: { traits: 'dry', voice: 'short', address: 'you', boundaries: 'none' }
             },
             /* 第二个角色:**置顶、没有一句对话、而且比上面那个建得晚** ——
@@ -2246,6 +2268,13 @@ async function main() {
             return b ? JSON.stringify(b.textContent) : '(没找到)'
           })(),
           photoRendered: !!document.querySelector('img.msg-photo'),
+          /* 头部第二行**不再写角色的身份描述**(2026-10-06,用户:"角色描述不要")。
+             判据用那句身份原文,而不是"有没有 .head-sub 这个类":
+             类名可以改名,而"这行字还在不在"才是用户看到的东西。
+             判别性:把那一行加回模板,这条立刻红 */
+          headShowsSpec: (
+            document.querySelector('.chat-head')?.textContent || ''
+          ).includes('probe spec line'),
           photoBelowText: !!order && order.imgAt > order.textAt && order.textAt >= 0,
           /* 库里那条只带场景、没有 photoId 的消息,读回来时**不再顶着骨架**:
              出图只活在内存里,而一次读取发生在页面刚打开(或往前翻)的时候,
@@ -2254,6 +2283,19 @@ async function main() {
              两个都量:失败提示该在,骨架不该在 */
           photoFailed: !!document.querySelector('.photo-fail'),
           photoRetry: !!document.querySelector('.photo-retry'),
+          /* "再摇一张"那一枚(2026-10-06)。**只挂在已经画好的图上** ——
+             判据落在"它在不在那张图的容器里"与它的 aria-label,
+             不落在图标上:换一个图标不该让这条断言变红。
+             没画出来的那条只该有 .photo-retry,不该有这一枚 */
+          photoRedraw: (() => {
+            const b = document.querySelector('.photo-redraw')
+            if (!b) return null
+            return {
+              label: b.getAttribute('aria-label') || '',
+              onDrawnPhoto: !!b.closest('.msg-photo-wrap')?.querySelector('img.msg-photo'),
+              onFailedPhoto: !!b.closest('.photo-fail')
+            }
+          })(),
           pendingSkeleton: !!document.querySelector('.msg-photo-skel'),
           photoOutsideBubble: !!order && order.inBubble === false,
           /* 实测反馈:"聊天记录里图片太大"。钉住它是个缩略图而不是一面墙 */
@@ -2442,6 +2484,30 @@ async function main() {
       chatProbe.backdropMenu.items = await evaluate(() =>
         [...document.querySelectorAll('.chat-menu button')].map((x) => (x.textContent || '').trim())
       )
+      /* 换模型那一条**在菜单里、而且排第一**(2026-10-06)。
+         它原来是头部的一枚常驻药丸,收进菜单之后头部那排不再有它 ——
+         判据落在"菜单第一项是不是它、名字对不对",而不是"有没有 .menu-model" */
+      chatProbe.backdropMenu.modelRow = await evaluate(() => {
+        const first = document.querySelector('.chat-menu button')
+        return {
+          isModel: !!first?.classList.contains('menu-model'),
+          text: (first?.textContent || '').trim(),
+          /* 头部那枚药丸已经不在了 */
+          chipGone: !document.querySelector('.chat-head .model-chip')
+        }
+      })
+      /* 菜单开着的时候留一张:里面第一行是"换模型" */
+      await shot('chat-menu', 1248, 900)
+      /* 同上面那条坑:截图收尾会把视口还回默认的窄窗,而下面几条布局断言
+         (shell 的 overflow、普通骨架是不是两列)依赖桌面宽度 —— 补回来。
+         漏了这一下,失败会**长在别的断言上**,看着像 UI 坏了 */
+      await send('Emulation.setDeviceMetricsOverride', {
+        width: 1280,
+        height: 900,
+        deviceScaleFactor: 1,
+        mobile: false
+      })
+      await settle()
       chatProbe.backdropMenu.hasNewBackground = chatProbe.backdropMenu.items.some((e) =>
         /New background/i.test(e)
       )
@@ -2552,6 +2618,119 @@ async function main() {
       })
       await settle()
       chatProbe.zoomClosed = await evaluate(() => !document.querySelector('.zoom'))
+
+      /* ⑦b "再摇一张"(2026-10-06)。它只该挂在**已经画好**的那张图上 ——
+             没画出来的那条走的是另一条路(.photo-fail 里的 .photo-retry):
+             一条是"再来一次",一条是"摇到满意为止",两条不能混 */
+      chatProbe.photoRedraw = await evaluate(() => {
+        const b = document.querySelector('.photo-redraw')
+        if (!b) return { clicked: false }
+        /* 点之前先看一眼那条中性提示 —— 下面要用"它变了"来判"失败被说出来了",
+           而不是"有一条提示在"(前面几步也可能留下过一条,那样判不出东西来) */
+        const before = document.querySelector('.note-msg')?.textContent?.trim() || ''
+        b.click()
+        return { clicked: true, noticeBefore: before }
+      })
+      await sleep(600)
+      /* 点完之后要看出三件事:
+         ① 旧图**没被撤掉** —— 这一次必然失败(预览服务上没有 /api/generate),
+            而失败不该拿一行提示顶掉一张已经画好的图;
+         ② 那一枚键回到可点 —— 忙态漏收一处,它就永远转下去(忙时它让位给暗幕,
+            所以判据是"它回来了",不是"它 disabled 了");
+         ③ **失败被说出来了**。重画失败时那张好图还在,于是界面上唯一能说出
+            "这次没成"的地方就是那条中性提示 —— 少了它,用户点完什么都看不见。
+            判据是"提示变了",不是"有提示"(见上面 noticeBefore) */
+      chatProbe.afterRedraw = await evaluate(() => {
+        return {
+          photoStillThere: !!document.querySelector('img.msg-photo'),
+          buttonBack: !!document.querySelector('.photo-redraw'),
+          notice: document.querySelector('.note-msg')?.textContent?.trim() || ''
+        }
+      })
+      await settle()
+
+      /* ⑦c 正在重画时长什么样(2026-10-06)。用户报的是"看不出是不是在重绘",
+             所以这一档得**按住**了看:把 /api/generate 桩成一个永不落地的
+             promise,忙态就停在那儿,量得到、也截得到图。
+             量的重点是那层暗幕要**正好等于图的大小** —— 它挂在一个
+             "宽度由内容决定"的容器里(见 .msg-photo-wrap),而竖图的宽度比
+             那个上限窄:容器若是撑到上限,暗幕就盖到图外面的空白上了 */
+      await evaluate(() => {
+        const real = window.fetch.bind(window)
+        window.fetch = (url, init) =>
+          String(url).includes('/api/generate')
+            ? new Promise(() => {}) /* 永不落地 = 一直"正在重画" */
+            : real(url, init)
+      })
+      await evaluate(() => document.querySelector('.photo-redraw')?.click())
+      await sleep(400)
+      chatProbe.busyBox = await evaluate(() => {
+        const img = document.querySelector('img.msg-photo')
+        const busy = document.querySelector('.photo-busy')
+        const wrap = document.querySelector('.msg-photo-wrap')
+        if (!img || !busy || !wrap) return null
+        const r = (el) => el.getBoundingClientRect()
+        return {
+          img: { w: Math.round(r(img).width), h: Math.round(r(img).height) },
+          busy: { w: Math.round(r(busy).width), h: Math.round(r(busy).height) },
+          wrapW: Math.round(r(wrap).width),
+          /* 忙的时候那一枚重画键让位给暗幕(不该同时出现两个说法) */
+          redrawHidden: !document.querySelector('.photo-redraw'),
+          ring: !!document.querySelector('.photo-busy-ring')
+        }
+      })
+      /* 把这一张贴进视口再截图:它在这一屏下面(消息流不短),
+         不滚过去的话截到的是一屏别的消息 */
+      await evaluate(() =>
+        document.querySelector('.photo-busy')?.scrollIntoView({ block: 'center' })
+      )
+      await sleep(300)
+      await shot('chat-photo-redrawing', 1248, 900)
+      /* **量的时候必须站在截图那个视口上** —— shot() 会临时把视口改成 1248×900
+         再清掉,而布局跟着视口变:在别的宽度上量出来的尺寸与那张图对不上,
+         会得出一个"看着对、其实对不上"的结论(这一步就是这么踩出来的)。
+         所以这里把同一个视口再按一次,量完再放开 */
+      await send('Emulation.setDeviceMetricsOverride', {
+        width: 1248,
+        height: 900,
+        deviceScaleFactor: 1,
+        mobile: false
+      })
+      await sleep(400)
+      chatProbe.boxesAtShotViewport = await evaluate(() =>
+        [...document.querySelectorAll('img.msg-photo')].map((img) => {
+          const wrap = img.closest('.msg-photo-wrap')
+          const busy = wrap?.querySelector('.photo-busy')
+          const size = (el) => {
+            const b = el.getBoundingClientRect()
+            return [Math.round(b.width), Math.round(b.height)]
+          }
+          return {
+            natural: [img.naturalWidth, img.naturalHeight],
+            img: size(img),
+            wrap: wrap ? size(wrap) : null,
+            busy: busy ? size(busy) : null,
+            /* 暗幕与图**逐边相等**才算对(留 1px 给亚像素)。
+               这一条只在**这个确定的视口**上判 —— 上面那个 busyBox 量的是
+               探针窗口当前的宽度,而窗口宽度随机器变:暗幕跑偏那个 bug
+               正是在宽视口下才显形的(容器撑到 76% 上限、图只有它自己那么宽) */
+            covers: (() => {
+              if (!busy) return false
+              const a = img.getBoundingClientRect()
+              const b = busy.getBoundingClientRect()
+              return (
+                Math.abs(a.left - b.left) <= 1 &&
+                Math.abs(a.top - b.top) <= 1 &&
+                Math.abs(a.width - b.width) <= 1 &&
+                Math.abs(a.height - b.height) <= 1
+              )
+            })()
+          }
+        })
+      )
+      await send('Emulation.clearDeviceMetricsOverride')
+
+      await settle()
 
       /* ⑤ 记忆:入口在头部,点开是一张悬浮卡片(从前它是消息流最上面那一块,
             聊得越久越够不着) */
@@ -2826,6 +3005,12 @@ async function main() {
         chatProbe.immersive?.menuShown === true &&
         /* 点开它,里面得有"重画这一场的背景"那一条 */
         chatProbe.backdropMenu?.hasNewBackground === true &&
+        /* **换模型那一条也在里面,而且排第一** —— 它原来在头部是一枚常驻药丸,
+           窄屏上先被挤掉的是它,而沉浸态下头部那一排整个不显示(换模型得先退出)。
+           判别性:把它挪回头部、或从菜单里删掉,这两条立刻红 */
+        chatProbe.backdropMenu?.modelRow?.isModel === true &&
+        /No model/.test(chatProbe.backdropMenu?.modelRow?.text || '') &&
+        chatProbe.backdropMenu?.modelRow?.chipGone === true &&
         chatProbe.immersive?.soloShown === true &&
         chatProbe.immersive?.pickHidden === true &&
         chatProbe.immersive?.exitBtn === true &&
@@ -2861,6 +3046,8 @@ async function main() {
         chatProbe.rendered?.hasMemory === true &&
         chatProbe.rendered?.oldMemoryBlock === false &&
         chatProbe.rendered?.charInRail === true &&
+        /* 头部第二行不再写角色的身份描述(用户:"角色描述不要") */
+        chatProbe.rendered?.headShowsSpec === false &&
         /* 回来时知道自己离开了多久 —— 而且说的是**真实的那段间隔**(3 天)。
            判别性:核对的是精确文本,常量或错数都过不去 */
         chatProbe.rendered?.awayLine === 'Last spoke 3 days ago' &&
@@ -2874,6 +3061,27 @@ async function main() {
            这一条兜的是 df9dffa 那次修复 —— 它当时只补了实现,探针还停在旧行为上 */
         chatProbe.rendered?.photoFailed === true &&
         chatProbe.rendered?.photoRetry === true &&
+        /* "摇到满意为止"那一枚挂在已经画好的那张图上,而且带着读得出来的名字。
+           判别性:把它挂到失败那条上(或漏掉 aria-label),这条立刻红 */
+        chatProbe.rendered?.photoRedraw?.onDrawnPhoto === true &&
+        chatProbe.rendered?.photoRedraw?.onFailedPhoto === false &&
+        /photo again/i.test(chatProbe.rendered?.photoRedraw?.label || '') &&
+        chatProbe.photoRedraw?.clicked === true &&
+        /* 失败**不许顶掉那张好图**(这条是本次修复的核心),忙态必须收掉,
+           而且这次没成要**说出来** —— 图还在的时候,那是唯一的说法 */
+        chatProbe.afterRedraw?.photoStillThere === true &&
+        chatProbe.afterRedraw?.buttonBack === true &&
+        !!chatProbe.afterRedraw?.notice &&
+        chatProbe.afterRedraw.notice !== chatProbe.photoRedraw?.noticeBefore &&
+        /* 正在重画那一档:暗幕+圆环在,重画键让位,而且**暗幕正好盖住图**
+           (逐边相等,在截图那个确定的 1248 视口上判 —— 见 boxesAtShotViewport)。
+           判别性:把 `.msg-photo-wrap` 的 fit-content 去掉、或让按钮那条 76% 上限
+           重新生效,这一条立刻红(暗幕会比图宽出一截,盖到图外面的空白上) */
+        chatProbe.busyBox?.ring === true &&
+        chatProbe.busyBox?.redrawHidden === true &&
+        chatProbe.busyBox?.img?.w > 0 &&
+        chatProbe.boxesAtShotViewport?.length === 1 &&
+        chatProbe.boxesAtShotViewport[0].covers === true &&
         chatProbe.rendered?.pendingSkeleton === false &&
         chatProbe.rendered?.photoOutsideBubble === true &&
         chatProbe.rendered?.photoWidth > 0 &&

@@ -27,22 +27,28 @@
  *  这一层与 chatPhoto 的"失败只降级、绝不 reject"是同一条纪律:
  *  摄影指导挂了,这张图照样得出得来。
  *
- *  —— 它不判视角(2026-10-05 改)——
+ *  —— 它不判视角,也不判景别 ——
  *
  *  视角(自拍 / 他拍 / 空镜)曾经也归它判,现在不归了:它只看得到一句场景,
  *  而"谁拿的相机"是聊天模型在标签里说的话(见 server/chatTags.js)。
  *  让它判的结果是大多数图落成他拍 —— 用户报的正是这个。现在它是**被告知**
  *  这件事,然后只负责在这个视角下把机位写准。
  *
+ *  景别(特写 / 半身 / 全身)是 2026-10-06 加进来的**第二件被告知的事**,
+ *  理由一模一样:它写的就是 `Camera:` 那一行,而"推多近"是那一行的内容 ——
+ *  不告诉它,它就只能按场景猜,而 `applyDirector` 是**整句替换**:
+ *  它猜出来的那个距离会把模板里那句正确的机位句一个字不剩地顶掉。
+ *
  *  抽成纯函数是为了能直接断言 —— 上面每一条护栏都是"出错时画面会变形、
  *  但不会报错"的那类问题,而真正的出图要花钱、要联网,靠手测试不全。
  */
 
-import type { ChatLayer, ChatPhotoPlan, ChatShot } from './chatPhoto'
+import type { ChatFrame, ChatLayer, ChatPhotoPlan, ChatShot } from './chatPhoto'
 import { composeChatPrompt, missingSlots } from './chatPhoto'
 
-/** 摄影指导能补的四位。**它不许碰 medium / 场景 / 锚点 / 负面约束** ——
- *  那几样分别是"媒介""内容""这个人是谁"与"挡什么",都不是"怎么拍" */
+/** 摄影指导能补的四位。**它不许碰 medium / 场景 / 锚点 / 负面约束,也不许碰
+ *  pin 与 frame** —— 那几样分别是"媒介""内容""这个人是谁""挡什么",
+ *  以及"谁拿的相机 / 离得多近"这两条不可让渡的事实,都不是"怎么拍" */
 export const DIRECTOR_SLOTS = ['camera', 'lens', 'light', 'env'] as const
 export type DirectorSlot = (typeof DIRECTOR_SLOTS)[number]
 
@@ -106,15 +112,18 @@ function lineValue(raw: string): string {
 }
 
 /**
- * 摄影指导的结果并进方案。**它只补那四位,视角不归它管**(2026-10-05 改)。
+ * 摄影指导的结果并进方案。**它只补那四位,视角与景别不归它管**(2026-10-05 / 10-06)。
  *
- * 四条不变量(每一条都有单测):
+ * 五条不变量(每一条都有单测):
  * 1. **视角它一个字都改不了** —— 它只收到"这一张是自拍 / 他拍 / 空镜"这个事实,
  *    并据此写机位。理由见下面那段;
- * 2. **场景已经说过的那一位不接受覆盖** —— 场景里写了光,模型再写一句光就是
+ * 2. **景别同样一个字都改不了**(2026-10-06)—— `frame` 槽不在 DIRECTOR_SLOTS 里,
+ *    所以它那句 `Camera:` 即便写了个别的距离,也顶不掉那一层。理由是同一个:
+ *    "推多近"是意图,它看不到对话、判不出来;
+ * 3. **场景已经说过的那一位不接受覆盖** —— 场景里写了光,模型再写一句光就是
  *    自相矛盾,而模型会挑一处当噪声丢掉、或者把两者硬凑成一张谁都不像的图;
- * 3. **没被补上或验收不过的位退回模板** —— 降级是逐位的,不是整层;
- * 4. **只换那四位**。medium / 场景 / 锚点 / 动作 / 负面约束 / 那两条硬约束一律不动。
+ * 4. **没被补上或验收不过的位退回模板** —— 降级是逐位的,不是整层;
+ * 5. **只换那四位**。medium / 场景 / 锚点 / pin / frame / 动作 / 负面约束一律不动。
  *
  * —— 为什么把视角从它手里收回来 ——
  *
@@ -158,13 +167,13 @@ export function applyDirector(
 
 /** 给摄影指导模型的那段活。**纯字符串**,所以能直接断言口径。
  *
- *  —— 交代给它的一件事实:这一张是谁拿的相机 ——
+ *  —— 交代给它的两件事实:谁拿的相机、以及推得多近 ——
  *
- *  这不是它的判断,是它写机位的前提(2026-10-05 改)。它拿到的只有一句场景,
- *  看不到对话,所以"谁拿的相机"它判不出来 —— 让它判就是让它猜,
- *  而猜出来的默认是他拍(用户报的那个毛病)。
+ *  这两件都不是它的判断,是它写机位的前提(2026-10-05 视角 / 2026-10-06 景别)。
+ *  它拿到的只有一句场景,看不到对话,所以这两件它都判不出来 —— 让它判就是让它猜,
+ *  而猜出来的默认是他拍(用户报的那个毛病)、以及一个它自己挑的距离。
  *
- *  另外两件它推不出来的事实:画面里有没有人(`photoSelf`)、
+ *  另外三件它推不出来的事实:画面里有没有人(`photoSelf`)、
  *  以及哪几位场景已经有着落了(由 missingSlots 算)。
  *
  *  "do not change it" 那一句管的是**场景**。 */
@@ -178,6 +187,7 @@ export function directorTask(plan: ChatPhotoPlan): string {
     '',
     subject,
     shotBrief(plan.shot),
+    frameBrief(plan.frame, plan.self),
     directorBrief(plan),
     '',
     'Now write the four lines.'
@@ -198,6 +208,36 @@ export function shotBrief(shot: ChatShot): string {
     return 'Somebody else is holding the phone \u2014 this is a snapshot another person took of the character, not a selfie. Write the camera line so it matches that casual hand-held look, and do not turn it into a selfie or a posed studio portrait.'
   }
   return 'The camera is set down or held steady on the place itself.'
+}
+
+/** 这一张**离得多近**,同样以**事实**的口吻告诉它(2026-10-06 新增)。
+ *
+ *  它与 shotBrief 是同一条推理的产物:景别也是"用户要什么",不是"怎么拍"。
+ *  它写的是 `Camera:` 那一行,而"推多近"正是那一行的内容 —— 不告诉它,
+ *  它就只能按场景猜;猜错的那一刻,`applyDirector` 会把模板里那句正确的
+ *  机位句整句换掉,而它连"这是特写"都不知道。
+ *
+ *  结构上的保证与视角一样:景别进的是 `frame` 槽,而它不在 DIRECTOR_SLOTS 里
+ *  —— **它一个字都改不了,只被告知**。
+ *
+ *  人与空镜分开写是有意的:空镜里没有"整个人"这回事(见 chatPhoto 的 frameLine)。 */
+export function frameBrief(frame: ChatFrame, self: boolean): string {
+  if (!self) {
+    if (frame === 'close') {
+      return 'This picture is a tight close-up of one detail of the place, and nobody is in it. Write the camera line so it stays that close, and do not pull back to show the whole place.'
+    }
+    if (frame === 'full') {
+      return 'This picture takes in the whole place at once, and nobody is in it. Write the camera line so it stays that wide, and do not push in on one detail.'
+    }
+    return 'This picture is an ordinary mid-distance view of the place, and nobody is in it. Write the camera line to match that distance.'
+  }
+  if (frame === 'close') {
+    return 'This picture is a tight close-up: one detail of the character fills the frame and the rest of them is cropped out. Write the camera line so it stays that close, and do not pull back to show their face, their body, or the room.'
+  }
+  if (frame === 'full') {
+    return 'This picture is a full-figure shot: the whole character, head to feet, is inside the frame. Write the camera line to match that distance, and do not push in to a close-up.'
+  }
+  return 'This picture is a half-body shot: the face and upper body, not the whole figure. Write the camera line to match that distance, and do not pull back to a full figure.'
 }
 
 /** 哪些位场景已经有着落了。**判据必须与 applyDirector 同一处**(missingSlots)——

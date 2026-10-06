@@ -466,6 +466,29 @@ export function extraParamsFor(
 }
 
 /**
+ * **对话出图那两条路**(角色发的那张照片 + 沉浸页那张背景图)要带哪些扩展参数。
+ *
+ * —— 这个函数存在的全部理由,是**它的签名里没有 background** ——
+ *
+ * 那两条路原先和创作区共用同一个调用:`extraParamsFor(cfg, 'high', background.value)`。
+ * 那个 `background.value` 是**创作区面板上的一项**(见 useGeneration 里那个 ref,
+ * 默认 'auto' 表示不发)。于是用户在创作区把它设成非 auto 之后,对话里的图也会
+ * 跟着带上 —— 与当初那个 quality 的毛病是同一类(对话出图不该继承创作区的参数),
+ * 只是这一次**不会报错**:一张"背景透明"的人物照只是看着不对。
+ *
+ * 参数从签名里拿掉之后,那条路就再也漏不进来了 —— 这比在调用处写一句注释
+ * "记得传 auto" 可靠。画质那一项仍然照旧走能力表(豆包/万相不认这个字段,
+ * 一个字节都不发),所以它不能直接写死进请求体。
+ */
+export function chatExtraParams(cfg: ApiConfig): Record<string, string> {
+  return extraParamsFor(cfg, CHAT_PHOTO_QUALITY, 'auto')
+}
+
+/** 对话出图固定用的画质档。与创作区那一档同名同值,不引入新枚举;
+ *  它不跟创作区的选择走 —— 对话这条路没有让用户选过画质 */
+export const CHAT_PHOTO_QUALITY = 'high'
+
+/**
  * 上游自己盖在图角上的那枚水印,要不要请它别盖。
  *
  * 只有明确知道"有这一项、且默认开着"的厂商才发(见能力表的 watermark):

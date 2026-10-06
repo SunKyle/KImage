@@ -341,6 +341,48 @@ async function main() {
     ok('photoSelf 照样是 true（它在画面里，只是相机在别人手上）', out.done?.photoSelf === true)
     ok('前缀不进场景描述', out.done?.photo === 'me on stage, taken from the crowd', String(out.done?.photo))
 
+    /* —— 用例 3c：这一张离得多近（2026-10-06 新增） ——
+       用户报的是"让角色拍特写图，总是变成自拍"。景别在服务端只做一件事：
+       把标签里那个词原样带出去 —— 而它**很容易在这一层被漏掉**（多一个字段、
+       多一处解构、多一处 return），漏掉的表现是静默的：图照样出得来，
+       只是又变回一张臂展自拍。所以这里两个形状都要盯：
+       带相机前缀的、以及人根本不在画面里的那种"拍个特写给我看" */
+    console.log('\n用例 3c · 这一张离得多近')
+    chatReply = 'Look, up close.\n[photo:selfie:close:my eyes, looking straight at you]'
+    r = await post(APP_PORT, '/api/chat', { ...cfg, messages: [{ role: 'user', content: 'hi' }] })
+    out = await readChat(r)
+    ok('photoFrame = close', out.done?.photoFrame === 'close', String(out.done?.photoFrame))
+    ok('photoShot 照旧', out.done?.photoShot === 'selfie', String(out.done?.photoShot))
+    ok('两类前缀都不进场景描述', out.done?.photo === 'my eyes, looking straight at you', String(out.done?.photo))
+
+    /* 人不在画面里也照样有景别 —— 这正是"拍个特写给我看"最常见的形状 */
+    chatReply = 'Here.\n[photo:close:rain running down the window pane]'
+    r = await post(APP_PORT, '/api/chat', { ...cfg, messages: [{ role: 'user', content: 'hi' }] })
+    out = await readChat(r)
+    ok('空镜也有景别', out.done?.photoFrame === 'close', String(out.done?.photoFrame))
+    ok('空镜仍然没有人', out.done?.photoSelf === false)
+    ok('相机那一项仍然是空的', out.done?.photoShot === '', String(out.done?.photoShot))
+
+    /* 没说就是空串 —— 客户端据此落回"按场景判、再不行这一档的缺省" */
+    chatReply = 'Fine.\n[photo:selfie:me on the balcony]'
+    r = await post(APP_PORT, '/api/chat', { ...cfg, messages: [{ role: 'user', content: 'hi' }] })
+    out = await readChat(r)
+    ok('没说景别时是空串（不是替它猜一个）', out.done?.photoFrame === '', String(out.done?.photoFrame))
+
+    /* 半身那一档是他拍那一档**唯一**能比"全身"更近的来路：它的缺省就是全身，
+       而 scene 词表与标签前缀都得走通，那段覆盖才不是死代码 */
+    chatReply = 'Sure, up close.\n[photo:third:medium:me at my desk, the lamp still on behind me]'
+    r = await post(APP_PORT, '/api/chat', { ...cfg, messages: [{ role: 'user', content: 'hi' }] })
+    out = await readChat(r)
+    ok('半身那一档也带得出来', out.done?.photoFrame === 'medium', String(out.done?.photoFrame))
+
+    /* 中段那枚标签那条路也要带上它 —— 两条路的字段是分开解构的 */
+    chatReply = 'One sec.\n\n[photo:third:close:my hands wrapped around the mug]\n\nOkay.'
+    r = await post(APP_PORT, '/api/chat', { ...cfg, messages: [{ role: 'user', content: 'hi' }] })
+    out = await readChat(r)
+    ok('中段那枚也带景别', out.done?.photoFrame === 'close', String(out.done?.photoFrame))
+    ok('中段那枚的视角也在', out.done?.photoShot === 'third', String(out.done?.photoShot))
+
     /* —— 用例 4：photo 档确实按五行回 —— */
     console.log('\n用例 4 · /api/enhance 的 photo 档')
     r = await post(APP_PORT, '/api/enhance', {
@@ -467,6 +509,16 @@ async function main() {
         systemOf().includes('Most of your messages have no picture in them') &&
         systemOf().includes('same place, at the same hour'),
       JSON.stringify(systemOf().split('\n').filter((l) => l.includes('carry it') || l.includes('picture')))
+    )
+    /* 2026-10-06：教它怎么写景别。**这一条只断言"它在 system 里"** ——
+       模型用不用、用得像不像人，属于提示词类改动，只能手测。
+       但少了这一句，`close:` 就永远不会出现在标签里，特写还是变自拍 */
+    ok(
+      '规则里教了景别那个词，并且点明"拿着的东西的特写不是自拍"',
+      systemOf().includes('[photo:selfie:close:') &&
+        systemOf().includes('is not a selfie') &&
+        systemOf().includes("not a picture of your face held out at arm's length"),
+      JSON.stringify(systemOf().split('\n').filter((l) => l.includes('close:')))
     )
 
     /* 没给时间（老前端、手搓请求、时钟坏掉）→ 整块不出现，且**不影响这一轮**。

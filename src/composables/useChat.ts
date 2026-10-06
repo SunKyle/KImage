@@ -101,7 +101,10 @@ async function readChatForExport(id: string): Promise<ImportedChat> {
           ...(m.photoSelf ? { photoSelf: true } : {}),
           /* 视角也一起带走:对方重画这一张时,依据该是同一个 ——
              少了它就退回"按场景判",而那正是当初画错视角的那条路 */
-          ...(m.photoShot ? { photoShot: m.photoShot } : {})
+          ...(m.photoShot ? { photoShot: m.photoShot } : {}),
+          /* 景别同上。**它比视角更容易被"按场景重判"改掉** ——
+             场景串里有没有"特写"这两个字,是模型每次写都不一样的事 */
+          ...(m.photoFrame ? { photoFrame: m.photoFrame } : {})
         }
       : {})
   }))

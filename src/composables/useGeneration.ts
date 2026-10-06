@@ -3,6 +3,7 @@ import {
   FREE_SIZES,
   acceptableSize,
   allowedSizes,
+  chatExtraParams,
   enhancePrompt,
   extraParamsFor,
   normalizeSize,
@@ -16,6 +17,9 @@ import {
   sizeForVendor
 } from '../api'
 import { REF_ARCHIVE_EDGE, REF_IMAGE_EDGE } from '../lib/payload'
+/* 场景串的长度上限。**权威定义住在服务端**(剪标签那一层就在用),
+   这里与 api.ts 的导入校验都引它 —— 同一个数抄成三份,已经漏改过一次 */
+import { PHOTO_SCENE_CHARS } from '../../server/chatTags.js'
 import {
   backdropViewOrder,
   characterAnchor,
@@ -339,12 +343,6 @@ function undoEnhance() {
 }
 
 
-  /* 对话里"角色发一张图"的场景描述上限。与 server/chatTags.js 的
-     PHOTO_SCENE_CHARS 同一口径 —— 那边剪下来时已经截过一次,这里是第二道。
-     2026-10-04 两边一起从 120 提到 400:120 字只装得下"在哪",
-     而时间/天气/周围有什么正是下游摄影指导最缺的输入 */
-  const CHAT_PHOTO_SCENE_CHARS = 400
-
   /* 摄影指导这一跳最多等多久。它不是用户主动发起的(用户只看到"图在画"),
      所以超时不能太长 —— 卡住时宁可交一张模板拼的图,也不能让骨架一直转。
      15 秒是给"思考型"文本模型留的余量:它们会把思考也算进这段时间 */
@@ -385,8 +383,8 @@ function undoEnhance() {
       /* 一位都没解析出来 = 它没按格式回。这时**整层当作不可用**,
          而不是逐位退回 —— 一个都没认出来说明格式已经崩了,
          再从碎片里挑可信的只会引入噪声。
-         **视角不在它那几位里**(2026-10-05 起它不判视角,只被告知),
-         所以这里只看那四位 */
+         **视角与景别都不在它那几位里**(2026-10-05 / 10-06 起它不判这两样,
+         只被告知),所以这里只看那四位 */
       if (!DIRECTOR_SLOTS.some((s) => written[s])) return null
       return applyDirector(base, written)
     } catch {
@@ -443,6 +441,10 @@ function undoEnhance() {
    *  - `shot` = **谁拿的相机**,由聊天模型写在标签前缀里(selfie: / third:)。
    *    它才是知道这件事的那一层(见 lib/chatPhoto 的 planChatPhoto);
    *    空串 = 它没说,由场景文本判、再不行默认自拍;
+   *  - `frame` = **离得多近**,同样由聊天模型写在标签前缀里(close: / medium: /
+   *    full:,2026-10-06 加)。空串/认不出的词 = 它没说,由场景文本判、再不行
+   *    落回这一档视角的缺省景别。**它是"让角色拍特写却总变成臂展自拍"的解药**:
+   *    在它之前,景别写死在模板的机位句里,谁都说不动;
    *  - 拼进提示词的是**锚点句**而不是那份全量设定表 —— 后者正是"死板"的来源;
    *  - 尺寸与参考图顺序也跟着镜头走:自拍竖、空镜横,全身那张打头才交代得住体型
    *
@@ -452,17 +454,22 @@ function undoEnhance() {
     charId: string,
     scene: string,
     self: boolean,
-    shot = ''
+    shot = '',
+    frame = ''
   ): Promise<ChatPhotoResult> {
-    const text = String(scene || '').trim().slice(0, CHAT_PHOTO_SCENE_CHARS)
+    /* 场景串的第二道收口。上限引的是**服务端那一份**(剪标签时已经截过一次)——
+       从前这里是另抄的一个 400,而同一个数在导入校验那处抄漏成了 120 */
+    const text = String(scene || '').trim().slice(0, PHOTO_SCENE_CHARS)
     if (!text) return { error: 'There is no scene to draw for this message.' }
     /* **认对话里那个角色**,不认创作区选中的那个:设定与参考图都按 charId 取。
        这一点错了就会"一点不像" —— 参考图是空的,等于纯文生图 */
     const who = deps.characters.value.find((c) => c.id === charId)
     /* 视角只认标签给的那两个词 —— 它是库里的字段、也是模型写的自由文本,
-       认不出的当"没说",由 planChatPhoto 按场景判(见那个函数的说明) */
+       认不出的当"没说",由 planChatPhoto 按场景判(见那个函数的说明)。
+       景别同理,只认那三档 */
     const wantShot = shot === 'selfie' || shot === 'third' ? shot : undefined
-    const basePlan = planChatPhoto(text, self, who ? characterAnchor(who) : '', wantShot)
+    const wantFrame = frame === 'close' || frame === 'medium' || frame === 'full' ? frame : undefined
+    const basePlan = planChatPhoto(text, self, who ? characterAnchor(who) : '', wantShot, wantFrame)
     const cfg = deps.config.value
     const gap = imageConfigGap(cfg)
     if (gap) return { error: gap }
@@ -506,15 +513,19 @@ function undoEnhance() {
           size: usedSize,
           n: 1,
           ...(refList.length ? { images: refList } : {}),
-          /* 画质显式给一档。对话这条路此前没有让用户选过 quality,于是
-             extraParamsFor 永远看到 'auto'、永远不发这个参数 —— 等于把画质
-             交给厂商的默认档,而那一档多半是给"快速预览"用的。
-             'high' 与创作区那一档同名同值,不引入新枚举。
+          /* 画质显式给一档,而**创作区那个 background 一概不带**(2026-10-06)。
+             画质:对话这条路此前没有让用户选过 quality,于是 extraParamsFor 永远
+             看到 'auto'、永远不发这个参数 —— 等于把画质交给厂商的默认档,
+             而那一档多半是给"快速预览"用的。'high' 与创作区那一档同名同值。
+             背景:它原先读的是创作区面板上那一项,用户在那儿设成非 auto,对话里的
+             图也跟着带上。
+             **两者都由 chatExtraParams 收口** —— 那个函数签名里就没有 background,
+             所以这条路上再也漏不进来(见它的说明)。
 
-             **但"显式给一档"仍要走能力表**:从前这里是先摊 extraParams 再写死
+             **但仍然要走能力表**:从前这里是先摊 extraParams 再写死
              `quality: 'high'`,后写的把前者的门控整个盖掉 —— 豆包/万相这些
              请求体里没有 quality 的厂商照样收到它,整条请求 400(实测) */
-          ...extraParamsFor(cfg, 'high', background.value)
+          ...chatExtraParams(cfg)
         },
         cfg,
         ctrl.signal
@@ -583,9 +594,10 @@ function undoEnhance() {
           size: usedSize,
           n: 1,
           ...(refList.length ? { images: refList } : {}),
-          /* 与那张照片同一条规矩:画质显式给 'high',但仍过能力表 ——
-             没有 quality 字段的厂商(豆包/万相)一个字节都不发 */
-          ...extraParamsFor(cfg, 'high', background.value)
+          /* 与那张照片同一条规矩:画质显式给 'high'、创作区那个 background 一概
+             不带,两项都过能力表(没有 quality 字段的厂商一个字节都不发)。
+             见 chatExtraParams 那一段说明 */
+          ...chatExtraParams(cfg)
         },
         cfg,
         ctrl.signal

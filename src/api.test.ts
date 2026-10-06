@@ -1,11 +1,14 @@
 import { describe, expect, it } from 'vitest'
+import { strToU8, zipSync } from 'fflate'
 import {
   CHARACTER_VIEWS,
+  CHAT_PHOTO_QUALITY,
   FREE_SIZES,
   REF_IDENTITY_ONLY,
   acceptableSize,
   asConfigKind,
   characterViewPrompt,
+  chatExtraParams,
   configKindOf,
   defaultSizeFor,
   extraParamsFor,
@@ -16,6 +19,7 @@ import {
   photoFailureText,
   pickActiveByKind,
   providerBodyFields,
+  readCharacterZip,
   seedFor,
   sizeClosestTo,
   sizeFieldFor,
@@ -27,6 +31,9 @@ import {
   watermarkParamFor
 } from './api'
 import type { ApiConfig, Character, HistoryEntry } from './types'
+/* 上限的**权威定义**在服务端那一层(剪标签用的就是它)。
+   这个测试要断的正是"读回来的长度等于那个权威值",所以直接引它 */
+import { PHOTO_SCENE_CHARS } from '../server/chatTags.js'
 
 /* 造一条配置。只有 id 与 kind 参与挑选,其余字段给最小值即可 */
 function cfg(id: string, kind?: ApiConfig['kind']): ApiConfig {
@@ -308,6 +315,36 @@ describe('extraParamsFor · 按能力决定带哪些扩展参数', () => {
   it('老配置按域名回填后同样受能力表约束', () => {
     const legacy = imgCfg({ vendor: undefined, baseUrl: 'https://api.openai.com/v1' })
     expect(extraParamsFor(legacy, 'low', 'auto')).toEqual({ quality: 'low' })
+  })
+})
+
+/* ===== 对话出图那两条路的扩展参数(2026-10-06) =====
+   角色发的那张照片 + 沉浸页那张背景图。它们原先与创作区共用同一个调用 ——
+   第三个参数传的是**创作区面板上那个 background**,于是用户在那儿把它设成
+   transparent,对话里的图也跟着透明。与当初那个 quality 的毛病是同一类
+   (对话出图不该继承创作区的参数),只是这次**不报错**,只是图不对。
+   这里钉住的是"那两类图一个 background 都不带",而不是"记得传 auto" ——
+   判据落在一个**签名里没有 background** 的函数上,改不回去。 */
+
+describe('chatExtraParams · 对话出图不继承创作区那几项', () => {
+  it('创作区那一项非默认时,那两条路照旧不带它', () => {
+    expect(chatExtraParams(imgCfg({ vendor: 'openai' }))).toEqual({ quality: CHAT_PHOTO_QUALITY })
+    /* 对照:创作区那一路**会**带上它 —— 那才是被隔离掉的东西 */
+    expect(extraParamsFor(imgCfg({ vendor: 'openai' }), 'high', 'transparent')).toEqual({
+      quality: 'high',
+      background: 'transparent'
+    })
+  })
+
+  it('画质那一档仍然照旧过能力表 —— 不认它的厂商一个字段都不发', () => {
+    expect(chatExtraParams(imgCfg({ vendor: 'ark' }))).toEqual({})
+    expect(chatExtraParams(imgCfg({ vendor: 'gemini' }))).toEqual({})
+  })
+
+  it('老配置按域名回填后同样受约束', () => {
+    expect(chatExtraParams(imgCfg({ vendor: undefined, baseUrl: 'https://api.openai.com/v1' }))).toEqual({
+      quality: CHAT_PHOTO_QUALITY
+    })
   })
 })
 
@@ -732,5 +769,88 @@ describe('characterViewPrompt · 设定图的提示词', () => {
   it('老角色(没有 fields)照旧退回 desc,不因为这一改就没了设定', () => {
     const legacy: Character = { id: 'y', name: 'Y', createdAt: 0, desc: 'a quiet stranger' }
     expect(characterViewPrompt(legacy, 'front', false)).toContain('a quiet stranger')
+  })
+})
+
+/* ===== 角色包走一趟:对话里的场景串不许在路上被截短(2026-10-06) =====
+   场景上限 2026-10-04 从 120 放宽到 400,而**导入这一处漏改了** ——
+   它还在按 120 截。表现完全是静默的:图照旧显示(字节在包里),
+   只有"重画这一张"会拿到一句被砍掉尾巴的场景,而尾巴正是
+   时间/天气/光那些"只有聊天模型看得见"的信息。
+
+   这里**真的打一个 zip 再读回来**,而不是直接调那个校验函数 ——
+   被漏改的正是"打包 → 解包 → 逐条过筛"这条缝,只测其中一段就不是它了。 */
+
+describe('readCharacterZip · 场景串完整读回来', () => {
+  /** 打一个最小角色包:清单里挂一份 chat.json */
+  function pkg(chat: unknown): File {
+    const manifest = {
+      format: 'kimage-character',
+      version: 1,
+      characters: [{ name: 'Alice', createdAt: 1, chat: 'chat.json' }]
+    }
+    const bytes = zipSync({
+      'character.json': strToU8(JSON.stringify(manifest)),
+      'chat.json': strToU8(JSON.stringify(chat))
+    })
+    return new File([bytes], 'alice.zip', { type: 'application/zip' })
+  }
+
+  /* 单倍空格、无首尾空白 —— 导入那一道会把连续空白压成一个空格,
+     而真实场景串在剪标签时就已经压过了(见 server/chatTags 的 cleanScene) */
+  const SCENE =
+    'me leaning on the balcony rail at dusk, the rain just stopped, streetlights coming ' +
+    'on below, hair still wet from the shower, the harbour lights doubled in the puddles ' +
+    'on the deck'
+
+  it('比 120 长的场景原样读回来', async () => {
+    expect(SCENE.length).toBeGreaterThan(120)
+    expect(SCENE.length).toBeLessThan(400)
+    const rows = await readCharacterZip(
+      pkg({ messages: [{ role: 'assistant', content: 'hi', createdAt: 1, photo: SCENE, photoId: 'p1' }] })
+    )
+    expect(rows[0].chat?.messages[0].photo).toBe(SCENE)
+  })
+
+  it('超过权威上限才截,而且截到那个上限', async () => {
+    const long = 'x'.repeat(PHOTO_SCENE_CHARS + 250)
+    const rows = await readCharacterZip(
+      pkg({ messages: [{ role: 'assistant', content: 'hi', createdAt: 1, photo: long, photoId: 'p1' }] })
+    )
+    expect(rows[0].chat?.messages[0].photo?.length).toBe(PHOTO_SCENE_CHARS)
+  })
+
+  it('视角与景别一起走过这条缝 —— 少了任何一个,重画都会换个拍法', async () => {
+    const rows = await readCharacterZip(
+      pkg({
+        messages: [
+          {
+            role: 'assistant',
+            content: 'hi',
+            createdAt: 1,
+            photo: SCENE,
+            photoId: 'p1',
+            photoSelf: true,
+            photoShot: 'third',
+            photoFrame: 'close'
+          }
+        ]
+      })
+    )
+    const m = rows[0].chat?.messages[0]
+    expect(m?.photoSelf).toBe(true)
+    expect(m?.photoShot).toBe('third')
+    expect(m?.photoFrame).toBe('close')
+  })
+
+  it('认不出的景别词不进库(它会流进提示词模板的选择)', async () => {
+    const rows = await readCharacterZip(
+      pkg({
+        messages: [
+          { role: 'assistant', content: 'hi', createdAt: 1, photo: SCENE, photoId: 'p1', photoFrame: 'extreme' }
+        ]
+      })
+    )
+    expect(rows[0].chat?.messages[0].photoFrame).toBeUndefined()
   })
 })

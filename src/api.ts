@@ -11,6 +11,11 @@ import {
 /* "现在几点"也是服务端那套提示词的一部分,而它要的**本地时刻**只有前端给得出
    (见 server/chatTime.js)。这里只负责生成那个字符串,措辞全在那边 */
 import { localStamp } from '../server/chatTime.js'
+/* 对话里的场景串有多长,权威定义在服务端那一层(剪标签时就是按它截的)。
+   导入校验这里从前另写了一个数 —— 2026-10-04 把上限从 120 提到 400 时漏改了
+   这一处,于是**导进来的对话"重画这一张"会拿到一句被砍掉尾巴的场景**,
+   而且不报错。上限只该有一个出处 */
+import { PHOTO_SCENE_CHARS } from '../server/chatTags.js'
 import {
   getAll,
   pruneHistory,
@@ -1413,8 +1418,10 @@ function coerceImportedChat(raw: unknown): ImportedChat | undefined {
       ...(typeof o.photoId === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(o.photoId)
         ? { photoId: o.photoId }
         : {}),
+      /* 场景串。**按权威上限收口,不是另写一个数** —— 它是"重画这一张"的全部
+         依据,截短了就会画出一张和原文对不上的图(见上面 import 那段说明) */
       ...(typeof o.photo === 'string' && o.photo.trim()
-        ? { photo: o.photo.replace(/\s+/g, ' ').trim().slice(0, 120) }
+        ? { photo: o.photo.replace(/\s+/g, ' ').trim().slice(0, PHOTO_SCENE_CHARS) }
         : {}),
       ...(o.photoSelf === true ? { photoSelf: true } : {}),
       /* 这一张谁拿的相机。**只认那两个词** —— 它会流进提示词模板的选择
@@ -1422,6 +1429,10 @@ function coerceImportedChat(raw: unknown): ImportedChat | undefined {
          缺省(老包)就是"没说",由客户端按场景判、再不行默认自拍 */
       ...(o.photoShot === 'selfie' || o.photoShot === 'third'
         ? { photoShot: o.photoShot }
+        : {}),
+      /* 这一张离得多近。同一条纪律:只认那三档,别的词不进提示词模板 */
+      ...(o.photoFrame === 'close' || o.photoFrame === 'medium' || o.photoFrame === 'full'
+        ? { photoFrame: o.photoFrame }
         : {}),
       /* 上一次失败的原因。**这是一句外部输入**(它最初来自上游的报错原文),
          会被直接渲染在界面上,所以按文案那一道收:去掉控制字符、限长。
@@ -2171,6 +2182,10 @@ export interface ChatStreamResult {
   /* 这一张**谁拿的相机**:'selfie' / 'third' / 空串(模型没说)。
      客户端按"它 → 场景文本 → 默认自拍"定下最终视角(见 lib/chatPhoto) */
   photoShot: string
+  /* 这一张**离得多近**:'close' / 'medium' / 'full' / 空串(模型没说)。
+     客户端按"它 → 场景文本 → 这一档视角的缺省"定下最终景别(见 lib/chatPhoto
+     的 resolveFrame)。它与 photoShot 是同一性质的一位,所以同路送达 */
+  photoFrame: string
 }
 
 /* ===== 长期记忆的节奏 =================================================
@@ -2313,6 +2328,8 @@ export async function chatStream(opts: ChatStreamOpts): Promise<ChatStreamResult
   let photoSelf = false
   /* 这一张谁拿的相机(见 ChatStreamResult.photoShot)。与 photo 同路 */
   let photoShot = ''
+  /* 这一张离得多近(见 ChatStreamResult.photoFrame)。与 photo 同路 */
+  let photoFrame = ''
   try {
     for (;;) {
       const { done, value } = await reader.read()
@@ -2332,6 +2349,7 @@ export async function chatStream(opts: ChatStreamOpts): Promise<ChatStreamResult
           photo?: string
           photoSelf?: boolean
           photoShot?: string
+          photoFrame?: string
         }
         try {
           evt = JSON.parse(text)
@@ -2348,13 +2366,15 @@ export async function chatStream(opts: ChatStreamOpts): Promise<ChatStreamResult
             mood: evt.mood || mood,
             photo: evt.photo || photo,
             photoSelf: evt.photoSelf === true || photoSelf,
-            photoShot: evt.photoShot || photoShot
+            photoShot: evt.photoShot || photoShot,
+            photoFrame: evt.photoFrame || photoFrame
           }
         }
         if (typeof evt.finish === 'string' && evt.finish) finish = evt.finish
         if (typeof evt.mood === 'string' && evt.mood) mood = evt.mood
         if (evt.photoSelf === true) photoSelf = true
         if (typeof evt.photoShot === 'string' && evt.photoShot) photoShot = evt.photoShot
+        if (typeof evt.photoFrame === 'string' && evt.photoFrame) photoFrame = evt.photoFrame
       }
     }
   } finally {
@@ -2362,7 +2382,7 @@ export async function chatStream(opts: ChatStreamOpts): Promise<ChatStreamResult
        不取消这条读流就悬着。已经读完时取消是空操作 */
     reader.cancel().catch(() => {})
   }
-  return { finish, mood, photo, photoSelf, photoShot }
+  return { finish, mood, photo, photoSelf, photoShot, photoFrame }
 }
 
 /* ===== 提示词库(收藏) ===== */

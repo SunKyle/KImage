@@ -70,64 +70,123 @@ export function cleanScene(s) {
    **第 3 种为什么不等于"他拍"** —— 它只说了"我在画面里"。谁拿的相机由客户端
    按"标签 → 场景文本 → 默认自拍"定(见 lib/chatPhoto 的 planChatPhoto)。
    2026-10-05 之前标签只有"在不在画面里"这一位，视角交给一次额外的文本调用去猜，
-   大多数图被猜成他拍 —— 用户报的正是这个。现在一次说清两件事。 */
-const SELFIE_STRIP_RE = /^\s*(?:self-?portrait|selfie|mirror\s*selfie)\b\s*[:：,，\-–—]?\s*/i
-const THIRD_STRIP_RE = /^\s*(?:third[\s-]?person|third)\b\s*[:：,，\-–—]?\s*/i
-const SELF_STRIP_RE = /^\s*(?:self|myself)\b\s*[:：,，\-–—]?\s*/i
+   大多数图被猜成他拍 —— 用户报的正是这个。现在一次说清两件事。
+
+   —— 第二类前缀:景别(2026-10-06 新增)——
+
+   `close:` / `medium:` / `full:` —— 这一张**离得多近**，写在"谁拿的相机"之后
+   (`[photo:selfie:close:my eyes]`)。两类前缀顺序不挑，同一类只认第一枚。
+
+   为什么"特写"必须由它来说:`close-up` 这三个字从前在链路里的**唯一作用**是
+   把景深那句删掉(见 lib/chatPhoto 的 LENS_RE)，而机位那句写死的是半身 ——
+   于是用户要的特写，交上来是一张臂展自拍。景别与视角是同一个性质的判断
+   (用户要什么)，所以归同一层说。它没说时由场景词表判、再不行按这一档的缺省
+   (见 lib/chatPhoto 的 resolveFrame)。 */
+const SHOT_HEAD_RE =
+  /^\s*(self-?portrait|selfie|mirror\s*selfie|third[\s-]?person|third|self|myself)\b\s*[:：,，\-–—]?\s*/i
+/** 词表要小写、去掉空格与连字符之后查(见 headToken):模型写
+ *  "Third-person" / "third person" 是同一样东西。空串 = 认出来了但那一项没值
+ *  (`self:` 就只说"在画面里"，它不说相机) */
+const SHOT_TOKENS = {
+  selfportrait: 'selfie',
+  selfie: 'selfie',
+  mirrorselfie: 'selfie',
+  thirdperson: 'third',
+  third: 'third',
+  self: '',
+  myself: ''
+}
+/* 景别那一类**必须要求一个分隔符** —— 与上面那类不同:"close" / "medium" /
+   "full" 本身就是常用词，不要求分隔符就会把 "close to the window" 里的那个
+   close 当成景别剪掉，于是场景从"离窗很近"变成"窗"。
+
+   长的写法必须排在短的前面:`full-length:` 若先被 `full` 吃掉，剩下的
+   "-length:me by the window" 会顶在场景最前面(正则取第一个能匹配的选项,
+   不是最长的那个)。 */
+const FRAME_HEAD_RE =
+  /^\s*(close-?up|closeup|close|macro|detail|half-?body|medium(?:[- ]?shot)?|full-?body|full-?length|full(?:[- ]?shot)?|wide(?:[- ]?shot)?)\s*[:：,，\-–—]\s*/i
+/** **必须与 src/lib/chatPhoto 的 FRAME_CLOSE_RE / FRAME_FULL_RE 落到同一套档** ——
+ *  这里是"模型写的词"，那里是"场景里的词"，两边认的都只能是那三档 */
+const FRAME_TOKENS = {
+  closeup: 'close',
+  close: 'close',
+  macro: 'close',
+  detail: 'close',
+  halfbody: 'medium',
+  medium: 'medium',
+  mediumshot: 'medium',
+  fullbody: 'full',
+  fulllength: 'full',
+  full: 'full',
+  fullshot: 'full',
+  wide: 'full',
+  wideshot: 'full'
+}
 const SELF_MARK_RE = /^\s*(?:me|i\s*'?m|i\s+am)\b\s*[:：,，\-–—]\s*/i
 const SELF_PLAIN_RE = /^\s*(?:me|i\s*'?m|i\s+am)\b/i
 /** 模型偶尔会画蛇添足写个 scene: / view: —— 那不是内容，抹掉 */
 const SCENE_PREFIX_RE = /^\s*(?:scene|view|no-?self)\s*[:：,，\-–—]\s*/i
 
+/** 前缀词 → 查表用的键:小写、去掉空格与连字符("Third-person" → "thirdperson") */
+function headToken(word) {
+  return String(word || '')
+    .toLowerCase()
+    .replace(/[\s-]+/g, '')
+}
+
 /**
- * 拆出"场景 + 有没有它本人 + 谁拿的相机"。
+ * 拆出"场景 + 有没有它本人 + 谁拿的相机 + 景别"。
  *
  * @param raw      标签里那段自由文本
  * @param charName 角色名。**描述里点了自己的名字**也算它在画面里 ——
  *                 这是给"没写前缀但显然在说自己"的那种回复兜底。
  *                 名字为空(没传)时这条不生效。
- * @returns {{ scene: string, self: boolean, shot: 'selfie'|'third'|'' }}
- *          shot 空串 = 标签没说谁拿的相机(客户端按场景判，再不行**默认自拍**)
+ * @returns {{ scene: string, self: boolean, shot: 'selfie'|'third'|'', frame: 'close'|'medium'|'full'|'' }}
+ *          shot 空串 = 标签没说谁拿的相机(客户端按场景判，再不行**默认自拍**);
+ *          frame 空串 = 标签没说离得多近(客户端按场景判，再不行按这一档的缺省)
  */
 export function parsePhotoIntent(raw, charName = '') {
   const s = String(raw || '')
   let self = false
   let shot = ''
+  let frame = ''
   let base = s
 
-  const selfie = SELFIE_STRIP_RE.exec(s)
-  const third = selfie ? null : THIRD_STRIP_RE.exec(s)
-  if (selfie) {
-    self = true
-    shot = 'selfie'
-    base = s.slice(selfie[0].length)
-  } else if (third) {
-    self = true
-    shot = 'third'
-    base = s.slice(third[0].length)
-  } else {
-    const strip = SELF_STRIP_RE.exec(s)
-    if (strip) {
+  /* 两枚前缀:谁拿的相机、以及景别。顺序不挑(`close:selfie:` 也认)，
+     同一类只认第一枚 —— 第二枚同名同类的多半是内容里的词，不是前缀 */
+  for (let i = 0; i < 2 && base; i++) {
+    const head = SHOT_HEAD_RE.exec(base)
+    if (head && !self) {
       self = true
-      base = s.slice(strip[0].length)
-    } else {
-      const marked = SELF_MARK_RE.exec(s)
-      if (marked) {
-        self = true
-        base = s.slice(marked[0].length)
-      } else if (SELF_PLAIN_RE.test(s)) {
-        // 代词留在描述里(它是内容)，只置位
-        self = true
-      }
+      shot = SHOT_TOKENS[headToken(head[1])] || ''
+      base = base.slice(head[0].length)
+      continue
     }
+    const fr = FRAME_HEAD_RE.exec(base)
+    if (fr && !frame) {
+      frame = FRAME_TOKENS[headToken(fr[1])] || ''
+      base = base.slice(fr[0].length)
+      continue
+    }
+    break
+  }
+
+  const marked = SELF_MARK_RE.exec(base)
+  if (marked) {
+    self = true
+    base = base.slice(marked[0].length)
+  } else if (SELF_PLAIN_RE.test(base)) {
+    // 代词留在描述里(它是内容)，只置位
+    self = true
   }
   base = base.replace(SCENE_PREFIX_RE, '')
 
   const scene = cleanScene(base)
   const name = String(charName || '').trim().toLowerCase()
   const named = !!name && !!scene && scene.toLowerCase().includes(name)
-  /* 名字兜底只回答"它在画面里" —— 相机那一项它一个字都没说，留空给客户端判 */
-  return { scene, self: self || named, shot: self ? shot : '' }
+  /* 相机那一项要在画面里有人时才有意义,所以 self 为假时丢掉它。
+     **景别不丢** —— "拍一张桌上的咖啡特写"里没有人,可它照样是特写 */
+  return { scene, self: self || named, shot: self ? shot : '', frame }
 }
 
 /**
@@ -155,6 +214,7 @@ export function stripStandaloneTags(s, charName = '') {
   let photo = ''
   let photoSelf = false
   let photoShot = ''
+  let photoFrame = ''
   let mood = ''
   let removed = false
   for (const line of lines) {
@@ -170,6 +230,7 @@ export function stripStandaloneTags(s, charName = '') {
         photo = shot.scene
         photoSelf = shot.self
         photoShot = shot.shot
+        photoFrame = shot.frame
       }
     } else if (!mood) {
       mood = m[2].trim().toLowerCase()
@@ -181,7 +242,7 @@ export function stripStandaloneTags(s, charName = '') {
      否则用户看到的是一段话、两个空行、再一段话(收成一段一处空行)。
      没抽掉任何东西时一个字都不动 —— 不借着这个机会去改别人的正文 */
   const text = removed ? kept.join('\n').replace(/\n{3,}/g, '\n\n') : kept.join('\n')
-  return { text, photo, photoSelf, photoShot, mood }
+  return { text, photo, photoSelf, photoShot, photoFrame, mood }
 }
 
 /* 一枚标签的**名字**。**必须与那两条正则认的前缀一致** ——
@@ -367,14 +428,16 @@ function isTagRoom(s) {
  * @param s        整段回复
  * @param charName 角色名。只用于判断"这一张里有没有它本人"(见 parsePhotoIntent)——
  *                 传空也能用,只是少一条兜底判据
- * @returns {{ text: string, mood: string, photo: string, photoSelf: boolean, photoShot: string }}
+ * @returns {{ text: string, mood: string, photo: string, photoSelf: boolean, photoShot: string, photoFrame: string }}
  *   - text      真正要说的话(标签连同它前面那个换行一起收走)
  *   - mood      小写情绪词，空串表示这一轮没给
- *   - photo     场景描述(已收敛成一行、已剪掉 selfie:/self:/third: 前缀)，
+ *   - photo     场景描述(已收敛成一行、已剪掉 selfie:/close:/self: 这几类前缀)，
  *               空串表示这一轮不发图
  *   - photoSelf 这张图里有没有它本人。true 才把角色设定与设定图发给出图模型
  *   - photoShot 这一张**谁拿的相机**:'selfie' / 'third' / 空串(= 标签没说)。
  *               客户端按"它 → 场景文本 → 默认自拍"定下最终视角(见 lib/chatPhoto)
+ *   - photoFrame 这一张**离得多近**:'close' / 'medium' / 'full' / 空串(= 标签没说)。
+ *               客户端按"它 → 场景文本 → 这一档视角的缺省"定下最终景别
  */
 export function splitTags(s, charName = '') {
   const str = s || ''
@@ -391,10 +454,18 @@ export function splitTags(s, charName = '') {
         mood: m[1].toLowerCase(),
         photo: shot.scene,
         photoSelf: shot.self,
-        photoShot: shot.shot
+        photoShot: shot.shot,
+        photoFrame: shot.frame
       }
     }
-    return { text: head, mood: m[1].toLowerCase(), photo: '', photoSelf: false, photoShot: '' }
+    return {
+      text: head,
+      mood: m[1].toLowerCase(),
+      photo: '',
+      photoSelf: false,
+      photoShot: '',
+      photoFrame: ''
+    }
   }
 
   const p = PHOTO_RE.exec(str)
@@ -408,24 +479,31 @@ export function splitTags(s, charName = '') {
         mood: mm[1].toLowerCase(),
         photo: shot.scene,
         photoSelf: shot.self,
-        photoShot: shot.shot
+        photoShot: shot.shot,
+        photoFrame: shot.frame
       }
     }
-    return { text: head, mood: '', photo: shot.scene, photoSelf: shot.self, photoShot: shot.shot }
+    return {
+      text: head,
+      mood: '',
+      photo: shot.scene,
+      photoSelf: shot.self,
+      photoShot: shot.shot,
+      photoFrame: shot.frame
+    }
   }
 
   /* 两枚都没写全:把半截的擦掉、只擦不取。
      顺序上先看 photo —— 它的括号更长，半截的 mood 只可能出现在它之后 */
+  const empty = { mood: '', photo: '', photoSelf: false, photoShot: '', photoFrame: '' }
   const pp = PHOTO_PARTIAL_RE.exec(str)
-  if (pp)
-    return { text: str.slice(0, pp.index).trimEnd(), mood: '', photo: '', photoSelf: false, photoShot: '' }
+  if (pp) return { text: str.slice(0, pp.index).trimEnd(), ...empty }
   const mp = MOOD_PARTIAL_RE.exec(str)
-  if (mp)
-    return { text: str.slice(0, mp.index).trimEnd(), mood: '', photo: '', photoSelf: false, photoShot: '' }
+  if (mp) return { text: str.slice(0, mp.index).trimEnd(), ...empty }
   /* 一枚标签都没有。**末尾空白照样收掉** —— 这里以前是原样返回,于是
      "模型忘了写标签、但结尾带了个换行"的回复会把那行空行留在气泡里。
      它与上面几条分支做的事其实是同一件:末尾的空白不是它要说的话 */
-  return { text: str.trimEnd(), mood: '', photo: '', photoSelf: false, photoShot: '' }
+  return { text: str.trimEnd(), ...empty }
 }
 
 
