@@ -60,12 +60,6 @@ export interface CharacterWizardDeps {
 
 export type WizardStep = 1 | 2 | 3
 
-/** 这一轮向导是来改什么的。两处措辞不一样,流程也不同:
- *  - `spec`  改设定 —— 只有第 1 步,存完回详情
- *  - `voice` 改嗓音 —— 直接落在第 2 步,存完回详情
- *  新建时它没有意义(intent 只被编辑态的卡头读) */
-export type WizardIntent = 'spec' | 'voice'
-
   /* 三步各配一枚图标,给步骤条上那个圆点用(见模板里的 .wz-dot)。
      挑的是"这一步在做什么",不是"它的序号是几":
        Basics  填名字、性别与那份设定 —— 收的全是字
@@ -86,9 +80,6 @@ export type WizardIntent = 'spec' | 'voice'
 export function useCharacterWizard(deps: CharacterWizardDeps) {
   // 正在编辑(新建)的表单:向导开着没有
   const editing = ref(false)
-  /* 这一轮是来改设定还是改嗓音。只影响编辑态卡头那句说明 ——
-     两条路都要在库里有这条角色之后才认得出来 */
-  const intent = ref<WizardIntent>('spec')
   /* 这两份状态归页面(草稿那一块也读同一份),这里只拿引用 */
   const { editingId, draft, draftError } = deps
   /** 开向导。不带角色是新建,带角色是改它 ——
@@ -103,10 +94,10 @@ export function useCharacterWizard(deps: CharacterWizardDeps) {
        否则编辑一个已克隆过的角色、什么都不动就退出,会把它的样本删掉 */
     deps.markSampleCommitted(c?.voice?.sampleId)
     /* 向导从头开始:上一次留下的 id、步数与起稿标记必须清掉,否则会直接跳进旧角色的第 3 步。
-       编辑态也归零 —— 那一轮只做第 1 步,第 2、3 步锁着不动 */
+       wizardId 归零:新建流程里它是"第 1 步存下的那条",要等存完才有;
+       编辑流程里谁在库里由 editingId 说(见 activeCharId),它也不必在这一轮被认成 wizardId */
     step.value = 1
     wizardId.value = ''
-    intent.value = 'spec'
     /* 上一轮的"存完跳到哪一步"不能留到这一轮:上一次若存失败,标记还在,
        这次随便存点什么都跳到第 3 步去了 */
     afterSaveStep = 0
@@ -118,20 +109,17 @@ export function useCharacterWizard(deps: CharacterWizardDeps) {
     nextTick(() => wizardBox.value?.focus())
   }
 
-  /** 从详情页 Voice 那一块进来改嗓音。
+  /** 从详情页 Voice 那一块进来改嗓音:直接把步数拨到第 2 步。
    *
-   *  为什么需要一条**单独的入口**:第 2、3 步的解锁条件是 `wizardId`,
-   *  而它只在新建流程里(第 1 步存完)才会有值 —— 于是"编辑"那条路上
-   *  嗓音那一步永远进不去,一个角色的嗓子建完就再也改不了。
+   *  它现在只是一条**捷径**,不再是唯一入口 —— startEdit 那条路上
+   *  第 2 步本来就是开着的(见 activeCharId)。这一枚省掉的是"先落回第 1 步
+   *  再自己点一下 Voice"。
    *
-   *  这里把 wizardId 认成这条角色(它确实已经在库里了),再把步数直接拨到 2:
-   *  改嗓音不必先走一遍设定表单。存的那一下走 saveFromVoiceStep ——
-   *  它本来就是按 wizardId 存的。 */
+   *  所以这里不再去认 wizardId:那会让第 1 步那张表单变成只读摘要
+   *  (表单的判据是 `!wizardId`),从嗓音往回退一步就改不了设定了。 */
   function startVoiceEdit(c: Character) {
     startEdit(c)
-    wizardId.value = c.id
     step.value = 2
-    intent.value = 'voice'
   }
 
   /* —— 新建向导 ——
@@ -145,6 +133,16 @@ export function useCharacterWizard(deps: CharacterWizardDeps) {
   const step = ref<WizardStep>(1)
   // 向导进行中的角色 id。第 1 步存完才有,后两步都靠它取图
   const wizardId = ref('')
+  /* 这一轮向导说的**是哪条角色**:新建流程里是第 1 步存下的那条(wizardId),
+     编辑流程里就是正在改的那条(editingId —— 它本来就在库里)。
+     第 2 步(嗓音)能不能进、存哪一条,读的都是这一个。
+
+     原来这两件事只认 wizardId,于是编辑态永远进不去第 2 步:一个角色的嗓子
+     建完就再也改不了,只能回详情页点"Change voice"走另一条入口 ——
+     而那条入口做的事与"编辑"完全一样(同一张卡、同一份草稿、同一个存盘),
+     差别只是它偷偷把 wizardId 认成了这条角色。现在把这层窗户纸捅破:
+     编辑态本来就有 id,用不着绕。 */
+  const activeCharId = computed(() => wizardId.value || editingId.value)
   // 漂浮卡本身:用来把焦点收进来、把 Tab 圈住(与看大图的 viewerBox 同一套)
   const wizardBox = ref<HTMLElement | null>(null)
   // 打开向导时焦点在哪,关掉要还回去
@@ -175,11 +173,11 @@ export function useCharacterWizard(deps: CharacterWizardDeps) {
   )
 
   /** 这一步能不能进。声音与设定图都挂在角色上,所以后两步的前提是同一个:
-   *  角色已经在库里(第 1 步存过)。
+   *  角色已经在库里 —— 新建时是第 1 步存下的那条,编辑时就是正改的这条。
    *  **第 3 步不再要求先有正脸** —— 正脸现在就在那一屏里,是它的第一件事 */
   function stepUnlocked(n: WizardStep): boolean {
     if (n === 1) return true
-    return !!wizardId.value
+    return !!activeCharId.value
   }
   /** 这一步做完没有。做完的在步骤条上打勾,和"正在这一步"区分开 */
   function stepDone(n: WizardStep): boolean {
@@ -258,7 +256,7 @@ export function useCharacterWizard(deps: CharacterWizardDeps) {
        不该因为没点那个按钮就把刚配好的嗓子丢掉(见 saveFromVoiceStep 的 -1)。
        **必须排在 dropOrphanVoiceSample 之前**:保存会把 sampleId 记成"有主",
        那之后清理才不会把刚认领的样本删掉 */
-    if (step.value === 2 && wizardId.value) saveFromVoiceStep(-1)
+    if (step.value === 2 && activeCharId.value) saveFromVoiceStep(-1)
     /* 正念着的试听也停掉,并把这一轮建出来、却没人认领的那段克隆录音清掉 ——
        它是用户的录音,留着既没用又该清 */
     stopSpeaking()
@@ -278,7 +276,7 @@ export function useCharacterWizard(deps: CharacterWizardDeps) {
   /** 走完三步:把角色交给详情页 —— 那里是它的"落地页",
    *  有完整设定表、大图查看,以及"用它开画" */
   function finishWizard() {
-    const id = wizardId.value
+    const id = activeCharId.value
     /* 走完是"换页"而不是"关浮层",所以不留焦点还回目标 ——
        列表里那个按钮已经不在页面上了,还回去只会把焦点丢在 body */
     restoreWizardFocus = null
@@ -297,7 +295,7 @@ export function useCharacterWizard(deps: CharacterWizardDeps) {
    *  它同时把整份草稿交出去(名字、设定、参考图都一样)—— 不只是声音:
    *  这一屏能改的其实只有声音,但交一份残缺的表单反而要父组件去猜哪几项没动 */
   function saveFromVoiceStep(nextStep: number) {
-    const id = wizardId.value
+    const id = activeCharId.value
     if (!id) return
     const d = draft.value
     /* 存完去哪由调用方定:从"Save & continue"来的是 3(接着去出图),
@@ -317,7 +315,6 @@ export function useCharacterWizard(deps: CharacterWizardDeps) {
   }
   return {
     editing,
-    intent,
     step,
     wizardId,
     wizardBox,

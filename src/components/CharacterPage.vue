@@ -284,7 +284,6 @@ function workAria(w: { entry: HistoryEntry }): string {
    表单内容与声音分别在 useCharacterDraft / useCharacterVoice 里,这里只调度 */
 const {
   editing,
-  intent: wizardIntent,
   step,
   wizardId,
   wizardBox,
@@ -327,6 +326,13 @@ const {
 /* openDetail 也交出去:对话页头部的 Details 要直接落到**这个角色**的详情,
    而不是把用户扔到角色列表让他自己再找一遍 */
 defineExpose({ onSaved, onUpdated, openDetail })
+
+/* 卡头上摆几步。编辑态只走前两步(设定 / 嗓音)——
+   出图那一步这一轮不做:五张设定图在详情页已经有整片网格(点开看大图、
+   重出、一次补齐都在那儿),再塞进编辑向导就是两处做同一件事。
+   而嗓音必须留着:它是这个角色的一部分,编辑态进不去的话,一个角色的嗓子
+   建完就只能从详情页那枚 "Change voice" 改 —— 两个入口,其中一个还做不全 */
+const wizardSteps = computed(() => (isEditing.value ? STEPS.filter((s) => s.n <= 2) : STEPS))
 
 /* 列表顺序与卡片 ⋮ 菜单(开合 / 指针宽限 / 点外收起 / 四个动作的转发)。
    顺序是**派生**的:置顶在前,其余保持主界面给的顺序(最近建的在前) */
@@ -479,22 +485,30 @@ function pickStyle(v: string) {
         :aria-label="isEditing ? 'Edit character' : 'New character'"
         tabindex="-1"
       >
-        <!-- 编辑态没有三步可走:改完就回详情,出图那两步那一轮不做。
-             摆一条点不动的步骤条只会让人以为还要走下去。
-             (改嗓音是另一条入口,见 startVoiceEdit —— 它同样落在这张卡里,
-             所以卡头那句话要跟着这一轮到底在改什么走) -->
-        <div v-if="isEditing" class="wz-edit-head">
-          <h3 class="wz-edit-title">Edit {{ editingChar?.name }}</h3>
-          <p class="wz-edit-sub">
-            {{
-              wizardIntent === 'voice'
-                ? 'The voice is what this character sounds like when read aloud. Its spec is untouched.'
-                : 'The spec is what every image of this character is built from — the reference views stay as they are.'
-            }}
-          </p>
-        </div>
-        <nav v-else class="wz-steps" aria-label="Creation steps">
-          <template v-for="s in STEPS" :key="s.n">
+        <!-- 卡头是步骤条。新建三步,编辑两步(见 wizardSteps)。
+
+             编辑态原来没有这条步骤条,只给一句 "Edit {name}" —— 于是
+             **改嗓音这件事在这一页根本走不到**:第 2 步是锁的,一个角色的嗓子
+             建完就只能回详情页点 "Change voice" 走另一条入口。可编辑态本来就
+             有 id(角色就在库里),后两步没有任何理由锁着。
+             现在两个入口合流:详情页那一枚仍是一条捷径(直接落在第 2 步),
+             从 Edit 进来也能自己点过去 -->
+        <nav class="wz-steps" aria-label="Creation steps">
+          <template v-if="isEditing">
+            <h3 class="wz-edit-title">Edit {{ editingChar?.name }}</h3>
+            <!-- 那句话跟着**当前这一步**走,不跟"从哪个入口进来"走:
+                 编辑态现在两步都到得了,从设定点过嗓音、或从嗓音退回设定,
+                 卡头这句都得说对 -->
+            <p class="wz-edit-sub">
+              {{
+                step === 2
+                  ? 'The voice is what this character sounds like when read aloud. Its spec is untouched.'
+                  : 'The spec is what every image of this character is built from — the reference views stay as they are.'
+              }}
+            </p>
+          </template>
+          <div class="wz-step-row">
+          <template v-for="s in wizardSteps" :key="s.n">
             <span
               v-if="s.n > 1"
               class="wz-line"
@@ -524,6 +538,7 @@ function pickStyle(v: string) {
               <span class="wz-name">{{ s.label }}</span>
             </button>
           </template>
+          </div>
         </nav>
 
         <div class="wz-body">
@@ -1263,6 +1278,14 @@ function pickStyle(v: string) {
             Done
           </button>
 
+          <!-- 编辑态的下一步是嗓音,而脚下那枚主按钮是"Save"(改设定到这儿就完了)。
+               两件事都摆在明面上,免得专门来改嗓子的人顺手点了 Save、卡就关了。
+               排在整条 v-if / v-else-if 链之后:插在中间会把那条链切断,
+               新建流程的第 1 步会同时冒出两枚主按钮 -->
+          <button v-if="step === 1 && isEditing" class="ed-btn" @click="goStep(2)">
+            Next: voice
+          </button>
+
           <button v-if="step > 1" class="ed-btn" @click="backStep">Back</button>
           <button class="ed-btn" @click="closeWizard">
             {{ step === 1 && !wizardId ? 'Cancel' : 'Close' }}
@@ -1952,15 +1975,9 @@ function pickStyle(v: string) {
 }
 /* 步骤条:横向三步,中间用短线连起来。
    线点亮 = 前一步做完了 —— 进度不必靠读文字,余光扫一眼就知道走到哪 */
-/* 编辑态的卡头:这一趟只有一步,摆一条点不动的步骤条只会让人以为还要走下去,
-   所以换成一行字说清"在改谁"。占的是同一个位置,也同样是那张独立的卡 */
-.wz-edit-head {
-  flex: none;
-  padding: 13px var(--sp-4);
-  border-radius: var(--r);
-  background: var(--surface);
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05), var(--sh-sm);
-}
+/* 编辑态卡头那两行(在改谁、这一轮改什么)现在住在 .wz-steps 那张卡里 ——
+   原来它们自成一卡,于是编辑态是"一句说明 + 一张没有步骤条的卡",
+   而嗓音那一步根本走不到 */
 .wz-edit-title {
   font-size: var(--fs-md);
   font-weight: 600;
@@ -1978,13 +1995,22 @@ function pickStyle(v: string) {
    这儿不再自己写 margin —— 卡与卡的距离只该有一处定义 */
 .wz-steps {
   flex: none;
+  /* 一列:编辑态这张卡里先有一行"Edit {name}"与那句说明,步骤条跟在其下;
+     新建态没有那两行,这一列里就只有那一排步骤 —— 两种态共用同一张卡,
+     卡的数量与顺序都不变(卡头 / 卡身 / 卡脚) */
   display: flex;
-  align-items: center;
-  gap: 10px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
   padding: 10px var(--sp-4);
   border-radius: var(--r);
   background: var(--surface);
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05), var(--sh-sm);
+}
+.wz-step-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
 /* 连接线:走过的那一段整条转成墨色 —— 它和左边那枚墨色圆点连成一段实心的墨,
    于是"走到哪儿了"不用读文字,一条深浅就看出来了。
