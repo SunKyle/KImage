@@ -597,7 +597,9 @@ export async function deleteChatMessage(id: string): Promise<void> {
 export async function deleteChatOf(charId: string): Promise<void> {
   const db = await openDB()
   await new Promise<void>((resolve, reject) => {
-    const tx = db.transaction([CHAT_STORE, SUMMARY_STORE, CHAT_IMAGE_STORE], 'readwrite')
+    const storeNames = [CHAT_STORE, SUMMARY_STORE, CHAT_IMAGE_STORE]
+    if (db.objectStoreNames.contains(BACKDROP_STORE)) storeNames.push(BACKDROP_STORE)
+    const tx = db.transaction(storeNames, 'readwrite')
     const store = tx.objectStore(CHAT_STORE)
     const index = store.index('charId')
     /* 两个请求都在事务开头发出:读到的都是"动手删之前"的状态,
@@ -612,6 +614,9 @@ export async function deleteChatOf(charId: string): Promise<void> {
       for (const id of referencedChatImages(msgsReq.result as ChatMessage[])) imgs.delete(id)
     }
     tx.objectStore(SUMMARY_STORE).delete(charId)
+    if (db.objectStoreNames.contains(BACKDROP_STORE)) {
+      tx.objectStore(BACKDROP_STORE).delete(charId)
+    }
     tx.oncomplete = () => resolve()
     tx.onerror = () => reject(tx.error)
   })
@@ -1147,7 +1152,17 @@ let pruneWrites = 0
  *
  * 返回清了多少条,交由界面告知用户。
  */
+let pruneInFlight: Promise<PruneResult | null> | null = null
+
 export async function pruneHistory(): Promise<PruneResult | null> {
+  if (pruneInFlight) return pruneInFlight
+  pruneInFlight = doPruneHistory().finally(() => {
+    pruneInFlight = null
+  })
+  return pruneInFlight
+}
+
+async function doPruneHistory(): Promise<PruneResult | null> {
   /* 先问"要不要体检",再决定要不要连库 —— 节流的意义就在于被跳过时
      连 openDB 与 estimate() 都不发生 */
   const now = Date.now()

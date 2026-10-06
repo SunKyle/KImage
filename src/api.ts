@@ -716,7 +716,11 @@ function normalizeConfig(c: ApiConfig): ApiConfig {
 }
 
 export function saveConfigs(list: ApiConfig[]) {
-  localStorage.setItem(CONFIG_KEY, JSON.stringify(list))
+  try {
+    localStorage.setItem(CONFIG_KEY, JSON.stringify(list))
+  } catch {
+    /* 存储满或无痕模式受限时吞掉异常,避免阻塞主流程 */
+  }
 }
 
 /* ===== 按用途挑「当前生效」的那条 ====================================
@@ -762,49 +766,89 @@ export function pickActiveByKind(
 }
 
 export function loadActiveId(): string {
-  return localStorage.getItem(CONFIG_ACTIVE_KEY) || ''
+  try {
+    return localStorage.getItem(CONFIG_ACTIVE_KEY) || ''
+  } catch {
+    return ''
+  }
 }
 
 export function saveActiveId(id: string) {
-  localStorage.setItem(CONFIG_ACTIVE_KEY, id)
+  try {
+    localStorage.setItem(CONFIG_ACTIVE_KEY, id)
+  } catch {
+    /* ignore */
+  }
 }
 
 // 文本类别的当前生效配置 id:与出图那条互不影响,两条各存各的
 export function loadActiveTextId(): string {
-  return localStorage.getItem(TEXT_ACTIVE_KEY) || ''
+  try {
+    return localStorage.getItem(TEXT_ACTIVE_KEY) || ''
+  } catch {
+    return ''
+  }
 }
 
 export function saveActiveTextId(id: string) {
-  localStorage.setItem(TEXT_ACTIVE_KEY, id)
+  try {
+    localStorage.setItem(TEXT_ACTIVE_KEY, id)
+  } catch {
+    /* ignore */
+  }
 }
 
 /* 对话类别的当前生效配置 id。**它可能一直是空串** —— 没有单独配一条对话模型时,
    角色对话会借用改写那条(见 composables/useConfigs.ts 的 chatConfig),
    所以空着不是"没配",只是"还没分开" */
 export function loadActiveChatId(): string {
-  return localStorage.getItem(CHAT_ACTIVE_KEY) || ''
+  try {
+    return localStorage.getItem(CHAT_ACTIVE_KEY) || ''
+  } catch {
+    return ''
+  }
 }
 
 export function saveActiveChatId(id: string) {
-  localStorage.setItem(CHAT_ACTIVE_KEY, id)
+  try {
+    localStorage.setItem(CHAT_ACTIVE_KEY, id)
+  } catch {
+    /* ignore */
+  }
 }
 
 // 识图类别的当前生效配置 id:各记各的,配一条识图不该顶掉出图或改写
 export function loadActiveVisionId(): string {
-  return localStorage.getItem(VISION_ACTIVE_KEY) || ''
+  try {
+    return localStorage.getItem(VISION_ACTIVE_KEY) || ''
+  } catch {
+    return ''
+  }
 }
 
 export function saveActiveVisionId(id: string) {
-  localStorage.setItem(VISION_ACTIVE_KEY, id)
+  try {
+    localStorage.setItem(VISION_ACTIVE_KEY, id)
+  } catch {
+    /* ignore */
+  }
 }
 
 // 朗读类别的当前生效配置 id:与上面三条互不影响
 export function loadActiveTtsId(): string {
-  return localStorage.getItem(TTS_ACTIVE_KEY) || ''
+  try {
+    return localStorage.getItem(TTS_ACTIVE_KEY) || ''
+  } catch {
+    return ''
+  }
 }
 
 export function saveActiveTtsId(id: string) {
-  localStorage.setItem(TTS_ACTIVE_KEY, id)
+  try {
+    localStorage.setItem(TTS_ACTIVE_KEY, id)
+  } catch {
+    /* ignore */
+  }
 }
 
 /* ===== 朗读(语音合成) =================================================
