@@ -9,6 +9,9 @@ import {
   rateLimit,
   safeFetch
 } from '../core.js'
+/* 尺寸 → 宽高比那条换算归 generate 那一份(见那里的 geminiRatio) ——
+   编辑这条路只是复用同一个换算,不另写一遍 */
+import { geminiRatio } from './generate.js'
 
 export function registerEditRoute(app) {
 /* ===== 局部编辑 ========================================================

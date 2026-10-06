@@ -174,3 +174,22 @@ export function htmlTitle(html) {
   const t = (html.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1]
   return t ? t.trim().replace(/\s+/g, ' ').slice(0, 160) : ''
 }
+
+/** 上游原文里那句给人看的话:整页 HTML 只取标题,JSON 取 message,其余截断。
+ *  三条代理路由(对话/出图/语音)都要把上游的报错转成人话,口径收在这一处 */
+export /** 上游原文里那句给人看的话:整页 HTML 只取标题,JSON 取 message,其余截断 */
+function shortDetail(text) {
+  if (!text) return ''
+  if (looksLikeHtml(text)) {
+    const t = htmlTitle(text)
+    return `The host answered with an HTML page${t ? `: ${t}` : ''}`
+  }
+  try {
+    const j = JSON.parse(text)
+    const m = j?.error?.message ?? j?.message
+    if (typeof m === 'string' && m.trim()) return m.trim().slice(0, 300)
+  } catch {
+    /* 不是 JSON 就原样截断 */
+  }
+  return text.slice(0, 300)
+}

@@ -1,36 +1,21 @@
 import {
-  CONNECT_HINTS,
-  PROD_LIKE,
-  UPSTREAM_TIMEOUT_MS,
   assertSafeTarget,
+  CONNECT_HINTS,
   dispatchAttempts,
+  dispatcherFor,
   htmlTitle,
   looksLikeHtml,
+  PROD_LIKE,
   rateLimit,
-  safeFetch
+  safeFetch,
+  shortDetail,
+  UPSTREAM_TIMEOUT_MS
 } from '../core.js'
 
 export function registerTestRoutes(app) {
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true })
 })
-
-/** 上游原文里那句给人看的话:整页 HTML 只取标题,JSON 取 message,其余截断 */
-function shortDetail(text) {
-  if (!text) return ''
-  if (looksLikeHtml(text)) {
-    const t = htmlTitle(text)
-    return `The host answered with an HTML page${t ? `: ${t}` : ''}`
-  }
-  try {
-    const j = JSON.parse(text)
-    const m = j?.error?.message ?? j?.message
-    if (typeof m === 'string' && m.trim()) return m.trim().slice(0, 300)
-  } catch {
-    /* 不是 JSON 就原样截断 */
-  }
-  return text.slice(0, 300)
-}
 
 /** 从 GET /models 的响应里取模型 id。两条协议的回法不一样:
     OpenAI 是 { data: [{ id }] },Gemini 是 { models: [{ name: 'models/xxx' }] } */
