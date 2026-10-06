@@ -252,6 +252,24 @@ async function main() {
     out = await readChat(r)
     ok('正文中间的分行留着', out.text === 'First line.\nSecond line.', JSON.stringify(out.text))
 
+    /* —— 用例 1d：正文里的 emoji 不许被弄坏 ——
+       放开 emoji 之后,风险不在"模型写不写",而在**链路上有没有东西把它吃掉
+       或截断**。假上游的 tinyChunks 是按 UTF-16 码元每 3 个切一刀,所以一个
+       emoji(代理对 = 2 个码元)必然被劈进两帧,中间还要过 JSON、过扣尾的
+       逐段回退再拼回来。这一条盯的就是"劈开之后还能不能拼回去"。
+       用例里特意放了两个更脆的:😮‍💨 是 ZWJ 连接符拼起来的组合,
+       ✨️ 后面跟着变体选择符 —— 它们比单个 emoji 更容易被按码元截断 */
+    console.log('\n用例 1d · 正文里的 emoji 原样保留')
+    chatReply = '累死了😮\u200d💨 不过还行✨\uFE0F\n[mood:tired]'
+    r = await post(APP_PORT, '/api/chat', { ...cfg, messages: [{ role: 'user', content: 'hi' }] })
+    out = await readChat(r)
+    ok(
+      'emoji(ZWJ 组合 + 变体选择符)一字不差',
+      out.text === '累死了😮\u200d💨 不过还行✨\uFE0F',
+      JSON.stringify(out.text)
+    )
+    ok('末尾的 mood 照旧剪掉', out.done?.mood === 'tired', String(out.done?.mood))
+
     /* —— 用例 1c：标签被正文顶到中间 ——
        模型先说一句、再决定给你看张图、然后又补一句收尾的话。splitTags 只认末尾
        (那是为了不误吃正文里的方括号),所以这一枚原来会**原样流给用户看** ——
@@ -426,6 +444,11 @@ async function main() {
       systemOf().indexOf('Right now: 2026') < systemOf().indexOf('What has happened so far')
     )
     ok('规则里带着"别每句都报时"', systemOf().includes('it is a clock'))
+    /* 2026-10-06:放开 emoji。原先没有任何一条提到它,而"只写说出口的话"
+       与"别用 markdown"那两条的口气是压着它的,于是模型基本不用。
+       这里断言的同样只是"它进了 system" —— 模型用不用、用得像不像人,
+       属于提示词类改动,只能手测(与上面两条软规则同一条纪律) */
+    ok('规则里放开了 emoji', systemOf().includes('Emoji are fine'), 'system 里没有这一句')
     /* 这两条是 T6.5 加的软规则。这里断言的只是"它们确实进了 system" ——
        模型照不照做是另一回事(那是提示词类改动,只能手测),别把这条
        当成"接话题行为已验证"。

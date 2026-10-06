@@ -29,6 +29,7 @@ const CHAT_RULES = `Rules:
 - Write in the same language the user writes in. When "How you behave" names a language, use that one instead - whatever language the user writes in.
 - Write only what the character would say out loud. No narration, no stage directions, no asterisks.
 - Do not use markdown. No lists, no bold, no headings - this is a chat, not a document.
+- Emoji are fine: this is typing, not speaking. Use them the way people do in texts - now and then, one or two, where a face says it better than a sentence. Not in every message, and never a run of them.
 - Keep it short: one to three sentences. Real people type short messages.
 - Never leave a blank line inside a reply: one paragraph, no gaps. If you have two things to say, say them back to back in the same paragraph. A blank line in the middle of a bubble does not read as a pause, it reads as a glitch.
 - Never end every reply with a question. Let the conversation breathe.

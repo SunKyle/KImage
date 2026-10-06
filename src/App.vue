@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onBeforeUnmount, watch, toRaw } from 'vue'
+import { ref, computed, nextTick, onMounted, onBeforeUnmount, watch, toRaw } from 'vue'
 import {
   PhSun,
   PhMoon,
@@ -2091,6 +2091,18 @@ function stopChat(id: string) {
  * 空表单给的是空白草稿而不是某家预设:填哪家只有用户知道,
  * 而用途那一步已经替他选好了(见设置页的 setPurpose)。
  */
+/** 从对话页头部的 Details 去这个角色的详情。
+ *
+ *  三步的次序不能换:**先记下"选中他"、再切页、最后才让角色页打开详情**。
+ *  反过来的话,角色页会先按旧的 activeCharId 渲染一帧、再跳过去 ——
+ *  看起来就是"先闪了一下别的角色"。nextTick 是把"详情"这一句
+ *  排在切页那次渲染之后(角色页这时才挂载得上) */
+function openCharacterDetail(id: string) {
+  activeCharId.value = id
+  page.value = 'chars'
+  nextTick(() => charPageRef.value?.openDetail(id))
+}
+
 function openChatConfigSettings() {
   const cfg = chatConfig.value
   if (cfg && (!cfg.model.trim() || !cfg.baseUrl.trim())) {
@@ -2984,6 +2996,7 @@ function createAssignCollection(title: string) {
         @clear="clearChat"
         @load-earlier="loadEarlierChat"
         @goto-chars="page = 'chars'"
+        @open-character="openCharacterDetail"
         @configure-chat-model="openChatConfigSettings"
       />
 

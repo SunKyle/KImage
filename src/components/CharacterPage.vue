@@ -324,7 +324,9 @@ const {
 
 /* 主界面拿这个 ref 回调向导的两处收尾:存完推进、改完收尾
    (见 App 的 saveCharFromPage / charPageRef) */
-defineExpose({ onSaved, onUpdated })
+/* openDetail 也交出去:对话页头部的 Details 要直接落到**这个角色**的详情,
+   而不是把用户扔到角色列表让他自己再找一遍 */
+defineExpose({ onSaved, onUpdated, openDetail })
 
 /* 列表顺序与卡片 ⋮ 菜单(开合 / 指针宽限 / 点外收起 / 四个动作的转发)。
    顺序是**派生**的:置顶在前,其余保持主界面给的顺序(最近建的在前) */
@@ -1444,46 +1446,76 @@ function pickStyle(v: string) {
            主视觉用**正脸那张大图**,而不是一枚小圆头像 —— 88px 的圆是
            "通讯录条目"的形状,而这一页要看起来像一个人。
            3:4 与列表里的角色卡同一个比例:这一页就是那张卡"打开之后"的样子,
-           同一个人该是同一个形状,只是尺寸大了一档 -->
+           同一个人该是同一个形状,只是尺寸大了一档。
+
+           **两栏**:左图,右边再分"我是谁"(文字列,封到 46ch)与
+           "能做什么"(动作列,靠右站成一条竖列)。
+           以前文字列一路铺到卡的右边缘、动作跟在文字后面,于是
+           1000px 宽的卡里最长的一行只有 421px,右边近 380px 是空的,
+           两枚按钮还悬在整条中线上。 -->
       <header class="hero">
         <div class="hero-shot">
           <img v-if="avatarSrc" :src="avatarSrc" alt="" />
           <PhMaskHappy v-else aria-hidden="true" />
         </div>
         <div class="hero-body">
-          <h2 class="hero-name">{{ detailChar.name }}</h2>
-          <p v-if="heroSub(detailChar)" class="hero-sub">{{ heroSub(detailChar) }}</p>
-          <!-- 用量:这个角色到底干了多少活。放在设定摘要下面、标签上面 ——
-               它比"几张图"更像这个角色的成绩单 -->
-          <p class="hero-meta">
-            <span v-for="m in heroMeta" :key="m">{{ m }}</span>
-          </p>
-          <div class="hero-tags">
-            <span class="tag">{{ filledCount }} / {{ sheetCells.length }} views</span>
-            <span v-if="hasFront" class="tag tag-on">
-              <PhEye weight="fill" aria-hidden="true" />
-              Main view · Front
-            </span>
-            <span v-else class="tag">No main view yet</span>
+          <div class="hero-id">
+            <h2 class="hero-name">{{ detailChar.name }}</h2>
+            <p v-if="heroSub(detailChar)" class="hero-sub">{{ heroSub(detailChar) }}</p>
+            <!-- 用量:这个角色到底干了多少活。放在设定摘要下面、标签上面 ——
+                 它比"几张图"更像这个角色的成绩单 -->
+            <p class="hero-meta">
+              <span v-for="m in heroMeta" :key="m">{{ m }}</span>
+            </p>
+            <div class="hero-tags">
+              <span class="tag">{{ filledCount }} / {{ sheetCells.length }} views</span>
+              <span v-if="hasFront" class="tag tag-on">
+                <PhEye weight="fill" aria-hidden="true" />
+                Main view · Front
+              </span>
+              <span v-else class="tag">No main view yet</span>
+            </div>
           </div>
 
+          <!-- 动作列:同一时刻只该有一个涂黑的主按钮,否则"下一步做什么"就含糊了。
+               设定图没齐时那件事是**补齐**(只有在这儿能做);
+               齐了之后主操作换成**拿它去开画** —— 那一件事本来就在这一页的
+               职责里(见 doc/角色创建流程设计.md 第 7 节),而列表卡上一直有它。
+               原来这一格是一枚禁用的 All views ready:全页最重的位置上
+               摆着一件点不动的事,而真正该点的那个入口根本不在这一页 -->
           <div class="hero-actions">
-          <!-- 跟这个人说话。它比"补齐设定图"更常点,但这一页的主动作仍是补齐
-               (那件事只有在这儿能做),所以这一枚用描边样式 —— 同一时刻
-               只该有一个涂黑的主按钮,否则"下一步做什么"就含糊了 -->
-          <button class="ed-btn hero-chat" @click="emit('chat', detailChar.id)">
-            <PhChatCircleDots aria-hidden="true" />
-            Chat
-          </button>
-          <!-- 生成中按钮自己也要说出来:它是刚才被点的那个,状态留在原地最容易被看到 -->
-          <button
-            class="ed-btn primary hero-cta"
-            :disabled="!missingCount || frontBusy(detailChar.id)"
-            @click="emit('generateAll', detailChar.id)"
-          >
-            <PhSparkle v-if="!detailBusy.length" aria-hidden="true" />
-            {{ detailBusy.length ? `Generating ${busyLabel}…` : generateAllLabel }}
-          </button>
+            <button
+              v-if="missingCount"
+              class="ed-btn primary hero-cta"
+              :disabled="frontBusy(detailChar.id)"
+              @click="emit('generateAll', detailChar.id)"
+            >
+              <PhSparkle v-if="!detailBusy.length" aria-hidden="true" />
+              {{ detailBusy.length ? `Generating ${busyLabel}…` : generateAllLabel }}
+            </button>
+            <button
+              v-else
+              class="ed-btn primary hero-cta"
+              :aria-label="`Create with ${detailChar.name}`"
+              @click="emit('create', detailChar.id)"
+            >
+              Create
+              <PhArrowRight aria-hidden="true" />
+            </button>
+            <!-- 没齐的时候"开画"退成描边的次动作:图还没备全时它仍是可用的 -->
+            <button
+              v-if="missingCount"
+              class="ed-btn hero-create"
+              :aria-label="`Create with ${detailChar.name}`"
+              @click="emit('create', detailChar.id)"
+            >
+              Create
+              <PhArrowRight aria-hidden="true" />
+            </button>
+            <button class="ed-btn hero-chat" @click="emit('chat', detailChar.id)">
+              <PhChatCircleDots aria-hidden="true" />
+              Chat
+            </button>
           </div>
         </div>
       </header>
@@ -1607,7 +1639,7 @@ function pickStyle(v: string) {
       <!-- 三张资料表并排成一段"附录"(见 .dt-facts 的说明)。
            它们同等次要,所以每一张都得是个完整的卡:标题 + 一句话(说明它管哪一头) -->
       <div class="dt-facts">
-      <section class="panel">
+      <section class="panel fact-spec">
         <div class="panel-head">
           <h3 class="panel-title">Spec</h3>
           <span class="panel-note">Merged into every image you make.</span>
@@ -1624,7 +1656,7 @@ function pickStyle(v: string) {
            这一段一项都不会 —— 它只在对话里起作用。混在同一张表里,
            用户会以为改"说话方式"也会改变出图。
            标题同向导那边:用 Personality,把 Voice 让给嗓音 -->
-      <section class="panel">
+      <section class="panel fact-persona">
         <div class="panel-head">
           <h3 class="panel-title">Personality</h3>
           <span class="panel-note">Used in Chat only — never merged into your prompts.</span>
@@ -1643,7 +1675,7 @@ function pickStyle(v: string) {
            而改的那一枚是**必需的**:向导第 2、3 步的解锁条件是 wizardId,
            只有新建流程里第 1 步存完才有 —— 光靠详情页那枚 Edit 进不去嗓音那一步,
            一个角色的嗓子建完就再也改不了(见 startVoiceEdit) -->
-      <section class="panel">
+      <section class="panel fact-voice">
         <div class="panel-head">
           <h3 class="panel-title">Voice</h3>
           <div class="panel-acts">
@@ -3474,11 +3506,12 @@ textarea.wz-idea {
   height: 15px;
 }
 
-/* 身份区:一张卡把"这是谁、进行到哪、能做什么"说全 */
+/* 身份区:一张卡把"这是谁、进行到哪、能做什么"说全。
+   卡里是两栏 —— 左图,右边一栏里再分"我是谁"与"能做什么"。
+   图与文字之间留一档半的呼吸:200px 的图旁边紧贴文字会读起来像"图注" */
 .hero {
   display: flex;
   align-items: center;
-  /* 图与文字之间留一档半的呼吸:200px 的图旁边紧贴文字会读起来像"图注" */
   gap: var(--sp-5);
   padding: var(--sp-5);
   border: 1px solid var(--line);
@@ -3514,9 +3547,20 @@ textarea.wz-idea {
   width: 40px;
   height: 40px;
 }
+/* 文字那一栏与动作那一栏并排,各占一头。
+   文字**封到 46ch**:这一栏要回答的是一句"这是谁",不是一段正文 ——
+   封顶之后右端不再被拉成一整行空,动作列也有地方站 */
 .hero-body {
   flex: 1;
   min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-6);
+}
+.hero-id {
+  min-width: 0;
+  max-width: 46ch;
 }
 /* 名字是这一页的标题,而它旁边现在站的是一张 267px 高的图 ——
    22px 的名字配那个体量会显得像图注。抬到 28px(fs-3xl,与各页页标题同档) */
@@ -3576,19 +3620,19 @@ textarea.wz-idea {
   font-weight: 600;
 }
 .hero-cta {
-  flex: none;
   padding: 10px 16px;
 }
-/* 两枚动作同排(Chat + 一次补齐)。它们是这一列的收尾,跟在标签下面 ——
-   不再是右侧独立的一列:左边站着 267px 的图,再切出第三列按钮,
-   那一列会孤零零地悬在中线上,读起来像工具栏而不是一个人。
-   整条 hero 在窄屏会换行,这一组自己也留一条换行的余地 */
+/* 动作靠右站成一条竖列(不再是跟在文字后面的下半段):
+   一是它与上面 .dt-bar 那排动作同为"能做什么",该在同一条右边缘上;
+   二是主次一眼可见 —— 涂黑的那枚永远在最上面。
+   三枚按钮里只有一或两枚在场(齐了就没有"补齐"那一枚),
+   用 align-items: stretch 让它们同宽,列才不会看着参差 */
 .hero-actions {
+  flex: none;
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
+  flex-direction: column;
+  align-items: stretch;
   gap: var(--sp-2);
-  margin-top: var(--sp-4);
 }
 .hero-chat {
   min-height: 40px;
@@ -3602,23 +3646,51 @@ textarea.wz-idea {
   border-radius: var(--r);
   background: var(--surface);
 }
-/* 三张资料表(Spec / Personality / Voice)并排,收成一段"附录"。
+/* 三张资料表(Spec / Personality / Voice)收成一段"附录"。
    它们原来是三张上下堆叠的卡,一路读下来就是一堵"表单墙" ——
    可它们其实是同等次要的东西:都是"要用的时候才查"的资料,
    而这一页的主角是上面那张脸,以及它那五张设定图。
    并排之后它们从"页面正文"退成一段注脚,视线扫过就行。
-   用 auto-fit 而不是写死三列:窄屏自己落成两列、一列,不必再挂一条媒体查询 */
+
+   排法是**左一右二**:Spec 跨两行,人格与嗓音叠在右栏。
+   为什么不是三张等宽一排 —— 三张的行数差得太远(13 / 5 / 3):等宽时
+   Spec 的每个值都折两三行,自己长到 658px,而人格与嗓音底下各空着
+   327px 和 475px。试过把 Spec 加宽成 1.6 : 1 : 1 与 2 : 1 : 1(行高压到
+   554 / 492),但那是拿另外两张的宽度换来的:242px 时值那一列只剩 114px、
+   一行十来个字符,嗓音卡头上那两枚按钮直接溢出卡外。
+   改成一左一右之后 Spec 拿到 599px(每个值一行放得下),另外两张各 353px
+   (比原来的 323px 还宽),整段从 658 降到 509,剩下的一点余量全落在
+   Spec 卡内(它比右栏矮 56px),底边由 align-items: stretch 拉齐 */
 .dt-facts {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  grid-template-columns: minmax(0, 1.7fr) minmax(0, 1fr);
   gap: var(--sp-4);
-  align-items: start;
+  align-items: stretch;
   margin-top: var(--sp-4);
 }
 /* 并排之后卡自己那条上边距要去掉:间隙由 grid 的 gap 统一给,
    否则三张卡会一起再往下挪一格 */
 .dt-facts > .panel {
   margin-top: 0;
+}
+/* 三张卡各自的位置写死(不再靠 auto-fit 自动落位):
+   Spec 管"进提示词的设定"这一头,行数最多,给它左栏两行的高度 */
+.fact-spec {
+  grid-column: 1;
+  grid-row: 1 / span 2;
+}
+.fact-persona {
+  grid-column: 2;
+  grid-row: 1;
+}
+.fact-voice {
+  grid-column: 2;
+  grid-row: 2;
+}
+/* 861–900 这一段右栏只有 250–290px,嗓音卡头刚好卡在临界上:
+   让它能换行 —— 那两枚按钮掉到第二行,好过挤出卡外 */
+.fact-voice .panel-head {
+  flex-wrap: wrap;
 }
 .panel-head {
   display: flex;
@@ -4142,6 +4214,21 @@ textarea.wz-idea {
   margin-top: 6px;
 }
 
+/* 资料区那一左一右在 860 以下并排不下:右栏只剩 250 来像素,嗓音卡头上
+   那三样(标题 + Hear it + Change voice)会挤到卡外。落成一栏,三张各占一行。
+   位置是写死的,这里必须一起复位,否则后两张会叠进同一个格子 */
+@media (max-width: 860px) {
+  .dt-facts {
+    grid-template-columns: 1fr;
+  }
+  .fact-spec,
+  .fact-persona,
+  .fact-voice {
+    grid-column: 1;
+    grid-row: auto;
+  }
+}
+
 @media (max-width: 720px) {
   /* 手机上把这一排的触控目标抬到 40px —— 站内对触屏的底线
      (见 App.vue 里 .param-btn / .clear-icon 那几条)。桌面维持原尺寸:
@@ -4305,10 +4392,28 @@ textarea.wz-idea {
   .hero {
     flex-wrap: wrap;
     padding: var(--sp-4);
+    gap: var(--sp-4);
   }
   .hero-shot {
     width: 104px;
     border-radius: 16px;
+  }
+  /* 窄屏那一栏再竖着分:先"我是谁",再"能做什么"。
+     动作排不成竖列了(横过来一行放得下),主按钮仍旧独占一行 */
+  .hero-body {
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--sp-4);
+  }
+  .hero-id {
+    max-width: none;
+  }
+  .hero-actions {
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+  .hero-actions .ed-btn {
+    flex: 1 1 auto;
   }
   .hero-cta {
     width: 100%;

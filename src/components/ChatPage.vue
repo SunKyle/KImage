@@ -7,15 +7,18 @@ import {
   PhArrowsOutSimple,
   PhArrowsClockwise,
   PhBrain,
+  PhCaretDown,
   PhChatCircleDots,
   PhDotsThree,
   PhEraser,
   PhImage,
   PhImageBroken,
+  PhMagnifyingGlass,
   PhMaskHappy,
   PhPencilSimple,
   PhPushPin,
   PhSlidersHorizontal,
+  PhSmiley,
   PhSpeakerHigh,
   PhStopCircle,
   PhTrash,
@@ -118,6 +121,10 @@ const emit = defineEmits<{
      那件事必须说出来,否则用户会以为音色配置生效了、只是"听起来不对" */
   (e: 'notice', text: string): void
   (e: 'gotoChars'): void
+  /* 去这个角色的详情。**只交意图** —— 切页、选中、让角色页把详情打开,
+     全归主界面(与 gotoChars 同一条分工)。对话里想改设定/看出图,
+     从前只能自己切到角色页再从列表里找一遍 */
+  (e: 'openCharacter', charId: string): void
   /* 去配那条对话模型。**只交意图**:是回列表还是直接开一张新表单,
      由主界面定(它才知道现在有没有专配的对话配置)—— 见 App 的 openChatConfigSettings */
   (e: 'configureChatModel'): void
@@ -222,6 +229,43 @@ const lastOf = lastMessageLookup(
 
 const ordered = computed(() => orderConversations(props.characters, lastOf))
 
+/* 左栏的搜索词。**只在本地过滤** —— 对话目录本来就在手上,
+   没有请求、没有新状态,清空即回到原样 */
+const railQuery = ref('')
+/** 按"名字 或 最后一句"过滤。两句都过 trim+小写:
+ *  用户不会为了搜一个人先去把首字母大写打对 */
+const railList = computed(() => {
+  const q = railQuery.value.trim().toLowerCase()
+  if (!q) return ordered.value
+  return ordered.value.filter(
+    (c) => c.name.toLowerCase().includes(q) || lastLine(c).toLowerCase().includes(q)
+  )
+})
+function clearRailQuery() {
+  railQuery.value = ''
+}
+
+/** 左栏那一行右上角的时刻:最后一条消息**什么时候说的**。
+ *
+ *  取的是最后一条消息的 createdAt —— 与摘要那一行同源,所以"谁说的"与
+ *  "什么时候说的"永远指同一条,不会一个说新、一个说旧。
+ *  没有消息时返回 0,那一格就不渲染。
+ *
+ *  **只有"今天"才报到分钟**:更早的报日期。那一格只有 42px 宽,
+ *  11px 下 "Aug 3" 刚好、"Yesterday" 就放不下了;而列表本来就是索引 ——
+ *  今天精确到分有价值,上周三说了什么,看日期比看钟点有用。 */
+function lastAt(c: Character): number {
+  return lastOf(c.id)?.createdAt ?? 0
+}
+function railStamp(t: number): string {
+  const d = new Date(t)
+  if (d.toDateString() === new Date().toDateString()) {
+    /* 24 小时制、不带 AM/PM:那一格放不下,而列表里"10:52 / 15:52"不会认错 */
+    return d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false })
+  }
+  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+}
+
 /** 左栏那一行摘要:最后一句说了什么 */
 function lastLine(c: Character): string {
   const m = lastOf(c.id)
@@ -277,6 +321,10 @@ const SEP_GAP = 30 * 60 * 1000
    (ImagePreview 的时间戳也是这么钉的,同一套理由) */
 function timeLabel(t: number): string {
   return new Date(t).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })
+}
+/** <time datetime> 要的是机器可读的那一刻;给人看的那句由 timeLabel 给 */
+function stampOf(t: number): string {
+  return new Date(t).toISOString()
 }
 function dayLabel(t: number): string {
   const d = new Date(t)
@@ -839,6 +887,46 @@ function pick(id: string) {
 
 /* ===== 头部那枚 ⋮ 菜单 ==============================================
    里面只有一项,但清空是个不可逆动作,摆在人眼前等于给误触留门 */
+/* —— 输入栏那枚 emoji 键 ——
+   一格常用表,不做全量选择器:全量要么引一个大依赖,要么自己攒上千个码位,
+   而聊天里真正会被用到的就那几十个。点了插在**光标处**,不是追加到末尾 ——
+   用户多半是想在句子中间补一个表情 */
+const EMOJI = [
+  '😊','😄','😂','🥲','😉','😍',
+  '🥰','😘','😳','😭','😤','😏',
+  '🙄','😴','🤔','🫠','😅','😌',
+  '👍','👏','🙏','🤝','💪','✌️',
+  '🫶','👀','❤️','💔','✨','🎉',
+  '🔥','☕','🌙','🥺','😮','💨'
+]
+const emojiOpen = ref(false)
+const emojiWrap = ref<HTMLElement | null>(null)
+const emojiBtn = ref<HTMLButtonElement | null>(null)
+
+function closeEmoji(returnFocus = false) {
+  if (!emojiOpen.value) return
+  emojiOpen.value = false
+  if (returnFocus) nextTick(() => emojiBtn.value?.focus())
+}
+
+/** 插在光标处,并把光标挪到插入的那个字符之后 ——
+ *  连着点几个才不会每一个都跑到句子最前面 */
+function insertEmoji(e: string) {
+  const el = inputEl.value
+  if (!el) {
+    text.value += e
+    return
+  }
+  const start = el.selectionStart ?? text.value.length
+  const end = el.selectionEnd ?? start
+  text.value = text.value.slice(0, start) + e + text.value.slice(end)
+  nextTick(() => {
+    el.focus()
+    const at = start + e.length
+    el.setSelectionRange(at, at)
+  })
+}
+
 const menuOpen = ref(false)
 const menuWrap = ref<HTMLElement | null>(null)
 const pickerOpen = ref(false)
@@ -885,6 +973,8 @@ function onDocPointerDown(e: PointerEvent) {
   ) {
     closeMemory()
   }
+  /* emoji 面板在输入栏那一头,与菜单互不相干:各自判各自的 */
+  if (emojiOpen.value && !isInside(e.target, emojiWrap.value)) closeEmoji()
   if (!menuOpen.value) return
   if (isInside(e.target, menuWrap.value)) return
   closeMenu()
@@ -899,6 +989,9 @@ function onKey(e: KeyboardEvent) {
     { open: pickerOpen.value, close: () => void closePicker() },
     { open: memoryOpen.value, close: closeMemory },
     { open: menuOpen.value, close: closeMenu },
+    /* emoji 面板是这一页**最轻**的一层浮层:它压在最下面(输入栏),
+       所以排在菜单后面 —— 上层的东西先收 */
+    { open: emojiOpen.value, close: () => closeEmoji(true) },
     /* 沉浸是**最外面**那一层:一次 Esc 只退一层 —— 菜单开着时先关菜单,
        再按一次才退出沉浸。反过来(一次按两下)会让人以为"Esc 把我的菜单和
        整个模式一起弄没了" */
@@ -982,16 +1075,40 @@ onBeforeUnmount(() => {
 
     <!-- —— 左栏:角色。与对话是同一个对象的两个面 —— -->
     <aside v-show="!immersive" class="chat-rail" aria-label="Characters">
-      <p class="rail-eyebrow">Conversations</p>
+      <!-- 搜索只过滤左栏这一份列表(见 railList)。放在眉标之下、列表之上:
+           它是"在这些对话里找",不是页面上另开一块。
+           与历史页那一枚同款 —— 同一语义在全站用同一套视觉 -->
+      <div class="rail-search">
+        <PhMagnifyingGlass class="rail-search-ico" aria-hidden="true" />
+        <input
+          v-model="railQuery"
+          class="rail-search-input"
+          type="search"
+          placeholder="Search conversations…"
+          aria-label="Search conversations"
+        />
+        <button
+          v-if="railQuery"
+          class="rail-search-x"
+          aria-label="Clear search"
+          @click="clearRailQuery"
+        >
+          <PhX aria-hidden="true" />
+        </button>
+      </div>
+      <!-- 搜不到时**教它怎么搜**,不是干巴巴一句"没有" -->
+      <p v-if="characters.length && !railList.length" class="rail-none">
+        No conversation matches that. Try a name, or a word from what they said.
+      </p>
       <div v-if="characters.length" class="rail-list no-bar">
         <!-- 一行 = 一个"选它"按钮 + 一枚图钉(两个兄弟节点)。
              **不能把图钉嵌在行按钮里**:按钮不能套按钮,那是无效 HTML,
              读屏与键盘也会跟着乱 -->
         <div
-          v-for="c in ordered"
+          v-for="c in railList"
           :key="c.id"
           class="rail-item"
-          :class="{ on: c.id === active }"
+          :class="{ on: c.id === active, pinned: c.pinned }"
         >
           <button
             class="rail-row"
@@ -1003,7 +1120,20 @@ onBeforeUnmount(() => {
               <PhMaskHappy v-else aria-hidden="true" />
             </span>
             <span class="rail-text">
-              <span class="rail-name">{{ c.name }}</span>
+              <!-- 名字与时间同一行:时间在流里,**按构造就不会压到右边那枚图钉** ——
+                   行的右内边距已经为图钉留出 42px,时间自然止在那条线之前。
+                   (试过把时间绝对定位到右上角:32px 的图钉框在 52px 的行里
+                    居中时,两者会真的叠上,只能再靠挪图钉去躲,越躲越脆) -->
+              <span class="rail-top">
+                <span class="rail-name">{{ c.name }}</span>
+                <time
+                  v-if="lastAt(c)"
+                  class="rail-time"
+                  :datetime="stampOf(lastAt(c))"
+                >
+                  {{ railStamp(lastAt(c)) }}
+                </time>
+              </span>
               <span class="rail-last">{{ lastLine(c) }}</span>
             </span>
           </button>
@@ -1012,12 +1142,11 @@ onBeforeUnmount(() => {
                置顶的那一枚常驻(它是状态),其余悬停才浮出 -->
           <button
             class="rail-pin"
-            :class="{ 'is-on': c.pinned }"
             :aria-label="c.pinned ? `Unpin ${c.name}` : `Pin ${c.name}`"
             :aria-pressed="!!c.pinned"
             @click="emit('pin', c.id)"
           >
-            <PhPushPin :weight="c.pinned ? 'fill' : 'regular'" aria-hidden="true" />
+            <PhPushPin aria-hidden="true" />
           </button>
         </div>
       </div>
@@ -1086,6 +1215,19 @@ onBeforeUnmount(() => {
           <!-- 头部右侧:模型入口 + 记忆入口 + ⋮ 菜单。
                三者一起靠右收在 head-acts 里,窄屏把名字挤省略号时才不会错位 -->
           <div class="head-acts">
+            <!-- 去它的详情:改设定、看那五张设定图、看拿它做过的图,都在那一页。
+                 排在模型/记忆那两枚**左边**,因为它是"离开这一段对话",
+                 与那两枚"调这一段对话"不是一类。
+                 **不能塞进左边那个大按钮里** —— 按钮不能套按钮(见左栏那条注释) -->
+            <button
+              class="head-chip detail-chip"
+              :title="`Open ${current.name} in Characters`"
+              @click="emit('openCharacter', current.id)"
+            >
+              <span class="chip-label">Details</span>
+              <PhCaretDown aria-hidden="true" />
+            </button>
+
             <!-- 现在用的是哪个模型。**这一页自己的配置入口** ——
                  以前它只在生图那页的参数面板里能改(而且是和改写混在一排里),
                  于是"跟角色说话"用哪个模型,只能在画图那一侧动。
@@ -1284,7 +1426,11 @@ onBeforeUnmount(() => {
 
             <template v-for="r in rows" :key="r.key">
               <p v-if="r.kind === 'sep'" class="sep" :class="{ away: r.away }">{{ r.label }}</p>
-              <div v-else class="msg" :class="[r.msg.role, { 'group-first': r.first }]">
+              <div
+                v-else
+                class="msg"
+                :class="[r.msg.role, { 'group-first': r.first, 'has-ops': hasMsgOps(r.msg) }]"
+              >
                 <!-- 用户附的图。**独立一块,不放进气泡**(文字有文字的框,图有图的位置)。
                      压在文字上面是因为它是那句话的前提:先看图,再读字 -->
                 <button
@@ -1425,8 +1571,15 @@ onBeforeUnmount(() => {
             <!-- 重新生成 / 重试的**退路**:末尾那条没有气泡可挂时(只发了一张图、
                  没有文字 —— 那种消息不渲染气泡,下角那排也就没有落脚点)才出现在
                  这儿。正常情况下它在末尾那条的悬停动作里,排在"删"后面。
-                 一样只有图标(名字在 title / aria-label 上) -->
-            <div v-if="(canRegenerate || canRetry) && !tailBubble" class="regen">
+                 一样只有图标(名字在 title / aria-label 上)。
+                 **它站在哪一边,跟着它要重来的那条消息**:canRetry 说明末尾是
+                 用户那句(靠右),canRegenerate 说明是角色那条(靠左)——
+                 站在对面的时候,它跟那张图之间隔着整个面板,谁也不会把两者连起来 -->
+            <div
+              v-if="(canRegenerate || canRetry) && !tailBubble"
+              class="regen"
+              :class="{ 'is-user': canRetry }"
+            >
               <button
                 class="regen-btn"
                 :title="regenLabel"
@@ -1494,7 +1647,21 @@ onBeforeUnmount(() => {
               That message is over {{ CHAT_MAX_CHARS }} characters. Trim it before sending.
             </p>
             <div v-else class="compose-box">
-              <!-- 附图键放最左:右端那一枚永远留给"把这句话发出去" -->
+              <textarea
+                ref="inputEl"
+                v-grow
+                v-model="text"
+                class="no-bar"
+                rows="1"
+                :placeholder="`Tell ${current.name} something…`"
+                :aria-label="`Message ${current.name}`"
+                @keydown="onKeydown"
+              ></textarea>
+              <!-- 附图 / 表情两枚键挪到**右端**,挨着发送键(2026-10-06 用户要求
+                   "输入框 icon 都移到右边")。三枚同侧是有道理的:它们都是
+                   "对这一句话做的事",不是"开始说一句话"的入口 —— 字从左边起,
+                   工具收在右边,视线不用在两端来回跳。
+                   **最右那一枚仍然永远留给"把这句话发出去"** -->
               <button
                 type="button"
                 class="img-btn"
@@ -1506,16 +1673,36 @@ onBeforeUnmount(() => {
                 <PhImage aria-hidden="true" />
               </button>
               <input ref="imgInput" type="file" accept="image/*" hidden @change="onPickImage" />
-              <textarea
-                ref="inputEl"
-                v-grow
-                v-model="text"
-                class="no-bar"
-                rows="1"
-                :placeholder="`Tell ${current.name} something…`"
-                :aria-label="`Message ${current.name}`"
-                @keydown="onKeydown"
-              ></textarea>
+              <!-- 表情键与附图键同款(都是输入栏里的图标键)。面板**向上、且向左**开:
+                   这一行贴着屏幕最底,往下开就出画面了;而锚点跟着键挪到了右端,
+                   再按 left: 0 展开就会从输入区右缘伸出去(见 .emoji-pop 的 right: 0) -->
+              <div ref="emojiWrap" class="emoji-wrap">
+                <button
+                  ref="emojiBtn"
+                  type="button"
+                  class="img-btn"
+                  :class="{ on: emojiOpen }"
+                  aria-label="Insert an emoji"
+                  aria-haspopup="dialog"
+                  :aria-expanded="emojiOpen"
+                  title="Insert an emoji"
+                  @click="emojiOpen = !emojiOpen"
+                >
+                  <PhSmiley aria-hidden="true" />
+                </button>
+                <div v-if="emojiOpen" class="emoji-pop" role="dialog" aria-label="Emoji">
+                  <button
+                    v-for="e in EMOJI"
+                    :key="e"
+                    type="button"
+                    class="emoji-cell"
+                    :aria-label="`Insert ${e}`"
+                    @click="insertEmoji(e)"
+                  >
+                    {{ e }}
+                  </button>
+                </div>
+              </div>
               <!-- 生成中把这一枚原地换成停止键 —— 不是并排多一个按钮 -->
               <button
                 v-if="streaming"
@@ -1553,13 +1740,37 @@ onBeforeUnmount(() => {
         @click.stop
         @keydown="onPickerKey"
       >
-        <p class="rail-eyebrow">Conversations</p>
+        <!-- 搜索只过滤左栏这一份列表(见 railList)。放在眉标之下、列表之上:
+             它是"在这些对话里找",不是页面上另开一块。
+             与历史页那一枚同款 —— 同一语义在全站用同一套视觉 -->
+        <div class="rail-search">
+          <PhMagnifyingGlass class="rail-search-ico" aria-hidden="true" />
+          <input
+            v-model="railQuery"
+            class="rail-search-input"
+            type="search"
+            placeholder="Search conversations…"
+            aria-label="Search conversations"
+          />
+          <button
+            v-if="railQuery"
+            class="rail-search-x"
+            aria-label="Clear search"
+            @click="clearRailQuery"
+          >
+            <PhX aria-hidden="true" />
+          </button>
+        </div>
+        <!-- 搜不到时**教它怎么搜**,不是干巴巴一句"没有" -->
+        <p v-if="characters.length && !railList.length" class="rail-none">
+          No conversation matches that. Try a name, or a word from what they said.
+        </p>
         <div class="rail-list">
           <div
-            v-for="c in ordered"
+            v-for="c in railList"
             :key="c.id"
             class="rail-item"
-            :class="{ on: c.id === active }"
+            :class="{ on: c.id === active, pinned: c.pinned }"
           >
             <button class="rail-row" @click="pick(c.id)">
               <span class="rail-ava">
@@ -1567,18 +1778,26 @@ onBeforeUnmount(() => {
                 <PhMaskHappy v-else aria-hidden="true" />
               </span>
               <span class="rail-text">
-                <span class="rail-name">{{ c.name }}</span>
+                <span class="rail-top">
+                  <span class="rail-name">{{ c.name }}</span>
+                  <time
+                    v-if="lastAt(c)"
+                    class="rail-time"
+                    :datetime="stampOf(lastAt(c))"
+                  >
+                    {{ railStamp(lastAt(c)) }}
+                  </time>
+                </span>
                 <span class="rail-last">{{ lastLine(c) }}</span>
               </span>
             </button>
             <button
               class="rail-pin"
-              :class="{ 'is-on': c.pinned }"
               :aria-label="c.pinned ? `Unpin ${c.name}` : `Pin ${c.name}`"
               :aria-pressed="!!c.pinned"
               @click="emit('pin', c.id)"
             >
-              <PhPushPin :weight="c.pinned ? 'fill' : 'regular'" aria-hidden="true" />
+              <PhPushPin aria-hidden="true" />
             </button>
           </div>
         </div>
@@ -1616,7 +1835,12 @@ onBeforeUnmount(() => {
   /* 屏很矮时宁可让整页滚,也不要压成一条缝 */
   min-height: 420px;
   display: grid;
-  grid-template-columns: 240px minmax(0, 1fr);
+  /* 左栏 320(从 280 加上来)。那一栏里要放下头像 + 名字 + 最近一句 + 时刻,
+     而**搜索框的宽度就是栏宽减去两侧内边距**,所以"搜索框太窄"这件事
+     只能在栏宽上解 —— 把框自己的内缩改小会变成"贴着栏边",那条走过了。
+     860px 以下这栏整个收起(见断点),所以加宽只影响真正并排的那些宽度:
+     最窄的并排宽度 861 时,对话区还剩 861-32(shell)-320-16(间距) ≈ 493px */
+  grid-template-columns: 320px minmax(0, 1fr);
   gap: var(--sp-4);
   min-width: 0;
 }
@@ -1630,15 +1854,6 @@ onBeforeUnmount(() => {
   border: 1px solid var(--line);
   border-radius: var(--r);
   background: var(--surface);
-}
-.rail-eyebrow {
-  margin: 0 0 var(--sp-3);
-  padding: 0 6px;
-  font-size: var(--fs-micro);
-  font-weight: 600;
-  letter-spacing: var(--ls-eyebrow);
-  text-transform: uppercase;
-  color: var(--text-3);
 }
 .rail-list {
   display: flex;
@@ -1658,8 +1873,9 @@ onBeforeUnmount(() => {
   width: 100%;
   /* 触控目标 ≥40px */
   min-height: 52px;
-  /* 右边留出图钉那一格,名字与摘要不会被压在下面 */
-  padding: 6px 42px 6px 8px;
+  /* **不再为图钉留右侧那一格** —— 它已经挪到头像框上了(见 .rail-pin),
+     腾出来的 42px 全给名字与摘要 */ 
+  padding: 6px 8px;
   border: 0;
   border-radius: var(--r-sm);
   background: none;
@@ -1675,20 +1891,57 @@ onBeforeUnmount(() => {
 .rail-item.on .rail-row {
   background: var(--accent-soft);
 }
-/* 置顶:一枚贴着行右缘的小圆钮。**置顶过的常驻**(它同时是状态),
-   其余悬停才浮出 —— 每一行都挂一枚可见的图钉会把名单弄得很吵 */
+/* —— 置顶 = **行底加深一档**,不再有角标 ——
+ *
+ *  取值是"墨 8% 混进面",不是直接取某个现成档:现有那几档在浅色下彼此只差
+ *  一两级(#EFEFEA 与 #F0F0F0 几乎看不出差别),而这一档要**单独承担
+ *  "这行置顶了"**,必须和悬停、常态都分得开。
+ *  用 --text 而不是写死的黑:它在深色主题下会反相,于是两套主题都得到
+ *  "离底再重一档"的同一种效果 —— 浅色更深、深色更亮,而两者都是"更重"。
+ *  三档在两种主题下的顺序一致:常态 < 悬停 < 置顶。
+ *
+ *  写在 .on 之后:**又置顶又正开着**的那一行,底色按置顶走。
+ *  "正开着"不会因此丢掉 —— 它还有一条 .rail-item.on .rail-name 的字重与深色 */
+.rail-item.pinned .rail-row {
+  background: color-mix(in oklab, var(--text) 8%, var(--surface));
+}
+/* 名字那一行:名字吃掉剩余宽度,时间按自身宽度靠右收口 */
+.rail-top {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+/* 每行名字右侧那一刻。**在流里** —— 行的右内边距已为图钉留出 42px,
+   它自然落在图钉左边,不需要绝对定位,也就没有"压到图钉"这回事。
+   等宽数字:一列时间右对齐时才不会抖 */
+.rail-time {
+  flex: none;
+  /* --text-3 而不是 --text-4:后者是**禁用**档(浅 #C5C5C5 / 深 #45454A),
+     在两种主题下都只有约 1.9:1 —— 而这条时间是真信息,不是禁用态。
+     设计文档那条"最弱的一级文字也要约 4.6:1"说的正是这一档。
+     与下面那行摘要同色同级(它俩本来就是同一层信息),靠字号(11 vs 12)再分主次 */
+  color: var(--text-3);
+  font-size: var(--fs-micro);
+  font-variant-numeric: tabular-nums;
+}
 .rail-pin {
   position: absolute;
-  top: 50%;
-  right: 6px;
-  transform: translateY(-50%);
+  /* 贴在**头像框右上角**,像一枚状态徽章。坐标是从行的几何推出来的,不是随手填的:
+       头像 36px、行高 52px、行左内边距 8px(--sp-2)、行高内边距 6px
+       → 头像占 x 8..44、y 8..44
+       → 徽章 22px 且外沿出头像 3px:left = 44+3-22 = 25,top = 8-3 = 5
+     改头像尺寸或行内边距时,这两个数要跟着重算 */
+  left: 25px;
+  top: 5px;
   display: grid;
   place-items: center;
-  width: 32px;
-  height: 32px;
-  border: 0;
+  width: 22px;
+  height: 22px;
+  /* 压在头像这张图上,得有自己的底与一圈边,否则图形和脸糊在一起 */
+  border: 1px solid var(--line);
   border-radius: 999px;
-  background: none;
+  background: var(--surface);
   color: var(--text-3);
   cursor: pointer;
   opacity: 0;
@@ -1699,17 +1952,18 @@ onBeforeUnmount(() => {
 .rail-item:focus-within .rail-pin {
   opacity: 1;
 }
-.rail-pin.is-on {
-  opacity: 1;
-  color: var(--text-2);
-}
+/* **置顶不再有角标** —— 那件事已经由行底承担(见 .rail-item.pinned)。
+   这枚图钉于是退回成**纯动作**:平时不出现,悬停(或键盘聚焦)才浮出来,
+   点了就是"置顶 / 取消置顶"。
+   触屏没有悬停,那边仍靠 @media (hover: none) 让它常驻一份淡的,
+   否则置顶过的行就没有取消的入口了 */
 .rail-pin:hover {
   background: var(--accent-soft);
   color: var(--text);
 }
 .rail-pin svg {
-  width: 14px;
-  height: 14px;
+  width: 11px;
+  height: 11px;
 }
 /* 触屏没有 hover:常驻但压暗一档,免得名单看起来很吵 */
 @media (hover: none) {
@@ -1741,9 +1995,15 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   gap: 1px;
+  /* **撑满行内剩下的宽度** —— 少了这一条,这一栏就按内容宽度收着,
+     于是名字右边那一枚时间只是"跟在名字后面",而不是贴着行右缘对齐;
+     摘要那行也失去一个明确的宽度边界,省略号什么时候出现全看运气 */
+  flex: 1;
   min-width: 0;
 }
 .rail-name {
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
   font-size: var(--fs-sm);
   color: var(--text-2);
@@ -1842,6 +2102,131 @@ onBeforeUnmount(() => {
 }
 /* 窄屏:记忆那枚只留图标与时间,模型那枚收窄名字、去掉来源说明 ——
    名字与身份已经占满了那一行,而这两条补充信息都能在展开/进入设置后看到 */
+/* —— 左栏的搜索 ——
+   与历史页那一枚同款(圆角胶囊 / 1px 线 / 聚焦用 box-shadow 补一圈而不切 border:
+   切了里面整行会挪一下)。**同一语义在全站用同一套视觉**是这一站的纪律,
+   所以这里是照抄它的取值,不是另设计一个 */
+.rail-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  /* **不许被压缩**。它是 .chat-rail(纵向 flex)的子项,默认 flex-shrink 是 1 ——
+     对话一多,列表把剩余空间吃光之后,被压的就是它:14 行时实测从 56 掉到 53。
+     要滚的是 .rail-list(它自己有 overflow-y 与 min-height: 0),不是这一格 */
+  flex: none;
+  /* **44**。站内控件的常规档是 40,44 是它上面那一档;也在文档
+     "触控目标 ≥40px"那条硬约束之上。
+     (34 → 38 → 44 是"确实偏矮"的三档;之后的 52 与 56 是为了追一条
+      其实在说**宽度**的反馈而加过头的,已退回。这一格的高度以 44 为准。) */
+  height: 44px;
+  /* **不外探**。让它和列表行共用同一条内缩线(都从 .chat-rail 的 padding 起算)——
+     外探过的那一版,框几乎贴到栏的边上,两侧一点余量都没有。
+     与列表行的底距给足 --sp-3,免得框和第一行粘在一起 */
+  margin: 0 0 var(--sp-3);
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  /* 圆角矩形(与列表行、图标键同一档),不做胶囊:这个高度上胶囊两端各是半个圆,
+     框里可用的横向空间也被啃掉一截 —— 这正是它看起来"窄"的原因之一 */
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  transition: box-shadow var(--dur) var(--ease);
+}
+.rail-search:focus-within {
+  box-shadow: 0 0 0 1px var(--line-strong);
+}
+.rail-search-ico {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  color: var(--text-4);
+}
+.rail-search-input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  font-size: var(--fs-sm);
+}
+.rail-search-input:focus {
+  outline: none;
+}
+/* 原生那枚清除键与右边自绘的那枚重复,藏掉 */
+.rail-search-input::-webkit-search-cancel-button {
+  display: none;
+}
+.rail-search-x {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border: 0;
+  border-radius: 999px;
+  background: none;
+  color: var(--text-3);
+  cursor: pointer;
+}
+.rail-search-x:hover {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+.rail-search-x svg {
+  width: 13px;
+  height: 13px;
+}
+/* 搜不到时那一行。**教它怎么搜**,不是干巴巴一句"没有" */
+.rail-none {
+  margin: 0;
+  padding: 14px 8px;
+  color: var(--text-3);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+}
+
+/* —— 输入栏的表情面板 —— */
+.emoji-wrap {
+  position: relative;
+  flex: none;
+}
+.emoji-wrap .img-btn.on {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+.emoji-pop {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  /* **贴着键的右缘、往左展开**。这一排图标在输入区的右端,
+     再按 left: 0 展开的话整块面板会从输入区右缘伸出去(窄屏上直接出屏) */
+  right: 0;
+  /* 与 .chat-menu 同一层:两者都是浮在内容上的小面板,且互斥(一个在头部、
+     一个在输入栏),不需要再分层 */
+  z-index: 20;
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 2px;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  box-shadow: var(--sh-md);
+}
+.emoji-cell {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: none;
+  font-size: 19px;
+  line-height: 1;
+  cursor: pointer;
+}
+.emoji-cell:hover {
+  background: var(--accent-soft);
+}
 @media (max-width: 560px) {
   .mem-chip .chip-label,
   .model-chip .chip-note {
@@ -2069,9 +2454,15 @@ onBeforeUnmount(() => {
 .msg.user {
   align-items: flex-end;
 }
-/* 念 / 删 / 重来这几枚键贴着气泡外侧下角,绝对定位 —— 它们**不该占气泡的宽度**。
-   放进流里(哪怕用 opacity 藏起来)会实打实地把每个气泡压窄 80px,
+/* 念 / 删 / 重来这几枚键装在一枚**动作药丸**里,绝对定位 —— 它们不该占气泡的宽度。
+   放进流里(哪怕用 opacity 藏起来)会实打实地把每个气泡压窄一排的宽度,
    而不悬停的时候谁也看不见它们,那份窄就成了一份没来由的窄。
+
+   **药丸是它的底,不是装饰**(2026-10-06 改)。从前三枚是光着挂在气泡外侧的:
+   没有底,三枚之间只隔 2px 而各自的框有 40px 宽 —— 图标之间因此空着近 30px,
+   读起来是"三个谁也不挨着谁的点",而不是一条工具;到了沉浸页还直接躺在剧照上,
+   而 --text-3 是照面板面调的一档灰,照片一亮就没了。给一个 --surface 的底
+   (与 .chat-menu / 记忆卡片同一层语言),三枚才是一件事,对比度也不再靠运气。
 
    两侧的挂法不同:角色那条挂在气泡右边,自己那条挂在气泡左边 ——
    自己说的靠右排,右侧再挂东西就出面板了。所以两侧的气泡都要有个
@@ -2082,14 +2473,36 @@ onBeforeUnmount(() => {
 .msg.user .bubble {
   position: relative;
 }
+/* 药丸的尺寸。三枚是上限(末尾那条同时有"念 / 删 / 重来"),
+   下面几个变量同时喂给三处:药丸自己、气泡要让出的走道(--ops-lane),
+   以及挂不下时气泡要让出的高度(--ops-rail)。
+   鼠标那档 34px:三枚并排时比 40px 少 18px,排在一起才读得出是一组。
+   触屏那档抬回 40px —— 站内对触控目标的底线(见 PRODUCT.md) */
+.chat {
+  --ops-btn: 34px;
+  --ops-gap: 2px;
+  --ops-pad: 3px;
+  --ops-rail: calc(var(--ops-btn) + 2 * var(--ops-pad));
+  /* 走道 = 药丸自己的宽 + 与气泡之间的缝 + 一点余量。少了最后那一点,
+     气泡正好长到"药丸贴着滚动内沿"的位置 —— 差 1px 就又被裁 */
+  --ops-lane: calc(
+    3 * var(--ops-btn) + 2 * var(--ops-gap) + 2 * var(--ops-pad) + 2px + 2 * var(--sp-2)
+  );
+}
 .msg-ops {
   position: absolute;
-  /* 与气泡下沿对齐。40px 的触控目标比一行气泡略高,
-     往下多出来的那 2px 落在消息之间那道缝里(最窄的一档也有 --sp-2),不会压到上一条 */
-  bottom: -2px;
+  /* 与气泡下沿齐平:图标在药丸里居中,药丸贴着气泡的底边,
+     三枚的光学中线正好落在气泡最后一行字上(从前是 bottom: -2px,
+     整排的下沿压到气泡外面,图标看着浮在气泡下角外头) */
+  bottom: 0;
   display: flex;
   align-items: center;
-  gap: 2px;
+  gap: var(--ops-gap);
+  padding: var(--ops-pad);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  box-shadow: var(--sh-sm);
   /* 每条消息都挂着一排按钮会把对话流弄得很吵,所以手指悬上来它才浮出来。
      触屏没有 hover,那种设备上让它常驻但压暗一档(见下面的媒体查询) */
   opacity: 0;
@@ -2097,11 +2510,11 @@ onBeforeUnmount(() => {
 }
 .msg.assistant .msg-ops {
   left: 100%;
-  margin-left: 2px;
+  margin-left: var(--sp-2);
 }
 .msg.user .msg-ops {
   right: 100%;
-  margin-right: 2px;
+  margin-right: var(--sp-2);
 }
 .msg:hover .msg-ops {
   opacity: 1;
@@ -2120,19 +2533,18 @@ onBeforeUnmount(() => {
 .msg-ops.on .speak-btn {
   color: var(--text-2);
 }
-/* 念 / 删 / 重来同形:40×40 的圆点,无底无边,悬停才浮出淡底。
+/* 念 / 删 / 重来同形:圆点,无底无边,悬停才在药丸里浮出淡底。
    重新生成**只有图标**(2026-10-05 用户要求"只保留 icon"):同一个动作有
    两种叫法("Regenerate" / "Try again",见 regenLabel),而那行字放在这一排里
-   既比旁边两枚长出一大截,又会在窄屏被面板裁掉 —— 气泡上限占着消息区 76%,
-   留给外侧那排的只有剩下的 24%(见 .msg-ops)。
+   会比其他两枚宽出一大截。
    名字留在 title 与 aria-label 上:看得见的是图标,读得到的是词 */
 .speak-btn,
 .del-btn,
 .regen-btn {
   display: grid;
   place-items: center;
-  width: 40px;
-  height: 40px;
+  width: var(--ops-btn);
+  height: var(--ops-btn);
   border: 0;
   border-radius: 999px;
   background: none;
@@ -2176,13 +2588,43 @@ onBeforeUnmount(() => {
     animation: none;
   }
 }
+/* 触屏没有 hover:常驻,但压暗一档,免得名单看起来很吵。
+   可点区域同时抬回 40px —— 那一档是手指在按,不是鼠标在指。
+   **底色也一并收掉**:那层底是"悬停把它浮出来"这件事的一半,而对触屏来说
+   它从来没有"浮出来"的那一刻,常驻的底就只剩"每条消息下面挂一块牌子"
+   (一屏五块,见改动前的截图)。收掉之后回到一排安静的图标,散不散由间距承担。
+   border 只把颜色收掉、宽度留着 —— 免得两种输入的图标位置差一个像素 */
 @media (hover: none) {
+  .chat {
+    --ops-btn: 40px;
+    --ops-gap: 4px;
+    --ops-pad: 4px;
+  }
   .msg-ops {
     opacity: 0.5;
+    /* 底不是收干净,而是降到站内已有的"抬起来"那一档(--bg-elev,输入框、
+       角色气泡都用它)。光秃秃的图标在触屏上会散成两枚飘着的字形 ——
+       常驻的东西得看得出是一组 */
+    border-color: transparent;
+    background: var(--bg-elev);
+    box-shadow: none;
+  }
+  /* 沉浸页是这条的唯一例外:那一页的底是一张照片,没有底就没有对比度
+     (与上面 .bubble 的 text-shadow 是同一件事 —— 图标没有字可以描边) */
+  .chat.is-immersive .msg-ops {
+    border-color: var(--line);
+    background: var(--surface);
+    box-shadow: var(--sh-sm);
   }
 }
 .bubble {
-  max-width: 76%;
+  /* 76% 是阅读上限,而**外侧还得给那枚药丸让出一条走道** —— 两条一起算。
+     从前只有 76%:气泡一放宽(窄屏那一档是 88%)药丸就没了立足之地,
+     整排被 .chat-stream 的滚动容器裁掉,末尾那两枚点都点不到。
+     走道按"三枚的最大档"算,所以鼠标与触屏两种尺寸都够(见 --ops-lane)。
+     min() 只在真挤的时候才咬:1440 的桌面上 76% 本来就比走道宽,
+     气泡宽度一个像素都不动 */
+  max-width: min(76%, calc(100% - var(--ops-lane)));
   /* 保留换行:角色可能分句写,压成一行就不是它写的样子了 */
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -2420,11 +2862,24 @@ onBeforeUnmount(() => {
 }
 /* 重新生成是这一页最次要的动作 —— 它不该和对话争视线。
    平时它挂在末尾那条消息的悬停动作里(见 .regen-btn);只有末尾那条
-   **没有气泡可挂**时才退回这里(自己站一行)。它是同一枚图标键:
-   无底无边,悬停才浮出淡底,可点区域仍是 40×40 */
+   **没有气泡可挂**时才退回这里(自己站一行)。
+   长相跟那一排一致:同一枚药丸,只是里面只有一枚按钮 —— 同一个动作
+   在两处有两种长相,用户就得重新认一次 */
 .regen {
   display: flex;
+  /* 一步都不多占:它是这一行里唯一的东西 */
+  align-self: flex-start;
   margin-top: var(--sp-1);
+  padding: var(--ops-pad);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  box-shadow: var(--sh-sm);
+}
+/* 要重来的那条是**用户**说的(靠右)——它也跟着靠右,落在那张图下面,
+   而不是站在面板另一边 */
+.regen.is-user {
+  align-self: flex-end;
 }
 /* "最次要的动作"的统一长相:无底无边的一行细字,悬停才浮出淡底。
    "改记忆"用它 —— 它也是"这一页顺带能做的事",做成按钮会和对话本身抢视线。
@@ -3019,10 +3474,35 @@ onBeforeUnmount(() => {
   .bubble {
     max-width: 88%;
   }
+  /* 88% 一放开,外侧只剩 12% —— 药丸挂不下了(三枚要 120px,那条缝只有 40px)。
+     于是它改挂到气泡**下面**:横向不够就往下走,高度由气泡让出来。
+     不压字、不出面板,也不会在悬停那一刻把下面的东西顶走(高度是常备的)。
+     占高度而不占宽度是这两种代价里更小的一份:390 的屏上真要留出走道的话,
+     气泡只剩 196px,比上面那句"76% 太窄"否掉的一档还窄 */
+  .msg.has-ops .bubble {
+    margin-bottom: calc(var(--ops-rail) + var(--sp-1));
+  }
+  .msg.assistant .msg-ops {
+    left: auto;
+    right: 0;
+    top: 100%;
+    bottom: auto;
+    margin: var(--sp-1) 0 0;
+  }
+  .msg.user .msg-ops {
+    left: 0;
+    right: auto;
+    top: 100%;
+    bottom: auto;
+    margin: var(--sp-1) 0 0;
+  }
   /* 窄屏才把输入框字号提回 16px:低于这个值 iOS Safari 聚焦时会放大整页
      (站内硬约束,见 style.css 的 --fs-lg)。桌面没有这个问题,
-     所以那一档只在需要它的地方出现 */
-  .compose-box textarea {
+     所以那一档只在需要它的地方出现。
+     搜索框也在这里:窄屏下左栏收起,它是从"换角色"那个浮层里用的 ——
+     也就是**手机上真的会被聚焦**,同样躲不开这条 */
+  .compose-box textarea,
+  .rail-search-input {
     font-size: var(--fs-lg);
   }
 }
@@ -3099,6 +3579,22 @@ onBeforeUnmount(() => {
 }
 .chat.is-immersive .msg {
   align-items: flex-start;
+}
+/* 动作药丸在沉浸页**也不能挂在气泡外侧**:这一页的气泡放到了 100%(字是整列的),
+   挂外侧就掉到字列右边、压在剧照上;自己那条更糟 —— right: 100% 会把它甩到
+   字列左边,窄屏上直接出屏(点不到,也看不见)。
+   所以这里与窄屏同一条规矩:挂到气泡下面,高度由气泡让出来。
+   药丸自带的底兜住了对比度 —— 这一页的背景是一张明暗不可控的照片
+   (与上面那条 text-shadow 是同一件事,只是图标没有字可以描边) */
+.chat.is-immersive .msg.has-ops .bubble {
+  margin-bottom: calc(var(--ops-rail) + var(--sp-1));
+}
+.chat.is-immersive .msg-ops {
+  left: auto;
+  right: 0;
+  top: 100%;
+  bottom: auto;
+  margin: var(--sp-1) 0 0;
 }
 .chat.is-immersive .msg.assistant .bubble {
   font-size: var(--fs-xl);
