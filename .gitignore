@@ -12,3 +12,7 @@ tmp-design
 .npm-logs
 # 性能测量的临时 Chrome profile(脚本自己会在 /tmp 下建,这里兜底)
 .perf-profile
+# JetBrains 的工程配置:里面是每台机器各一份的东西
+# (project-jdk-name、窗口布局、本机路径),与本项目无关 ——
+# 它自己生成的那份 .idea/.gitignore 只挡得住 workspace.xml
+.idea
